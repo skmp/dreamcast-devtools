@@ -8,7 +8,6 @@ import type {
   EventLogEntry,
   RegisterValue,
   RpcError,
-  ThreadInfo,
   WatchDescriptor,
 } from "../lib/debuggerSchema";
 import type { DebuggerClient } from "../services/debuggerClient";
@@ -27,21 +26,20 @@ interface DebuggerDataState {
   registersByPath: Record<string, RegisterValue[]>;
   availableEvents: string[];
   breakpoints: BreakpointDescriptor[];
-  threads: ThreadInfo[];
   eventLog: EventLogEntry[];
-  executionState: { state: "running" | "paused"; breakpointId?: string };
+  executionState: { state: "running" | "paused"; breakpointId?: number };
   watches: WatchDescriptor[];
   callstacks: Record<string, CallstackFrame[]>;
   // Methods
   initialize: (client: DebuggerClient) => Promise<void>;
   reset: () => void;
   addWatch: (expression: string) => Promise<void>;
-  removeWatch: (watchId: string) => Promise<void>;
-  editWatch: (watchId: string, value: string) => Promise<void>;
-  modifyWatchExpression: (watchId: string, newExpression: string) => Promise<void>;
-  addBreakpoint: (location: string, kind?: BreakpointDescriptor["kind"]) => Promise<void>;
-  removeBreakpoint: (id: string) => Promise<void>;
-  toggleBreakpoint: (id: string, enabled: boolean) => Promise<void>;
+  removeWatch: (watchId: number) => Promise<void>;
+  editWatch: (watchId: number, value: string) => Promise<void>;
+  modifyWatchExpression: (watchId: number, newExpression: string) => Promise<void>;
+  addBreakpoint: (event: string, address?: number, kind?: BreakpointDescriptor["kind"]) => Promise<void>;
+  removeBreakpoint: (id: number) => Promise<void>;
+  toggleBreakpoint: (id: number, enabled: boolean) => Promise<void>;
   showError: (message: string) => void;
   clearError: () => void;
 }
@@ -65,7 +63,6 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => ({
   registersByPath: {},
   availableEvents: [],
   breakpoints: [],
-  threads: [],
   eventLog: [],
   executionState: { state: "paused" },
   watches: [],
@@ -80,7 +77,6 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => ({
       latestTick: undefined,
       deviceTree: [],
       breakpoints: [],
-      threads: [],
       eventLog: [],
       executionState: { state: "paused" },
       watches: [],
@@ -108,7 +104,6 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => ({
               breakpoints: breakpointList,
               eventLog: tick.eventLog,
               executionState: tick.executionState,
-              threads: tick.threads ?? [],
               watches: tick.watches ?? [],
               callstacks: tick.callstacks ?? get().callstacks,
             });
@@ -155,7 +150,6 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => ({
         availableEvents: [],
         watches: [],
         breakpoints: [],
-        threads: [],
         eventLog: [],
         executionState: { state: "paused" },
         callstacks: {},
@@ -258,8 +252,8 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => ({
       throw error;
     }
   },
-  async addBreakpoint(location, kind = "code") {
-    const trimmed = location.trim();
+  async addBreakpoint(event, address, kind = "code") {
+    const trimmed = event.trim();
     if (!trimmed) {
       return;
     }
@@ -268,7 +262,7 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => ({
       return;
     }
     try {
-      const result = await client.addBreakpoint(trimmed, kind) as RpcError;
+      const result = await client.addBreakpoint(trimmed, address, kind) as RpcError;
       if (result.error) {
         get().showError(result.error.message);
       }

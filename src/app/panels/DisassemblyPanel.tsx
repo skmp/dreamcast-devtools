@@ -1,11 +1,12 @@
-import { useMemo } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useRef } from "react";
 import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import SubdirectoryArrowRightIcon from "@mui/icons-material/SubdirectoryArrowRight";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { categoryStates, syncCategoryStatesToServer, type BreakpointCategory } from "../../state/breakpointCategoryState";
-import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks } from "../components/DisassemblyView";
+import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks, type DisassemblyViewRef } from "../components/DisassemblyView";
+import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
+import { generateUUID } from "../../lib/uuid";
 
 const formatHexAddress = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
 
@@ -50,7 +51,6 @@ interface DisassemblyPanelProps {
 }
 
 const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => {
-  const [searchParams] = useSearchParams();
   const client = useSessionStore((state) => state.client);
   const executionState = useSessionStore((state) => state.executionState);
   const initialized = useDebuggerDataStore((state) => state.initialized);
@@ -59,6 +59,8 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
   const addBreakpoint = useDebuggerDataStore((state) => state.addBreakpoint);
   const removeBreakpoint = useDebuggerDataStore((state) => state.removeBreakpoint);
   const toggleBreakpoint = useDebuggerDataStore((state) => state.toggleBreakpoint);
+  const viewRef = useRef<DisassemblyViewRef>(null);
+  const panelIdRef = useRef(generateUUID());
 
   // Get current PC/STEP value
   const currentPc = useMemo(() => {
@@ -76,15 +78,14 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
 
   // Map addresses to breakpoints
   const breakpointsByAddress = useMemo(() => {
-    const map = new Map<number, { id: string; enabled: boolean }>();
+    const map = new Map<number, { id: number; enabled: boolean }>();
     const cpuPath = target === "dsp" ? "dc.aica.dsp" : target === "sh4" ? "dc.sh4.cpu" : "dc.aica.arm7";
     const counterName = target === "dsp" ? "step" : "pc";
+    const expectedEvent = `${cpuPath}.${counterName}`;
 
     for (const bp of breakpoints) {
-      const match = bp.location.match(new RegExp(`${cpuPath}\\.${counterName}\\s*==\\s*0x([0-9A-Fa-f]+)`));
-      if (match) {
-        const addr = Number.parseInt(match[1], 16);
-        map.set(addr, { id: bp.id, enabled: bp.enabled });
+      if (bp.kind === "code" && bp.event === expectedEvent && bp.address !== undefined) {
+        map.set(bp.address, { id: bp.id, enabled: bp.enabled });
       }
     }
     return map;
@@ -103,11 +104,12 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
       formatAddressInput: (value: number) => formatAddressInput(target, value),
       formatAddressDisplay: (value: number) => formatAddressForDisplay(target, value),
       parseAddressInput: (input: string) => parseAddressInput(target, input),
-      gridColumns: isDsp ? "24px 80px 120px 1fr" : "24px 140px 140px 1fr",
+      gridColumns: isDsp ? "24px 80px 1fr" : "24px 140px 140px 1fr",
       stepLabel: isDsp ? "Step" : "Step Over",
       stepIcon: isDsp ? ArrowForwardIcon : SubdirectoryArrowRightIcon,
       showStepInOut: target === "sh4" || target === "arm7",
       urlParamName: isDsp ? "step" : "address",
+      showBytes: !isDsp,
     };
   }, [target]);
 
@@ -147,13 +149,13 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
       onBreakpointAdd: async (address: number) => {
         const cpuPath = target === "dsp" ? "dc.aica.dsp" : target === "sh4" ? "dc.sh4.cpu" : "dc.aica.arm7";
         const counterName = target === "dsp" ? "step" : "pc";
-        const location = `${cpuPath}.${counterName} == ${formatHexAddress(address)}`;
-        await addBreakpoint(location, "code");
+        const event = `${cpuPath}.${counterName}`;
+        await addBreakpoint(event, address, "code");
       },
-      onBreakpointRemove: async (id: string) => {
+      onBreakpointRemove: async (id: number) => {
         await removeBreakpoint(id);
       },
-      onBreakpointToggle: async (id: string, enabled: boolean) => {
+      onBreakpointToggle: async (id: number, enabled: boolean) => {
         await toggleBreakpoint(id, enabled);
       },
       onMuteToggle: () => {
@@ -186,20 +188,20 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
     [client, target, executionState, addBreakpoint, removeBreakpoint, toggleBreakpoint, category],
   );
 
-  // Get initial URL address
-  const initialUrlAddress = useMemo(() => {
-    const addressParam = searchParams.get(config.urlParamName);
-    if (addressParam) {
-      const parsed = parseAddressInput(target, addressParam);
-      if (parsed !== undefined) {
-        return { address: parsed, fromUrl: true };
-      }
+  // Register with navigation service
+  useEffect(() => {
+    const panelId = panelIdRef.current;
+    if (viewRef.current) {
+      disassemblyNavigationService.register(panelId, viewRef.current);
     }
-    return undefined;
-  }, [searchParams, config.urlParamName, target]);
+    return () => {
+      disassemblyNavigationService.unregister(panelId);
+    };
+  }, []);
 
   return (
     <DisassemblyView
+      ref={viewRef}
       config={config}
       callbacks={callbacks}
       defaultAddress={defaultAddress}
@@ -208,7 +210,7 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
       initialized={initialized}
       executionState={executionState}
       categoryState={categoryState}
-      initialUrlAddress={initialUrlAddress}
+      target={target}
     />
   );
 };
@@ -218,7 +220,7 @@ export const Sh4DisassemblyPanel = () => {
   const registers = registersByPath["dc.sh4.cpu"];
   const pcReg = registers?.find((r) => r.name === "PC");
 
-  let defaultAddress = 0x8c0000a0;
+  let defaultAddress = 0x8c010000;
   if (pcReg?.value) {
     const pc = Number.parseInt(pcReg.value.replace(/^0x/i, ""), 16);
     if (!Number.isNaN(pc)) {

@@ -3,16 +3,22 @@ import type { ReactNode } from "react";
 import { SimpleTreeView } from "@mui/x-tree-view/SimpleTreeView";
 import { TreeItem } from "@mui/x-tree-view/TreeItem";
 import { Panel } from "../layout/Panel";
-import type { DeviceNodeDescriptor, RegisterValue } from "../../lib/debuggerSchema";
-import { Box, Divider, IconButton, Stack, TextField, Tooltip, Typography } from "@mui/material";
+import type { DeviceNodeDescriptor, RegisterValue, PanelId } from "../../lib/debuggerSchema";
+import { Box, Divider, IconButton, Stack, TextField, Typography } from "@mui/material";
+import { HideOnHoverTooltip as Tooltip } from "../components";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import AddIcon from "@mui/icons-material/Add";
 import SearchIcon from "@mui/icons-material/Search";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
+import { PANEL_REGISTRY } from "../layout/panelRegistry";
 
 
-export const DeviceTreePanel = () => {
+interface DeviceTreePanelProps {
+  onOpenPanel?: (panelId: PanelId) => void;
+}
+
+export const DeviceTreePanel = ({ onOpenPanel }: DeviceTreePanelProps = {}) => {
   const initialized = useDebuggerDataStore((state) => state.initialized);
   const deviceTree = useDebuggerDataStore((state) => state.deviceTree);
   const registersByPath = useDebuggerDataStore((state) => state.registersByPath);
@@ -41,12 +47,13 @@ export const DeviceTreePanel = () => {
 
       const nodePath = node.path.toLowerCase();
       const nodeLabel = node.label.toLowerCase();
+      const nodeDescription = node.description?.toLowerCase() || "";
 
       // Check if this node matches the current level's query word
       const currentWord = queryWords[depth] || queryWords[queryWords.length - 1];
-      const nodeMatches = nodePath.includes(currentWord) || nodeLabel.includes(currentWord);
+      const nodeMatches = nodePath.includes(currentWord) || nodeLabel.includes(currentWord) || nodeDescription.includes(currentWord);
 
-      // Filter registers - check if any register matches remaining query words
+      // Filter registers - only if this node matches, check registers with remaining words
       const remainingWords = queryWords.slice(depth + (nodeMatches ? 1 : 0));
       const filteredRegisters = node.registers?.filter((reg) => {
         const regName = reg.name.toLowerCase();
@@ -66,9 +73,10 @@ export const DeviceTreePanel = () => {
       const hasMatchingChildren = filteredChildren && filteredChildren.length > 0;
 
       // Include this node if:
-      // 1. It has matching children, OR
-      // 2. It has matching registers and all query words up to this point are satisfied
-      if (hasMatchingChildren || hasMatchingRegisters) {
+      // 1. This node matches the query word, OR
+      // 2. It has matching children, OR
+      // 3. It has matching registers
+      if (nodeMatches || hasMatchingChildren || hasMatchingRegisters) {
         return {
           ...node,
           registers: hasMatchingRegisters ? filteredRegisters : undefined,
@@ -129,8 +137,8 @@ export const DeviceTreePanel = () => {
           key={`${nodePath}.reg.${register.name}`}
           itemId={`${nodePath}.reg.${register.name}`}
           label={
-            <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
-              <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
+            <Stack direction="row" spacing={0.5} alignItems="center" justifyContent="space-between" sx={{ py: 0 }}>
+              <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.813rem", lineHeight: 1.4 }}>
                 {register.name} = {displayValue}
               </Typography>
               <Tooltip title={watched ? "Already in watch" : "Add to watch"}>
@@ -143,13 +151,20 @@ export const DeviceTreePanel = () => {
                       event.stopPropagation();
                       void handleRegisterWatch(expression);
                     }}
+                    sx={{ padding: "2px" }}
                   >
-                    <AddIcon fontSize="inherit" />
+                    <AddIcon sx={{ fontSize: "0.875rem" }} />
                   </IconButton>
                 </span>
               </Tooltip>
             </Stack>
           }
+          sx={{
+            "& .MuiTreeItem-content": {
+              py: 0,
+              minHeight: "24px",
+            },
+          }}
         />
       );
     },
@@ -162,21 +177,60 @@ export const DeviceTreePanel = () => {
         key={node.path}
         itemId={node.path}
         label={
-          <Stack direction="row" spacing={1} alignItems="center">
-            <Typography variant="body2" fontWeight={500}>
-              {node.label}
-            </Typography>
-            <Typography variant="caption" color="text.secondary">
-              {node.kind}
-            </Typography>
+          <Stack direction="row" spacing={0.5} alignItems="center" justifyContent="space-between" sx={{ py: 0, width: "100%" }}>
+            <Stack direction="row" spacing={0.5} alignItems="center" sx={{ flex: 1, minWidth: 0 }}>
+              {node.actions && node.actions.length > 0 ? (
+                <Tooltip title={node.description} placement="right">
+                  <Typography variant="body2" fontWeight={500} sx={{ fontSize: "0.813rem", lineHeight: 1.4 }}>
+                    {node.label}
+                  </Typography>
+                </Tooltip>
+              ) : (
+                <Typography variant="body2" fontWeight={500} sx={{ fontSize: "0.813rem", lineHeight: 1.4 }}>
+                  {node.label}
+                </Typography>
+              )}
+              {!node.actions && (
+                <Typography variant="caption" color="text.secondary" sx={{ fontSize: "0.688rem", lineHeight: 1.4 }}>
+                  {node.description}
+                </Typography>
+              )}
+            </Stack>
+            {node.actions && node.actions.length > 0 && (
+              <Stack direction="row" spacing={0.25} alignItems="center">
+                {node.actions.map((panelId) => {
+                  const panelInfo = PANEL_REGISTRY[panelId];
+                  return (
+                    <Tooltip key={panelId} title={`Open ${panelInfo.name}`} placement="left">
+                      <IconButton
+                        size="small"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onOpenPanel?.(panelId);
+                        }}
+                        sx={{ padding: "2px" }}
+                      >
+                        {panelInfo.icon}
+                      </IconButton>
+                    </Tooltip>
+                  );
+                })}
+              </Stack>
+            )}
           </Stack>
         }
+        sx={{
+          "& .MuiTreeItem-content": {
+            py: 0,
+            minHeight: "24px",
+          },
+        }}
       >
         {node.registers?.map((register) => renderRegister(node.path, register))}
         {node.children?.map((child) => renderNode(child))}
       </TreeItem>
     ),
-    [renderRegister],
+    [renderRegister, onOpenPanel],
   );
 
   return (
@@ -212,7 +266,19 @@ export const DeviceTreePanel = () => {
             defaultExpandedItems={expandedItems}
             slots={{ collapseIcon: ExpandMoreIcon, expandIcon: ChevronRightIcon }}
             multiSelect
-            sx={{ px: 1, py: 1, flex: 1, overflowY: "auto" }}
+            sx={{
+              px: 1,
+              py: 0.5,
+              flex: 1,
+              overflowY: "auto",
+              "& .MuiTreeItem-group": {
+                marginLeft: "12px",
+                marginTop: 0,
+              },
+              "& .MuiTreeItem-content": {
+                marginBottom: 0,
+              },
+            }}
           >
             {filteredTree.map((node) => renderNode(node))}
           </SimpleTreeView>

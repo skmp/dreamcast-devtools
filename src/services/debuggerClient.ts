@@ -1,11 +1,14 @@
 ﻿import type { JsonRpcNotification } from "../lib/jsonRpc";
 import type {
   BreakpointDescriptor,
+  BreakpointId,
   CallstackFrame,
   DebuggerNotification,
   DebuggerRpcSchema,
-  MemorySlice,
+  TargetProcessor,
+  WatchId,
 } from "../lib/debuggerSchema";
+import { DebuggerRpcMethodSchemas, RpcMethod } from "../lib/debuggerSchema";
 import { JsonRpcClient } from "./jsonRpcClient";
 import type { JsonRpcClientOptions } from "./jsonRpcClient";
 import type { DebuggerTransport, TransportOptions } from "./transport";
@@ -27,7 +30,11 @@ export class DebuggerClient {
   constructor(config: DebuggerClientConfig) {
     this.config = config;
     this.transport = createTransport(config.mode);
-    this.rpc = new JsonRpcClient<DebuggerRpcSchema>(this.transport, config.rpcOptions);
+    this.rpc = new JsonRpcClient<DebuggerRpcSchema>(this.transport, {
+      ...config.rpcOptions,
+      validationSchemas: DebuggerRpcMethodSchemas,
+      validateResponses: true,
+    });
     this.rpc.onNotification((notification) => {
       const mapped = mapNotification(notification);
       if (mapped) {
@@ -44,92 +51,82 @@ export class DebuggerClient {
     this.rpc.disconnect();
   }
 
-  async handshake(clientName: string, clientVersion: string, transportBuild: "native" | "wasm") {
-    return this.rpc.call("debugger.handshake", {
-      clientName,
-      clientVersion,
-      transport: { build: transportBuild },
-    });
-  }
-
   async describe() {
-    return this.rpc.call("debugger.describe", {});
+    return this.rpc.call(RpcMethod.DEBUGGER_DESCRIBE, {});
   }
 
   async fetchCallstack(target: "sh4" | "arm7", maxFrames = 32): Promise<{ target: string; frames: CallstackFrame[] }> {
-    return this.rpc.call("state.getCallstack", { target, maxFrames });
+    return this.rpc.call(RpcMethod.STATE_GET_CALLSTACK, { target, maxFrames });
   }
 
   async watch(expressions: string[]) {
     if (!expressions.length) {
       return {};
     }
-    return this.rpc.call("state.watch", { expressions });
+    return this.rpc.call(RpcMethod.STATE_WATCH, { expressions });
   }
 
-  async unwatch(expressions: string[]) {
-    if (!expressions.length) {
+  async unwatch(watchIds: WatchId[]) {
+    if (!watchIds.length) {
       return {};
     }
-    return this.rpc.call("state.unwatch", { expressions });
+    return this.rpc.call(RpcMethod.STATE_UNWATCH, { watchIds });
   }
 
-  async editWatch(watchId: string, value: string) {
-    return this.rpc.call("state.editWatch", { watchId, value });
+  async editWatch(watchId: WatchId, value: string) {
+    return this.rpc.call(RpcMethod.STATE_EDIT_WATCH, { watchId, value });
   }
 
-  async modifyWatchExpression(watchId: string, newExpression: string) {
-    return this.rpc.call("state.modifyWatchExpression", { watchId, newExpression });
+  async modifyWatchExpression(watchId: WatchId, newExpression: string) {
+    return this.rpc.call(RpcMethod.STATE_MODIFY_WATCH_EXPRESSION, { watchId, newExpression });
   }
 
-  async addBreakpoint(location: string, kind: BreakpointDescriptor["kind"] = "code", enabled = true) {
-    return this.rpc.call("breakpoints.add", { location, kind, enabled });
+  async addBreakpoint(event: string, address?: number, kind: BreakpointDescriptor["kind"] = "code", enabled = true) {
+    return this.rpc.call(RpcMethod.BREAKPOINTS_ADD, { event, address, kind, enabled });
   }
 
-  async removeBreakpoint(id: string) {
-    return this.rpc.call("breakpoints.remove", { id });
+  async removeBreakpoint(id: BreakpointId) {
+    return this.rpc.call(RpcMethod.BREAKPOINTS_REMOVE, { id });
   }
 
-  async toggleBreakpoint(id: string, enabled: boolean) {
-    return this.rpc.call("breakpoints.toggle", { id, enabled });
+  async toggleBreakpoint(id: BreakpointId, enabled: boolean) {
+    return this.rpc.call(RpcMethod.BREAKPOINTS_TOGGLE, { id, enabled });
   }
 
   async setCategoryStates(categories: Record<string, { muted: boolean; soloed: boolean }>) {
-    return this.rpc.call("breakpoints.setCategoryStates", { categories });
+    return this.rpc.call(RpcMethod.BREAKPOINTS_SET_CATEGORY_STATES, { categories });
   }
 
-  async pause(target?: string) {
-    return this.rpc.call("control.pause", { target });
+  async pause(target?: TargetProcessor) {
+    return this.rpc.call(RpcMethod.CONTROL_PAUSE, { target });
   }
 
-  async step(target: string) {
-    return this.rpc.call("control.step", { target });
+  async step(target: TargetProcessor) {
+    return this.rpc.call(RpcMethod.CONTROL_STEP, { target });
   }
 
-  async stepOver(target: string) {
-    return this.rpc.call("control.stepOver", { target });
+  async stepOver(target: TargetProcessor) {
+    return this.rpc.call(RpcMethod.CONTROL_STEP_OVER, { target });
   }
 
-  async stepOut(target: string) {
-    return this.rpc.call("control.stepOut", { target });
+  async stepOut(target: TargetProcessor) {
+    return this.rpc.call(RpcMethod.CONTROL_STEP_OUT, { target });
   }
 
-  async runUntil(target: string, type: "interrupt" | "exception" | "primitive" | "tile" | "vertex" | "list" | "sample", value?: string) {
-    return this.rpc.call("control.runUntil", { target, type, value });
+  async runUntil() {
+    return this.rpc.call(RpcMethod.CONTROL_RUN_UNTIL, {});
   }
 
   async fetchMemorySlice(params: {
-    target: string;
+    target: TargetProcessor;
     address: number;
     length: number;
-    encoding?: MemorySlice["encoding"];
-    wordSize?: MemorySlice["wordSize"];
   }) {
-    return this.rpc.call("state.getMemorySlice", params);
+    return this.rpc.call(RpcMethod.STATE_GET_MEMORY_SLICE, params);
   }
 
-  async fetchDisassembly(params: { target: string; address: number; count: number; context?: number }) {
-    return this.rpc.call("state.getDisassembly", params);
+  async fetchDisassembly(params: { target: TargetProcessor; address: number; count: number; context?: number }) {
+    return this.rpc.call(RpcMethod.STATE_GET_DISASSEMBLY, params);
   }
 
   async sendNotification(method: keyof DebuggerRpcSchema, params: unknown) {
@@ -145,7 +142,7 @@ export class DebuggerClient {
 const mapNotification = (notification: JsonRpcNotification): DebuggerNotification | undefined => {
   const { method, params } = notification;
   switch (method) {
-    case "event.tick":
+    case RpcMethod.EVENT_TICK:
       return {
         topic: "tick",
         payload: params as import("../lib/debuggerSchema").DebuggerTick,

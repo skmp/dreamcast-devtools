@@ -1,5 +1,6 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { Box, Button, CircularProgress, IconButton, InputAdornment, Paper, Stack, TextField, Tooltip, Typography } from "@mui/material";
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { Box, Button, CircularProgress, IconButton, InputAdornment, Paper, Stack, TextField, Typography } from "@mui/material";
+import { HideOnHoverTooltip as Tooltip } from "./HideOnHoverTooltip";
 import CircleIcon from "@mui/icons-material/Circle";
 import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
 import RadioButtonCheckedIcon from "@mui/icons-material/RadioButtonChecked";
@@ -10,6 +11,8 @@ import ArrowUpwardRoundedIcon from "@mui/icons-material/ArrowUpwardRounded";
 import VolumeOffIcon from "@mui/icons-material/VolumeOff";
 import VolumeUpIcon from "@mui/icons-material/VolumeUp";
 import RefreshIcon from "@mui/icons-material/Refresh";
+import PlayArrowIcon from "@mui/icons-material/PlayArrow";
+import PauseIcon from "@mui/icons-material/Pause";
 import type { DisassemblyLine } from "../../lib/debuggerSchema";
 
 const WHEEL_PIXEL_THRESHOLD = 60;
@@ -36,6 +39,30 @@ export interface DisassemblyViewConfig {
   showStepInOut: boolean;
   /** URL parameter name for address (e.g., "address" or "step") */
   urlParamName: string;
+  /** Whether to show the opcode/bytes column (default: true) */
+  showBytes?: boolean;
+  /** Whether to show mute/solo buttons (default: true) */
+  showMuteSolo?: boolean;
+  /** Icon for the run/pause button */
+  runPauseIcon?: { paused: typeof ArrowForwardIcon; running: typeof ArrowForwardIcon };
+  /** Label for the run/pause button */
+  runPauseLabel?: { paused: string; running: string };
+  /** Prefix action buttons to show before step buttons (after run/pause) */
+  prefixActions?: Array<{
+    key: string;
+    icon: typeof ArrowForwardIcon;
+    label: string;
+    disabled?: boolean;
+    onClick: () => void;
+  }>;
+  /** Extra action buttons to show after step buttons */
+  extraActions?: Array<{
+    key: string;
+    icon: typeof ArrowForwardIcon;
+    label: string;
+    disabled?: boolean;
+    onClick: () => void;
+  }>;
 }
 
 export interface DisassemblyViewCallbacks {
@@ -50,13 +77,15 @@ export interface DisassemblyViewCallbacks {
   /** Add a breakpoint at the given address */
   onBreakpointAdd: (address: number) => Promise<void>;
   /** Remove a breakpoint by ID */
-  onBreakpointRemove: (id: string) => Promise<void>;
+  onBreakpointRemove: (id: number) => Promise<void>;
   /** Toggle a breakpoint's enabled state */
-  onBreakpointToggle: (id: string, enabled: boolean) => Promise<void>;
+  onBreakpointToggle: (id: number, enabled: boolean) => Promise<void>;
   /** Handle mute toggle for this view's category */
   onMuteToggle: () => void;
   /** Handle solo toggle for this view's category */
   onSoloToggle: () => void;
+  /** Handle run/pause toggle (if provided, run/pause button will be shown) */
+  onRunPauseToggle?: () => void;
 }
 
 export interface DisassemblyViewProps {
@@ -69,15 +98,22 @@ export interface DisassemblyViewProps {
   /** Current program counter value */
   currentPc?: number;
   /** Map of addresses to breakpoint info */
-  breakpointsByAddress: Map<number, { id: string; enabled: boolean }>;
+  breakpointsByAddress: Map<number, { id: number; enabled: boolean }>;
   /** Whether the debugger is initialized */
   initialized: boolean;
   /** Current execution state */
   executionState: "running" | "paused";
   /** Category state (muted/soloed) */
   categoryState?: { muted: boolean; soloed: boolean };
-  /** Initial address from URL if any */
-  initialUrlAddress?: { address: number; fromUrl: boolean };
+  /** Target CPU type for registration in navigation service */
+  target?: "sh4" | "arm7" | "dsp";
+}
+
+export interface DisassemblyViewRef {
+  scrollToAddress: (address: number, highlight?: boolean) => void;
+  focus: () => void;
+  getSize: () => { width: number; height: number };
+  getTarget: () => string;
 }
 
 const normalizeAddress = (value: number, max: number, step: number) => {
@@ -92,7 +128,7 @@ interface DisassemblyLineItemProps {
   line: DisassemblyLine;
   currentPc?: number;
   executionState: "running" | "paused";
-  breakpoint?: { id: string; enabled: boolean };
+  breakpoint?: { id: number; enabled: boolean };
   config: DisassemblyViewConfig;
   onBreakpointClick: (address: number) => void;
   onBreakpointToggle: (address: number, event: React.MouseEvent) => void;
@@ -109,8 +145,6 @@ const DisassemblyLineItem = memo(({
   onBreakpointToggle,
   lineRef,
 }: DisassemblyLineItemProps) => {
-  const commentText = line.comment ? `; ${line.comment}` : "";
-  const mnemonicSegment = line.operands ? `${line.mnemonic} ${line.operands}` : line.mnemonic;
   const hasBreakpoint = !!breakpoint;
   const breakpointEnabled = breakpoint?.enabled ?? false;
 
@@ -166,16 +200,13 @@ const DisassemblyLineItem = memo(({
       <Typography component="span" sx={{ color: "text.secondary" }}>
         {config.formatAddressDisplay(line.address)}
       </Typography>
-      <Typography component="span" sx={{ color: "text.secondary" }}>
-        {line.bytes}
-      </Typography>
+      {(config.showBytes ?? true) && (
+        <Typography component="span" sx={{ color: "text.secondary" }}>
+          {line.bytes}
+        </Typography>
+      )}
       <Typography component="span" sx={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-        {mnemonicSegment}
-        {commentText && (
-          <Box component="span" sx={{ color: "text.secondary", ml: 1, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-            {commentText}
-          </Box>
-        )}
+        {line.disassembly}
       </Typography>
     </Box>
   );
@@ -183,7 +214,7 @@ const DisassemblyLineItem = memo(({
 
 DisassemblyLineItem.displayName = "DisassemblyLineItem";
 
-export const DisassemblyView = ({
+export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewProps>(({
   config,
   callbacks,
   defaultAddress,
@@ -192,30 +223,15 @@ export const DisassemblyView = ({
   initialized,
   executionState,
   categoryState,
-  initialUrlAddress,
-}: DisassemblyViewProps) => {
+  target,
+}, ref) => {
   const [lines, setLines] = useState<DisassemblyLine[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
 
-  // Initialize address from URL or default
-  const initialAddress = initialUrlAddress?.address ?? defaultAddress;
-  const [address, setAddress] = useState(initialAddress);
-  const [addressInput, setAddressInput] = useState(config.formatAddressInput(initialAddress));
-
-  // Update address when URL changes (only on navigation, not on every render)
-  useEffect(() => {
-    if (initialUrlAddress?.fromUrl) {
-      const contextOffset = config.instructionSize * 10;
-      const targetAddress = Math.max(0, initialUrlAddress.address - contextOffset);
-      const normalizedTarget = normalizeAddress(targetAddress, config.maxAddress, config.instructionSize);
-      setAddress(normalizedTarget);
-
-      // Set target for highlighting
-      targetAddressRef.current = initialUrlAddress.address;
-      targetTimestampRef.current = Date.now();
-    }
-  }, [initialUrlAddress?.address, initialUrlAddress?.fromUrl, config.instructionSize, config.maxAddress]);
+  // Initialize address from default
+  const [address, setAddress] = useState(defaultAddress);
+  const [addressInput, setAddressInput] = useState(config.formatAddressInput(defaultAddress));
 
   const requestIdRef = useRef(0);
   const wheelRemainder = useRef(0);
@@ -227,11 +243,69 @@ export const DisassemblyView = ({
   const lineRefsMap = useRef<Map<number, HTMLDivElement>>(new Map());
   const [, forceUpdate] = useState(0);
 
+  // Track previous execution state for detecting pauses
+  const prevExecutionStateRef = useRef(executionState);
+
+  // Helper to apply highlight with auto-removal
+  const applyHighlight = useCallback((targetAddr: number) => {
+    const element = lineRefsMap.current.get(targetAddr);
+    if (element) {
+      element.classList.remove("target-address");
+      // Force reflow to restart animation
+      void element.offsetWidth;
+      element.classList.add("target-address");
+
+      // Remove class after animation completes (2s animation duration)
+      setTimeout(() => {
+        element.classList.remove("target-address");
+      }, 2000);
+    } else {
+      // Address not visible yet, try again when it loads
+      setTimeout(() => {
+        const el = lineRefsMap.current.get(targetAddr);
+        if (el) {
+          el.classList.remove("target-address");
+          void el.offsetWidth;
+          el.classList.add("target-address");
+          setTimeout(() => {
+            el.classList.remove("target-address");
+          }, 2000);
+        }
+      }, 100);
+    }
+  }, []);
+
+  // Expose methods via ref
+  useImperativeHandle(ref, () => ({
+    scrollToAddress: (targetAddr: number, highlight: boolean = true) => {
+      const contextOffset = config.instructionSize * 10;
+      const scrollAddr = Math.max(0, targetAddr - contextOffset);
+      const normalizedAddr = normalizeAddress(scrollAddr, config.maxAddress, config.instructionSize);
+      setAddress(normalizedAddr);
+
+      if (highlight) {
+        applyHighlight(targetAddr);
+      }
+    },
+    focus: () => {
+      containerRef.current?.focus();
+    },
+    getSize: () => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      return {
+        width: rect?.width ?? 0,
+        height: rect?.height ?? 0,
+      };
+    },
+    getTarget: () => target ?? "unknown",
+  }), [config.instructionSize, config.maxAddress, target, applyHighlight]);
+
   // Update DOM directly when PC or execution state changes
   useEffect(() => {
     const isPaused = executionState === "paused";
     const oldPc = currentPcRef.current;
     const newPc = currentPc;
+    const wasRunning = prevExecutionStateRef.current === "running";
 
     if (oldPc !== newPc) {
       // Remove current styling from old PC
@@ -263,7 +337,18 @@ export const DisassemblyView = ({
         }
       }
     }
-  }, [currentPc, executionState]);
+
+    // Auto-scroll to current PC when transitioning from running to paused
+    if (isPaused && wasRunning && newPc !== undefined) {
+      const contextOffset = config.instructionSize * 10;
+      const targetAddress = Math.max(0, newPc - contextOffset);
+      const normalizedTarget = normalizeAddress(targetAddress, config.maxAddress, config.instructionSize);
+      setAddress(normalizedTarget);
+    }
+
+    // Update previous execution state
+    prevExecutionStateRef.current = executionState;
+  }, [currentPc, executionState, config.instructionSize, config.maxAddress]);
 
   const fetchDisassembly = useCallback(
     async (addr: number) => {
@@ -304,42 +389,6 @@ export const DisassemblyView = ({
       void fetchDisassembly(normalized);
     }
   }, [address, fetchDisassembly, config, initialized]);
-
-  // Trigger highlight effect when URL address changes (or action_guid changes for re-clicks)
-  useEffect(() => {
-    if (!initialUrlAddress?.fromUrl || !initialized) {
-      return;
-    }
-
-    const targetAddr = initialUrlAddress.address;
-
-    // Helper to apply highlight with auto-removal
-    const applyHighlight = (el: HTMLDivElement) => {
-      el.classList.remove("target-address");
-      // Force reflow to restart animation
-      void el.offsetWidth;
-      el.classList.add("target-address");
-
-      // Remove class after animation completes (2s animation duration)
-      setTimeout(() => {
-        el.classList.remove("target-address");
-      }, 2000);
-    };
-
-    // Check if element is already in DOM
-    const element = lineRefsMap.current.get(targetAddr);
-    if (element) {
-      applyHighlight(element);
-    } else {
-      // Address not visible yet, try again when it loads
-      setTimeout(() => {
-        const el = lineRefsMap.current.get(targetAddr);
-        if (el) {
-          applyHighlight(el);
-        }
-      }, 100);
-    }
-  }, [initialUrlAddress, initialized]);
 
   // Process pending scroll steps after loading completes
   useEffect(() => {
@@ -521,8 +570,19 @@ export const DisassemblyView = ({
     forceUpdate((v) => v + 1);
   }, [callbacks]);
 
+  const handleRunPauseToggle = useCallback(() => {
+    if (callbacks.onRunPauseToggle) {
+      callbacks.onRunPauseToggle();
+    }
+  }, [callbacks]);
+
   const stepDisabled = executionState !== "paused";
   const StepIcon = config.stepIcon;
+
+  const RunPausedIcon = config.runPauseIcon?.paused ?? PlayArrowIcon;
+  const RunRunningIcon = config.runPauseIcon?.running ?? PauseIcon;
+  const runPausedLabel = config.runPauseLabel?.paused ?? "Run";
+  const runRunningLabel = config.runPauseLabel?.running ?? "Pause";
 
   return (
     <Paper
@@ -546,9 +606,42 @@ export const DisassemblyView = ({
         }}
       >
         <Stack direction="row" spacing={0.5} alignItems="center">
+          {callbacks.onRunPauseToggle && (
+            <Tooltip title={executionState === "paused" ? runPausedLabel : runRunningLabel}>
+              <span>
+                <IconButton
+                  size="small"
+                  onClick={handleRunPauseToggle}
+                  disabled={!initialized}
+                >
+                  {executionState === "paused" ? (
+                    <RunPausedIcon fontSize="small" />
+                  ) : (
+                    <RunRunningIcon fontSize="small" />
+                  )}
+                </IconButton>
+              </span>
+            </Tooltip>
+          )}
+          {config.prefixActions?.map((action) => {
+            const ActionIcon = action.icon;
+            return (
+              <Tooltip key={action.key} title={action.label}>
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={action.onClick}
+                    disabled={action.disabled ?? !initialized}
+                  >
+                    <ActionIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            );
+          })}
           <Tooltip title={config.stepLabel}>
             <span>
-              <IconButton size="small" onClick={handleStep} disabled={stepDisabled}>
+              <IconButton size="small" onClick={handleStep} disabled={stepDisabled || !initialized}>
                 <StepIcon fontSize="small" />
               </IconButton>
             </span>
@@ -557,32 +650,52 @@ export const DisassemblyView = ({
             <>
               <Tooltip title="Step In">
                 <span>
-                  <IconButton size="small" onClick={handleStepIn} disabled={stepDisabled}>
+                  <IconButton size="small" onClick={handleStepIn} disabled={stepDisabled || !initialized}>
                     <ArrowDownwardRoundedIcon fontSize="small" />
                   </IconButton>
                 </span>
               </Tooltip>
               <Tooltip title="Step Out">
                 <span>
-                  <IconButton size="small" onClick={handleStepOut} disabled={stepDisabled}>
+                  <IconButton size="small" onClick={handleStepOut} disabled={stepDisabled || !initialized}>
                     <ArrowUpwardRoundedIcon fontSize="small" />
                   </IconButton>
                 </span>
               </Tooltip>
             </>
           )}
+          {config.extraActions?.map((action) => {
+            const ActionIcon = action.icon;
+            return (
+              <Tooltip key={action.key} title={action.label}>
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={action.onClick}
+                    disabled={action.disabled ?? !initialized}
+                  >
+                    <ActionIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            );
+          })}
         </Stack>
         <Stack direction="row" spacing={1} alignItems="center" sx={{ flex: 1, justifyContent: "flex-end" }}>
-          <Tooltip title={categoryState?.muted ? "Unmute category" : "Mute category"}>
-            <IconButton size="small" onClick={handleMuteToggle} color={categoryState?.muted ? "warning" : "default"}>
-              {categoryState?.muted ? <VolumeOffIcon fontSize="small" /> : <VolumeUpIcon fontSize="small" />}
-            </IconButton>
-          </Tooltip>
-          <Tooltip title={categoryState?.soloed ? "Unsolo category" : "Solo category"}>
-            <IconButton size="small" onClick={handleSoloToggle} color={categoryState?.soloed ? "primary" : "default"}>
-              {categoryState?.soloed ? <RadioButtonCheckedIcon fontSize="small" /> : <RadioButtonUncheckedIcon fontSize="small" />}
-            </IconButton>
-          </Tooltip>
+          {(config.showMuteSolo ?? true) && (
+            <>
+              <Tooltip title={categoryState?.muted ? "Unmute category" : "Mute category"}>
+                <IconButton size="small" onClick={handleMuteToggle} color={categoryState?.muted ? "warning" : "default"}>
+                  {categoryState?.muted ? <VolumeOffIcon fontSize="small" /> : <VolumeUpIcon fontSize="small" />}
+                </IconButton>
+              </Tooltip>
+              <Tooltip title={categoryState?.soloed ? "Unsolo category" : "Solo category"}>
+                <IconButton size="small" onClick={handleSoloToggle} color={categoryState?.soloed ? "primary" : "default"}>
+                  {categoryState?.soloed ? <RadioButtonCheckedIcon fontSize="small" /> : <RadioButtonUncheckedIcon fontSize="small" />}
+                </IconButton>
+              </Tooltip>
+            </>
+          )}
           <Tooltip title="Go to current PC">
             <span>
               <IconButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
@@ -715,4 +828,6 @@ export const DisassemblyView = ({
       </Box>
     </Paper>
   );
-};
+});
+
+DisassemblyView.displayName = "DisassemblyView";

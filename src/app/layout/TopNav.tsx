@@ -1,46 +1,80 @@
-import type { ReactNode } from "react";
-import { Toolbar, Stack, Typography, Divider, Button, Box } from "@mui/material";
+import { useMemo, type ReactNode } from "react";
+import { Toolbar, Stack, Divider, Button, Box, Autocomplete, TextField } from "@mui/material";
+import { useNavigate } from "react-router-dom";
+import { createNavigationItems } from "./navigationItems";
 
 interface TopNavProps {
-  onHomeClick: () => void;
-  onDocsClick: () => void;
   onAboutClick: () => void;
   onResetLayout?: () => void;
   rightSection?: ReactNode;
-  active?: "home" | "docs" | "workspace";
+  centerSection?: ReactNode;
+  currentPage?: string;
 }
 
 export const TopNav = ({
-  onHomeClick,
-  onDocsClick,
   onAboutClick,
   onResetLayout,
   rightSection,
-  active,
+  centerSection,
+  currentPage,
 }: TopNavProps) => {
-  const homeVariant = active === "home" ? "contained" : "text";
-  const docsVariant = active === "docs" ? "contained" : "text";
+  const navigate = useNavigate();
+
+  // Navigation items are now defined in navigationItems.ts (not configurable)
+  const navigationItems = useMemo(() => createNavigationItems(navigate), [navigate]);
+
+  // Find the current page in navigation items
+  const currentValue = currentPage
+    ? navigationItems.find(item => item.id === currentPage) || null
+    : null;
 
   return (
-    <Toolbar sx={{ gap: 2 }}>
+    <Toolbar sx={{ gap: 2, position: "relative" }}>
       <Stack direction="row" spacing={1.5} alignItems="center" sx={{ flexShrink: 0 }}>
-        <Typography variant="h6">nullDC Debugger</Typography>
+        <Autocomplete
+          options={navigationItems}
+          groupBy={(option) => option.category}
+          getOptionLabel={(option) => option.label}
+          value={currentValue}
+          onChange={(_, value) => {
+            if (value) {
+              value.onClick();
+            }
+          }}
+          sx={{ width: 300 }}
+          size="small"
+          renderInput={(params) => (
+            <TextField
+              {...params}
+              placeholder="Navigate to..."
+              variant="outlined"
+            />
+          )}
+          disableClearable={false}
+          blurOnSelect
+          autoHighlight
+          autoSelect
+          selectOnFocus
+          clearOnEscape
+        />
+        {onResetLayout && (
+          <>
+            <Divider orientation="vertical" flexItem />
+            <Button variant="text" color="primary" onClick={onResetLayout}>
+              Reset layout
+            </Button>
+          </>
+        )}
         <Divider orientation="vertical" flexItem />
-        <Button variant={homeVariant} color="primary" onClick={onHomeClick}>
-          Home
-        </Button>
-        <Button variant={docsVariant} color="primary" onClick={onDocsClick}>
-          Docs
-        </Button>
         <Button variant="text" color="primary" onClick={onAboutClick}>
           About
         </Button>
-        {onResetLayout && (
-          <Button variant="text" color="primary" onClick={onResetLayout}>
-            Reset layout
-          </Button>
-        )}
       </Stack>
+      {centerSection && (
+        <Box sx={{ position: "absolute", left: "50%", transform: "translateX(-50%)" }}>
+          {centerSection}
+        </Box>
+      )}
       <Box sx={{ flexGrow: 1 }} />
       {rightSection}
     </Toolbar>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, Button, CircularProgress, IconButton, InputAdornment, Stack, TextField, Tooltip, Typography } from "@mui/material";
+import { Box, Button, CircularProgress, IconButton, InputAdornment, Stack, TextField, Typography } from "@mui/material";
+import { HideOnHoverTooltip as Tooltip } from "./HideOnHoverTooltip";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import type { MemorySlice } from "../../lib/debuggerSchema";
 
@@ -27,7 +28,7 @@ export interface MemoryViewConfig {
 
 export interface MemoryViewCallbacks {
   /** Fetch memory slice starting at the given address */
-  onFetchMemory: (address: number, length: number, encoding?: MemorySlice["encoding"], wordSize?: MemorySlice["wordSize"]) => Promise<MemorySlice>;
+  onFetchMemory: (address: number, length: number) => Promise<MemorySlice>;
   /** Handle address change (for URL sync) */
   onAddressChange?: (address: number) => void;
 }
@@ -43,10 +44,6 @@ export interface MemoryViewProps {
   initialized: boolean;
   /** Initial address from URL if any */
   initialUrlAddress?: { address: number; fromUrl: boolean };
-  /** Encoding for memory display */
-  encoding?: MemorySlice["encoding"];
-  /** Word size for memory display */
-  wordSize?: MemorySlice["wordSize"];
 }
 
 const clampAddress = (value: number, max: number, alignment = 1) => {
@@ -67,8 +64,6 @@ export const MemoryView = ({
   defaultAddress,
   initialized,
   initialUrlAddress,
-  encoding,
-  wordSize,
 }: MemoryViewProps) => {
   const [slice, setSlice] = useState<MemorySlice | null>(null);
   const [loading, setLoading] = useState(false);
@@ -98,7 +93,7 @@ export const MemoryView = ({
         const remainingAddressSpace = 0xffffffff - addr;
         const adjustedLength = Math.min(config.length, Math.max(1, remainingAddressSpace + 1));
 
-        const result = await callbacks.onFetchMemory(addr, adjustedLength, encoding, wordSize);
+        const result = await callbacks.onFetchMemory(addr, adjustedLength);
         if (requestIdRef.current !== requestId) {
           return;
         }
@@ -113,7 +108,7 @@ export const MemoryView = ({
         }
       }
     },
-    [callbacks, config.length, encoding, wordSize],
+    [callbacks, config.length],
   );
 
   useEffect(() => {
@@ -168,16 +163,15 @@ export const MemoryView = ({
     if (!slice) {
       return [];
     }
-    const bytes = slice.data.match(/.{1,2}/g) ?? [];
+    const bytes = slice.data;
     const result: MemoryRow[] = [];
     for (let offset = 0; offset < bytes.length; offset += BYTES_PER_ROW) {
       const chunk = bytes.slice(offset, offset + BYTES_PER_ROW);
       const rowAddress = slice.baseAddress + offset;
-      const hex = chunk.join(" ");
+      const hex = chunk.map(b => b.toString(16).toUpperCase().padStart(2, "0")).join(" ");
       const ascii = chunk
         .map((byte) => {
-          const charCode = Number.parseInt(byte, 16);
-          const char = String.fromCharCode(charCode);
+          const char = String.fromCharCode(byte);
           return /[\x20-\x7E]/.test(char) ? char : ".";
         })
         .join("");
@@ -188,13 +182,9 @@ export const MemoryView = ({
 
   const adjustAddress = useCallback(
     (delta: number) => {
-      setAddress((prev) => {
-        const newAddr = clampAddress(prev + delta, config.maxAddress, BYTES_PER_ROW);
-        callbacks.onAddressChange?.(newAddr);
-        return newAddr;
-      });
+      setAddress((prev) => clampAddress(prev + delta, config.maxAddress, BYTES_PER_ROW));
     },
-    [config.maxAddress, callbacks],
+    [config.maxAddress],
   );
 
   const handleWheel = useCallback(

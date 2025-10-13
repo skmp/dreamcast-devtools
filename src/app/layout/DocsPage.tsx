@@ -1,9 +1,8 @@
-import type { ReactNode } from "react";
+import { type ReactNode } from "react";
 import { AppBar, Box, Container, Stack, Typography } from "@mui/material";
 import { TopNav } from "./TopNav";
 import { AboutDialog } from "./AboutDialog";
 import { useAboutModal } from "./useAboutModal";
-import { useNavigate } from "react-router-dom";
 
 type AnchorHeadingProps = {
   id: string;
@@ -111,7 +110,7 @@ const documentationSections = [
         level: 2 as const,
         items: [
           "Audio panel visualizes oscillator channels, DSP accumulators, and waveform streams.",
-          "DSP Playground (coming soon) will allow authoring effect chains with live previews.",
+          "DSP Playground is a standalone tool accessible from the home page for authoring effect chains with live previews.",
           "Breakpoint filters highlight AICA- and DSP-related events to understand audio frame scheduling.",
         ],
       },
@@ -137,6 +136,7 @@ const documentationSections = [
         title: "SH4 Simulator",
         level: 2 as const,
         items: [
+          "SH4 Simulator is a standalone tool accessible from the home page.",
           "Visualize execution hazards by feeding assembly directly into the simulator.",
           "Hovering over cells reveals stall explanations and dependency highlights.",
           "Horizontal scroll container keeps the editor static while exploring wide tables.",
@@ -185,17 +185,14 @@ const renderSectionContent = (section: typeof documentationSections[number]) => 
 };
 
 export const DocsPage = () => {
-  const navigate = useNavigate();
   const { open: aboutOpen, show: showAbout, hide: hideAbout } = useAboutModal();
 
   return (
     <Box sx={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
       <AppBar position="static" elevation={1} color="default">
         <TopNav
-          onHomeClick={() => navigate("/")}
-          onDocsClick={() => navigate("/docs")}
           onAboutClick={showAbout}
-          active="docs"
+          currentPage="docs"
         />
       </AppBar>
       <Container maxWidth="lg" component="main" sx={{ py: 6, flex: 1 }}>

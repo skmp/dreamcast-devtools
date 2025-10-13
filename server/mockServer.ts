@@ -5,6 +5,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createServer as createViteServer } from "vite";
+import { z } from "zod";
 import {
   JSON_RPC_VERSION,
   type JsonRpcMessage,
@@ -24,7 +25,11 @@ import type {
   MemorySlice,
   RegisterValue,
   RpcError,
-  ThreadInfo,
+} from "../src/lib/debuggerSchema";
+import {
+  DebuggerRpcMethodSchemas,
+  DebuggerTickSchema,
+  PANEL_IDS,
 } from "../src/lib/debuggerSchema";
 
 const PORT = Number(process.env.PORT ?? 5173);
@@ -38,20 +43,22 @@ interface ClientContext {
 }
 
 interface ServerWatch {
-  id: string;
+  id: number;
   expression: string;
 }
 
-const serverWatches = new Map<string, ServerWatch>(); // id -> {id, expression}
-const serverBreakpoints = new Map<string, BreakpointDescriptor>();
+const serverWatches = new Map<number, ServerWatch>(); // id -> {id, expression}
+const serverBreakpoints = new Map<number, BreakpointDescriptor>();
 let isRunning = true; // Execution state
 let nextEventId = 1n; // Event ID counter (BigInt for 64-bit)
 let tickId = 0; // Tick counter
+let nextWatchId = 1; // Watch ID counter
+let nextBreakpointId = 1; // Breakpoint ID counter
 
 // Initialize default watches
 const DEFAULT_WATCH_EXPRESSIONS = ["dc.sh4.cpu.pc", "dc.sh4.dmac.dmaor"];
 for (const expr of DEFAULT_WATCH_EXPRESSIONS) {
-  const id = randomUUID();
+  const id = nextWatchId++;
   serverWatches.set(id, { id, expression: expr });
 }
 
@@ -76,7 +83,7 @@ const categorizeBreakpoint = (bp: BreakpointDescriptor): BreakpointCategory => {
   }
 
   // Code breakpoints are categorized by processor
-  const lower = bp.location.toLowerCase();
+  const lower = bp.event.toLowerCase();
   if (lower.includes("sh4")) return "sh4";
   if (lower.includes("arm7")) return "arm7";
   if (lower.includes("aica") || lower.includes("dsp")) return "dsp";
@@ -153,8 +160,7 @@ const buildDeviceTree = (): DeviceNodeDescriptor[] => [
   {
     path: "dc",
     label: "Dreamcast",
-    kind: "beloved console",
-    description: "Sega Dreamcast system bus",
+    description: "beloved console",
     registers: [
       { name: "SYSCLK", value: getRegisterValue("dc", "SYSCLK"), width: 0 },
       { name: "ASIC_REV", value: getRegisterValue("dc", "ASIC_REV"), width: 16 },
@@ -163,13 +169,7 @@ const buildDeviceTree = (): DeviceNodeDescriptor[] => [
       {
         path: "dc.sh4",
         label: "SH4",
-        kind: "processor",
-        description: "Hitachi SH-4 main CPU",
-        registers: [
-          { name: "VBR", value: getRegisterValue("dc.sh4", "VBR"), width: 32 },
-          { name: "SR", value: getRegisterValue("dc.sh4", "SR"), width: 32 },
-          { name: "FPSCR", value: getRegisterValue("dc.sh4", "FPSCR"), width: 32 },
-        ],
+        description: "SH7750-alike SoC",
         events: [
           "dc.sh4.interrupt",
           "dc.sh4.exception",
@@ -179,49 +179,118 @@ const buildDeviceTree = (): DeviceNodeDescriptor[] => [
           {
             path: "dc.sh4.cpu",
             label: "Core",
-            kind: "processor",
-            description: "Integer pipeline",
+            description: "SuperH4 CPU Core",
             registers: [
               { name: "PC", value: getRegisterValue("dc.sh4.cpu", "PC"), width: 32 },
               { name: "PR", value: getRegisterValue("dc.sh4.cpu", "PR"), width: 32 },
+              { name: "VBR", value: getRegisterValue("dc.sh4", "VBR"), width: 32 },
+              { name: "SR", value: getRegisterValue("dc.sh4", "SR"), width: 32 },
+              { name: "FPSCR", value: getRegisterValue("dc.sh4", "FPSCR"), width: 32 },
             ],
+            actions: [PANEL_IDS.SH4_DISASSEMBLY, PANEL_IDS.SH4_MEMORY],
           },
           {
-            path: "dc.sh4.icache",
-            label: "I-Cache",
-            kind: "peripheral",
-            description: "Instruction cache",
-            registers: [
-              { name: "ICRAM", value: "16KB", width: 0 },
-              { name: "ICACHE_CTRL", value: getRegisterValue("dc.sh4.icache", "ICACHE_CTRL"), width: 32 },
+            path: "dc.sh4.pbus",
+            label: "PBUS",
+            description: "Peripherals Bus",
+            children: [
+            {
+              path: "dc.sh4.bsc",
+              label: "BSC",
+              description: "Bus State Controller",
+              actions: [PANEL_IDS.SH4_BSC_REGISTERS],
+            },
+            {
+              path: "dc.sh4.ccn",
+              label: "CCN",
+              description: "Cache Controller",
+              actions: [PANEL_IDS.SH4_CCN_REGISTERS],
+            },
+            {
+              path: "dc.sh4.cpg",
+              label: "CPG",
+              description: "Clock Pulse Generator",
+              actions: [PANEL_IDS.SH4_CPG_REGISTERS],
+            },
+            {
+              path: "dc.sh4.dmac",
+              label: "DMAC",
+              description: "Direct Memory Access Controller",
+              actions: [PANEL_IDS.SH4_DMAC_REGISTERS],
+            },
+            {
+              path: "dc.sh4.intc",
+              label: "INTC",
+              description: "Interrupt Controller",
+              actions: [PANEL_IDS.SH4_INTC_REGISTERS],
+            },
+            {
+              path: "dc.sh4.rtc",
+              label: "RTC",
+              description: "Real Time Clock",
+              actions: [PANEL_IDS.SH4_RTC_REGISTERS],
+            },
+            {
+              path: "dc.sh4.sci",
+              label: "SCI",
+              description: "Serial Communications Interface",
+              actions: [PANEL_IDS.SH4_SCI_REGISTERS],
+            },
+            {
+              path: "dc.sh4.scif",
+              label: "SCIF",
+              description: "Serial Communications Interface w/ FIFO",
+              actions: [PANEL_IDS.SH4_SCIF_REGISTERS],
+            },
+            {
+              path: "dc.sh4.tmu",
+              label: "TMU",
+              description: "Timer Unit",
+              actions: [PANEL_IDS.SH4_TMU_REGISTERS],
+            },
+            {
+              path: "dc.sh4.ubc",
+              label: "UBC",
+              description: "User Break Controller",
+              actions: [PANEL_IDS.SH4_UBC_REGISTERS],
+            },
+            {
+              path: "dc.sh4.sq",
+              label: "SQ",
+              description: "Store Queues",
+              actions: [PANEL_IDS.SH4_SQ_CONTENTS],
+            },
+            {
+              path: "dc.sh4.icache",
+              label: "ICACHE",
+              description: "Instruction Cache",
+              actions: [PANEL_IDS.SH4_ICACHE_CONTENTS],
+            },
+            {
+              path: "dc.sh4.ocache",
+              label: "OCACHE",
+              description: "Operand Cache",
+              actions: [PANEL_IDS.SH4_OCACHE_CONTENTS],
+            },
+            {
+              path: "dc.sh4.ocram",
+              label: "OCRAM",
+              description: "Operand RAM",
+              actions: [PANEL_IDS.SH4_OCRAM_CONTENTS],
+            },
+            {
+              path: "dc.sh4.tlb",
+              label: "TLB",
+              description: "Translation Lookaside Buffer",
+              actions: [PANEL_IDS.SH4_TLB_CONTENTS],
+            },
             ],
-          },
-          {
-            path: "dc.sh4.dcache",
-            label: "D-Cache",
-            kind: "peripheral",
-            description: "Data cache",
-            registers: [
-              { name: "DCRAM", value: "8KB", width: 0 },
-              { name: "DCACHE_CTRL", value: getRegisterValue("dc.sh4.dcache", "DCACHE_CTRL"), width: 32 },
-            ],
-          },
-          {
-            path: "dc.sh4.tlb",
-            label: "TLB",
-            kind: "peripheral",
-            description: "Translation lookaside buffer",
-            registers: [
-              { name: "UTLB_ENTRIES", value: "64", width: 0 },
-              { name: "ITLB_ENTRIES", value: "4", width: 0 },
-            ],
-          },
-        ],
+          }
+        ]
       },
       {
         path: "dc.holly",
         label: "Holly",
-        kind: "peripheral",
         description: "System ASIC",
         registers: [
           { name: "HOLLY_ID", value: getRegisterValue("dc.holly", "HOLLY_ID"), width: 32 },
@@ -231,7 +300,7 @@ const buildDeviceTree = (): DeviceNodeDescriptor[] => [
           {
             path: "dc.holly.dmac",
             label: "DMA Controller",
-            kind: "peripheral",
+            description: "peripheral",
             registers: [
               { name: "DMAOR", value: getRegisterValue("dc.holly.dmac", "DMAOR"), width: 16 },
               { name: "CHCR0", value: getRegisterValue("dc.holly.dmac", "CHCR0"), width: 32 },
@@ -244,7 +313,8 @@ const buildDeviceTree = (): DeviceNodeDescriptor[] => [
           {
             path: "dc.holly.ta",
             label: "TA",
-            kind: "pipeline",
+            description: "Tile Accelerator",
+            actions: [PANEL_IDS.CLX2_TA],
             registers: [
               { name: "TA_LIST_BASE", value: getRegisterValue("dc.holly.ta", "TA_LIST_BASE"), width: 32 },
               { name: "TA_STATUS", value: getRegisterValue("dc.holly.ta", "TA_STATUS"), width: 32 },
@@ -259,7 +329,8 @@ const buildDeviceTree = (): DeviceNodeDescriptor[] => [
           {
             path: "dc.holly.core",
             label: "CORE",
-            kind: "pipeline",
+            description: "Depth and Shading Engine",
+            actions: [PANEL_IDS.CLX2_CORE],
             registers: [
               { name: "PVR_CTRL", value: getRegisterValue("dc.holly.core", "PVR_CTRL"), width: 32 },
               { name: "PVR_STATUS", value: getRegisterValue("dc.holly.core", "PVR_STATUS"), width: 32 },
@@ -275,8 +346,7 @@ const buildDeviceTree = (): DeviceNodeDescriptor[] => [
       {
         path: "dc.aica",
         label: "AICA",
-        kind: "coprocessor",
-        description: "Sound processor",
+        description: "Sound SoC",
         registers: [
           { name: "AICA_CTRL", value: getRegisterValue("dc.aica", "AICA_CTRL"), width: 32 },
           { name: "AICA_STATUS", value: getRegisterValue("dc.aica", "AICA_STATUS"), width: 32 },
@@ -289,37 +359,64 @@ const buildDeviceTree = (): DeviceNodeDescriptor[] => [
           {
             path: "dc.aica.arm7",
             label: "ARM7",
-            kind: "processor",
-            description: "ARM7TDMI sound CPU",
+            description: "ARM7DI CPU Core",
             registers: [
               { name: "PC", value: getRegisterValue("dc.aica.arm7", "PC"), width: 32 },
             ],
+            actions: [PANEL_IDS.ARM7_DISASSEMBLY, PANEL_IDS.ARM7_MEMORY],
           },
           {
-            path: "dc.aica.channels",
-            label: "Channels",
-            kind: "channel",
-            registers: [
-              { name: "CH0_VOL", value: getRegisterValue("dc.aica.channels", "CH0_VOL"), width: 8 },
-              { name: "CH1_VOL", value: getRegisterValue("dc.aica.channels", "CH1_VOL"), width: 8 },
-            ],
+            path: "dc.aica.sgc",
+            label: "SGC",
+            description: "Sound Generation Core",
+            actions: [PANEL_IDS.SGC],
             events: [
               "dc.aica.channels.key_on",
               "dc.aica.channels.key_off",
               "dc.aica.channels.loop",
             ],
+            children: [
+              {
+                path: "dc.aica.sgc.0",
+                label: "Channel 0",
+                description: "SGC Channel 0",
+                registers: [
+                  { name: "VOL", value: getRegisterValue("dc.aica.channels", "CH0_VOL"), width: 8 },
+                ],
+                events: [
+                  "dc.aica.channel.0.key_on",
+                  "dc.aica.channel.0.key_off",
+                  "dc.aica.channel.0.loop",
+                ],
+              },
+              {
+                path: "dc.aica.sgc.1",
+                label: "Channel 1",
+                description: "SGC Channel 1",
+                registers: [
+                  { name: "VOL", value: getRegisterValue("dc.aica.channels", "CH1_VOL"), width: 8 },
+                ],
+                events: [
+                  "dc.aica.channel.0.key_on",
+                  "dc.aica.channel.0.key_off",
+                  "dc.aica.channel.0.loop",
+                ],
+              }
+            ]
           },
           {
             path: "dc.aica.dsp",
             label: "DSP",
-            kind: "coprocessor",
+            description: "DSP VLIW Core",
             registers: [
               { name: "STEP", value: getRegisterValue("dc.aica.dsp", "STEP"), width: 16 },
               { name: "DSP_ACC", value: getRegisterValue("dc.aica.dsp", "DSP_ACC"), width: 16 },
             ],
             events: [
               "dc.aica.dsp.step",
+              "dc.aica.dsp.sample_start",
             ],
+            actions: [PANEL_IDS.DSP_DISASSEMBLY],
           },
         ],
       },
@@ -418,8 +515,7 @@ const generateDisassembly = (target: string, address: number, count: number): Di
       lines.push({
         address: step,
         bytes: ((step * 2) & 0xff).toString(16).toUpperCase().padStart(2, "0"),
-        mnemonic: programLine,
-        operands: "",
+        disassembly: programLine,
       });
     }
 
@@ -448,6 +544,7 @@ const generateDisassembly = (target: string, address: number, count: number): Di
     const offset = (hash * 7) & 0xfff;
 
     const operands = instr.operands(r1, r2, r3, val, offset);
+    const disassembly = operands ? `${instr.mnemonic} ${operands}` : instr.mnemonic;
 
     const byteValues: number[] = [];
     for (let b = 0; b < instr.bytes; b++) {
@@ -458,9 +555,7 @@ const generateDisassembly = (target: string, address: number, count: number): Di
     lines.push({
       address: currentAddr,
       bytes,
-      mnemonic: instr.mnemonic,
-      operands,
-      isCurrent: false,
+      disassembly,
     });
 
     currentAddr += instr.bytes;
@@ -468,32 +563,6 @@ const generateDisassembly = (target: string, address: number, count: number): Di
 
   return lines;
 };
-
-const sampleThreads: ThreadInfo[] = [
-  {
-    id: "thread-main",
-    name: "Main Thread",
-    state: "running",
-    core: "SH4",
-    priority: 0,
-    backtrace: [
-      { index: 0, pc: 0x8c0000a0, symbol: "_start", location: "crt0.S:42" },
-      { index: 1, pc: 0x8c001234, symbol: "kernel_main", location: "kernel.c:120" },
-      { index: 2, pc: 0x8c0100ff, symbol: "game_loop", location: "game.c:240" },
-    ],
-  },
-  {
-    id: "thread-audio",
-    name: "AICA Worker",
-    state: "blocked",
-    core: "AICA",
-    priority: 3,
-    backtrace: [
-      { index: 0, pc: 0x7f000020, symbol: "aica_wait", location: "aica.c:88" },
-      { index: 1, pc: 0x7f000120, symbol: "aica_mix", location: "aica.c:132" },
-    ],
-  },
-];
 
 const EVENT_LOG_LIMIT = 60;
 
@@ -533,8 +602,36 @@ const sendNotification = (client: ClientContext, notification: DebuggerNotificat
 
 const handleRequest = async (client: ClientContext, message: JsonRpcRequest) => {
   try {
-    const params = (message.params ?? {}) as Record<string, unknown>;
-    const { result, shouldBroadcastTick } = await dispatchMethod(message.method as keyof DebuggerRpcSchema, params, client);
+    const method = message.method as keyof DebuggerRpcSchema;
+    const params = message.params ?? {};
+
+    // Validate params using Zod schema
+    const methodSchema = DebuggerRpcMethodSchemas[method as keyof typeof DebuggerRpcMethodSchemas];
+    if (methodSchema?.params) {
+      try {
+        methodSchema.params.parse(params);
+      } catch (error) {
+        if (error instanceof z.ZodError) {
+          throw new Error(`Invalid parameters for ${method}: ${error.message}`);
+        }
+        throw error;
+      }
+    }
+
+    const { result, shouldBroadcastTick } = await dispatchMethod(method, params as Record<string, unknown>, client);
+
+    // Validate result using Zod schema
+    if (methodSchema?.result) {
+      try {
+        methodSchema.result.parse(result);
+      } catch (error) {
+        if (error instanceof z.ZodError) {
+          console.error(`Invalid result for ${method}:`, error.message);
+          // Still send the result, but log the validation error
+        }
+      }
+    }
+
     await respondSuccess(client.socket, message.id, result);
     if (shouldBroadcastTick) {
       broadcastTick();
@@ -606,14 +703,6 @@ const dispatchMethod = async (
   client: ClientContext,
 ): Promise<{ result: unknown; shouldBroadcastTick: boolean }> => {
   switch (method) {
-    case "debugger.handshake":
-      return {
-        result: {
-          sessionId: client.sessionId,
-          capabilities: ["watches", "step", "breakpoints", "frame-log"],
-        },
-        shouldBroadcastTick: false,
-      };
     case "debugger.describe":
       return {
         result: {
@@ -627,15 +716,11 @@ const dispatchMethod = async (
       const target = typeof params.target === "string" ? params.target : "sh4";
       const addressValue = Number(params.address);
       const lengthValue = Number(params.length);
-      const encoding = params.encoding as MemorySlice["encoding"] | undefined;
-      const wordSize = params.wordSize as MemorySlice["wordSize"] | undefined;
       return {
         result: buildMemorySlice({
           target,
           address: Number.isFinite(addressValue) ? addressValue : undefined,
           length: Number.isFinite(lengthValue) && lengthValue > 0 ? lengthValue : undefined,
-          encoding,
-          wordSize,
         }),
         shouldBroadcastTick: false,
       };
@@ -668,8 +753,8 @@ const dispatchMethod = async (
     case "state.watch": {
       const expressions = (params.expressions as string[]) ?? [];
       expressions.forEach((expr) => {
-        const id = randomUUID();
-        client.watches.add(id);
+        const id = nextWatchId++;
+        client.watches.add(id.toString());
         serverWatches.set(id, { id, expression: expr });
       });
       return {
@@ -678,10 +763,9 @@ const dispatchMethod = async (
       };
     }
     case "state.unwatch": {
-      const expressions = (params.expressions as string[]) ?? [];
-      // expressions here are actually watch IDs
-      expressions.forEach((watchId) => {
-        client.watches.delete(watchId);
+      const watchIds = (params.watchIds as number[]) ?? [];
+      watchIds.forEach((watchId) => {
+        client.watches.delete(watchId.toString());
         serverWatches.delete(watchId);
       });
       return {
@@ -690,7 +774,7 @@ const dispatchMethod = async (
       };
     }
     case "state.editWatch": {
-      const { watchId, value } = params as { watchId: string; value: string };
+      const { watchId, value } = params as { watchId: number; value: string };
 
       // Validate that the watch exists
       const watch = serverWatches.get(watchId);
@@ -741,7 +825,7 @@ const dispatchMethod = async (
       }
     }
     case "state.modifyWatchExpression": {
-      const { watchId, newExpression } = params as { watchId: string; newExpression: string };
+      const { watchId, newExpression } = params as { watchId: number; newExpression: string };
 
       // Find the watch by ID
       const watch = serverWatches.get(watchId);
@@ -750,7 +834,7 @@ const dispatchMethod = async (
           result: {
             error: {
               code: -32602,
-              message: `Watch "${watchId}" not found`,
+              message: `Watch ${watchId} not found`,
             },
           } as RpcError,
           shouldBroadcastTick: false,
@@ -805,16 +889,17 @@ const dispatchMethod = async (
         shouldBroadcastTick: true,
       };
     case "breakpoints.add": {
-      const location = params.location as string;
+      const event = params.event as string;
+      const address = params.address as number | undefined;
       const kind = (params.kind as BreakpointDescriptor["kind"]) ?? "code";
       const enabled = params.enabled !== false;
-      const id = `bp-${randomUUID().slice(0, 8)}`;
+      const id = nextBreakpointId++;
       const breakpoint: BreakpointDescriptor = {
         id,
-        location,
+        event,
+        address,
         kind,
         enabled,
-        hitCount: 0,
       };
       serverBreakpoints.set(id, breakpoint);
       return {
@@ -823,7 +908,7 @@ const dispatchMethod = async (
       };
     }
     case "breakpoints.remove": {
-      const id = params.id as string;
+      const id = params.id as number;
       const removed = serverBreakpoints.delete(id);
       if (!removed) {
         return {
@@ -837,7 +922,7 @@ const dispatchMethod = async (
       };
     }
     case "breakpoints.toggle": {
-      const id = params.id as string;
+      const id = params.id as number;
       const enabled = params.enabled as boolean;
       const breakpoint = serverBreakpoints.get(id);
       if (!breakpoint) {
@@ -876,20 +961,17 @@ const sha256Byte = (input: string): number => {
   return hash[0];
 };
 
-const memoryProfiles: Record<string, { defaultBase: number; wordSize: MemorySlice["wordSize"]; generator: (index: number, base: number) => number }> = {
+const memoryProfiles: Record<string, { defaultBase: number; generator: (index: number, base: number) => number }> = {
   sh4: {
     defaultBase: 0x8c000000,
-    wordSize: 4,
     generator: (index, base) => sha256Byte(`SH4:${(base + index).toString(16)}`),
   },
   arm7: {
     defaultBase: 0x00200000,
-    wordSize: 4,
     generator: (index, base) => sha256Byte(`ARM7:${(base + index).toString(16)}`),
   },
   dsp: {
     defaultBase: 0x00000000,
-    wordSize: 2,
     generator: (index, base) => sha256Byte(`DSP:${(base + index).toString(16)}`),
   },
 };
@@ -898,26 +980,18 @@ const buildMemorySlice = ({
   target,
   address,
   length,
-  encoding,
-  wordSize,
 }: {
   target: string;
   address?: number;
   length?: number;
-  encoding?: MemorySlice["encoding"];
-  wordSize?: MemorySlice["wordSize"];
 }): MemorySlice => {
   const profile = memoryProfiles[target] ?? memoryProfiles.sh4;
   const effectiveLength = length && length > 0 ? length : 64;
   const baseAddress = typeof address === "number" && address >= 0 ? address : profile.defaultBase;
-  const effectiveWordSize = wordSize ?? profile.wordSize;
-  const effectiveEncoding = encoding ?? "hex";
   const bytes = Array.from({ length: effectiveLength }, (_, index) => profile.generator(index, baseAddress) & 0xff);
   return {
     baseAddress,
-    wordSize: effectiveWordSize,
-    encoding: effectiveEncoding,
-    data: Buffer.from(bytes).toString("hex"),
+    data: bytes,
     validity: "ok",
   };
 };
@@ -936,9 +1010,9 @@ const collectRegistersFromTree = (tree: DeviceNodeDescriptor[]): Array<{ path: s
 };
 
 const checkBreakpoint = (path: string, registerName: string, value: number): BreakpointDescriptor | undefined => {
-  const location = `${path}.${registerName.toLowerCase()} == 0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
+  const event = `${path}.${registerName.toLowerCase()}`;
   for (const bp of serverBreakpoints.values()) {
-    if (bp.location === location && bp.enabled && bp.kind === "code" && isBreakpointActive(bp)) {
+    if (bp.event === event && bp.address === value && bp.enabled && bp.kind === "code" && isBreakpointActive(bp)) {
       return bp;
     }
   }
@@ -947,7 +1021,7 @@ const checkBreakpoint = (path: string, registerName: string, value: number): Bre
 
 // Emulation tick - advances the emulator state
 const emulationTick = () => {
-  let hitBreakpointId: string | undefined;
+  let hitBreakpointId: number | undefined;
 
   // Only mutate registers and generate events when running
   if (isRunning) {
@@ -966,7 +1040,6 @@ const emulationTick = () => {
       const hitBp = checkBreakpoint("dc.sh4.cpu", "PC", newPc);
       if (hitBp) {
         isRunning = false;
-        hitBp.hitCount++;
         hitBreakpointId = hitBp.id;
         const message = `SH4 breakpoint hit at 0x${newPc.toString(16).toUpperCase()}`;
 
@@ -1006,7 +1079,6 @@ const emulationTick = () => {
       const hitBp = checkBreakpoint("dc.aica.arm7", "pc", newPc);
       if (hitBp && !hitBreakpointId) {
         isRunning = false;
-        hitBp.hitCount++;
         hitBreakpointId = hitBp.id;
         const message = `ARM7 breakpoint hit at 0x${newPc.toString(16).toUpperCase()}`;
 
@@ -1037,7 +1109,6 @@ const emulationTick = () => {
       const hitBp = checkBreakpoint("dc.aica.dsp", "step", newStep);
       if (hitBp && !hitBreakpointId) {
         isRunning = false;
-        hitBp.hitCount++;
         hitBreakpointId = hitBp.id;
         const message = `DSP breakpoint hit at step ${newStep}`;
 
@@ -1076,7 +1147,7 @@ const emulationTick = () => {
 };
 
 // Build and broadcast tick to all connected clients
-const broadcastTick = (hitBreakpointId?: string) => {
+const broadcastTick = (hitBreakpointId?: number) => {
   // Build complete tick with all state
   const deviceTree = buildDeviceTree();
   const allRegisters = collectRegistersFromTree(deviceTree);
@@ -1141,9 +1212,18 @@ const broadcastTick = (hitBreakpointId?: string) => {
     breakpoints: breakpointsById,
     eventLog: eventLogEntries.slice(),
     watches: serverWatches.size > 0 ? watches : undefined,
-    threads: sampleThreads,
     callstacks,
   };
+
+  // Validate tick before broadcasting
+  try {
+    DebuggerTickSchema.parse(tick);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      console.error("Invalid tick data:", error.message);
+      return; // don't do the broadcast
+    }
+  }
 
   // Broadcast tick to all clients
   for (const client of clients) {
