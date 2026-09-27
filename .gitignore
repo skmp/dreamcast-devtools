@@ -25,3 +25,6 @@ dist-ssr
 *.sw?
 
 .claude/
+
+# Rust build output (was covered by the nullDC-rust root .gitignore)
+target/
