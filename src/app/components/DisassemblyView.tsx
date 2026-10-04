@@ -240,42 +240,49 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   const pendingScrollSteps = useRef(0);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const currentPcRef = useRef<number | undefined>(currentPc);
-  const targetAddressRef = useRef<number | undefined>(undefined);
-  const targetTimestampRef = useRef<number | undefined>(undefined);
+  const pendingHighlightRef = useRef<number | undefined>(undefined);
   const lineRefsMap = useRef<Map<number, HTMLDivElement>>(new Map());
   const [, forceUpdate] = useState(0);
 
   // Track previous execution state for detecting pauses
   const prevExecutionStateRef = useRef(executionState);
 
-  // Helper to apply highlight with auto-removal
-  const applyHighlight = useCallback((targetAddr: number) => {
-    const element = lineRefsMap.current.get(targetAddr);
-    if (element) {
-      element.classList.remove("target-address");
-      // Force reflow to restart animation
-      void element.offsetWidth;
-      element.classList.add("target-address");
-
-      // Remove class after animation completes (2s animation duration)
-      setTimeout(() => {
-        element.classList.remove("target-address");
-      }, 2000);
-    } else {
-      // Address not visible yet, try again when it loads
-      setTimeout(() => {
-        const el = lineRefsMap.current.get(targetAddr);
-        if (el) {
-          el.classList.remove("target-address");
-          void el.offsetWidth;
-          el.classList.add("target-address");
-          setTimeout(() => {
-            el.classList.remove("target-address");
-          }, 2000);
-        }
-      }, 100);
+  // Flash the line of the requested address. The line may not exist yet (it is still
+  // being fetched), so the request stays pending until a render contains it.
+  const applyPendingHighlight = useCallback(() => {
+    const target = pendingHighlightRef.current;
+    if (target === undefined) {
+      return;
     }
+    const element = lineRefsMap.current.get(target);
+    if (!element) {
+      return;
+    }
+    pendingHighlightRef.current = undefined;
+    element.classList.remove("target-address");
+    // Force reflow to restart animation
+    void element.offsetWidth;
+    element.classList.add("target-address");
+
+    // Remove class after animation completes (2s animation duration)
+    setTimeout(() => {
+      element.classList.remove("target-address");
+    }, 2000);
   }, []);
+
+  // Helper to apply highlight with auto-removal
+  const applyHighlight = useCallback(
+    (targetAddr: number) => {
+      pendingHighlightRef.current = normalizeAddress(targetAddr, config.maxAddress, config.instructionSize);
+      applyPendingHighlight();
+    },
+    [applyPendingHighlight, config.maxAddress, config.instructionSize],
+  );
+
+  // Fetched lines have just been rendered: highlight the requested one if it is among them
+  useEffect(() => {
+    applyPendingHighlight();
+  }, [lines, applyPendingHighlight]);
 
   // Expose methods via ref
   useImperativeHandle(ref, () => ({
@@ -462,21 +469,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
 
     setAddress(normalizedTarget);
 
-    // Set target address and timestamp for animation trigger
-    targetAddressRef.current = parsed;
-    targetTimestampRef.current = Date.now();
-
-    // Update DOM when lines are available
-    setTimeout(() => {
-      const element = lineRefsMap.current.get(parsed);
-      if (element) {
-        element.classList.remove("target-address");
-        // Force reflow to restart animation
-        void element.offsetWidth;
-        element.classList.add("target-address");
-      }
-    }, 0);
-  }, [addressInput, config]);
+    // Flash the line once it is on screen (now, or after the fetch)
+    applyHighlight(parsed);
+  }, [addressInput, config, applyHighlight]);
 
   const handleRefresh = useCallback(() => {
     void fetchDisassembly(address);

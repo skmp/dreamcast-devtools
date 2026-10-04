@@ -8,6 +8,7 @@ import {
   openWorkspace,
   panel,
   pauseFromToolbar,
+  recordFlashes,
   tooltipButton,
   KNOWN,
   type WorkspaceId,
@@ -198,6 +199,23 @@ for (const target of TARGETS) {
       ).toBeVisible();
       await expect(tooltipButton(page, "Run")).toBeEnabled();
       await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(address));
+    });
+
+    test("entering an address flashes its line", async ({ page }) => {
+      // regression (race): the flash was applied from a 0 ms timer started on submit, before
+      // the lines of the new range had been fetched; it only showed when the server won
+      const view = panel(page, target.disassembly);
+      const box = view.getByRole("textbox");
+      const flashes = await recordFlashes(view);
+      const size = target.instructionSize;
+      const addresses = [target.farAddress, target.farAddress - 40 * size, target.farAddress + 20 * size];
+
+      for (const [index, address] of addresses.entries()) {
+        await box.fill(target.input(address));
+        await box.press("Enter");
+        await expect(disassemblyRow(view, address)).toBeVisible();
+        await expect.poll(flashes).toEqual(addresses.slice(0, index + 1));
+      }
     });
 
     test("the address box, the mouse wheel, Refresh and Go to current PC move the view", async ({ page, rpc }) => {

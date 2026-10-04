@@ -8,6 +8,7 @@ import {
   openWorkspace,
   panel,
   pauseFromToolbar,
+  recordFlashes,
   tooltipButton,
 } from "./support/fixtures";
 
@@ -69,10 +70,13 @@ for (const { name, workspace, id, disassembly, symbol, location, caller } of [
     await expect(disassemblyRows(code).first()).toHaveAttribute("data-address", String(caller + 0x4000 - 10 * size));
     await expect(disassemblyRow(code, target)).toHaveCount(0);
 
+    const flashes = await recordFlashes(code);
     await view.getByText(hex8(target), { exact: true }).click();
 
     await expect(disassemblyRow(code, target)).toBeVisible();
     await expect(disassemblyRows(code).first()).toHaveAttribute("data-address", String(target - 10 * size));
+    // and flashes the line of the frame
+    await expect.poll(flashes).toEqual([target]);
   });
 }
 

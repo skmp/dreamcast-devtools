@@ -93,10 +93,9 @@ for (const { name, workspace, id, base, firstRow } of [
   });
 }
 
-test.fixme("entering an address highlights its row", async ({ page }) => {
-  // BROKEN (race): MemoryView adds the highlight class from a 0 ms timer started when the
-  // address is submitted. The row only exists once the new slice has been fetched and
-  // rendered, so the highlight appears only when the server answers within that timer.
+test("entering an address highlights its row", async ({ page }) => {
+  // regression (race): the highlight class was added from a 0 ms timer started on submit,
+  // before the slice with that row had been fetched; it only showed when the server won
   await openWorkspace(page, "sh4-debugger");
   const view = panel(page, "sh4-memory");
   for (const address of [0x8c008030, 0x8c00a040, 0x8c00c050]) {
@@ -104,7 +103,14 @@ test.fixme("entering an address highlights its row", async ({ page }) => {
     await view.getByRole("textbox").press("Enter");
     await expect(rowAt(view, address)).toBeVisible();
     await expect(rowAt(view, address)).toHaveClass(/target-address/);
+    // exactly one row is marked
+    await expect(view.locator(".target-address")).toHaveCount(1);
   }
+  // an address that is already on screen: nothing is fetched, the row is marked right away
+  await view.getByRole("textbox").fill(hex8(0x8c00c050 + 0x40));
+  await view.getByRole("textbox").press("Enter");
+  await expect(rowAt(view, 0x8c00c050 + 0x40)).toHaveClass(/target-address/);
+  await expect(view.locator(".target-address")).toHaveCount(1);
 });
 
 test.fixme("an address in the URL is shown again after a reload", async ({ page }) => {

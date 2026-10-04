@@ -285,3 +285,22 @@ export const canvasStats = (canvas: Locator): Promise<CanvasStats> =>
       hash,
     };
   });
+
+/**
+ * Starts recording which disassembly rows flash (the "fadeOutTarget" animation of the
+ * "target-address" class, which is removed again after two seconds, so it is recorded
+ * instead of polled). Returns a reader for the `data-address` values flashed so far.
+ */
+export const recordFlashes = async (view: Locator): Promise<() => Promise<number[]>> => {
+  await view.evaluate((root) => {
+    const store = window as unknown as { __flashes: number[] };
+    store.__flashes = [];
+    root.addEventListener("animationstart", (event) => {
+      const row = (event.target as HTMLElement).closest("[data-address]");
+      if ((event as AnimationEvent).animationName === "fadeOutTarget" && row) {
+        store.__flashes.push(Number(row.getAttribute("data-address")));
+      }
+    });
+  });
+  return () => view.page().evaluate(() => (window as unknown as { __flashes: number[] }).__flashes);
+};

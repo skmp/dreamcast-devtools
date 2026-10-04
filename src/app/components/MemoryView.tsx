@@ -78,10 +78,28 @@ export const MemoryView = ({
   const wheelRemainder = useRef(0);
   const pendingScrollDelta = useRef(0);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const targetAddressRef = useRef<number | undefined>(undefined);
-  const targetTimestampRef = useRef<number | undefined>(undefined);
+  const pendingHighlightRef = useRef<number | undefined>(undefined);
   const lineRefsMap = useRef<Map<number, HTMLDivElement>>(new Map());
   const urlHighlightTriggeredRef = useRef(false);
+
+  // Flash the row of the requested address. The row may not exist yet (its slice is still
+  // being fetched), so the request stays pending until a render contains it.
+  const applyPendingHighlight = useCallback(() => {
+    const target = pendingHighlightRef.current;
+    if (target === undefined) {
+      return;
+    }
+    const element = lineRefsMap.current.get(target);
+    if (!element) {
+      return;
+    }
+    pendingHighlightRef.current = undefined;
+    // Rows are reused for other addresses when the view scrolls: drop stale markers
+    lineRefsMap.current.forEach((row) => row.classList.remove("target-address"));
+    // Force reflow to restart animation
+    void element.offsetWidth;
+    element.classList.add("target-address");
+  }, []);
 
   const fetchSlice = useCallback(
     async (addr: number) => {
@@ -132,23 +150,13 @@ export const MemoryView = ({
     urlHighlightTriggeredRef.current = true;
 
     // Align the address to row boundary for proper highlighting
-    const alignedAddress = clampAddress(initialUrlAddress.address, 0xffffffff - (BYTES_PER_ROW - 1), BYTES_PER_ROW);
-
-    // Set target address for animation trigger
-    targetAddressRef.current = alignedAddress;
-    targetTimestampRef.current = Date.now();
-
-    // Update DOM when rows are available
-    setTimeout(() => {
-      const element = lineRefsMap.current.get(alignedAddress);
-      if (element) {
-        element.classList.remove("target-address");
-        // Force reflow to restart animation
-        void element.offsetWidth;
-        element.classList.add("target-address");
-      }
-    }, 0);
-  }, [initialUrlAddress, initialized, slice]);
+    pendingHighlightRef.current = clampAddress(
+      initialUrlAddress.address,
+      0xffffffff - (BYTES_PER_ROW - 1),
+      BYTES_PER_ROW,
+    );
+    applyPendingHighlight();
+  }, [initialUrlAddress, initialized, slice, applyPendingHighlight]);
 
   // Process pending scroll delta after loading completes
   useEffect(() => {
@@ -179,6 +187,11 @@ export const MemoryView = ({
     }
     return result;
   }, [slice]);
+
+  // A fetched slice has just been rendered: highlight the requested row if it is in there
+  useEffect(() => {
+    applyPendingHighlight();
+  }, [rows, applyPendingHighlight]);
 
   const adjustAddress = useCallback(
     (delta: number) => {
@@ -245,21 +258,13 @@ export const MemoryView = ({
     setAddress(clampedTarget);
     callbacks.onAddressChange?.(alignedAddress);
 
-    // Set target address (aligned) and timestamp for animation trigger
-    targetAddressRef.current = alignedAddress;
-    targetTimestampRef.current = Date.now();
-
-    // Update DOM when rows are available
-    setTimeout(() => {
-      const element = lineRefsMap.current.get(alignedAddress);
-      if (element) {
-        element.classList.remove("target-address");
-        // Force reflow to restart animation
-        void element.offsetWidth;
-        element.classList.add("target-address");
-      }
-    }, 0);
-  }, [addressInput, config, callbacks]);
+    // Highlight the row once it is on screen: right away when the view does not move,
+    // otherwise after the new slice has been fetched and rendered (see the rows effect)
+    pendingHighlightRef.current = alignedAddress;
+    if (clampedTarget === address) {
+      applyPendingHighlight();
+    }
+  }, [addressInput, config, callbacks, address, applyPendingHighlight]);
 
   const handleRefresh = useCallback(() => {
     void fetchSlice(address);
