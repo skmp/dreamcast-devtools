@@ -91,7 +91,9 @@ subscribe/unsubscribe.
   - `state.recordSgcFrames`, `state.getSgcFrameData` (answered by a JSON result followed by one
     binary frame with the recorded data)
 
-The zod schemas in `src/lib/debuggerSchema.ts` are the reference for parameters and results.
+The zod schemas in `src/lib/debuggerSchema.ts` are the reference for parameters and results, except
+for the two SGC methods, which have no schema yet (see `server/mockServer.ts` and
+`src/services/debuggerClient.ts`).
 
 The mock server (`server/mockServer.ts`) keeps one shared state for all clients. It sends a tick to
 every connected client after `debugger.describe`, after each request that changes state, and when a

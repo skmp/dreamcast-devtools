@@ -111,7 +111,7 @@ export const documentationSections: DocumentationSection[] = [
       "JSON-RPC 2.0 over a single connection. There is no handshake and no subscribe/unsubscribe.",
       "The first request is `debugger.describe`; it returns the emulator name, version and build plus the device tree. The About dialog shows these next to the DevTools version.",
       "The server pushes `event.tick` notifications. Every tick is a complete snapshot: execution state, registers, breakpoints, event log, watches and callstacks.",
-      "Memory, disassembly and callstacks are fetched on demand with `state.getMemorySlice`, `state.getDisassembly` and `state.getCallstack`. The zod schemas in `src/lib/debuggerSchema.ts` are the reference for every method.",
+      "Memory, disassembly and callstacks are fetched on demand with `state.getMemorySlice`, `state.getDisassembly` and `state.getCallstack`. The zod schemas in `src/lib/debuggerSchema.ts` are the reference for every method except `state.recordSgcFrames` and `state.getSgcFrameData`, which have no schema yet.",
     ],
   },
 ];
