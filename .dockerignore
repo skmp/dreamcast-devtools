@@ -1,0 +1,16 @@
+# Keep the build context to what `npm ci` + `npm run build:native` need.
+.git
+.github
+.vscode
+.idea
+.claude
+node_modules
+dist-native
+dist-wasm
+crates
+experiments
+*.log
+*.local
+Dockerfile
+.dockerignore
+fly.toml

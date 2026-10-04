@@ -1,38 +1,29 @@
-# Build stage prepares dependencies and bundles the SPA assets
-FROM node:20-alpine AS build
+# Mock demo image: builds the UI and serves it from the mock debugger server
+# (server/mockServer.ts) in production mode. This is not how the emulator ships
+# the UI; it embeds the dist-native/ or dist-wasm/ build directly.
+
+# Build stage: install the locked dependencies and build dist-native/.
+# The generated AICA DSP wasm glue (src/wasm/aica-dsp) is committed, so no Rust
+# toolchain is needed here.
+FROM node:22-alpine AS build
 WORKDIR /app
 
-# Install build tools and Rust for WASM builds
-RUN apk add --no-cache bash curl build-base git openssl-dev
-
-# Install Rust (minimal profile, no extra docs)
-RUN curl https://sh.rustup.rs -sSf | bash -s -- -y --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Add wasm32 target for Rust
-RUN rustup target add wasm32-unknown-unknown
-RUN cargo install wasm-pack --locked
-
-# Install dependencies
 COPY package.json package-lock.json ./
-RUN npm install
+RUN npm ci
 
-# Copy source and build
 COPY . .
-RUN npm run build
+RUN npm run build:native
 
-# Runtime stage keeps the final image lean
-FROM node:20-alpine AS runner
+# Runtime stage: the mock server runs through tsx and imports vite, express and
+# ws (all devDependencies), so it keeps the node_modules of the build stage.
+FROM node:22-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8080
-ENV DEBUGGER_WS_PATH=/ws
 
-# Copy runtime dependencies only
 COPY --from=build /app/package.json /app/package-lock.json ./
-RUN apk add --no-cache git
 COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
+COPY --from=build /app/dist-native ./dist-native
 COPY --from=build /app/server ./server
 COPY --from=build /app/src ./src
 COPY --from=build /app/tsconfig.server.json ./
