@@ -71,7 +71,8 @@ for (const { name, workspace, id, disassembly, symbol, location, caller } of [
     await expect(disassemblyRow(code, target)).toHaveCount(0);
 
     const flashes = await recordFlashes(code);
-    await view.getByText(hex8(target), { exact: true }).click();
+    // frame #6 (frame #0, the program counter, can show the same address)
+    await view.getByRole("listitem").nth(6).getByText(hex8(target), { exact: true }).click();
 
     await expect(disassemblyRow(code, target)).toBeVisible();
     await expect(disassemblyRows(code).first()).toHaveAttribute("data-address", String(target - 10 * size));

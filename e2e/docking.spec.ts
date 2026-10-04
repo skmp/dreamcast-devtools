@@ -90,7 +90,8 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
   { title: "SH4: OCACHE", id: "ocache-contents", content: /Operand Cache Contents - Coming Soon/ },
   { title: "SH4: OC-RAM", id: "ocram-contents", content: /Operand RAM Contents\s*Memory contents \(all zeros\)/ },
   { title: "SH4: TLB", id: "tlb-contents", content: /TLB Contents - Coming Soon/ },
-  { title: "ARM7: Disassembly", id: "arm7-disassembly", content: /0x00200000/ },
+  // opened after the first tick, a disassembly view starts ten instructions before the PC
+  { title: "ARM7: Disassembly", id: "arm7-disassembly", content: /0x(001FFF|002000)[0-9A-F]{2}/ },
   { title: "ARM7: Memory", id: "arm7-memory", content: /0x00200000/ },
   { title: "ARM7: Breakpoints", id: "arm7-breakpoints", content: /No breakpoints defined\./ },
   { title: "CLX2: TA", id: "holly-ta", content: /This view is under consideration\./ },
@@ -194,7 +195,7 @@ test("the action buttons of a device tree node open that panel in the centre doc
 
   // a debugger panel of another target works in this workspace too
   await treeItemRow(page, "dc.aica.arm7").getByLabel("Open ARM7: Disassembly").click();
-  await expect(panel(page, "arm7-disassembly")).toContainText("0x00200000");
+  await expect(panel(page, "arm7-disassembly")).toContainText(/0x(001FFF|002000)[0-9A-F]{2}/);
 });
 
 const tabTitles = (page: Page) =>

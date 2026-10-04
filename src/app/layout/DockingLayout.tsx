@@ -8,6 +8,7 @@ import {
 } from "dockview";
 import { Box, IconButton } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import AddIcon from "@mui/icons-material/Add";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { PanelSelectorModal } from "./PanelSelectorModal";
@@ -63,7 +64,10 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
           data-panel-id={panel.id}
           sx={{ height: "100%", width: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}
         >
-          {panel.component}
+          {/* an exception in one panel must not take the workspace down */}
+          <ErrorBoundary scope="panel" name={panel.title} testId={`panel:${panel.id}`}>
+            {panel.component}
+          </ErrorBoundary>
         </Box>
       );
     });

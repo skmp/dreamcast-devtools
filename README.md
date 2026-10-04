@@ -54,6 +54,9 @@ not run it. After changing the crate, run it and commit the regenerated files.
   request to another origin, unless the test allows that message and says why
   (`diagnostics.allow` in `e2e/support/fixtures.ts`).
 - `test.fixme` marks behaviour that is known to be broken; the comment in the test says where.
+- Loading the page with `?crashTest` (before the `#route`) enables a hook that makes an error
+  boundary's child throw on a `nulldc:crash-test` window event; `e2e/error-boundary.spec.ts`
+  uses it. Without the flag the hook does not exist (`src/app/components/CrashProbe.tsx`).
 
 Install the browser once with `npx playwright install chromium` (add `--with-deps` on a fresh
 Linux machine). Useful variations:
@@ -64,6 +67,16 @@ npx playwright test -g "Reset layout"           # by title
 npx playwright test --headed --workers=1        # watch it
 E2E_SCREENSHOT_DIR=/tmp/shots npm run test:e2e  # also save the per-workspace screenshots there
 ```
+
+## Error boundaries
+
+Every dock panel and every route is wrapped in an error boundary
+(`src/app/components/ErrorBoundary.tsx`). An exception thrown while a panel renders or in one of
+its effects replaces that panel with the error message, the component stack and a `Reload panel`
+button; the other panels, the connection and the rest of the page keep running. An exception
+outside the panels replaces the page of that route with the same report and a `Reload page`
+button, and is dismissed by navigating elsewhere. Exceptions in event handlers and in promises
+are not caught by error boundaries.
 
 ## Configuration
 
