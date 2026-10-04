@@ -128,10 +128,9 @@ test("hovering a cell highlights its row and cycle; the options change the rende
   await expect.poll(() => stall.evaluate((element) => getComputedStyle(element).borderTopColor)).not.toBe(bordered);
 });
 
-test.fixme("Share copies a link to the source and stays on the simulator", async ({ page }) => {
-  // BROKEN: handleCopyShare assigns window.location.hash ("" for Share, "#<block id>" for a
-  // fragment link). Under the HashRouter that hash IS the route: "" is the home page and
-  // "#<block id>" matches no route and redirects there. Clicking Share leaves the tool.
+test("Share copies a link to the source and stays on the simulator", async ({ page }) => {
+  // regression: the panel used to write the fragment to window.location.hash, which is the
+  // route under the HashRouter, so Share and the copy-link buttons navigated to the home page
   await monacoReplaceAll(page, monacoEditor(page), "# shared\nADD R1,R2\n");
   await expect(fragment(page, "shared")).toBeVisible();
 
@@ -145,10 +144,9 @@ test.fixme("Share copies a link to the source and stays on the simulator", async
   await expect(fragment(page, "shared")).toBeVisible();
 });
 
-test.fixme("the copy-link button of a fragment copies a link to that fragment and stays on the simulator", async ({
+test("the copy-link button of a fragment copies a link to that fragment and stays on the simulator", async ({
   page,
 }) => {
-  // BROKEN: same cause as Share: the fragment id is written to window.location.hash.
   await monacoReplaceAll(page, monacoEditor(page), "# first\nADD R1,R2\n# second\nADD R3,R4\n");
   const second = fragment(page, "second");
   await expect(second).toBeVisible();

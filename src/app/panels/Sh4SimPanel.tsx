@@ -498,9 +498,9 @@ export const Sh4SimPanel = () => {
       try {
         await navigator.clipboard.writeText(url);
         setCopiedTarget(target);
-        if (typeof window !== "undefined") {
-          window.location.hash = hash ? `#${hash}` : "";
-        }
+        // Do not mirror the fragment into window.location.hash: the app runs under a
+        // HashRouter, where the hash is the route. Writing "" or "#<block id>" there
+        // navigates away from the simulator.
         if (copyTimeoutRef.current !== null) {
           window.clearTimeout(copyTimeoutRef.current);
         }
