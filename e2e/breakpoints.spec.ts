@@ -260,10 +260,10 @@ test("soloing a category disables the breakpoints of the others", async ({ page,
   await expect(categoryHeader(view, "Events").getByRole("button", { name: "Solo category" })).toBeVisible();
 });
 
-test.fixme("the mute button of a disassembly view works without a breakpoints panel", async ({ page, rpc }) => {
-  // BROKEN: breakpointCategoryState only learns the DebuggerClient from an effect of the
-  // breakpoints panels. The mixed-mode workspace has none by default, so the mute and solo
-  // buttons of its disassembly views change their icon and send nothing to the server.
+test("the mute and solo buttons of a disassembly view work without a breakpoints panel", async ({ page, rpc }) => {
+  // regression: only the breakpoints panels told breakpointCategoryState which client to use.
+  // The mixed-mode workspace has none by default, so these buttons changed their icon and
+  // sent nothing to the server.
   await openWorkspace(page, "mixed-mode-debugger");
   await pauseFromToolbar(page);
   const disassembly = panel(page, "sh4-disassembly");
@@ -275,8 +275,25 @@ test.fixme("the mute button of a disassembly view works without a breakpoints pa
   await disassembly.getByRole("button", { name: "Mute category" }).click();
   await expect(disassembly.getByRole("button", { name: "Unmute category" })).toBeVisible();
   await expect.poll(() => rpc.requests("breakpoints.setCategoryStates").length).toBe(1);
+  expect(rpc.requests("breakpoints.setCategoryStates")[0].params).toMatchObject({
+    categories: { sh4: { muted: true, soloed: false } },
+  });
 
+  // muted: the breakpoint does not stop the target
   await tooltipButton(page, "Run").click();
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
+  await page.waitForTimeout(1000);
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
+
+  // soloing the ARM7 category from the other view keeps SH4 breakpoints inactive
+  await disassembly.getByRole("button", { name: "Unmute category" }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "Breakpoint hit: dc.sh4.cpu.pc == 0x8C0000A6" })).toBeVisible();
+  await panel(page, "arm7-disassembly").getByRole("button", { name: "Solo category" }).click();
+  await expect.poll(() => rpc.requests("breakpoints.setCategoryStates").at(-1)?.params).toMatchObject({
+    categories: { arm7: { muted: false, soloed: true }, sh4: { muted: false, soloed: false } },
+  });
+  await tooltipButton(page, "Run").click();
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
   await page.waitForTimeout(1000);
   await expect(tooltipButton(page, "Pause")).toBeEnabled();
 });

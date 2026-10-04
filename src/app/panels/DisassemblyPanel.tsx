@@ -3,7 +3,7 @@ import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import SubdirectoryArrowRightIcon from "@mui/icons-material/SubdirectoryArrowRight";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import { categoryStates, syncCategoryStatesToServer, type BreakpointCategory } from "../../state/breakpointCategoryState";
+import { categoryStates, setClient, syncCategoryStatesToServer, type BreakpointCategory } from "../../state/breakpointCategoryState";
 import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks, type DisassemblyViewRef } from "../components/DisassemblyView";
 import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
 import { generateUUID } from "../../lib/uuid";
@@ -90,6 +90,12 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
     }
     return map;
   }, [breakpoints, target]);
+
+  // The mute/solo buttons send the category states through this module-level client. The
+  // breakpoints panels register it too, but a workspace does not have to contain one.
+  useEffect(() => {
+    setClient(client ?? null);
+  }, [client]);
 
   // Get category state
   const category: BreakpointCategory = target === "sh4" ? "sh4" : target === "arm7" ? "arm7" : "dsp";
