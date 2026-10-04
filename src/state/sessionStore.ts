@@ -1,4 +1,4 @@
-﻿import { create } from "zustand";
+import { create } from "zustand";
 import { appConfig } from "../config";
 import { DebuggerClient } from "../services/debuggerClient";
 import { ConnectionDiscovery, type AvailableConnection } from "../services/transport";

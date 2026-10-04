@@ -1,4 +1,4 @@
-﻿import { Panel } from "../layout/Panel";
+import { Panel } from "../layout/Panel";
 import { Typography } from "@mui/material";
 
 export const TaInspectorPanel = () => {

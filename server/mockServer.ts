@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import { createServer as createHttpServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { randomUUID, createHash } from "node:crypto";

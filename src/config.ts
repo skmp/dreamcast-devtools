@@ -1,4 +1,4 @@
-﻿import type { DebuggerClientConfig } from "./services/debuggerClient";
+import type { DebuggerClientConfig } from "./services/debuggerClient";
 import type { TransportOptions } from "./services/transport";
 
 type TransportMode = DebuggerClientConfig["mode"];

@@ -1,4 +1,4 @@
-﻿import { useMemo } from "react";
+import { useMemo } from "react";
 import { Panel } from "../layout/Panel";
 import { Box, List, ListItem, Typography } from "@mui/material";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";

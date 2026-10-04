@@ -1,4 +1,4 @@
-﻿import { AppLayout } from "./app/layout/AppLayout";
+import { AppLayout } from "./app/layout/AppLayout";
 import { HomePage } from "./app/layout/HomePage";
 import { DocsPage } from "./app/layout/DocsPage";
 import { Sh4SimPage } from "./app/layout/Sh4SimPage";

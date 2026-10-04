@@ -1,4 +1,4 @@
-﻿import type { JsonRpcNotification } from "../lib/jsonRpc";
+import type { JsonRpcNotification } from "../lib/jsonRpc";
 import type {
   BreakpointDescriptor,
   BreakpointId,

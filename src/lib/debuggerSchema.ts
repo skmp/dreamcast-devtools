@@ -1,4 +1,4 @@
-﻿import { z } from "zod";
+import { z } from "zod";
 import type { RpcSchema } from "./jsonRpc";
 
 // Common enums and ID types

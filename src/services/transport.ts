@@ -1,4 +1,4 @@
-﻿export type TransportState = "idle" | "connecting" | "open" | "closed";
+export type TransportState = "idle" | "connecting" | "open" | "closed";
 
 export type TransportMessageHandler = (payload: string) => void;
 export type BinaryMessageHandler = (payload: ArrayBuffer) => void;
