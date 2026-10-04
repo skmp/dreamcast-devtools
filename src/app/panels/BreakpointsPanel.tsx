@@ -158,9 +158,8 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
       address = undefined;
       kind = "event";
     } else if (addMode === "dsp") {
-      // Parse step value for DSP breakpoints
-      const normalized = trimmed.replace(/^0x/i, "");
-      const parsed = Number.parseInt(normalized, 16);
+      // DSP steps are decimal, as in the DSP disassembly view; hex needs the 0x prefix
+      const parsed = /^0x/i.test(trimmed) ? Number.parseInt(trimmed.slice(2), 16) : Number.parseInt(trimmed, 10);
       if (Number.isNaN(parsed)) {
         return;
       }

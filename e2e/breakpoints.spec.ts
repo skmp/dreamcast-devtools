@@ -142,20 +142,26 @@ test("DSP: Breakpoints adds a step breakpoint, toggles and removes it", async ({
   await expect(view.getByText("No breakpoints defined.")).toBeVisible();
 });
 
-test.fixme("DSP: Breakpoints reads a plain number as a decimal step", async ({ page, diagnostics }) => {
-  // BROKEN: BreakpointsPanel parses the DSP step with radix 16 although its placeholder
-  // ("0, 5, 0x10") and the DSP disassembly (decimal steps, decimal address box) are decimal:
-  // typing 10 sets a breakpoint on step 16.
+test("DSP: Breakpoints reads a plain number as a decimal step and 0x as hex", async ({ page, diagnostics }) => {
+  // regression: the step was parsed with radix 16 although the placeholder ("0, 5, 0x10") and
+  // the DSP disassembly view are decimal, so typing 10 set a breakpoint on step 16
   diagnostics.allow(...KNOWN.sgcNoData);
   await openWorkspace(page, "audio-debugger");
   await pauseFromToolbar(page);
   const view = panel(page, "dsp-breakpoints");
-  await view.getByPlaceholder("Step value (e.g., 0, 5, 0x10)").fill("10");
-  await view.getByPlaceholder("Step value (e.g., 0, 5, 0x10)").press("Enter");
-  await expect(view.getByRole("listitem")).toHaveCount(1);
+  const input = view.getByPlaceholder("Step value (e.g., 0, 5, 0x10)");
   const disassembly = panel(page, "dsp-disassembly");
+
+  await input.fill("10");
+  await input.press("Enter");
+  await expect(view.getByRole("listitem")).toHaveCount(1);
   await expect(breakpointGutter(disassemblyRow(disassembly, 10))).toHaveAttribute("data-breakpoint", "enabled");
   await expect(breakpointGutter(disassemblyRow(disassembly, 16))).toHaveAttribute("data-breakpoint", "none");
+
+  await input.fill("0x10");
+  await input.press("Enter");
+  await expect(view.getByRole("listitem")).toHaveCount(2);
+  await expect(breakpointGutter(disassemblyRow(disassembly, 16))).toHaveAttribute("data-breakpoint", "enabled");
 });
 
 test("Events: Breakpoints suggests the events of the device tree and lists every breakpoint by category", async ({
