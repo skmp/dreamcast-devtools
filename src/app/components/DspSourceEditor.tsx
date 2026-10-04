@@ -63,12 +63,12 @@ const registerDspSourceLanguage = (monaco: Monaco) => {
         [/\d+/, "number"],
 
         // Operators
-        [/[=:\[\]+\/\-]/, "operator"],
+        [/[=:[\]+/-]/, "operator"],
       ],
       comment: [
-        [/[^\/*]+/, 'comment'],
+        [/[^/*]+/, 'comment'],
         [/\*\//, 'comment', '@pop'],
-        [/[\/*]/, 'comment']
+        [/[/*]/, 'comment']
       ],
     },
     keywords: ['INPUT', 'OUTPUT', 'MAC', 'SMODE', 'ST', 'STF', 'LD', 'LDF', 'MADRS'],

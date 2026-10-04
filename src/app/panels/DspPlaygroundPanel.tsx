@@ -45,6 +45,13 @@ import { compileDspSource, CompilationError } from "../dsp/dspCompiler";
 import { DSP_DEFAULT_SOURCE } from "../dsp/defaultSource";
 import { DEFAULT_DSP_SOURCE } from "../dsp/defaultDspSource";
 
+declare global {
+  interface Window {
+    // Prefixed constructor still exposed by older Safari/WebKit
+    webkitAudioContext?: typeof AudioContext;
+  }
+}
+
 const DSP_SOURCE_STORAGE_KEY = "nulldc-debugger-dsp-source";
 const DSP_ASSEMBLY_STORAGE_KEY = "nulldc-debugger-dsp-assembly";
 const DSP_TAB_STORAGE_KEY = "nulldc-debugger-dsp-active-tab";
@@ -615,7 +622,7 @@ export const DspPlaygroundPanel = () => {
     aicaDsp.resetCounters();
     setCurrentDspStep(0);
 
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)({
       sampleRate: 44100,
     });
     const scriptNode = audioContext.createScriptProcessor(1024, 0, 1);
@@ -1217,7 +1224,7 @@ export const DspPlaygroundPanel = () => {
       // Mark channel as loading
       setLoadingChannels((prev) => new Set(prev).add(channel));
 
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       const fileId = `${Date.now()}-${Math.random()}`;
 
       // Add file immediately with loading state
@@ -1322,7 +1329,7 @@ export const DspPlaygroundPanel = () => {
     event.preventDefault();
 
     const files = Array.from(event.dataTransfer.files);
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
     for (const file of files) {
       const fileId = `${Date.now()}-${Math.random()}`;
@@ -1415,7 +1422,7 @@ export const DspPlaygroundPanel = () => {
     if (!file) return;
 
     // Create new audio context and play the file
-    const context = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const context = new (window.AudioContext || window.webkitAudioContext)();
     const source = context.createBufferSource();
     source.buffer = file.audioBuffer;
     source.connect(context.destination);
@@ -1461,7 +1468,7 @@ export const DspPlaygroundPanel = () => {
     input.multiple = true;
     input.onchange = async (e) => {
       const files = Array.from((e.target as HTMLInputElement).files || []);
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
       for (const file of files) {
         const fileId = `${Date.now()}-${Math.random()}`;
@@ -1546,7 +1553,7 @@ export const DspPlaygroundPanel = () => {
     const startStep = aicaDsp.getCurrentStep();
 
     // Always step at least once, then continue until we reach step 0
-    do {
+    for (;;) {
       aicaDsp.doDspStep();
       const currentStep = aicaDsp.getCurrentStep();
 
@@ -1559,7 +1566,7 @@ export const DspPlaygroundPanel = () => {
       if (currentStep === 0) {
         break;
       }
-    } while (true);
+    }
 
     // Update current step and sample for the disassembly view
     const newStep = aicaDsp.getCurrentStep();
@@ -1608,7 +1615,7 @@ export const DspPlaygroundPanel = () => {
       // Run one full sample (128 DSP steps) or until breakpoint hit
       let completedSample = false;
 
-      do {
+      for (;;) {
         aicaDsp.doDspStep();
         const currentStep = aicaDsp.getCurrentStep();
 
@@ -1625,7 +1632,7 @@ export const DspPlaygroundPanel = () => {
           completedSample = true;
           break;
         }
-      } while (true);
+      }
 
       // Only read outputs and update plotters if we completed the full sample
       if (completedSample) {

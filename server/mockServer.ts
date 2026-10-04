@@ -1459,10 +1459,11 @@ const generateSgcFrameData = (): Buffer => {
           case 2: // Sawtooth wave
             waveValue = 2 * ((frame * frequency + phaseOffset) % 1) - 1;
             break;
-          case 3: // Triangle wave
+          case 3: { // Triangle wave
             const sawValue = ((frame * frequency + phaseOffset) % 1);
             waveValue = sawValue < 0.5 ? sawValue * 4 - 1 : 3 - sawValue * 4;
             break;
+          }
         }
 
         sample_current = Math.floor(waveValue * amplitude);

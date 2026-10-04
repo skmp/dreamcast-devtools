@@ -52,7 +52,7 @@ const registerDspLanguage = (monaco: Monaco) => {
         [/\b0x[0-9a-fA-F]+\b/, "number"],
 
         // Operators
-        [/[=:\[\]]/, "operator"],
+        [/[=:[\]]/, "operator"],
       ],
     },
   });

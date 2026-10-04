@@ -112,7 +112,7 @@ function createSteps(lines: string[]): { steps: bigint[]; coefs: number[]; madrs
   };
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-    let line = lines[lineIndex].trim();
+    const line = lines[lineIndex].trim();
     const lineNum = lineIndex + 1;
 
     if (line.length === 0) continue;
@@ -383,7 +383,7 @@ function trickleDown(steps: bigint[], coefs: number[]): void {
 }
 
 function dropNops(steps: bigint[], coefs: number[]): { steps: bigint[]; coefs: number[] } {
-  let nbSteps = steps.length;
+  const nbSteps = steps.length;
   let wasNop = false;
 
   for (let idx = nbSteps - 1; idx >= 0; idx--) {
@@ -477,7 +477,9 @@ export function compileDspSource(source: string): string {
 
   // If preprocessing had errors, include them in the compilation errors
   const lines = preprocessedSource.split('\n');
-  let { steps, coefs, madrs, errors } = createSteps(lines);
+  const created = createSteps(lines);
+  let { steps, coefs } = created;
+  const { madrs, errors } = created;
 
   // Combine preprocessing and compilation errors
   const allErrors = [...preprocessErrors, ...errors];

@@ -52,7 +52,8 @@ import { useAboutModal } from "./useAboutModal";
 import { TopNav } from "./TopNav";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { DEBUGGER_VERSION } from "./aboutVersion";
-import { DockingLayout, clearDockingLayout, type PanelDefinition } from "./DockingLayout";
+import { DockingLayout, type PanelDefinition } from "./DockingLayout";
+import { clearDockingLayout } from "./dockingLayoutStorage";
 import type { DockviewApi } from "dockview";
 import { PANEL_IDS, type PanelId } from "../../lib/debuggerSchema";
 

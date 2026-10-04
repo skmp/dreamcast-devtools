@@ -11,6 +11,7 @@ import { HideOnHoverTooltip as Tooltip } from "../components";
 import AddIcon from "@mui/icons-material/Add";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { PanelSelectorModal } from "./PanelSelectorModal";
+import { loadLayout, saveLayout } from "./dockingLayoutStorage";
 import "dockview/dist/styles/dockview.css";
 
 export type PanelDefinition = {
@@ -27,9 +28,6 @@ type DockingLayoutProps = {
   defaultLayoutMode?: 'tabs' | 'vertical-stack' | 'sh4-layout' | 'mixed-mode-debugger-layout'; // How to layout initial panels
   onAddPanelRequest?: (panelId: string) => void;
 };
-
-const getDockingLayoutStorageKey = (workspaceId?: string) =>
-  workspaceId ? `nulldc-debugger-docking-layout-${workspaceId}` : "nulldc-debugger-docking-layout";
 
 // Store panel components and metadata in Maps
 const panelComponentsMap = new Map<string, ReactElement>();
@@ -519,37 +517,5 @@ function createDefaultLayout(api: DockviewApi, panels: PanelDefinition[], mode: 
 
     // Focus the first panel
     firstPanel.api.setActive();
-  }
-}
-
-function saveLayout(layout: any, workspaceId?: string) {
-  if (typeof window === "undefined") return;
-
-  try {
-    window.localStorage.setItem(getDockingLayoutStorageKey(workspaceId), JSON.stringify(layout));
-  } catch (error) {
-    console.warn("Failed to save docking layout", error);
-  }
-}
-
-function loadLayout(workspaceId?: string): any | null {
-  if (typeof window === "undefined") return null;
-
-  try {
-    const raw = window.localStorage.getItem(getDockingLayoutStorageKey(workspaceId));
-    return raw ? JSON.parse(raw) : null;
-  } catch (error) {
-    console.warn("Failed to load docking layout", error);
-    return null;
-  }
-}
-
-export function clearDockingLayout(workspaceId?: string) {
-  if (typeof window === "undefined") return;
-
-  try {
-    window.localStorage.removeItem(getDockingLayoutStorageKey(workspaceId));
-  } catch (error) {
-    console.warn("Failed to clear docking layout", error);
   }
 }
