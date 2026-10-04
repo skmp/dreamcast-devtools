@@ -476,6 +476,7 @@ export const DspPlaygroundPanel = () => {
       }
       updateShareToken();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot initial compile when wasm and the editors become ready; tab switches are handled by the next effect
   }, [wasmInitialized, editorsReady]);
 
   // Re-compile/re-assemble when switching tabs
@@ -1901,6 +1902,7 @@ export const DspPlaygroundPanel = () => {
         });
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- dropping breakpoints would stop DisassemblyView refetching on breakpoint changes (it refetches when callbacks changes identity)
   }), [wasmInitialized, audioPlaying, audioPaused, breakpoints]);
 
   if (!wasmInitialized) {

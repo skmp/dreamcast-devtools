@@ -181,7 +181,7 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
         dockviewApisMap.delete(event.api.id);
       };
     },
-    [panels, workspaceId]
+    [panels, workspaceId, defaultLayoutMode]
   );
 
   useEffect(() => {
@@ -212,6 +212,7 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
     return () => {
       disposables.forEach((d) => d.dispose());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- apiRef.current as a dep re-subscribes on the first render after onDockviewReady assigns it; dropping it changes when the listeners attach
   }, [apiRef.current]);
 
   const handlePanelSelect = useCallback((panelId: string) => {
