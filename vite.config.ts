@@ -1,12 +1,17 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { execSync } from 'node:child_process';
+import pkg from './package.json';
 
+// package.json version, plus `git describe` when building from a git checkout,
+// e.g. "3.0.0-pre+6ef95de-dirty". Without git (tarball, Docker) it is the
+// package.json version alone.
 function resolveVersion(): string {
   try {
-    return execSync('git describe', { stdio: 'pipe' }).toString().trim() || "(unknown version)";
+    const describe = execSync('git describe --tags --always --dirty', { stdio: 'pipe' }).toString().trim();
+    return describe ? `${pkg.version}+${describe}` : pkg.version;
   } catch {
-    return "unknown";
+    return pkg.version;
   }
 }
 
