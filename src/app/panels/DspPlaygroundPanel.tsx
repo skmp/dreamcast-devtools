@@ -229,6 +229,10 @@ export const DspPlaygroundPanel = () => {
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const scriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  // True from the moment the DSP is paused (button or breakpoint). AudioContext.suspend()
+  // is asynchronous: audio callbacks that are already queued still arrive afterwards and
+  // must not advance the DSP behind the debugger's back.
+  const dspHaltedRef = useRef(false);
   const filePlaybackContextRef = useRef<AudioContext | null>(null);
   const filePlaybackSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const tappedChannelRef = useRef<number | null>(null);
@@ -628,8 +632,13 @@ export const DspPlaygroundPanel = () => {
     });
     const scriptNode = audioContext.createScriptProcessor(1024, 0, 1);
 
+    dspHaltedRef.current = false;
     scriptNode.onaudioprocess = (event) => {
       const outputBuffer = event.outputBuffer.getChannelData(0);
+      if (dspHaltedRef.current) {
+        outputBuffer.fill(0);
+        return;
+      }
       const sampleRate = 44100;
       const TWO_PI = Math.PI * 2;
 
@@ -700,6 +709,7 @@ export const DspPlaygroundPanel = () => {
         // If we hit a breakpoint, pause audio and don't continue processing this buffer
         if (hitBreakpoint) {
           // Pause audio immediately
+          dspHaltedRef.current = true;
           if (audioContextRef.current) {
             void audioContextRef.current.suspend();
           }
@@ -804,6 +814,7 @@ export const DspPlaygroundPanel = () => {
     }
     audioContextRef.current = null;
     scriptNodeRef.current = null;
+    dspHaltedRef.current = false;
     setAudioPlaying(false);
     setAudioPaused(false);
   }, []);
@@ -815,6 +826,7 @@ export const DspPlaygroundPanel = () => {
 
     // Only handle cases where state changed outside of the pause button
     // (e.g., when stopping playback)
+    dspHaltedRef.current = audioPaused;
     if (audioPaused) {
       void audioContextRef.current.suspend();
     } else {
@@ -1828,6 +1840,7 @@ export const DspPlaygroundPanel = () => {
       // Pause audio first if playing (to avoid hitting the breakpoint immediately)
       if (audioPlaying && !audioPaused && audioContextRef.current) {
         audioWasPaused = true;
+        dspHaltedRef.current = true;
         await void audioContextRef.current.suspend();
         setAudioPaused(true);
 
@@ -1880,6 +1893,7 @@ export const DspPlaygroundPanel = () => {
 
       if (audioPaused) {
         // Resume - update state first, then resume audio in microtask
+        dspHaltedRef.current = false;
         setAudioPaused(false);
         queueMicrotask(() => {
           if (audioContextRef.current) {
@@ -1888,6 +1902,7 @@ export const DspPlaygroundPanel = () => {
         });
       } else {
         // Pause - first suspend audio immediately, then update state in microtask
+        dspHaltedRef.current = true;
         if (audioContextRef.current) {
           void audioContextRef.current.suspend();
         }

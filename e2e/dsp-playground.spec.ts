@@ -103,17 +103,11 @@ test("Start DSP runs the program; paused, the debugger steps it one step, one sa
   // the audio callback always stops at a sample boundary
   await expect(register(page, "Step")).toHaveText(/^\s*0$/);
   await expect(page.locator(".current-instruction")).toHaveAttribute("data-address", "0");
-  // TODAY an audio buffer that was already on its way still runs after Pause (see the fixme
-  // below), so let it pass and take the sample counter from the first step.
-  await page.waitForTimeout(500);
-
-  // Step: one DSP step
-  await tooltipButton(page, "Step").click();
-  await expect(register(page, "Step")).toHaveText(/^\s*1$/);
-  await expect(page.locator(".current-instruction")).toHaveAttribute("data-address", "1");
   const sample = await registerValue(page, "Sample");
   expect(sample).toBeGreaterThanOrEqual(0);
-  for (const step of [2, 3]) {
+
+  // Step: one DSP step
+  for (const step of [1, 2, 3]) {
     await tooltipButton(page, "Step").click();
     await expect(register(page, "Step")).toHaveText(new RegExp(`^\\s*${step}$`));
     await expect(page.locator(".current-instruction")).toHaveAttribute("data-address", String(step));
@@ -145,10 +139,10 @@ test("Start DSP runs the program; paused, the debugger steps it one step, one sa
   await expect(page.getByRole("button", { name: "Start DSP" })).toBeVisible();
 });
 
-test.fixme("Pause stops the DSP at once", async ({ page }) => {
-  // BROKEN (race): Pause calls AudioContext.suspend(), which is asynchronous, and shows the
-  // paused state right away. An audio buffer that is already queued still runs 1024 samples
-  // afterwards, so the Sample register shown at the pause is stale until the next step.
+test("Pause stops the DSP at once", async ({ page }) => {
+  // regression (race): Pause calls AudioContext.suspend(), which is asynchronous. An audio
+  // buffer that was already queued used to run 1024 more samples after the debugger showed
+  // the paused state, so the Sample register shown at the pause was stale.
   await expect(editorStatus(page)).toHaveText("Compiled");
   await page.getByRole("button", { name: "Start DSP" }).click();
   await expandDebugger(page);
