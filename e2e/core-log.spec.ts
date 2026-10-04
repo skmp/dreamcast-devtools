@@ -75,10 +75,9 @@ test("a refsw2 log is drawn tile by tile", async ({ page }) => {
   expect(await pixel(page, 64, 64)).toEqual([255, 0, 0, 255]);
 });
 
-test.fixme("clicking a pixel lists what was logged for it", async ({ page }) => {
-  // BROKEN (off by one): handleCanvasClick measures from the canvas' border box, and the
-  // canvas has a 1px border, so a click on pixel (x, y) selects pixel (x + 1, y + 1):
-  // clicking the marked pixel (1, 1) of the tile reports "Local X: 2, Local Y: 2".
+test("clicking a pixel lists what was logged for it", async ({ page }) => {
+  // regression: the click was measured from the canvas' border box; with its 1px border a
+  // click on pixel (x, y) selected pixel (x + 1, y + 1)
   await loadLog(page, buildLog());
   const canvas = page.locator("canvas");
   await expect(canvas).toBeVisible();
