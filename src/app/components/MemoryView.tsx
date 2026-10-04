@@ -69,8 +69,14 @@ export const MemoryView = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
 
-  // Initialize address from URL or default
-  const initialAddress = initialUrlAddress?.address ?? defaultAddress;
+  // Initialize address from URL or default. An address from the URL is treated like a
+  // submitted one: aligned to its row and shown with ten rows of context above it.
+  const initialAddress = initialUrlAddress
+    ? Math.max(
+        0,
+        clampAddress(initialUrlAddress.address, 0xffffffff - (BYTES_PER_ROW - 1), BYTES_PER_ROW) - BYTES_PER_ROW * 10,
+      )
+    : defaultAddress;
   const [address, setAddress] = useState(initialAddress);
   const [addressInput, setAddressInput] = useState(config.formatAddress(initialAddress));
 

@@ -113,10 +113,9 @@ test("entering an address highlights its row", async ({ page }) => {
   await expect(view.locator(".target-address")).toHaveCount(1);
 });
 
-test.fixme("an address in the URL is shown again after a reload", async ({ page }) => {
-  // BROKEN: on load MemoryView uses the ?address= value as the first fetched row but still
-  // prints "first row + 10 rows" in the address box, so after a reload the box shows a
-  // different address (0x8C0081C0 for ?address=0x8C008120) and the context rows are gone.
+test("an address in the URL is shown again after a reload", async ({ page }) => {
+  // regression: on load the ?address= value was used as the first fetched row while the box
+  // still printed "first row + 10 rows": 0x8C0081C0 for ?address=0x8C008120, without context
   await openWorkspace(page, "sh4-debugger");
   const view = panel(page, "sh4-memory");
   const box = view.getByRole("textbox");
@@ -138,4 +137,7 @@ test("a memory panel opened with ?address= shows and highlights that address", a
   const view = panel(page, "sh4-memory");
   await expect(rowAt(view, 0x8c004560)).toBeVisible();
   await expect(rowAt(view, 0x8c004560)).toHaveClass(/target-address/);
+  await expect(view.getByRole("textbox")).toHaveValue("0x8C004560");
+  // ten rows of context above it, as after typing the address
+  await expect(memoryRows(view).first().locator("span").first()).toHaveText("0x8C0044C0");
 });
