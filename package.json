@@ -8,12 +8,19 @@
     "mock:serve": "tsx --tsconfig tsconfig.server.json server/mockServer.ts",
     "mock:dev": "npm run build:dspsim && tsx --tsconfig tsconfig.server.json server/mockServer.ts",
     "mock:prod": "npm run build:native && cross-env NODE_ENV=production tsx --tsconfig tsconfig.server.json server/mockServer.ts",
+    "build": "npm run build:native",
     "build:native": "tsc -b && vite build --outDir dist-native",
     "build:wasm": "tsc -b && cross-env VITE_TRANSPORT_MODE=wasm vite build --outDir dist-wasm",
     "build:dspsim": "cd crates/aica-dsp && wasm-pack build --target web --out-dir ../../src/wasm/aica-dsp && node -e \"require('node:fs').rmSync('../../src/wasm/aica-dsp/.gitignore', { force: true })\"",
     "lint": "eslint .",
+    "typecheck": "tsc -b",
     "test": "vitest",
-    "test:ui": "vitest --ui"
+    "test:run": "vitest run",
+    "test:ui": "vitest --ui",
+    "check": "npm run lint && npm run typecheck && npm run test:run && npm run build:native"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",
