@@ -129,7 +129,9 @@ test("the navigation dropdown switches between workspaces, tools and pages", asy
 
 test("the theme switch toggles dark and light mode and the choice survives a reload", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
-  const toggle = page.getByRole("switch");
+  // regression: the name was passed through the deprecated `inputProps`, which the MUI 7
+  // Switch does not forward, so the <input role="switch"> had no accessible name
+  const toggle = page.getByRole("switch", { name: "Toggle dark mode" });
   await expect(toggle).toBeChecked();
   const darkBackground = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
 
@@ -138,12 +140,5 @@ test("the theme switch toggles dark and light mode and the choice survives a rel
   await expect.poll(() => page.evaluate(() => getComputedStyle(document.body).backgroundColor)).not.toBe(darkBackground);
 
   await page.reload();
-  await expect(page.getByRole("switch")).not.toBeChecked();
-});
-
-test.fixme("the theme switch has an accessible name", async ({ page }) => {
-  // BROKEN: AppLayout passes the name through the deprecated `inputProps`, which the MUI 7
-  // Switch does not forward: the rendered <input role="switch"> has no aria-label.
-  await openWorkspace(page, "sh4-debugger");
-  await expect(page.getByRole("switch", { name: "Toggle dark mode" })).toBeVisible();
+  await expect(page.getByRole("switch", { name: "Toggle dark mode" })).not.toBeChecked();
 });

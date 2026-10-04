@@ -530,7 +530,9 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                     size="small"
                     checked={isDarkMode}
                     onChange={handleToggleTheme}
-                    inputProps={{ "aria-label": "Toggle dark mode" }}
+                    // MUI 7 replaces its own { role: "switch" } with slotProps.input and
+                    // drops the deprecated inputProps, so both have to be given here
+                    slotProps={{ input: { role: "switch", "aria-label": "Toggle dark mode" } }}
                   />
                 </Tooltip>
               </Stack>
