@@ -1,5 +1,7 @@
 {
   "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.server.tsbuildinfo",
+    "noEmit": true,
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "node",
