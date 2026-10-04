@@ -213,10 +213,11 @@ const WatchItem = ({ expression, value, onRemove, onEdit, onModifyExpression }: 
 const collectRegisterPaths = (nodes: DeviceNodeDescriptor[]): string[] => {
   const paths: string[] = [];
   for (const node of nodes) {
-    // Add register paths - node.path already contains the full path
+    // Add register paths - node.path already contains the full path. Watch expressions use
+    // the lower-case register name, like the "+" button of the device tree.
     if (node.registers) {
       for (const reg of node.registers) {
-        paths.push(`${node.path}.${reg.name}`);
+        paths.push(`${node.path}.${reg.name.toLowerCase()}`);
       }
     }
 
@@ -280,15 +281,19 @@ export const WatchesPanel = () => {
             fullWidth
             freeSolo
             options={availablePaths}
-            value={newWatch}
-            onChange={(_, newValue) => setNewWatch(newValue ?? "")}
+            // The typed text is the input value, not a selected option: bound to `value`,
+            // MUI treats it as the selection and stops filtering the suggestions by it.
+            value={null}
+            inputValue={newWatch}
             onInputChange={(_, newValue) => setNewWatch(newValue)}
             renderInput={(params) => (
               <TextField
                 {...params}
                 placeholder="Enter expression"
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") {
+                  // Enter on a highlighted suggestion completes the text (MUI does that)
+                  const suggestionHighlighted = (e.target as HTMLElement).hasAttribute("aria-activedescendant");
+                  if (e.key === "Enter" && !suggestionHighlighted) {
                     e.preventDefault();
                     void handleAdd();
                   }

@@ -1,4 +1,4 @@
-import { test, expect, openWorkspace, panel, pauseFromToolbar, treeItemRow } from "./support/fixtures";
+import { test, expect, openWorkspace, panel, pauseFromToolbar, tooltipButton, treeItemRow } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
 
 const watchRow = (page: Page, expression: string): Locator =>
@@ -37,34 +37,48 @@ test("the expression box suggests the register paths of the device tree", async 
   await openWorkspace(page, "sh4-debugger");
   const input = panel(page, "watches").getByPlaceholder("Enter expression");
 
-  // typed key by key: see the fixme below for what happens when the text arrives in one go
   await input.pressSequentially("dc.aica.dsp");
   const options = page.getByRole("option");
-  await expect(options).toHaveCount(2);
-  await expect(options.nth(0)).toHaveText(/^dc\.aica\.dsp\.step$/i);
-  await expect(options.nth(1)).toHaveText(/^dc\.aica\.dsp\.dsp_acc$/i);
+  await expect(options).toHaveText(["dc.aica.dsp.step", "dc.aica.dsp.dsp_acc"]);
 });
 
-test.fixme("pasting an expression filters the suggestions", async ({ page }) => {
-  // BROKEN: WatchesPanel binds the typed text to the Autocomplete's `value` (not `inputValue`),
-  // so MUI considers the text "the selected option" and, on the change that opens the popup,
-  // lists every register path instead of the matching ones.
+test("pasting an expression filters the suggestions", async ({ page }) => {
+  // regression: the typed text was bound to the Autocomplete's `value`, so MUI considered it
+  // "the selected option" and listed every register path on the change that opens the popup
   await openWorkspace(page, "sh4-debugger");
   const input = panel(page, "watches").getByPlaceholder("Enter expression");
   await input.fill("dc.aica.dsp");
-  await expect(page.getByRole("option")).toHaveCount(2);
+  await expect(page.getByRole("option")).toHaveText(["dc.aica.dsp.step", "dc.aica.dsp.dsp_acc"]);
 });
 
-test.fixme("a watch picked from the suggestions shows the register's live value", async ({ page }) => {
-  // BROKEN: WatchesPanel offers `${path}.${NAME}` with the register name in upper case
-  // ("dc.sh4.cpu.PC"), while the device tree's "+" button and the server use lower case
-  // ("dc.sh4.cpu.pc"). The suggested expression resolves to nothing and reads 0x00000000.
+test("a watch picked from the suggestions shows the register's live value", async ({ page }) => {
+  // regression: the suggestions used the upper-case register name ("dc.sh4.cpu.VBR"), which
+  // neither the device tree's "+" button nor the server use; such a watch read 0x00000000
   await openWorkspace(page, "sh4-debugger");
-  const input = panel(page, "watches").getByPlaceholder("Enter expression");
-  await input.pressSequentially("dc.sh4.cpu.v");
-  await page.getByRole("option").first().click();
+  const watches = panel(page, "watches");
+  const input = watches.getByPlaceholder("Enter expression");
+
+  // with the mouse
+  await input.pressSequentially("dc.holly.dmac.c");
+  await page.getByRole("option", { name: "dc.holly.dmac.chcr0", exact: true }).click();
+  await expect(input).toHaveValue("dc.holly.dmac.chcr0");
   await input.press("Enter");
-  await expect(watchRow(page, "dc.sh4.cpu.vbr")).toHaveText(/dc\.sh4\.cpu\.vbr = 0x8C000000/i);
+  await expect(watchRow(page, "dc.holly.dmac.chcr0")).toHaveText("dc.holly.dmac.chcr0 = 0x00000001");
+  await expect(input).toHaveValue("");
+
+  // with the keyboard: Enter on a highlighted suggestion completes the text, Enter again adds it
+  await input.pressSequentially("dc.holly.dmac.d");
+  await input.press("ArrowDown");
+  await input.press("Enter");
+  await expect(input).toHaveValue("dc.holly.dmac.dmaor");
+  await expect(watches.getByRole("listitem")).toHaveCount(3);
+  await input.press("Enter");
+  await expect(watchRow(page, "dc.holly.dmac.dmaor")).toHaveText("dc.holly.dmac.dmaor = 0x8201");
+
+  // the device tree agrees that both registers are watched now
+  await treeItemRow(page, "dc.holly.dmac").click();
+  await expect(tooltipButton(treeItemRow(page, "dc.holly.dmac.reg.CHCR0"), "Already in watch")).toBeDisabled();
+  await expect(tooltipButton(treeItemRow(page, "dc.holly.dmac.reg.DMAOR"), "Already in watch")).toBeDisabled();
 });
 
 test("double-clicking the expression renames a watch", async ({ page }) => {
