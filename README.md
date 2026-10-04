@@ -31,6 +31,7 @@ Run `npm ci` once, then:
 | `npm test` | Vitest in watch mode. |
 | `npm run test:run` | Vitest, single run. |
 | `npm run test:ui` | Vitest with its browser UI. |
+| `npm run test:e2e` | Playwright smoke suite in headless Chromium (see [End-to-end tests](#end-to-end-tests)). Not part of `check`. |
 | `npm run check` | `lint`, `typecheck`, `test:run`, `build:native`; stops at the first failure. CI runs this. |
 
 ## Generated DSP module
@@ -41,6 +42,28 @@ type-checks, builds and runs without a Rust toolchain.
 
 `npm run build:dspsim` is the explicit regeneration step. `dev`, `build:native` and `build:wasm` do
 not run it. After changing the crate, run it and commit the regenerated files.
+
+## End-to-end tests
+
+`npm run test:e2e` drives the production build in headless Chromium. It needs nothing running:
+
+- `dist-native/` is built first when it is missing or older than the sources.
+- Every test starts its own mock server (production mode, free port) and kills it afterwards,
+  because the mock keeps one state for all clients.
+- A test fails on any `console.error`, uncaught exception, failed request, HTTP status >= 400 or
+  request to another origin, unless the test allows that message and says why
+  (`diagnostics.allow` in `e2e/support/fixtures.ts`).
+- `test.fixme` marks behaviour that is known to be broken; the comment in the test says where.
+
+Install the browser once with `npx playwright install chromium` (add `--with-deps` on a fresh
+Linux machine). Useful variations:
+
+```
+npx playwright test e2e/disassembly.spec.ts     # one file
+npx playwright test -g "Reset layout"           # by title
+npx playwright test --headed --workers=1        # watch it
+E2E_SCREENSHOT_DIR=/tmp/shots npm run test:e2e  # also save the per-workspace screenshots there
+```
 
 ## Configuration
 
@@ -123,5 +146,6 @@ production mode on port 8080. `fly.toml` deploys that image.
 
 ## CI
 
-`.github/workflows/ci.yml` runs `npm ci` and `npm run check` on Node 22 for pushes and pull
-requests.
+`.github/workflows/ci.yml` has two jobs on Node 22 for pushes and pull requests: `check` runs
+`npm ci` and `npm run check`; `e2e` installs Chromium (`npx playwright install --with-deps
+chromium`) and runs `npm run test:e2e`.

@@ -151,6 +151,7 @@ const DisassemblyLineItem = memo(({
   return (
     <Box
       ref={(el: HTMLDivElement | null) => lineRef(line.address, el)}
+      data-address={line.address}
       sx={{
         display: "grid",
         gridTemplateColumns: config.gridColumns,
@@ -170,6 +171,7 @@ const DisassemblyLineItem = memo(({
     >
       <Box
         className="breakpoint-gutter"
+        data-breakpoint={hasBreakpoint ? (breakpointEnabled ? "enabled" : "disabled") : "none"}
         sx={{
           display: "flex",
           alignItems: "center",

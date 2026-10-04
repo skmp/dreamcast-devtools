@@ -5,6 +5,18 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
+const unusedVars = [
+  'error',
+  {
+    argsIgnorePattern: '^_',
+    varsIgnorePattern: '^_',
+    ignoreRestSiblings: true,
+  },
+]
+
+// Playwright tests and config: Node code, no React.
+const e2eFiles = ['e2e/**/*.ts', 'playwright.config.ts']
+
 export default defineConfig([
   globalIgnores([
     'dist-native',
@@ -13,9 +25,12 @@ export default defineConfig([
     'experiments',
     'crates',
     'node_modules',
+    'test-results', // Playwright output
+    'playwright-report',
   ]),
   {
     files: ['**/*.{ts,tsx}'],
+    ignores: e2eFiles,
     extends: [
       js.configs.recommended,
       tseslint.configs.recommended,
@@ -27,14 +42,21 @@ export default defineConfig([
       globals: globals.browser,
     },
     rules: {
-      '@typescript-eslint/no-unused-vars': [
-        'error',
-        {
-          argsIgnorePattern: '^_',
-          varsIgnorePattern: '^_',
-          ignoreRestSiblings: true,
-        },
-      ],
+      '@typescript-eslint/no-unused-vars': unusedVars,
+    },
+  },
+  {
+    files: e2eFiles,
+    extends: [js.configs.recommended, tseslint.configs.recommended],
+    languageOptions: {
+      ecmaVersion: 2023,
+      // page.evaluate() callbacks run in the browser
+      globals: { ...globals.node, ...globals.browser },
+    },
+    rules: {
+      '@typescript-eslint/no-unused-vars': unusedVars,
+      // Playwright fixtures that depend on nothing are written `async ({}, use) => ...`
+      'no-empty-pattern': 'off',
     },
   },
 ])

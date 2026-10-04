@@ -59,7 +59,10 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
 
     availablePanels.forEach((panel) => {
       comps[panel.id] = () => (
-        <Box sx={{ height: "100%", width: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        <Box
+          data-panel-id={panel.id}
+          sx={{ height: "100%", width: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}
+        >
           {panel.component}
         </Box>
       );
