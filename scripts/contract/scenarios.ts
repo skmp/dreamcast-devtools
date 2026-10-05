@@ -1,7 +1,7 @@
 import { request as httpRequest } from "node:http";
 import WebSocket from "ws";
 import { BINARY_FRAME_HEADER_BYTES, BinaryFrameKind, SGC_BYTES_PER_FRAME, parseBinaryFrame } from "../../src/lib/binaryFrame";
-import { CAPABILITIES, PanelIdSchema, TABLE_IDS } from "../../src/lib/debuggerSchema";
+import { CAPABILITIES, PROTOCOL_BOUNDS, PanelIdSchema, TABLE_IDS } from "../../src/lib/debuggerSchema";
 import type {
   BreakpointCategoryState,
   BreakpointDescriptor,
@@ -14,6 +14,7 @@ import type {
 } from "../../src/lib/debuggerSchema";
 import { MOCK_SH4_RING, mockNextAddress } from "../../server/mockDebugger";
 import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
+import { registerValuePattern } from "./invariants";
 import { ContractFailure, ContractSession, check, describeState, fail } from "./session";
 import type { BinaryRecord, TickRecord } from "./session";
 import type { ElfSymbols } from "./elfSymbols";
@@ -135,23 +136,31 @@ const ensureRunning = async (context: RunContext): Promise<TickRecord> => {
 const disassemble = async (context: RunContext, target: TargetProcessor, address: number, count: number): Promise<DisassemblyLine[]> =>
   (await context.session.call("state.getDisassembly", { target, address, count })).lines;
 
-/** One step of a target: `{}`, then one paused tick with a new stopId and reason "step", and no running tick in between. */
-const stepOnce = async (context: RunContext, target: TargetProcessor): Promise<TickRecord> => {
+/**
+ * One step of a target: `{}`, then one paused tick with a new stopId and reason "step", and no
+ * running tick in between. `method` is control.step, or control.stepOver on a line that is not
+ * a call, which is a step.
+ */
+const stepOnce = async (
+  context: RunContext,
+  target: TargetProcessor,
+  method: "control.step" | "control.stepOver" = "control.step",
+): Promise<TickRecord> => {
   const { session } = context;
   const before = session.latestTick().tick;
   check(isPaused(before), "a step needs a paused target");
   const mark = session.mark();
-  await session.call("control.step", { target });
+  await session.call(method, { target });
   const stopped = await session.waitForTick(
     (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(before),
     2000,
-    `a paused tick with a new stopId after control.step {${target}}`,
+    `a paused tick with a new stopId after ${method} {${target}}`,
     mark,
   );
   const between = session.ticksSince(mark).filter((record) => record.seq <= stopped.seq);
-  check(!between.some((record) => isRunning(record.tick)), `control.step {${target}}: a running tick arrived before the paused tick of the step`);
-  check(stopped.tick.executionState.reason === "step", `control.step {${target}}: the stop has reason "${stopped.tick.executionState.reason}", expected "step"`);
-  check(stopped.tick.executionState.breakpointId === undefined, `control.step {${target}}: a step stop carries no breakpointId`);
+  check(!between.some((record) => isRunning(record.tick)), `${method} {${target}}: a running tick arrived before the paused tick of the step`);
+  check(stopped.tick.executionState.reason === "step", `${method} {${target}}: the stop has reason "${stopped.tick.executionState.reason}", expected "step"`);
+  check(stopped.tick.executionState.breakpointId === undefined, `${method} {${target}}: a step stop carries no breakpointId`);
   return stopped;
 };
 
@@ -426,6 +435,13 @@ const s01: Scenario = {
         for (const name of names) {
           expectThat(name === name.toUpperCase(), `register ${node.path}.${name} is not upper case`);
         }
+        // the values of the tree are written as those of a tick (I4)
+        for (const register of node.registers ?? []) {
+          expectThat(
+            register.width === 0 || registerValuePattern(register.width).test(register.value),
+            `${node.path}.${register.name} = "${register.value}" in the describe tree is not 0x + ${Math.ceil(register.width / 4)} upper-case hex digits or "n/a"`,
+          );
+        }
         for (const key of ["registers", "events", "actions", "children"] as const) {
           expectThat(node[key] === undefined || node[key]!.length > 0, `${node.path}: an empty "${key}" array is omitted, not sent`);
         }
@@ -531,10 +547,10 @@ const s04: Scenario = {
     let record = await ensurePaused(context);
 
     /** One step from where the target is, with what holds for every step; `atVector`: it ended at an exception vector. */
-    const step = async (): Promise<{ pc0: number; pc1: number; atVector: boolean }> => {
+    const step = async (method: "control.step" | "control.stepOver" = "control.step"): Promise<{ pc0: number; pc1: number; atVector: boolean }> => {
       const pc0 = pcOf(record.tick, sh4);
       const cycles0 = cyclesOf(record.tick);
-      record = await stepOnce(context, "sh4");
+      record = await stepOnce(context, "sh4", method);
       const pc1 = pcOf(record.tick, sh4);
       const cycles1 = cyclesOf(record.tick);
 
@@ -596,9 +612,33 @@ const s04: Scenario = {
       }
     }
 
+    // control.stepOver on a line that is not a call is a step
+    const text = await stepToPlainLine();
+    const over = await step("control.stepOver");
+    check(
+      over.pc1 === ((over.pc0 + 2) >>> 0) || over.atVector,
+      `control.stepOver: "${text}" at ${hex(over.pc0)} is not a call, and it ended at ${hex(over.pc1)}, not at ${hex(over.pc0 + 2)} or an exception vector`,
+    );
+
+    // control.stepOut is a resume until the return. Whether and when the return comes is the
+    // program's business: the running tick is asserted, and after 5 s the runner pauses.
+    const { session } = context;
+    const mark = session.mark();
+    await session.call("control.stepOut", { target: "sh4" });
+    const resumed = await session.waitForTick(isRunning, 1000, "a running tick after control.stepOut {sh4}", mark);
+    const returned = await session
+      .waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(record.tick), 5000, "the stop of control.stepOut {sh4}", resumed.seq)
+      .catch(() => undefined);
+    if (returned) {
+      // (somebody else's breakpoint can stop the target first: it has priority, and the stop then names it)
+      const { reason, breakpointId } = returned.tick.executionState;
+      check(reason === "step" || breakpointId !== undefined, `control.stepOut {sh4}: the stop has reason "${reason}", expected "step"`);
+    }
+    await ensurePaused(context);
+
     // a step while running is refused, in-band
     await ensureRunning(context);
-    await context.session.expectError("control.step", { target: "sh4" }, -32003);
+    await session.expectError("control.step", { target: "sh4" }, -32003);
     await ensurePaused(context);
   },
 };
@@ -647,7 +687,29 @@ const s06: Scenario = {
     const sh4 = requireTarget(context, "sh4");
     await ensurePaused(context);
     const original = categoriesOf(session.latestTick().tick);
+    const same = (tick: DebuggerTick, expected: Record<string, BreakpointCategoryState>) =>
+      JSON.stringify(sortKeys(tick.categories)) === JSON.stringify(sortKeys(expected));
     try {
+      // A request names the keys it changes: the others keep their state. Two requests of one
+      // key each, so that the second one finds a key that is not in its default state.
+      const flipped = (key: string) => ({ muted: !original[key].muted, soloed: original[key].soloed });
+      let expected: Record<string, BreakpointCategoryState> = { ...original, events: flipped("events") };
+      const first = await setCategories(context, { events: expected.events });
+      check(same(first.tick, expected), `breakpoints.setCategoryStates {events}: the categories are ${JSON.stringify(first.tick.categories)}, expected ${JSON.stringify(expected)}`);
+      expected = { ...expected, dsp: flipped("dsp") };
+      const second = await setCategories(context, { dsp: expected.dsp });
+      check(
+        same(second.tick, expected),
+        `breakpoints.setCategoryStates {dsp} changed a key it does not name: the categories are ${JSON.stringify(second.tick.categories)}, expected ${JSON.stringify(expected)}`,
+      );
+      // a key the server does not know is ignored: `{}`, and nothing changes
+      const unknown = session.mark();
+      await session.call("breakpoints.setCategoryStates", { categories: { "no-such-category": { muted: true, soloed: true } } });
+      for (const record of [...session.ticksSince(unknown), ...(await session.collectTicks(200))]) {
+        check(same(record.tick, expected), `breakpoints.setCategoryStates with an unknown key: the categories are ${JSON.stringify(record.tick.categories)}, expected ${JSON.stringify(expected)}`);
+      }
+      await setCategories(context, original);
+
       for (const [key, state, why] of [
         ["sh4", { muted: true, soloed: false }, "sh4 is muted"],
         ["arm7", { muted: false, soloed: true }, "arm7 is soloed, so sh4 breakpoints are inactive"],
@@ -685,6 +747,22 @@ const s07: Scenario = {
     // removing again and toggling an unknown id: in-band -32602
     await session.expectError("breakpoints.remove", { id: breakpoint.id }, -32602);
     await session.expectError("breakpoints.toggle", { id: breakpoint.id, enabled: true }, -32602);
+
+    // Event breakpoints: every event the device tree lists is in the server's table. Each is
+    // added disabled (an enabled one would stop the target when its event comes), listed and removed.
+    check(hasCapability(context, CAPABILITIES.EVENT_BREAKPOINTS), 'the capability "event-breakpoints" is part of milestone M1');
+    const events: string[] = [];
+    const visit = (nodes: DeviceNodeDescriptor[]) =>
+      nodes.forEach((node) => {
+        events.push(...(node.events ?? []));
+        visit(node.children ?? []);
+      });
+    visit(session.shape.deviceTree);
+    check(events.length > 0, "the device tree lists no events");
+    for (const event of events) {
+      const added = await addBreakpoint(context, { event, enabled: false });
+      await removeBreakpoint(context, added.id);
+    }
   },
 };
 
@@ -736,8 +814,20 @@ const s08: Scenario = {
     await unwatch(context, probeId);
 
     await unwatch(context, id);
-    const final = (session.latestTick().tick.watches ?? []).map((watch) => `${watch.id}:${watch.expression}`);
-    check(JSON.stringify(final) === JSON.stringify(initial), "the watches are as they were before the scenario");
+    // an id that is not there (any more) is ignored: `{}`
+    await session.call("state.unwatch", { watchIds: [id] });
+
+    // Bounds: at most 64 expressions in a call, at most 256 characters in an expression. The
+    // 65 expressions are registers of the SH4, so that their number is all that is wrong.
+    const names = session.index!.registers.get(sh4.pcPath)!.map((register) => register.name.toLowerCase());
+    const many = Array.from({ length: PROTOCOL_BOUNDS.watchExpressionsPerCall + 1 }, (_, position) => `${sh4.pcPath}.${names[position % names.length]}`);
+    await session.expectError("state.watch", { expressions: many }, -32602);
+    const long = `${sh4.pcPath}.${"r".repeat(PROTOCOL_BOUNDS.watchExpressionLength + 1 - sh4.pcPath.length - 1)}`;
+    await session.expectError("state.watch", { expressions: [long] }, -32602);
+
+    // none of the refused requests added anything (a tick follows the describe)
+    const final = ((await session.describe()).tick.watches ?? []).map((watch) => `${watch.id}:${watch.expression}`);
+    check(JSON.stringify(final) === JSON.stringify(initial), `the watches are ${JSON.stringify(final)}, before the scenario they were ${JSON.stringify(initial)}`);
   },
 };
 
@@ -771,10 +861,22 @@ const s09: Scenario = {
     // nothing readable: JSON-RPC -32010
     await session.expectError("state.getMemorySlice", { target: "sh4", address: 0x10000000, length: 16 }, -32010);
 
-    // a target without memory: -32004
+    // a target without memory: -32004; one with memory is read at its default address
     for (const target of session.shape.targets ?? []) {
       if (!target.memory) {
         await session.expectError("state.getMemorySlice", { target: target.id, address: 0, length: 16 }, -32004);
+      } else if (target.id !== "sh4") {
+        const address = target.defaultMemoryAddress ?? fail(`target ${target.id} has memory and no defaultMemoryAddress`);
+        const read = await session.call("state.getMemorySlice", { target: target.id, address, length: 16 });
+        check(read.baseAddress === address, `${target.id}: baseAddress is ${read.baseAddress}, the request asked for ${address}`);
+        check(read.data.length === 16, `${target.id}: data has ${read.data.length} entries, the request asked for 16`);
+        // what is readable there is what the disassembly shows there
+        const count = Math.ceil(16 / target.instructionSize);
+        const text = (await disassemble(context, target.id, address, count)).map((line) => line.bytes).join(" ");
+        if (!text.includes("??") && read.unreadable === undefined) {
+          const bytes = read.data.map((byte) => byte.toString(16).toUpperCase().padStart(2, "0")).join(" ");
+          check(text === bytes, `${target.id}: the bytes of ${count} disassembly lines at ${hex(address)} differ from the memory there:\n      lines:  ${text}\n      memory: ${bytes}`);
+        }
       }
     }
     // bounds

@@ -690,7 +690,8 @@ describe("the contract runner against a server that breaks the protocol", () => 
       ["S06"],
     );
     expect(statusOf(echoOnly, "S06")).toBe("failed");
-    expect(detailsOf(echoOnly, "S06")).toMatch(/breakpoints\.setCategoryStates: the tick echoes sh4 as \{"muted":false,"soloed":false\}, expected \{"muted":true,"soloed":false\}/);
+    // (the first request of S06 is the one that names only "events")
+    expect(detailsOf(echoOnly, "S06")).toMatch(/breakpoints\.setCategoryStates: the tick echoes events as \{"muted":false,"soloed":false\}, expected \{"muted":true,"soloed":false\}/);
     // (a request without effect is waited for, for a second)
   }, 30_000);
 
@@ -812,6 +813,153 @@ describe("the contract runner against a server that breaks the protocol", () => 
     // and the watch nobody asked for is removed again
     expect(summary.cleanUpProblems).toEqual([]);
     expect((await stateOf(direct)).watches).toEqual([]);
+  });
+
+  it("S01: register values of the describe tree that are not written as those of a tick", async () => {
+    const lower = (nodes: Json[]): Json[] =>
+      nodes.map((node) => ({
+        ...node,
+        ...(node.registers ? { registers: (node.registers as Json[]).map((register) => ({ ...register, value: String(register.value).toLowerCase() })) } : {}),
+        ...(node.children ? { children: lower(node.children as Json[]) } : {}),
+      }));
+    const summary = await run(
+      {
+        toClient: (frame) => {
+          const result = frame.result as Json | undefined;
+          return result?.deviceTree ? { ...frame, result: { ...result, deviceTree: lower(result.deviceTree as Json[]) } } : frame;
+        },
+      },
+      ["S01"],
+    );
+    expect(statusOf(summary, "S01")).toBe("failed");
+    expect(detailsOf(summary, "S01")).toMatch(/^dc\.sh4\.cpu\.PC = "0x8c0000a[0-9a-e]" in the describe tree is not 0x \+ 8 upper-case hex digits or "n\/a"$/m);
+    // the ticks are right, and the strict schema has nothing to say about a string
+    expect(summary.invariantViolations).toEqual([]);
+  });
+
+  it("S04: control.stepOver or control.stepOut of the SH4 that is not supported", async () => {
+    // control.reset is what the mock answers with the in-band -32004
+    const without = (method: string) =>
+      run({ toServer: (frame) => (frame.method === method ? { ...frame, method: "control.reset", params: {} } : frame) }, ["S04"]);
+    const noStepOver = await without("control.stepOver");
+    expect(statusOf(noStepOver, "S04")).toBe("failed");
+    expect(detailsOf(noStepOver, "S04")).toBe('control.stepOver {"target":"sh4"}: in-band error -32004 "not supported: control.reset"');
+    const noStepOut = await without("control.stepOut");
+    expect(statusOf(noStepOut, "S04")).toBe("failed");
+    expect(detailsOf(noStepOut, "S04")).toBe('control.stepOut {"target":"sh4"}: in-band error -32004 "not supported: control.reset"');
+
+    // a step-over that runs on instead of stepping
+    const resumes = await run({ toServer: (frame) => (frame.method === "control.stepOver" ? { ...frame, method: "control.stepOut" } : frame) }, ["S04"]);
+    expect(statusOf(resumes, "S04")).toBe("failed");
+    expect(detailsOf(resumes, "S04")).toBe('control.stepOver {sh4}: a running tick arrived before the paused tick of the step');
+  });
+
+  it("S06: breakpoints.setCategoryStates that resets the keys it is not given, or refuses a key it does not know", async () => {
+    const unmuted = { muted: false, soloed: false };
+    const resets = await run(
+      {
+        toServer: (frame) =>
+          frame.method === "breakpoints.setCategoryStates"
+            ? { ...frame, params: { categories: { events: unmuted, sh4: unmuted, arm7: unmuted, dsp: unmuted, ...((frame.params as Json).categories as Json) } } }
+            : frame,
+      },
+      ["S06"],
+    );
+    expect(statusOf(resets, "S06")).toBe("failed");
+    expect(detailsOf(resets, "S06")).toMatch(
+      /^breakpoints\.setCategoryStates \{dsp\} changed a key it does not name: the categories are \{"events":\{"muted":false,"soloed":false\},.*, expected \{"events":\{"muted":true,"soloed":false\},/,
+    );
+    expect(resets.cleanUpProblems).toEqual([]);
+
+    const refuses = await run(
+      {
+        // (toggling a breakpoint that does not exist is what the mock answers with the in-band -32602)
+        toServer: (frame) =>
+          frame.method === "breakpoints.setCategoryStates" && "no-such-category" in ((frame.params as Json).categories as Json)
+            ? { ...frame, method: "breakpoints.toggle", params: { id: 0x7fffffff, enabled: true } }
+            : frame,
+      },
+      ["S06"],
+    );
+    expect(statusOf(refuses, "S06")).toBe("failed");
+    expect(detailsOf(refuses, "S06")).toMatch(/^breakpoints\.setCategoryStates \{"categories":\{"no-such-category":\{"muted":true,"soloed":true\}\}\}: in-band error -32602 /);
+    expect(refuses.cleanUpProblems).toEqual([]);
+  }, 30_000);
+
+  it("S07: a server without event breakpoints", async () => {
+    const refused = await run(
+      {
+        // an event of the tree is answered as one that is not in the server's table
+        toServer: (frame) => {
+          const params = frame.params as Json;
+          return frame.method === "breakpoints.add" && params.address === undefined && params.kind !== "code" ? { ...frame, params: { ...params, event: "dc.no.such.event" } } : frame;
+        },
+      },
+      ["S07"],
+    );
+    expect(statusOf(refused, "S07")).toBe("failed");
+    expect(detailsOf(refused, "S07")).toBe('breakpoints.add {"event":"dc.system.reset","enabled":false}: in-band error -32004 "not supported: event dc.no.such.event"');
+
+    const notAdvertised = await run(
+      {
+        toClient: (frame) => {
+          const result = frame.result as Json | undefined;
+          return result?.deviceTree ? { ...frame, result: { ...result, capabilities: (result.capabilities as string[]).filter((capability) => capability !== "event-breakpoints") } } : frame;
+        },
+      },
+      ["S07"],
+    );
+    expect(statusOf(notAdvertised, "S07")).toBe("failed");
+    expect(detailsOf(notAdvertised, "S07")).toBe('the capability "event-breakpoints" is part of milestone M1');
+  }, 30_000);
+
+  it("S08: a watch bound that is not enforced, and state.unwatch that refuses an id it does not know", async () => {
+    // (state.unwatch of nothing is what the mock answers with {})
+    const accepted = (matches: (expressions: string[]) => boolean) =>
+      run(
+        {
+          toServer: (frame) =>
+            frame.method === "state.watch" && matches((frame.params as Json).expressions as string[]) ? { ...frame, method: "state.unwatch", params: { watchIds: [] } } : frame,
+        },
+        ["S08"],
+      );
+    const many = await accepted((expressions) => expressions.length > 64);
+    expect(statusOf(many, "S08")).toBe("failed");
+    expect(detailsOf(many, "S08")).toMatch(/^state\.watch \{"expressions":\["dc\.sh4\.cpu\.pc",.*\]\}: expected the error -32602, got the result \{\}$/);
+    const long = await accepted((expressions) => expressions.some((expression) => expression.length > 256));
+    expect(statusOf(long, "S08")).toBe("failed");
+    expect(detailsOf(long, "S08")).toMatch(/^state\.watch \{"expressions":\["dc\.sh4\.cpu\.r{246}"\]\}: expected the error -32602, got the result \{\}$/);
+
+    const strict = await run(() => {
+      // the watches of the last tick: an id that is not among them is answered as state.modifyWatchExpression answers it
+      let listed: unknown[] = [];
+      return {
+        toClient: (frame) => {
+          if (isTick(frame)) listed = (frame.params.watches as Json[]).map((watch) => watch.id);
+          return frame;
+        },
+        toServer: (frame) => {
+          const ids = frame.method === "state.unwatch" ? ((frame.params as Json).watchIds as unknown[]) : [];
+          const unknown = ids.find((id) => !listed.includes(id));
+          return unknown === undefined ? frame : { ...frame, method: "state.modifyWatchExpression", params: { watchId: unknown, newExpression: "dc.sh4.cpu.pc" } };
+        },
+      };
+    }, ["S08"]);
+    expect(statusOf(strict, "S08")).toBe("failed");
+    expect(detailsOf(strict, "S08")).toMatch(/^state\.unwatch \{"watchIds":\[1\]\}: in-band error -32602 "invalid params: unknown watch id 1"$/);
+  });
+
+  it("S09: a target that says memory: true and refuses state.getMemorySlice", async () => {
+    const summary = await run(
+      {
+        // (the DSP is what the mock answers with -32004)
+        toServer: (frame) =>
+          frame.method === "state.getMemorySlice" && (frame.params as Json).target === "arm7" ? { ...frame, params: { ...(frame.params as Json), target: "dsp" } } : frame,
+      },
+      ["S09"],
+    );
+    expect(statusOf(summary, "S09")).toBe("failed");
+    expect(detailsOf(summary, "S09")).toBe('state.getMemorySlice {"target":"arm7","address":0,"length":16}: JSON-RPC error -32004 "not supported: target dsp has no memory"');
   });
 
   it("S10: an unreadable word that is not \"??\" and \"<unreadable>\"", async () => {
@@ -1123,7 +1271,7 @@ describe("the emulator profile", () => {
 
   it("S04: a step that executes two instructions fails, wherever the target happens to be paused", async () => {
     /** The mock parked at its StartPaused stop with the SH4 at `pc`; with `skip` its step executes two instructions. */
-    const parkedAt = async (pc: number, skip: boolean) => {
+    const parkedAt = (pc: number, skip: boolean): MockDebugger => {
       const mock = new MockDebugger({ startPaused: true });
       if (skip) {
         const machine = mock as unknown as { advance(target: string): { wrapped: boolean }; running: boolean };
@@ -1135,39 +1283,42 @@ describe("the emulator profile", () => {
         };
       }
       ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: String(pc) });
-      const { url } = await startServer(undefined, mock);
-      return { url, mock };
+      return mock;
     };
     const stepFrom = async (pc: number, skip: boolean) => {
-      const { url } = await parkedAt(pc, skip);
-      const summary = await runContract({ url, profile: "emulator", timeoutFactor: 1, only: new Set(["S04"]) });
-      await closers.pop()!();
-      return summary;
+      const listener = await listenMockDebugger(parkedAt(pc, skip));
+      try {
+        return await runContract({ url: listener.url, profile: "emulator", timeoutFactor: 1, only: new Set(["S04"]) });
+      } finally {
+        await listener.close();
+      }
     };
 
     // The eight addresses of the mock's loop, whose last line is its branch, and 24 outside of
-    // it, where the mock disassembles branches of every kind and walks straight on.
+    // it, where the mock disassembles branches of every kind and walks straight on. (All at
+    // once: outside of its loop the mock never returns, and the runner waits 5 s for that.)
     const starts = [
       ...Array.from({ length: MOCK_SH4_RING.length }, (_, index) => MOCK_SH4_RING.base + index * 2),
       ...Array.from({ length: 24 }, (_, index) => 0x8c00ffc0 + index * 2),
     ];
     const kinds = { plain: 0, controlFlow: 0, afterDelayedBranch: 0 };
-    for (const pc of starts) {
-      const { mock } = await parkedAt(pc, false);
-      await closers.pop()!();
-      const [previous, line] = (ask(mock, "state.getDisassembly", { target: "sh4", address: pc - 2, count: 2 }).result as { lines: Array<{ disassembly: string }> }).lines;
-      kinds[isSh4ControlFlow(line.disassembly) ? "controlFlow" : isSh4DelayedBranch(previous.disassembly) ? "afterDelayedBranch" : "plain"]++;
+    await Promise.all(
+      starts.map(async (pc) => {
+        const lines = ask(parkedAt(pc, false), "state.getDisassembly", { target: "sh4", address: pc - 2, count: 2 }).result as { lines: Array<{ disassembly: string }> };
+        const [previous, line] = lines.lines;
+        kinds[isSh4ControlFlow(line.disassembly) ? "controlFlow" : isSh4DelayedBranch(previous.disassembly) ? "afterDelayedBranch" : "plain"]++;
 
-      // the server that follows the protocol passes from here ...
-      expect(reportOf(await stepFrom(pc, false)), `from 0x${pc.toString(16)}`).toEqual(["S04 passed "]);
-      // ... and the one whose step skips an instruction does not
-      const skipping = await stepFrom(pc, true);
-      expect(statusOf(skipping, "S04"), `from 0x${pc.toString(16)}`).toBe("failed");
-      expect(detailsOf(skipping, "S04")).toMatch(
-        /^".+" at 0x8C0[0-9A-F]{5} is not control flow, and the step ended at 0x8C0[0-9A-F]{5}, not at 0x8C0[0-9A-F]{5} or an exception vector$/,
-      );
-      expect(skipping.ok).toBe(false);
-    }
+        // the server that follows the protocol passes from here ...
+        expect(reportOf(await stepFrom(pc, false)), `from 0x${pc.toString(16)}`).toEqual(["S04 passed "]);
+        // ... and the one whose step skips an instruction does not
+        const skipping = await stepFrom(pc, true);
+        expect(statusOf(skipping, "S04"), `from 0x${pc.toString(16)}`).toBe("failed");
+        expect(detailsOf(skipping, "S04")).toMatch(
+          /^".+" at 0x8C0[0-9A-F]{5} is not control flow, and the step ended at 0x8C0[0-9A-F]{5}, not at 0x8C0[0-9A-F]{5} or an exception vector$/,
+        );
+        expect(skipping.ok).toBe(false);
+      }),
+    );
     // the PC of the first step cannot be checked on a control-flow line or in the slot of a delayed branch: the runner steps on from there
     expect(kinds.plain).toBeGreaterThan(0);
     expect(kinds.controlFlow).toBeGreaterThan(0);
