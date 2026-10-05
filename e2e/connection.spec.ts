@@ -5,6 +5,7 @@ import {
   openWorkspace,
   panel,
   pauseFromToolbar,
+  recordText,
   saveScreenshot,
   statusBar,
   tooltipButton,
@@ -168,19 +169,30 @@ test("while the server is down the page tries again after 1, 2 and 5 seconds; St
   rpc,
 }) => {
   diagnostics.allow(/^console\.error: WebSocket connection to/, "the server is down on purpose");
+  // what the notice says changes within a second: it is recorded, not looked for
+  const said = await recordText(page, '[role="alert"]');
+  const announced = async () =>
+    (await said()).flatMap(({ at, text }) => {
+      const attempt = /Reconnecting to \S+ in (\d+) s \(attempt (\d+)\)/.exec(text);
+      return attempt ? [{ at, wait: Number(attempt[1]), attempt: Number(attempt[2]) }] : [];
+    });
   await openWorkspace(page, "sh4-debugger");
+  const sockets = rpc.sockets.length;
   await mock.stop("SIGKILL");
   const notice = page.getByRole("alert").filter({ hasText: "Reconnecting to" });
-  await expect(notice).toContainText("in 1 s (attempt 1)");
-  const lost = Date.now();
-  const sockets = rpc.sockets.length;
 
-  // attempt 1 at about +1 s, attempt 2 at about +3 s; attempt 3 is not before +8 s
-  await expect(notice).toContainText("in 2 s (attempt 2)");
+  // the third attempt is announced when the first two have failed, and waits five seconds
   await expect(notice).toContainText("in 5 s (attempt 3)");
-  const second = Date.now() - lost;
-  expect(second).toBeGreaterThanOrEqual(2500);
-  expect(second).toBeLessThan(7000);
+  const attempts = await announced();
+  expect(attempts.map(({ wait, attempt }) => ({ wait, attempt }))).toEqual([
+    { wait: 1, attempt: 1 },
+    { wait: 2, attempt: 2 },
+    { wait: 5, attempt: 3 },
+  ]);
+  // each was announced when the one before it had waited its time and failed (the times are
+  // those at which the page showed the text, a few milliseconds after the timer was set)
+  expect(attempts[1].at - attempts[0].at).toBeGreaterThanOrEqual(900);
+  expect(attempts[2].at - attempts[1].at).toBeGreaterThanOrEqual(1900);
   expect(rpc.sockets.length).toBe(sockets + 2);
 
   // Stop: the session is over, nothing is tried any more
@@ -192,8 +204,8 @@ test("while the server is down the page tries again after 1, 2 and 5 seconds; St
 
   // Connect: a new session, whose attempts start at 1 s again
   await connectButton(page).click();
-  await expect(notice).toContainText("in 1 s (attempt 1)");
   await expect(statusBar(page)).toContainText("Connection: reconnecting");
+  await expect.poll(async () => (await announced()).slice(attempts.length)[0]).toMatchObject({ wait: 1, attempt: 1 });
   // Retry now does not wait for the timer
   const before = rpc.sockets.length;
   await notice.getByRole("button", { name: "Retry now" }).click();
@@ -203,6 +215,8 @@ test("while the server is down the page tries again after 1, 2 and 5 seconds; St
 test("a connection the server closes is taken up again, and the server is described again", async ({ page }) => {
   // the server inside the test: it ends the connection at a known moment, and counts
   const server = await serveScriptedDebugger(page);
+  const states = await recordText(page, "footer");
+  const tree = await recordText(page, '[data-panel-id="device-tree"]');
   await gotoRoute(page, "/workspace/sh4-debugger");
   await expect(statusBar(page)).toContainText("Connection: connected");
   await server.described();
@@ -210,13 +224,19 @@ test("a connection the server closes is taken up again, and the server is descri
   await expect(panel(page, "device-tree").getByRole("treeitem").first()).toBeVisible();
 
   server.drop();
-  await expect(statusBar(page)).toContainText("Connection: reconnecting");
-  await expect(panel(page, "device-tree")).toContainText("No Data");
   // one second later the page is back, without a click
-  await expect(statusBar(page)).toContainText("Connection: connected");
+  await expect.poll(() => server.connections()).toBe(2);
   await server.described();
-  expect(server.connections()).toBe(2);
+  await expect(statusBar(page)).toContainText("Connection: connected");
   expect(server.requestsOf("debugger.describe")).toHaveLength(2);
+  // in between it said that it was reconnecting, and showed no data
+  // (textContent runs the cells of the status bar together: "Connection: connectedEndpoint: ws://...")
+  const sequence = (await states()).map(({ text }) => /Connection: ([a-z]+)/.exec(text)?.[1]).filter(Boolean);
+  expect(sequence.slice(-3)).toEqual(["connected", "reconnecting", "connected"]);
+  expect((await tree()).some(({ text }) => text.includes("No Data"))).toBe(true);
+  const lost = (await states()).find(({ text }) => text.includes("Connection: reconnecting"))!.at;
+  const back = (await states()).findLast(({ text }) => text.includes("Connection: connected"))!.at;
+  expect(back - lost).toBeGreaterThanOrEqual(900);
   await expect(panel(page, "device-tree").getByRole("treeitem").first()).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
 });

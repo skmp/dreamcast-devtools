@@ -385,6 +385,31 @@ export const recordAlerts = async (page: Page): Promise<() => Promise<string[]>>
 };
 
 /**
+ * Records what an element says over time, from before the page loads: every text the first
+ * element matching `selector` has had, in order, with the time (ms, performance.now) at which
+ * it appeared. A state that lasts a second ("reconnecting", "attempt 1") can be over between
+ * two looks at the page; what was recorded cannot be missed. Call it before the navigation.
+ */
+export const recordText = async (page: Page, selector: string): Promise<() => Promise<Array<{ at: number; text: string }>>> => {
+  const key = `__texts:${selector}`;
+  await page.addInitScript(
+    ({ selector: watched, key: name }) => {
+      const store = window as unknown as Record<string, Array<{ at: number; text: string }>>;
+      const texts: Array<{ at: number; text: string }> = (store[name] = []);
+      const look = () => {
+        const text = document.querySelector(watched)?.textContent ?? "";
+        if (texts.at(-1)?.text !== text) {
+          texts.push({ at: performance.now(), text });
+        }
+      };
+      new MutationObserver(look).observe(document, { childList: true, subtree: true, characterData: true });
+    },
+    { selector, key },
+  );
+  return () => page.evaluate((name) => (window as unknown as Record<string, Array<{ at: number; text: string }>>)[name], key);
+};
+
+/**
  * Starts recording which disassembly rows flash (the "fadeOutTarget" animation of the
  * "target-address" class, which is removed again after two seconds, so it is recorded
  * instead of polled). Returns a reader for the `data-address` values flashed so far.

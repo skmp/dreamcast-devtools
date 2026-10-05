@@ -92,10 +92,10 @@ test("nothing of a connection is left in the next one: registers and callstack s
   server.describeAgain();
   server.afterDescribe = { paths: ["dc", "dc.sh4.cpu"], patch: { callstacks: undefined } };
   server.drop();
-  await expect(statusBar(page)).toContainText("Connection: reconnecting");
-  await expect(statusBar(page)).toContainText("Connection: connected");
+  // the page is back by itself a second later
+  await expect.poll(() => server.connections()).toBe(2);
   await server.described();
-  expect(server.connections()).toBe(2);
+  await expect(statusBar(page)).toContainText("Connection: connected");
 
   await expect(registerRow(page, "dc.sh4.tmu.reg.TCNT0")).toHaveText("TCNT0 = 0x22222222");
   await expect(panel(page, "sh4-callstack")).toContainText("Empty callstack.");
