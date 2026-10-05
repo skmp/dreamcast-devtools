@@ -39,7 +39,8 @@ const isSameDocument = (page: Page) => page.evaluate(() => (window as unknown as
 /** Clicks a button that reloads the page and waits for the new document. */
 const clickAndWaitForReload = async (page: Page, button: Locator) => {
   await markDocument(page);
-  await Promise.all([page.waitForEvent("load"), button.click()]);
+  // without a timeout of its own, a button that does not reload would only fail with the test's timeout
+  await Promise.all([page.waitForEvent("load", { timeout: 15_000 }), button.click()]);
   expect(await isSameDocument(page)).toBe(false);
 };
 
