@@ -930,8 +930,13 @@ const s14: Scenario = {
     const { id: watchId } = await addWatch(context, register.expression, register.expression);
     const changed = await setCategories(context, { ...original, dsp: { muted: !original.dsp.muted, soloed: false } });
     const before = changed.tick;
+    check(isPaused(before), "the target is paused before the reconnect");
 
-    old.close();
+    // A reconnect: the server has no client in between. The new connection is opened only
+    // after the old socket has finished closing, and after a moment for the server to notice
+    // (the close event can reach the client first); all of it well inside the grace period.
+    check(await old.closeAndWait(3000), "the server did not finish closing the connection within 3 s of the client's close frame");
+    await sleep(old.scale(200));
     const fresh = await context.openSession();
     // the scenario's violations are counted from the session it started with
     fresh.violations.unshift(...old.violations);
@@ -945,7 +950,11 @@ const s14: Scenario = {
         categories: sortKeys(tick.categories),
       });
     check(summary(first) === summary(before), `after the reconnect the first tick has\n      ${summary(first)}\n    before it the last tick had\n      ${summary(before)}`);
-    check(stopIdOf(first) >= stopIdOf(before), "stopId does not go back across a reconnect");
+    // the debugger stop is still in force: the same stop, not a new one and not released
+    check(
+      isPaused(first) && stopIdOf(first) === stopIdOf(before),
+      `after the reconnect the first tick is ${describeState(first)}; before it the target was ${describeState(before)}, and a stop outlives a reconnect within the grace period`,
+    );
 
     await setCategories(context, original);
     await unwatch(context, watchId);

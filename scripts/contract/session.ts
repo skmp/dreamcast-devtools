@@ -67,17 +67,28 @@ export class ContractSession {
   public index: DescribeIndex | undefined;
   public ticksChecked = 0;
   private readonly options: SessionOptions;
-  private readonly transport = new WebSocketTransport();
+  private readonly transport: WebSocketTransport;
   private readonly rpc: JsonRpcClient<DebuggerRpcSchema>;
   private readonly tracking: TickTracking = {};
   private readonly waiters = new Set<() => void>();
   private readonly openedAt = Date.now();
   private seq = 0;
   private closed = false;
+  private socketClosed = false;
 
   constructor(url: string, options: SessionOptions) {
     this.url = url;
     this.options = options;
+    this.transport = new WebSocketTransport((endpoint, protocols) => {
+      const socket = new WebSocket(endpoint, protocols);
+      // The transport says "closed" as soon as disconnect() is called. This is the close event
+      // of the socket itself: the closing handshake is over, the server has seen the close.
+      socket.addEventListener("close", () => {
+        this.socketClosed = true;
+        this.wake();
+      });
+      return socket;
+    });
     // The tap is subscribed before the client: it sees a frame first, and it sees the ticks
     // the client drops. It is also what makes the runner independent of when the client
     // dispatches: both frames of "response, then tick" can arrive in one turn.
@@ -133,6 +144,23 @@ export class ContractSession {
 
   close(): void {
     this.rpc.disconnect();
+  }
+
+  /**
+   * Closes the connection and waits for the close event of the socket, at most `timeoutMs`
+   * (not scaled). Returns whether the socket finished closing in that time.
+   */
+  async closeAndWait(timeoutMs: number): Promise<boolean> {
+    this.close();
+    const deadline = Date.now() + timeoutMs;
+    while (!this.socketClosed) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return false;
+      }
+      await this.sleepOrWake(remaining);
+    }
+    return true;
   }
 
   /** Resolves when the server has closed the connection. */

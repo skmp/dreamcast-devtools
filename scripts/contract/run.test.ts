@@ -3,7 +3,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { MockDebugger } from "../../server/mockDebugger";
-import type { MockDebuggerOptions } from "../../server/mockDebugger";
+import type { MockClient, MockConnection, MockDebuggerOptions } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
 import { runContract } from "./run";
 import type { ContractSummary } from "./run";
@@ -151,6 +151,50 @@ const statusesOf = (summary: ContractSummary) => Object.fromEntries(summary.scen
 const reportOf = (summary: ContractSummary) => summary.scenarios.map((scenario) => `${scenario.id} ${scenario.status} ${scenario.details.join(" | ")}`);
 
 /**
+ * A mock that counts reconnects, and that can do what a server must not do when its last
+ * client has gone: `forget` gets the state at that moment and returns the requests that undo it.
+ */
+class ForgetfulMock extends MockDebugger {
+  /** how often a client connected while the server had none, after it had had one */
+  public reconnects = 0;
+  private hadNone = false;
+  private readonly forget: (tick: Json) => Array<[method: string, params: Json]>;
+
+  constructor(forget: (tick: Json) => Array<[method: string, params: Json]> = () => [], options?: MockDebuggerOptions) {
+    super(options);
+    this.forget = forget;
+  }
+
+  override connect(connection: MockConnection): MockClient {
+    if (this.hadNone) {
+      this.hadNone = false;
+      this.reconnects++;
+    }
+    const client = super.connect(connection);
+    return {
+      id: client.id,
+      receive: (text) => client.receive(text),
+      close: () => {
+        client.close();
+        if (this.clientCount === 0) {
+          this.hadNone = true;
+          this.lastClientLeft();
+        }
+      },
+    };
+  }
+
+  private lastClientLeft(): void {
+    const frames: Json[] = [];
+    const hidden = super.connect({ sendText: (text) => frames.push(JSON.parse(text) as Json), sendBinary: () => undefined });
+    hidden.receive(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "debugger.describe", params: {} }));
+    const requests = this.forget(frames.find(isTick)!.params);
+    requests.forEach(([method, params], index) => hidden.receive(JSON.stringify({ jsonrpc: "2.0", id: index + 2, method, params })));
+    hidden.close();
+  }
+}
+
+/**
  * A tick that the server built before it handled a request, and that arrives after the
  * client has sent that request: a copy of the last tick, under the next tickId, in front of
  * the answer to every request. Nothing in the protocol forbids it (a periodic tick, or one
@@ -265,6 +309,14 @@ describe("the contract runner against the mock", () => {
     expect(reportOf(running)).toEqual(["S13 passed "]);
     expect(running.ok).toBe(true);
   }, 60_000);
+
+  it("S14: reconnects, i.e. the server has no client between the two connections", async () => {
+    const mock = new ForgetfulMock();
+    const { url } = await startServer(undefined, mock);
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S14"]) });
+    expect(reportOf(summary)).toEqual(["S14 passed "]);
+    expect(mock.reconnects).toBe(1);
+  });
 });
 
 describe("the contract runner against a server that breaks the protocol", () => {
@@ -477,6 +529,32 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(echoOnly, "S06")).toBe("failed");
     expect(detailsOf(echoOnly, "S06")).toMatch(/breakpoints\.setCategoryStates: the tick echoes sh4 as \{"muted":false,"soloed":false\}, expected \{"muted":true,"soloed":false\}/);
     // (a request without effect is waited for, for a second)
+  }, 30_000);
+
+  it("S14: a server that forgets, or lets go, when its last client disconnects", async () => {
+    const reconnect = async (forget: (tick: Json) => Array<[string, Json]>) => {
+      const { url } = await startServer(undefined, new ForgetfulMock(forget));
+      const summary = await runContract({ url, profile: "mock", only: new Set(["S14"]) });
+      expect(statusOf(summary, "S14")).toBe("failed");
+      return detailsOf(summary, "S14");
+    };
+    const before = /after the reconnect the first tick has\n.*\n.*before it the last tick had/;
+
+    const noWatches = await reconnect((tick) => [["state.unwatch", { watchIds: (tick.watches as Json[]).map((watch) => watch.id) }]]);
+    expect(noWatches).toMatch(before);
+    expect(noWatches).toMatch(/"watches":\[\],.*\n.*\n.*"watches":\[\[1,"dc\.sh4\.cpu\.gbr"\]\]/);
+
+    const noBreakpoints = await reconnect((tick) => Object.keys(tick.breakpoints as Json).map((id) => ["breakpoints.remove", { id: Number(id) }]));
+    expect(noBreakpoints).toMatch(before);
+    expect(noBreakpoints).toMatch(/\{"breakpoints":\{\},.*\n.*\n.*\{"breakpoints":\{"1":/);
+
+    const unmuted = { muted: false, soloed: false };
+    const noCategories = await reconnect(() => [["breakpoints.setCategoryStates", { categories: { events: unmuted, sh4: unmuted, arm7: unmuted, dsp: unmuted } }]]);
+    expect(noCategories).toMatch(before);
+    expect(noCategories).toMatch(/"dsp":\{"muted":false,"soloed":false\}.*\n.*\n.*"dsp":\{"muted":true,"soloed":false\}/);
+
+    const released = await reconnect(() => [["control.runUntil", {}]]);
+    expect(released).toMatch(/after the reconnect the first tick is #\d+ running stop 1; before it the target was #\d+ paused stop 1 pause, and a stop outlives a reconnect within the grace period/);
   }, 30_000);
 
   it("S08: a watch expression that is not stored in lower case", async () => {
