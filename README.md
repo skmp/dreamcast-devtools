@@ -83,6 +83,12 @@ not run it. After changing the crate, run it and commit the regenerated files.
   request to another origin, unless the test allows that message and says why
   (`diagnostics.allow` in `e2e/support/fixtures.ts`).
 - `test.fixme` marks behaviour that is known to be broken; the comment in the test says where.
+- A test that needs a server the default mock is not sets `test.use({ mockOptions: { ... } })`:
+  the mock then runs inside the test's process with those options (`supports`, `protocol`,
+  `startPaused`, `sliceContext`, ...), and the `machine` fixture is the mock itself, for what
+  the emulator's own window does (`machine.setLifetime("no-machine")`).
+- A test that needs exact ticks, a refused request, a message that breaks the schema or a
+  protocol v2 server answers the page's WebSocket itself (`e2e/support/scriptedDebugger.ts`).
 - Loading the page with `?crashTest` (before the `#route`) enables a hook that makes an error
   boundary's child throw on a `nulldc:crash-test` window event; `e2e/error-boundary.spec.ts`
   uses it. Without the flag the hook does not exist (`src/app/components/CrashProbe.tsx`).

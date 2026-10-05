@@ -1,6 +1,8 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { test as base, expect, type Locator, type Page, type TestInfo } from "@playwright/test";
+import type { MockDebugger, MockDebuggerOptions } from "../../server/mockDebugger";
+import { startLocalMock } from "./localMock";
 import { startMockServer, type MockServer } from "./mockServer";
 
 /**
@@ -112,17 +114,35 @@ export interface RpcLog {
 }
 
 interface Fixtures {
+  /**
+   * Options of the mock debugger (`test.use({ mockOptions: { ... } })`): a server that
+   * implements less, starts paused, reports stale registers, ... With them the mock runs
+   * inside the test's process and `machine` is that mock; without them `mock` is a server
+   * process of its own, which a test can kill.
+   */
+  mockOptions: MockDebuggerOptions | undefined;
   /** A fresh mock server per test: its state (breakpoints, watches, run state) is shared by all clients. */
   mock: MockServer;
+  /** The mock debugger itself, for what the emulator's own window does (`setLifetime`). Needs `mockOptions`. */
+  machine: MockDebugger;
   diagnostics: Diagnostics;
   rpc: RpcLog;
 }
 
 export const test = base.extend<Fixtures>({
-  mock: async ({}, use) => {
-    const mock = await startMockServer();
+  mockOptions: [undefined, { option: true }],
+
+  mock: async ({ mockOptions }, use) => {
+    const mock = mockOptions ? await startLocalMock(mockOptions) : await startMockServer();
     await use(mock);
     await mock.stop();
+  },
+
+  machine: async ({ mock }, use) => {
+    if (!("machine" in mock)) {
+      throw new Error("the `machine` fixture needs the mock in this process: test.use({ mockOptions: {} })");
+    }
+    await use((mock as MockServer & { machine: MockDebugger }).machine);
   },
 
   baseURL: async ({ mock }, use) => {
@@ -339,6 +359,30 @@ export const canvasStats = (canvas: Locator): Promise<CanvasStats> =>
       bars,
     };
   });
+
+/**
+ * Records the text of every notice (role="alert") the page shows, from before it loads: a
+ * notice that goes away after five seconds cannot be counted by looking. Call it before the
+ * navigation; the function it returns reads what was shown so far.
+ */
+export const recordAlerts = async (page: Page): Promise<() => Promise<string[]>> => {
+  await page.addInitScript(() => {
+    const store = window as unknown as { __alerts: string[] };
+    store.__alerts = [];
+    new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (!(node instanceof Element)) {
+            continue;
+          }
+          const alerts = node.matches('[role="alert"]') ? [node] : Array.from(node.querySelectorAll('[role="alert"]'));
+          store.__alerts.push(...alerts.map((alert) => alert.textContent ?? ""));
+        }
+      }
+    }).observe(document, { childList: true, subtree: true });
+  });
+  return () => page.evaluate(() => (window as unknown as { __alerts: string[] }).__alerts);
+};
 
 /**
  * Starts recording which disassembly rows flash (the "fadeOutTarget" animation of the
