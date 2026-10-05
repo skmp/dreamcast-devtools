@@ -158,6 +158,14 @@ export const test = base.extend<Fixtures>({
   page: async ({ page, mock, diagnostics }, use) => {
     diagnostics.serveFrom(mock.baseURL);
     attachDiagnostics(page, diagnostics);
+    // E2E_CPU_THROTTLE=4 gives the page a quarter of the CPU (Chromium's own throttling): what a
+    // loaded machine or a slow CI runner does to a test, on demand. A test that only passes on
+    // an idle machine fails with it.
+    const throttle = Number(process.env.E2E_CPU_THROTTLE ?? 1);
+    if (throttle > 1) {
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Emulation.setCPUThrottlingRate", { rate: throttle });
+    }
     await use(page);
     expect(
       diagnostics.unexpected(),

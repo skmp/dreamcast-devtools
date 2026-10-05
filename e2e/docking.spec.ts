@@ -121,17 +121,29 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
   { title: "DSP: Playground", id: "dsp-playground", content: /Start DSP/ },
   { title: "Device Tree", id: "device-tree", content: /SYSCLK = 200MHz/ },
   { title: "Watches", id: "watches", content: /dc\.sh4\.cpu\.pc = 0x8C0000A/ },
-  { title: "SH4: Callstack", id: "sh4-callstack", content: /Empty callstack\./ },
-  { title: "ARM7: Callstack", id: "arm7-callstack", content: /Empty callstack\./ },
+  // the target is paused when these are opened
+  { title: "SH4: Callstack", id: "sh4-callstack", content: CALLSTACKS["sh4-callstack"] },
+  { title: "ARM7: Callstack", id: "arm7-callstack", content: CALLSTACKS["arm7-callstack"] },
 ];
 
 test("the panel selector offers every panel that is not in the dock, and each one mounts with content", async ({
   page,
   diagnostics,
+  rpc,
 }) => {
   test.slow();
   diagnostics.allow(...KNOWN.sgcNoData);
   await openWorkspace(page, "sh4-debugger");
+
+  // The mock starts running and sends a tick five times a second, and every tick renders every
+  // mounted panel again: with 35 panels in the dock a slow machine has nothing left between two
+  // ticks, and the test would measure that instead of the selector. Nothing here needs a target
+  // that runs, so it is paused (a paused server sends no periodic tick), as soon as the event
+  // log has an entry for "Events: Log" to show.
+  await expect
+    .poll(() => rpc.received.some((frame) => frame.method === "event.tick" && (frame.params?.eventLog as unknown[]).length > 0))
+    .toBe(true);
+  await pauseFromToolbar(page);
 
   // the first group of the centre dock ("SH4: Disassembly")
   const addPanel = page.getByLabel("Add Panel", { exact: true }).nth(1);

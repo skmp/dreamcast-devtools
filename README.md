@@ -95,6 +95,7 @@ npx playwright test e2e/disassembly.spec.ts     # one file
 npx playwright test -g "Reset layout"           # by title
 npx playwright test --headed --workers=1        # watch it
 E2E_SCREENSHOT_DIR=/tmp/shots npm run test:e2e  # also save the per-workspace screenshots there
+E2E_CPU_THROTTLE=4 npx playwright test e2e/docking.spec.ts  # the page gets a quarter of the CPU
 ```
 
 ## Error boundaries
