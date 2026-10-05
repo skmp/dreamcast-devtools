@@ -707,6 +707,20 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect((await stateOf(direct)).watches).toEqual([]);
   });
 
+  it("S10: an unreadable word that is not \"??\" and \"<unreadable>\"", async () => {
+    const summary = await run(
+      {
+        toClient: (frame) => {
+          const lines = (frame.result as Json | undefined)?.lines as Json[] | undefined;
+          return lines ? { ...frame, result: { lines: lines.map((line) => (line.bytes === "??" ? { ...line, disassembly: "???" } : line)) } } : frame;
+        },
+      },
+      ["S10"],
+    );
+    expect(statusOf(summary, "S10")).toBe("failed");
+    expect(detailsOf(summary, "S10")).toBe('sh4: the unreadable word at 0x10000000 is bytes "??" and text "???", expected "??" and "<unreadable>"');
+  });
+
   it("S14: a server that forgets, or lets go, when its last client disconnects", async () => {
     const reconnect = async (forget: (tick: Json) => Array<[string, Json]>) => {
       const { url } = await startServer(undefined, new ForgetfulMock(forget));

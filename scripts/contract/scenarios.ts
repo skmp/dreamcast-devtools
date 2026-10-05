@@ -752,6 +752,17 @@ const s10: Scenario = {
         await session.expectError("state.getDisassembly", { target: target.id, address: start + 1, count: 1 }, -32602);
       }
     }
+    // an unreadable word is still a line: bytes "??", text "<unreadable>" (nothing is mapped at 0x10000000)
+    const unreadable = await disassemble(context, "sh4", 0x10000000, 2);
+    check(unreadable.length === 2, `sh4: ${unreadable.length} lines for count 2 at the unreadable ${hex(0x10000000)}, expected 2`);
+    unreadable.forEach((line, position) => {
+      check(line.address === 0x10000000 + position * 2, `sh4: line ${position} of the unreadable range is at ${hex(line.address)}`);
+      check(
+        line.bytes === "??" && line.disassembly === "<unreadable>",
+        `sh4: the unreadable word at ${hex(line.address)} is bytes "${line.bytes}" and text "${line.disassembly}", expected "??" and "<unreadable>"`,
+      );
+    });
+
     await session.expectError("state.getDisassembly", { target: "sh4", address: 0x8c010000, count: 0 }, -32602);
     await session.expectError("state.getDisassembly", { target: "sh4", address: 0x8c010000, count: 1025 }, -32602);
   },
