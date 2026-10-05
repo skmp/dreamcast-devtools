@@ -338,6 +338,17 @@ describe("the strict copy", () => {
     expect(paths(breakpoint)).toEqual(["breakpoints.1.address"]);
   });
 
+  it("takes a register width as a number of bits: an integer, 0 for free text; the client takes any number", () => {
+    for (const width of [-1, 31.5]) {
+      const register = tick();
+      register.registers["dc.sh4.cpu"][0].width = width;
+      expect(paths(register)).toEqual(["registers.dc.sh4.cpu.0.width"]);
+      expect(issuePaths(ConformanceSchemas.RegisterValueSchema.safeParse({ name: "PC", value: "0x8C0000A0", width }))).toEqual(["width"]);
+      expect(DebuggerRpcMethodSchemas["event.tick"].params.safeParse(register).success).toBe(true);
+    }
+    expect(ConformanceSchemas.RegisterValueSchema.safeParse({ name: "BUILD", value: "nullDC 3.0.0", width: 0 }).success).toBe(true);
+  });
+
   it("never accepts null for an optional field (both sets)", () => {
     const value = tick() as { executionState: Record<string, unknown> };
     value.executionState.breakpointId = null;
@@ -429,6 +440,9 @@ describe("the strict copy", () => {
     expect(rpcError.safeParse({ error: { code: -32003, message: "not paused" } }).success).toBe(true);
     expect(issuePaths(rpcError.safeParse({ error: { code: -32003, message: "not paused", data: { stack: "" } } }))).toEqual(["error"]);
     expect(rpcError.safeParse(null).success).toBe(false);
+    // an in-band code is an integer, as the code of a JSON-RPC error is; the client takes what it gets
+    expect(issuePaths(rpcError.safeParse({ error: { code: -32003.5, message: "not paused" } }))).toEqual(["error.code"]);
+    expect(DebuggerRpcMethodSchemas["control.step"].result.safeParse({ error: { code: -32003.5, message: "not paused" } }).success).toBe(true);
 
     const sgc = StrictDebuggerRpcMethodSchemas["state.getSgcFrameData"].result;
     expect(sgc.safeParse({ frameCount: 64, channelsPerFrame: 64, bytesPerChannel: 128, totalBytes: 524288, binaryId: 1 }).success).toBe(true);

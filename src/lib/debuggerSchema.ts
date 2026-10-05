@@ -358,7 +358,8 @@ const defineProtocol = (conformance: boolean) => {
     name: z.string(),
     /** "0x" + upper-case hex zero-padded to ceil(width / 4) digits; free text when `width` is 0; "n/a" when it cannot be read */
     value: z.string(),
-    width: z.number(),
+    /** bits; 0 for free text */
+    width: conformance ? z.number().int().min(0) : z.number(),
     flags: z.record(z.string(), z.boolean()).optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   });
@@ -597,7 +598,7 @@ const defineProtocol = (conformance: boolean) => {
   /** `{}` on success */
   const RpcErrorSchema = object({
     error: object({
-      code: z.number(),
+      code: conformance ? z.number().int() : z.number(),
       message: z.string(),
     }).optional(),
   });
