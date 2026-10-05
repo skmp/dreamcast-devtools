@@ -313,3 +313,39 @@ test("below 1200px the side docks are hidden and the centre dock keeps working",
   await expect(panel(page, "device-tree")).toContainText("SYSCLK = 200MHz");
   await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc");
 });
+
+test("a panel of a saved layout that this build does not have is left out, and the rest of the layout is kept", async ({ page }) => {
+  // a layout saved by a newer UI on the same origin, or by an older one whose panel is gone
+  await openWorkspace(page, "sh4-debugger");
+  await addPanelFromSelector(page, 1, "Events: Log");
+  await expect(panel(page, "events")).toBeVisible();
+  await expect.poll(() => tabTitles(page)).toContain("Events: Log");
+  const key = "nulldc-debugger-docking-layout-sh4-debugger";
+  await expect
+    .poll(() => page.evaluate((storageKey) => window.localStorage.getItem(storageKey)?.includes('"events"') ?? false, key))
+    .toBe(true);
+
+  // the saved layout now names a panel "hologram-viewer" where it had the event log
+  await page.evaluate((storageKey) => {
+    const rename = (name: string, from: string, to: string) => {
+      const saved = window.localStorage.getItem(name)!;
+      window.localStorage.setItem(name, saved.replaceAll(`"${from}"`, `"${to}"`));
+    };
+    rename(storageKey, "events", "hologram-viewer");
+  }, key);
+  await page.reload();
+  await expect(statusBar(page)).toContainText("Connection: connected");
+
+  // what the build knows is where it was
+  for (const id of ["sh4-disassembly", "sh4-memory", "sh4-breakpoints", "sh4-callstack", "device-tree"]) {
+    await expect(panel(page, id), id).toBeVisible();
+  }
+  await expect(panel(page, "sh4-disassembly")).toContainText("0x8C0000A0");
+  // what it does not know is not a tab, not an empty panel and not an error
+  expect(await tabTitles(page)).toEqual(["Device Tree", "SH4: Disassembly", "SH4: Memory", "SH4: Breakpoints", "Watches", "SH4: Callstack"]);
+  await expect(page.locator("[data-error-boundary]")).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  // and the panels that went missing can be opened again
+  await addPanelFromSelector(page, 1, "Events: Log");
+  await expect(panel(page, "events")).toBeVisible();
+});

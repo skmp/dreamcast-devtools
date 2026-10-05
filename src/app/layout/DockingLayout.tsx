@@ -14,7 +14,7 @@ import { useLazyImportArrivals } from "../components/lazyImport";
 import AddIcon from "@mui/icons-material/Add";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { PanelSelectorModal } from "./PanelSelectorModal";
-import { loadLayout, saveLayout } from "./dockingLayoutStorage";
+import { loadLayout, saveLayout, withKnownPanels } from "./dockingLayoutStorage";
 import "dockview/dist/styles/dockview.css";
 
 export type PanelDefinition = {
@@ -93,8 +93,10 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
       dockviewApisMap.set(event.api.id, event.api);
       console.log('[DockingLayout] Registered API with id:', event.api.id, 'workspace:', workspaceId);
 
-      // Try to load saved layout
-      const savedLayout = loadLayout(workspaceId);
+      // Try to load saved layout. It can name panels this build does not have (it was saved by
+      // another version of the UI): those are left out, the rest is kept.
+      const stored = loadLayout(workspaceId);
+      const savedLayout = stored ? withKnownPanels(stored, (allPanels ?? panels).map((panel) => panel.id)) : null;
 
       if (savedLayout) {
         try {
@@ -198,7 +200,7 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
         dockviewApisMap.delete(event.api.id);
       };
     },
-    [panels, workspaceId, defaultLayoutMode]
+    [panels, allPanels, workspaceId, defaultLayoutMode]
   );
 
   useEffect(() => {
