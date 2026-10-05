@@ -264,6 +264,10 @@ const noTickAfter = (matches: (request: Json) => boolean): Faults => {
   };
 };
 
+/** S08 adds a stored expression once more, with the register name in upper case: the one state.watch that changes nothing. */
+const isWatchOfStoredExpression = (frame: Json) =>
+  frame.method === "state.watch" && ((frame.params as Json).expressions as string[]).some((expression) => /[A-Z]/.test(expression));
+
 describe("the contract runner against the mock", () => {
   it("passes every scenario the mock's milestone covers, reports the rest as not applicable, and leaves the server as it found it", async () => {
     const { url, mock } = await startServer();
@@ -349,6 +353,12 @@ describe("the contract runner against the mock", () => {
     expect(reportOf(running)).toEqual(["S13 passed "]);
     expect(running.ok).toBe(true);
   }, 60_000);
+
+  it("S08: needs no tick after a state.watch that changed nothing", async () => {
+    const summary = await run(() => noTickAfter(isWatchOfStoredExpression), ["S08"]);
+    expect(reportOf(summary)).toEqual(["S08 passed "]);
+    expect(summary.ok).toBe(true);
+  });
 
   it("S14: reconnects, i.e. the server has no client between the two connections", async () => {
     const mock = new ForgetfulMock();
@@ -646,6 +656,19 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(reusedWatchIds, "S08")).toBe("failed");
     expect(detailsOf(reusedWatchIds, "S08")).toMatch(/state\.watch: the new watch has id 1, which an earlier watch of this run had; ids are never reused/);
     expect(reusedWatchIds.invariantViolations).toEqual([]);
+  });
+
+  it("S08: a stored expression that is added twice", async () => {
+    const { url, direct } = await startServer({
+      // the request that adds nothing adds something
+      toServer: (frame) => (isWatchOfStoredExpression(frame) ? { ...frame, params: { expressions: ["dc.aica.arm7.pc"] } } : frame),
+    });
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S08"]) });
+    expect(statusOf(summary, "S08")).toBe("failed");
+    expect(detailsOf(summary, "S08")).toBe("an expression that is already stored is not added twice");
+    // and the watch nobody asked for is removed again
+    expect(summary.cleanUpProblems).toEqual([]);
+    expect((await stateOf(direct)).watches).toEqual([]);
   });
 
   it("S14: a server that forgets, or lets go, when its last client disconnects", async () => {

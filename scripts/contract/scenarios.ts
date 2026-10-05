@@ -623,11 +623,10 @@ const s08: Scenario = {
       `the watch on ${first.expression} reads ${JSON.stringify(listed.value)}, the register in the same tick ${registerOf(record.tick, sh4.pcPath, first.name)}`,
     );
 
-    // adding a stored expression again adds nothing, and still returns {}
-    const again = session.mark();
+    // Adding a stored expression again adds nothing, and still returns {}. Whether a tick
+    // follows a request that changed nothing is the server's choice: the count is read from
+    // the tick of the rename below.
     await session.call("state.watch", { expressions: [first.expression.toUpperCase().replace(sh4.pcPath.toUpperCase(), sh4.pcPath)] });
-    const afterAgain = await session.waitForTick(() => true, 1000, "a tick after state.watch", again);
-    check(afterAgain.tick.watches!.length === record.tick.watches!.length, "an expression that is already stored is not added twice");
 
     // rename, with the register name in upper case: same id, lower-case expression, the other register's value
     const second = unwatchedRegister(context, sh4.pcPath, ["PR", "GBR", "VBR"]);
@@ -636,6 +635,7 @@ const s08: Scenario = {
     const renamed = await tickShowing(session, renameMark, "state.modifyWatchExpression", (tick) =>
       tick.watches?.find((watch) => watch.id === id)?.expression === first.expression ? `watch ${id} is still listed as "${first.expression}"` : undefined,
     );
+    check(renamed.tick.watches!.length === record.tick.watches!.length, "an expression that is already stored is not added twice");
     const after = renamed.tick.watches!.find((watch) => watch.id === id);
     check(after !== undefined, "state.modifyWatchExpression keeps the id");
     check(after!.expression === second.expression, `the renamed watch is listed as "${after!.expression}", expected "${second.expression}"`);
