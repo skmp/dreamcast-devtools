@@ -98,7 +98,7 @@ export const documentationSections: DocumentationSection[] = [
           "DSP Playground: write, compile, step and listen to AICA DSP programs on a DSP simulator compiled to WebAssembly. It needs no emulator connection.",
           "CORE Log Analyzer: load a refsw2 log file and click a pixel to see the ISP/TSP events and tile operations logged for it.",
           "TA Log Analyzer: placeholder, not implemented yet.",
-          "The SH4 Simulator and DSP Playground editors load Monaco from the jsDelivr CDN, so they need internet access.",
+          "Everything, including the Monaco editor of the SH4 Simulator and the DSP Playground, is part of the build: the UI requests nothing from any origin other than the one that served it and works without internet access.",
         ],
       },
     ],

@@ -1,4 +1,4 @@
-import { test, expect, gotoRoute, openWorkspace, panel, addPanelFromSelector, KNOWN } from "./support/fixtures";
+import { test, expect, gotoRoute, openWorkspace, panel, addPanelFromSelector } from "./support/fixtures";
 
 test("About on the home page shows the DevTools version and asks for a connection", async ({ page }) => {
   await gotoRoute(page, "/");
@@ -40,8 +40,7 @@ test("About in a workspace shows what the emulator reported in debugger.describe
   await expect(page).toHaveURL(/#\/workspace\/sh4-debugger$/);
 });
 
-test("the About button exists on every tool page and on the docs page", async ({ page, diagnostics }) => {
-  diagnostics.allow(...KNOWN.monacoCdn);
+test("the About button exists on every tool page and on the docs page", async ({ page }) => {
   for (const route of [
     "/docs",
     "/tool/sh4-sim",
@@ -72,6 +71,7 @@ test("the docs page describes scripts that exist in package.json", async ({ page
 
 test("the Documentation panel shows the same sections as the docs page", async ({ page }) => {
   await gotoRoute(page, "/docs");
+  await expect(page.getByRole("main").getByRole("heading", { name: "Protocol" })).toBeVisible();
   const pageHeadings = await page.getByRole("main").getByRole("heading").allInnerTexts();
   expect(pageHeadings).toEqual(
     expect.arrayContaining(["Overview", "Getting Started", "Launching the UI", "Workspaces & Tools", "Breakpoints", "Protocol"]),

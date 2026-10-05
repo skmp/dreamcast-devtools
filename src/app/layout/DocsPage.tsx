@@ -1,7 +1,7 @@
 import { type ReactNode } from "react";
 import { AppBar, Box, Container, Stack, Typography } from "@mui/material";
 import { TopNav } from "./TopNav";
-import { AboutDialog } from "./AboutDialog";
+import { LazyAboutDialog } from "./LazyAboutDialog";
 import { useAboutModal } from "./useAboutModal";
 import { documentationSections } from "./documentationSections";
 
@@ -80,7 +80,7 @@ export const DocsPage = () => {
           </Typography>
         </Container>
       </Box>
-      <AboutDialog open={aboutOpen} onClose={hideAbout} />
+      <LazyAboutDialog open={aboutOpen} onClose={hideAbout} />
     </Box>
   );
 };

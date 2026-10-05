@@ -19,6 +19,7 @@ import { Panel } from "../layout/Panel";
 import { SH4_SIM_DEFAULT_SOURCE } from "../sh4Sim/defaultSource";
 import { getAssembleError, simulate, SH4_MNEMONICS, SH4_REGISTERS } from "../sh4Sim/sim";
 import type { SimBlock, SimCell, SimRow, SimulateResult } from "../sh4Sim/sim";
+import "../monaco/monacoSetup";
 import Editor from "@monaco-editor/react";
 import type { Monaco } from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";

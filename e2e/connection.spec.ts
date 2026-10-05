@@ -1,4 +1,4 @@
-import { test, expect, gotoRoute, openWorkspace, panel, statusBar, tooltipButton, KNOWN } from "./support/fixtures";
+import { test, expect, gotoRoute, openWorkspace, panel, statusBar, tooltipButton } from "./support/fixtures";
 import type { Page } from "@playwright/test";
 import { startMockServer } from "./support/mockServer";
 
@@ -168,8 +168,7 @@ test.fixme("a manually entered WebSocket URL connects", async ({ page, mock }) =
   }
 });
 
-test("the tool pages do not open a debugger connection", async ({ page, diagnostics, rpc }) => {
-  diagnostics.allow(...KNOWN.monacoCdn);
+test("the tool pages do not open a debugger connection", async ({ page, rpc }) => {
   for (const route of ["/", "/docs", "/tool/sh4-sim", "/tool/dsp-playground", "/tool/holly-core-log-analyzer"]) {
     await gotoRoute(page, route);
     await page.waitForLoadState("networkidle");

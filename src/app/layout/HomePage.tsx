@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { Box, Card, CardActionArea, CardContent, Container, Stack, Typography } from "@mui/material";
 import { useNavigate } from "react-router-dom";
-import { AboutDialog } from "./AboutDialog";
+import { LazyAboutDialog } from "./LazyAboutDialog";
 import { useAboutModal } from "./useAboutModal";
 
 export const HomePage = () => {
@@ -221,7 +221,7 @@ export const HomePage = () => {
           </Stack>
         </Stack>
       </Container>
-      <AboutDialog open={aboutOpen} onClose={hideAbout} />
+      <LazyAboutDialog open={aboutOpen} onClose={hideAbout} />
     </Box>
   );
 };

@@ -1,5 +1,5 @@
 import { inflateSync } from "node:zlib";
-import { test, expect, gotoRoute, KNOWN } from "./support/fixtures";
+import { test, expect, gotoRoute } from "./support/fixtures";
 import { expectMonacoReady, monacoEditor, monacoReplaceAll, monacoTokenClasses, monacoVisibleText } from "./support/monaco";
 import type { Locator, Page } from "@playwright/test";
 
@@ -24,8 +24,7 @@ const decodeShareToken = (url: string): string => {
   return inflateSync(Buffer.from(token, "base64")).toString("utf8");
 };
 
-test.beforeEach(async ({ page, diagnostics, context }) => {
-  diagnostics.allow(...KNOWN.monacoCdn);
+test.beforeEach(async ({ page, context }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await gotoRoute(page, "/tool/sh4-sim");
   await expectMonacoReady(monacoEditor(page));

@@ -12,6 +12,19 @@ import { startMockServer, type MockServer } from "./mockServer";
 export class Diagnostics {
   private readonly problems: string[] = [];
   private readonly allowances: Array<{ pattern: RegExp; reason: string }> = [];
+  private readonly origins: string[] = [];
+
+  /** Declares an origin the page is served from; requests to any other origin are problems. */
+  serveFrom(origin: string) {
+    this.origins.push(origin.replace(/\/$/, ""));
+  }
+
+  isExternal(url: string): boolean {
+    if (/^(data|blob|about):/.test(url)) {
+      return false;
+    }
+    return !this.origins.some((origin) => url === origin || url.startsWith(`${origin}/`));
+  }
 
   record(problem: string) {
     this.problems.push(problem);
@@ -49,20 +62,9 @@ export const KNOWN = {
     /^console\.error: Failed to fetch SGC frame data: Error: No SGC frame data available/,
     "SGC panel logs the expected 'nothing recorded yet' answer of the server with console.error",
   ],
-  /**
-   * The three editors load Monaco from the jsDelivr CDN at run time
-   * (@monaco-editor/react default loader). Removed by the offline work.
-   */
-  monacoCdn: [
-    /^external request: https:\/\/cdn\.jsdelivr\.net\/npm\/monaco-editor@/,
-    "Monaco is fetched from jsDelivr by the default @monaco-editor/react loader",
-  ],
 } as const satisfies Record<string, readonly [RegExp, string]>;
 
-const isExternal = (url: string, origin: string) =>
-  !url.startsWith(`${origin}/`) && url !== origin && !/^(data|blob|about):/.test(url);
-
-const attachDiagnostics = (page: Page, diagnostics: Diagnostics, origin: string) => {
+const attachDiagnostics = (page: Page, diagnostics: Diagnostics) => {
   page.on("console", (message) => {
     if (message.type() === "error") {
       diagnostics.record(`console.error: ${message.text()}`);
@@ -75,7 +77,7 @@ const attachDiagnostics = (page: Page, diagnostics: Diagnostics, origin: string)
     diagnostics.record(`requestfailed: ${request.method()} ${request.url()} ${request.failure()?.errorText ?? ""}`);
   });
   page.on("request", (request) => {
-    if (isExternal(request.url(), origin)) {
+    if (diagnostics.isExternal(request.url())) {
       diagnostics.record(`external request: ${request.url()}`);
     }
   });
@@ -150,7 +152,8 @@ export const test = base.extend<Fixtures>({
   ],
 
   page: async ({ page, mock, diagnostics }, use) => {
-    attachDiagnostics(page, diagnostics, mock.baseURL);
+    diagnostics.serveFrom(mock.baseURL);
+    attachDiagnostics(page, diagnostics);
     await use(page);
     expect(
       diagnostics.unexpected(),

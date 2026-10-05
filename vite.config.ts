@@ -26,4 +26,10 @@ export default defineConfig({
     __APP_VERSION__: JSON.stringify(appVersion),
     __USE_BROADCAST__: JSON.stringify(useBroadcast),
   },
+  build: {
+    // The one big chunk is Monaco (about 3 MB), which is bundled on purpose (the UI must not
+    // load anything from another origin) and only fetched by the pages that show an editor.
+    // The size of the initial load is checked by e2e/offline.spec.ts instead.
+    chunkSizeWarningLimit: 3200,
+  },
 });

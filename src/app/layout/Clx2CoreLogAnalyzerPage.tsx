@@ -1,6 +1,6 @@
 import { AppBar, Box } from "@mui/material";
 import { TopNav } from "./TopNav";
-import { AboutDialog } from "./AboutDialog";
+import { LazyAboutDialog } from "./LazyAboutDialog";
 import { useAboutModal } from "./useAboutModal";
 import { CoreInspectorPanel } from "../panels/CoreInspectorPanel";
 
@@ -18,7 +18,7 @@ export const Clx2CoreLogAnalyzerPage = () => {
       <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <CoreInspectorPanel />
       </Box>
-      <AboutDialog open={aboutOpen} onClose={hideAbout} />
+      <LazyAboutDialog open={aboutOpen} onClose={hideAbout} />
     </Box>
   );
 };

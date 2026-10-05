@@ -23,8 +23,7 @@ test("/ lists the four workspaces, the four tools, documentation and about", asy
   await page.waitForLoadState("networkidle");
 });
 
-test("home page cards navigate to their routes", async ({ page, diagnostics }) => {
-  diagnostics.allow(...KNOWN.monacoCdn);
+test("home page cards navigate to their routes", async ({ page }) => {
   const cards: Array<[string, string]> = [
     ["SH4 Debugger", "#/workspace/sh4-debugger"],
     ["ARM7 Debugger", "#/workspace/arm7-debugger"],
@@ -65,8 +64,7 @@ for (const workspace of WORKSPACES) {
   });
 }
 
-test("/tool/sh4-sim loads the simulator", async ({ page, diagnostics }, testInfo) => {
-  diagnostics.allow(...KNOWN.monacoCdn);
+test("/tool/sh4-sim loads the simulator", async ({ page }, testInfo) => {
   await gotoRoute(page, "/tool/sh4-sim");
   await expect(page.getByRole("button", { name: "Share" })).toBeVisible();
   await expect(page.locator(".monaco-editor").first()).toBeVisible();
@@ -75,8 +73,7 @@ test("/tool/sh4-sim loads the simulator", async ({ page, diagnostics }, testInfo
   await saveScreenshot(page, testInfo, "tool-sh4-sim");
 });
 
-test("/tool/dsp-playground loads the playground", async ({ page, diagnostics }, testInfo) => {
-  diagnostics.allow(...KNOWN.monacoCdn);
+test("/tool/dsp-playground loads the playground", async ({ page }, testInfo) => {
   await gotoRoute(page, "/tool/dsp-playground");
   await expect(page.getByRole("button", { name: "Start DSP" })).toBeVisible();
   await expect(page.locator(".monaco-editor").first()).toBeVisible();

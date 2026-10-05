@@ -1,4 +1,4 @@
-import { test, expect, canvasStats, gotoRoute, tooltipButton, KNOWN } from "./support/fixtures";
+import { test, expect, canvasStats, gotoRoute, tooltipButton } from "./support/fixtures";
 import { expectMonacoReady, monacoEditor, monacoReplaceAll, monacoTokenClasses, monacoVisibleText } from "./support/monaco";
 import type { Locator, Page } from "@playwright/test";
 
@@ -20,8 +20,7 @@ const expandDebugger = async (page: Page) => {
   await expect(page.getByText("Disassembly", { exact: true })).toBeVisible();
 };
 
-test.beforeEach(async ({ page, diagnostics }) => {
-  diagnostics.allow(...KNOWN.monacoCdn);
+test.beforeEach(async ({ page }) => {
   await gotoRoute(page, "/tool/dsp-playground");
   await expectMonacoReady(monacoEditor(page));
 });

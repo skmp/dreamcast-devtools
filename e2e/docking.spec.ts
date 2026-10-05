@@ -112,7 +112,6 @@ test("the panel selector offers every panel that is not in the dock, and each on
 }) => {
   test.slow();
   diagnostics.allow(...KNOWN.sgcNoData);
-  diagnostics.allow(...KNOWN.monacoCdn);
   await openWorkspace(page, "sh4-debugger");
 
   // the first group of the centre dock ("SH4: Disassembly")

@@ -34,6 +34,29 @@ Run `npm ci` once, then:
 | `npm run test:e2e` | Playwright smoke suite in headless Chromium (see [End-to-end tests](#end-to-end-tests)). Not part of `check`. |
 | `npm run check` | `lint`, `typecheck`, `test:run`, `build:native`; stops at the first failure. CI runs this. |
 
+## Serving the build
+
+`dist-native/` (and `dist-wasm/`) is self-contained and can be served by any file server, from
+any path:
+
+- Nothing is loaded from another origin. The Monaco editor used by the SH4 Simulator and the DSP
+  Playground is bundled (`src/app/monaco/monacoSetup.ts`: editor core and the features the three
+  editors use, no built-in languages), together with its worker and its icon font.
+- `index.html` and every chunk reference their files relatively, and the routes live in the URL
+  hash (`#/workspace/sh4-debugger`), so no rewrite or fallback rule is needed.
+- The code is split: `index.html` loads one entry chunk (about 380 kB); each workspace, tool page
+  and large panel, and Monaco (about 3 MB), is a separate file under `assets/` that is fetched when
+  first needed. The server has to serve every file of `assets/`.
+- Content types that matter: `.js` as JavaScript (also for the worker, `assets/editor.worker-*.js`)
+  and `.wasm` as `application/wasm` (the DSP module is compiled from a streamed response).
+  `.css`, `.html`, `.png` and `.ttf` as usual.
+- A native build then opens its WebSocket at `/ws` on the same host and port (see
+  [Connecting](#connecting)).
+
+`python3 -m http.server --directory dist-native` is enough to look at everything that does not
+need a debugger connection; `e2e/offline.spec.ts` checks exactly that setup, with every other
+origin blocked.
+
 ## Generated DSP module
 
 `src/wasm/aica-dsp/` (JavaScript glue, type declarations and the `.wasm` file used by the DSP

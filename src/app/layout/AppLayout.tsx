@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useMemo, useState, useRef } from "react";
+import { lazy, useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { AppBar, Box, Button, Divider, IconButton, Stack, Switch, Typography, Alert } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
 import PowerSettingsNewIcon from "@mui/icons-material/PowerSettingsNew";
@@ -20,13 +20,9 @@ import { EventLogPanel } from "../panels/EventLogPanel";
 import { Sh4DisassemblyPanel, Arm7DisassemblyPanel, DspDisassemblyPanel } from "../panels/DisassemblyPanel";
 import { Sh4MemoryPanel, Arm7MemoryPanel } from "../panels/MemoryPanel";
 import CallstackPanel from "../panels/CallstackPanel";
-import { AudioPanel } from "../panels/AudioPanel";
 import { TaInspectorPanel } from "../panels/TaInspectorPanel";
-import { CoreInspectorPanel } from "../panels/CoreInspectorPanel";
 import { EventsBreakpointsPanel, Sh4BreakpointsPanel, Arm7BreakpointsPanel, DspBreakpointsPanel } from "../panels/BreakpointsPanel";
 import { DocumentationPanel } from "../panels/DocumentationPanel";
-import { Sh4SimPanel } from "../panels/Sh4SimPanel";
-import { DspPlaygroundPanel } from "../panels/DspPlaygroundPanel";
 import {
   BscRegistersPanel,
   CcnRegistersPanel,
@@ -56,6 +52,18 @@ import { DockingLayout, type PanelDefinition } from "./DockingLayout";
 import { clearDockingLayout } from "./dockingLayoutStorage";
 import type { DockviewApi } from "dockview";
 import { PANEL_IDS, type PanelId } from "../../lib/debuggerSchema";
+
+// Panels that are large or bring a large dependency (Monaco, the DSP WebAssembly module,
+// the WebGL waveform renderer) are fetched when they are first shown. DockingLayout shows a
+// placeholder in the panel meanwhile.
+const AudioPanel = lazy(() => import("../panels/AudioPanel").then((module) => ({ default: module.AudioPanel })));
+const CoreInspectorPanel = lazy(() =>
+  import("../panels/CoreInspectorPanel").then((module) => ({ default: module.CoreInspectorPanel })),
+);
+const Sh4SimPanel = lazy(() => import("../panels/Sh4SimPanel").then((module) => ({ default: module.Sh4SimPanel })));
+const DspPlaygroundPanel = lazy(() =>
+  import("../panels/DspPlaygroundPanel").then((module) => ({ default: module.DspPlaygroundPanel })),
+);
 
 type StoredLayoutPrefs = {
   leftPanelOpen: boolean;

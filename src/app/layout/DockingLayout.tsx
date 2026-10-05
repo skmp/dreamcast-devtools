@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, useMemo, useState, type ReactElement, type FunctionComponent } from "react";
+import { Suspense, useEffect, useRef, useCallback, useMemo, useState, type ReactElement, type FunctionComponent } from "react";
 import {
   DockviewReact,
   type DockviewReadyEvent,
@@ -9,6 +9,7 @@ import {
 import { Box, IconButton } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
 import { ErrorBoundary } from "../components/ErrorBoundary";
+import { LoadingPlaceholder } from "../components/LoadingPlaceholder";
 import AddIcon from "@mui/icons-material/Add";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { PanelSelectorModal } from "./PanelSelectorModal";
@@ -66,7 +67,8 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
         >
           {/* an exception in one panel must not take the workspace down */}
           <ErrorBoundary scope="panel" name={panel.title} testId={`panel:${panel.id}`}>
-            {panel.component}
+            {/* some panels are loaded on first use */}
+            <Suspense fallback={<LoadingPlaceholder scope="panel" />}>{panel.component}</Suspense>
           </ErrorBoundary>
         </Box>
       );
