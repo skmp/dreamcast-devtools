@@ -4,12 +4,14 @@ import {
   gotoRoute,
   panel,
   registerRow,
+  saveScreenshot,
   statusBar,
+  tooltipButton,
   treeItemRow,
   type WorkspaceId,
 } from "./support/fixtures";
 import type { Page } from "@playwright/test";
-import { inBandError, serveScriptedDebugger, type ScriptedDebugger } from "./support/scriptedDebugger";
+import { inBandError, jsonRpcError, serveScriptedDebugger, type ScriptedDebugger } from "./support/scriptedDebugger";
 
 // What the client does with a tick, against a server that sends exactly the ticks the test
 // asks for (the mock sends its own): registers are merged per path, a stop is acted on once,
@@ -140,4 +142,68 @@ test("mute and solo are the server's state: the buttons show what the ticks say,
   await expect(page.getByRole("alert").filter({ hasText: "emulator busy" })).toBeVisible();
   await expect(sh4.getByRole("button", { name: "Solo category" })).toBeVisible();
   await expect(arm7.getByRole("button", { name: "Unsolo category" })).toBeVisible();
+});
+
+test("a tick the client cannot use is dropped, and the page says so with the place that is wrong", async ({
+  page,
+  diagnostics,
+}, testInfo) => {
+  diagnostics.allow(/^console\.error: Notification validation failed for event\.tick/, "the client logs the tick it drops");
+  const server = await open(page, "sh4-debugger");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  const dropped = page.getByRole("alert").filter({ hasText: "could not use" });
+
+  // a subsystem has to be a string; this entry has a number
+  server.setRegister("dc", "SYSCLK", "from the bad tick");
+  server.tick({ patch: { eventLog: [{ eventId: "1", timestamp: 1, subsystem: 5, severity: "info", message: "x" }] } });
+  await expect(dropped).toContainText("The server sent a message this UI could not use, and it was dropped");
+  await expect(dropped).toContainText("event.tick: eventLog.0.subsystem:");
+  // nothing of that tick was applied
+  await expect(registerRow(page, "dc.reg.SYSCLK")).toHaveText("SYSCLK = 200MHz");
+
+  // the next one is counted, and the place is that of the last one
+  server.tick({ patch: { executionState: { state: "halted" } } });
+  await expect(dropped).toContainText("The server sent 2 messages this UI could not use, and they were dropped");
+  await expect(dropped).toContainText("event.tick: executionState.state:");
+  await saveScreenshot(page, testInfo, "dropped-ticks");
+
+  // the connection is fine, and a tick that is right is applied
+  await tickAndWait(page, server);
+  await expect(statusBar(page)).toContainText("Connection: connected");
+
+  // the notice can be put away; the next dropped message brings it back, counting from one
+  await dropped.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  server.tick({ patch: { tickId: "seven" } });
+  await expect(dropped).toContainText("The server sent a message this UI could not use");
+  await expect(dropped).toContainText("event.tick: tickId:");
+});
+
+test("a debugger.describe the client cannot use, or that the server refuses, is reported instead of an empty page", async ({
+  page,
+  diagnostics,
+}) => {
+  diagnostics.allow(/^console\.error: Failed to initialize debugger data/, "the store logs the failed initialisation");
+  const server = await serveScriptedDebugger(page);
+  // no version, and no device tree
+  server.shape = { emulator: { name: "half a server", build: "native" } };
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+
+  const failed = page.getByRole("alert").filter({ hasText: "debugger.describe failed" });
+  await expect(failed).toContainText("debugger.describe failed: Response validation failed for debugger.describe: emulator.version:");
+  await expect(failed).toContainText("deviceTree:");
+  for (const id of ["device-tree", "sh4-disassembly", "sh4-memory", "watches"]) {
+    await expect(panel(page, id), id).toContainText("No Data");
+  }
+  await expect(tooltipButton(page, "Run")).toBeDisabled();
+  await expect(tooltipButton(page, "Pause")).toBeDisabled();
+
+  // the next attempt is refused by the server
+  server.answer("debugger.describe", () => jsonRpcError(-32603, "internal error"));
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "debugger.describe failed: internal error" })).toBeVisible();
+  await expect(panel(page, "device-tree")).toContainText("No Data");
 });

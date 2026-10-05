@@ -52,7 +52,7 @@ import { DEBUGGER_VERSION } from "./aboutVersion";
 import { DockingLayout, type PanelDefinition } from "./DockingLayout";
 import { clearDockingLayout } from "./dockingLayoutStorage";
 import type { DockviewApi } from "dockview";
-import { PANEL_IDS, type PanelId } from "../../lib/debuggerSchema";
+import { PANEL_IDS, PROTOCOL_VERSION, type PanelId } from "../../lib/debuggerSchema";
 import { canResume } from "../../state/stopReasons";
 import { ExecutionStatus } from "./ExecutionStatus";
 
@@ -154,6 +154,14 @@ const connectionIcons = {
   connected: <CloudDoneIcon fontSize="small" />,
 };
 
+/** What the server's `protocol` means for this build, when it is not the build's own. */
+const protocolMismatch = (protocol: number | undefined): string =>
+  protocol === undefined
+    ? `This server speaks debugger protocol 2 (it reports no protocol version); this UI is built for protocol ${PROTOCOL_VERSION}. ` +
+      "It behaves as it did for protocol 2: stops are taken from the change of the run state, and every target and method is assumed to exist."
+    : `This server speaks debugger protocol ${protocol}; this UI is built for protocol ${PROTOCOL_VERSION}. ` +
+      "Parts of it may not work. Use the UI that belongs to the emulator.";
+
 interface AppLayoutProps {
   workspaceId: string;
 }
@@ -173,13 +181,20 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const control = useDebuggerDataStore((state) => state.control);
   const toasts = useDebuggerDataStore((state) => state.toasts);
   const dismissToast = useDebuggerDataStore((state) => state.dismissToast);
+  const initError = useDebuggerDataStore((state) => state.initError);
+  const invalidMessages = useDebuggerDataStore((state) => state.invalidMessages);
+  const dismissInvalidMessages = useDebuggerDataStore((state) => state.dismissInvalidMessages);
+  const epoch = useDebuggerDataStore((state) => state.epoch);
   const initialized = useDebuggerDataStore((state) => state.initialized);
+  const serverProtocol = useDebuggerDataStore((state) => state.shape?.protocol);
   const [leftPanelOpen, setLeftPanelOpen] = useState(() => loadLayoutPrefs(workspaceId).leftPanelOpen);
   const [rightPanelOpen, setRightPanelOpen] = useState(() => loadLayoutPrefs(workspaceId).rightPanelOpen);
   const [isNarrow, setIsNarrow] = useState(window.innerWidth < 1200);
   const { open: aboutOpen, show: showAbout, hide: hideAbout } = useAboutModal();
   const { mode, toggleMode } = useThemeMode();
   const isDarkMode = mode === "dark";
+  // the protocol notice of a connection can be put away; the next connection shows its own
+  const [protocolNoticeDismissed, setProtocolNoticeDismissed] = useState<number | null>(null);
   const [mainPanelApiState, setMainPanelApiState] = useState<DockviewApi | null>(null);
 
   // Use a ref to avoid stale closures
@@ -503,6 +518,24 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
             {connectionError}
           </Alert>
         )
+      )}
+      {initError && (
+        <Alert severity="error" sx={{ borderRadius: 0 }}>
+          {initError}
+        </Alert>
+      )}
+      {connected && initialized && serverProtocol !== PROTOCOL_VERSION && protocolNoticeDismissed !== epoch && (
+        <Alert severity="warning" sx={{ borderRadius: 0 }} onClose={() => setProtocolNoticeDismissed(epoch)}>
+          {protocolMismatch(serverProtocol)}
+        </Alert>
+      )}
+      {invalidMessages && (
+        <Alert severity="warning" sx={{ borderRadius: 0 }} onClose={dismissInvalidMessages}>
+          {invalidMessages.count === 1
+            ? "The server sent a message this UI could not use, and it was dropped"
+            : `The server sent ${invalidMessages.count} messages this UI could not use, and they were dropped`}
+          : {invalidMessages.last.message}
+        </Alert>
       )}
       <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <Box

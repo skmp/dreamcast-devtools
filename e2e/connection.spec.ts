@@ -4,6 +4,7 @@ import {
   gotoRoute,
   openWorkspace,
   panel,
+  pauseFromToolbar,
   saveScreenshot,
   statusBar,
   tooltipButton,
@@ -344,4 +345,28 @@ test("the tool pages do not open a debugger connection", async ({ page, rpc }) =
     await page.waitForLoadState("networkidle");
   }
   expect(rpc.sockets).toEqual([]);
+});
+
+test.describe("a server of another protocol version", () => {
+  test.use({ mockOptions: { protocol: 4 } });
+
+  test("the page says which, and goes on with what it understands", async ({ page }, testInfo) => {
+    await openWorkspace(page, "sh4-debugger");
+    const notice = page.getByRole("alert").filter({ hasText: "debugger protocol" });
+    await expect(notice).toHaveText(
+      "This server speaks debugger protocol 4; this UI is built for protocol 3. Parts of it may not work. Use the UI that belongs to the emulator.",
+    );
+    await saveScreenshot(page, testInfo, "session-protocol-mismatch");
+    // the session works as far as the two agree
+    await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
+    await pauseFromToolbar(page);
+    await expect(panel(page, "sh4-disassembly").locator(".current-instruction")).toHaveCount(1);
+
+    // put away, it stays away for this connection
+    await notice.getByRole("button", { name: "Close" }).click();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await tooltipButton(page, "Run").click();
+    await expect(tooltipButton(page, "Pause")).toBeEnabled();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
 });
