@@ -31,7 +31,7 @@ export const documentationSections: DocumentationSection[] = [
     title: "Getting Started",
     level: 1,
     content: [
-      "The DevTools repository contains a mock debugger server, so the UI can be explored without an emulator. Node.js 22 or newer is required.",
+      "The DevTools repository contains a mock debugger server, so the UI can be explored without an emulator. Node.js 22.13 or newer is required.",
     ],
     subsections: [
       {
@@ -43,7 +43,8 @@ export const documentationSections: DocumentationSection[] = [
           "`npm run mock:serve` runs the same server without the restart-on-change watcher. Set `PORT` to use another port.",
           "`npm run mock:prod` builds the UI into `dist-native/` and serves that build from the mock server.",
           "`npm run build:native` and `npm run build:wasm` build the WebSocket variant (`dist-native/`) and the BroadcastChannel variant (`dist-wasm/`).",
-          "`npm run check` runs lint, type-check, the tests and the native build.",
+          "`npm run check` runs lint, type-check, the unit tests and the native build.",
+          "`npm run test:e2e` runs the browser tests: headless Chromium (Playwright) against the built UI and the mock server.",
         ],
       },
       {

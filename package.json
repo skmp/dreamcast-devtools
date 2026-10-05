@@ -21,7 +21,7 @@
     "check": "npm run lint && npm run typecheck && npm run test:run && npm run build:native"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",

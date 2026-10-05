@@ -8,7 +8,7 @@ emulator.
 
 ## Requirements
 
-- Node.js 22 or newer.
+- Node.js 22.13 or newer (the locked dependencies do not support earlier 22.x releases).
 - Rust (with the `wasm32-unknown-unknown` target) and `wasm-pack` only if you change
   `crates/aica-dsp` (see [Generated DSP module](#generated-dsp-module)).
 
@@ -182,6 +182,6 @@ production mode on port 8080. `fly.toml` deploys that image.
 
 ## CI
 
-`.github/workflows/ci.yml` has two jobs on Node 22 for pushes and pull requests: `check` runs
+`.github/workflows/ci.yml` has two jobs on Node 22 (latest 22.x) for pushes and pull requests: `check` runs
 `npm ci` and `npm run check`; `e2e` installs Chromium (`npx playwright install --with-deps
 chromium`) and runs `npm run test:e2e`.
