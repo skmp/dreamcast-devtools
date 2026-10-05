@@ -447,7 +447,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                 </Tooltip>
               </Stack>
               {/* next to the run controls: why the target is stopped, and what the server has to say */}
-              {connected && initialized && <ExecutionStatus />}
+              {connected && initialized && <ExecutionStatus placement="beside" />}
             </Box>
           }
           rightSection={
@@ -485,6 +485,8 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
             </Stack>
           }
         />
+        {/* the same, for a window in which the toolbar has no room for it */}
+        {connected && initialized && <ExecutionStatus placement="below" />}
       </AppBar>
       {connectionState === "reconnecting" ? (
         <Alert

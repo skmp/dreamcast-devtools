@@ -271,3 +271,67 @@ test("a refusal that is repeated is one notice that counts, not a column of them
   await tooltipButton(view, "Step In").click();
   await expect(alerts).toHaveText(["Step out: cannot step: undefined opcode", "Step: cannot step: undefined opcode"]);
 });
+
+test("the reason of a stop can be read in a window that is not wide: it wraps beside the run controls, or is under the toolbar", async ({
+  page,
+}, testInfo) => {
+  const server = await serveScriptedDebugger(page);
+  const notice = "SH4 runs on the interpreter while breakpoints are armed: FPU results can differ from a run without breakpoints";
+  server.state.execution = { state: "paused", stopId: 3, reason: "breakpoint", breakpointId: 1, notice };
+  server.state.breakpoints = { "1": { id: 1, event: "dc.sh4.cpu.pc", address: 0x8c001000, kind: "code", enabled: true } };
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  const text = "Paused · breakpoint dc.sh4.cpu.pc == 0x8C001000 · stop 3";
+  const status = page.getByRole("status", { name: "Execution state" });
+  const said = page.getByRole("status", { name: "Notice from the server" });
+
+  /** What keeps a text from being read: it is cut off, it is outside the toolbar, or it lies on a control of the toolbar. */
+  const unreadable = (locator: typeof status) =>
+    locator.evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      const problems: string[] = [];
+      if (element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1) {
+        problems.push(`its text needs ${element.scrollWidth}x${element.scrollHeight} px and has ${element.clientWidth}x${element.clientHeight}`);
+      }
+      for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        const style = getComputedStyle(ancestor);
+        const clip = ancestor.getBoundingClientRect();
+        const clips = style.overflowX !== "visible" || style.overflowY !== "visible" || ancestor === document.documentElement;
+        if (clips && (box.left < clip.left - 0.5 || box.right > clip.right + 0.5 || box.top < clip.top - 0.5 || box.bottom > clip.bottom + 0.5)) {
+          problems.push(`cut off by <${ancestor.tagName.toLowerCase()} class="${ancestor.className}">`);
+        }
+      }
+      const bar = element.closest("header")?.getBoundingClientRect();
+      if (!bar || box.top < bar.top || box.bottom > bar.bottom) {
+        problems.push("outside the toolbar");
+      }
+      for (const control of Array.from(document.querySelectorAll("header button, header input"))) {
+        const other = control.getBoundingClientRect();
+        if (box.left < other.right && other.left < box.right && box.top < other.bottom && other.top < box.bottom) {
+          problems.push(`on top of ${control.getAttribute("aria-label") ?? control.textContent}`);
+        }
+      }
+      return problems;
+    });
+
+  for (const width of [1600, 1280, 1279, 1024]) {
+    await test.step(`${width} px wide`, async () => {
+      await page.setViewportSize({ width, height: 800 });
+      // one status is shown, with all of its text; the title has it too
+      await expect(status).toHaveText(text);
+      await expect(status).toHaveAttribute("title", text);
+      await expect(status).toBeInViewport({ ratio: 1 });
+      expect(await unreadable(status)).toEqual([]);
+      // the notice: on one line beside the controls (its title has what is cut), all of it under the toolbar
+      await expect(said).toHaveText(notice);
+      await expect(said).toHaveAttribute("title", notice);
+      if (width < 1280) {
+        expect(await unreadable(said)).toEqual([]);
+      }
+      // the run controls are where they were
+      await expect(tooltipButton(page, "Run")).toBeEnabled();
+      await saveScreenshot(page, testInfo, `toolbar-status-${width}`);
+    });
+  }
+});
