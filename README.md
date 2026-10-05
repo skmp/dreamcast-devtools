@@ -170,8 +170,9 @@ The version shown in the status bar and the About dialog is the `package.json` v
 
 The status bar of a workspace shows the connection state and the endpoint. A click on the
 endpoint opens the connection picker: the endpoints above with where each comes from, and a box
-for any other `ws://` or `wss://` URL. An endpoint picked from the list replaces a remembered
-manual entry.
+for any other `ws://` or `wss://` URL. Picking the build default or the page's own endpoint from
+the list puts a remembered manual entry away, so that the next load of the page uses that
+endpoint again.
 
 When a connection is lost, or cannot be made, the state is `reconnecting`: the page says why,
 shows `No Data` instead of the last values, and tries again 1, 2, 5 and then every 10 seconds
