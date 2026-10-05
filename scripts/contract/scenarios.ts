@@ -479,6 +479,19 @@ const s03: Scenario = {
     const values = [running, ...runningTicks].map((record) => sample(record.tick));
     check(new Set(values).size > 1, `${useCycles ? "dc.timing.SH4_CYCLES" : "the SH4 PC"} is ${values[0]} in every running tick`);
 
+    // Every fifth periodic tick is full (1 s): registers outside the base paths refresh while
+    // running. The 1.5 s above hold seven periodic ticks; 0.5 s more is allowed for a late one.
+    const isFull = (tick: DebuggerTick) => isRunning(tick) && missingPaths(session, tick).length === 0;
+    // (the tick of the resume itself is not a periodic one)
+    const full = await session.waitForTick(isFull, 500, "a full running tick", running.seq + 1).catch(() => undefined);
+    if (!full) {
+      const last = session.ticksSince(running.seq + 1).filter((record) => isRunning(record.tick)).at(-1) ?? running;
+      fail(
+        `no running tick in the ${session.scale(2000)} ms after the resume carries every described path; every fifth periodic tick is full. ` +
+          `The last one lacks ${missingPaths(session, last.tick).slice(0, 5).join(", ")}`,
+      );
+    }
+
     // a second resume returns {} and changes nothing
     await session.call("control.runUntil", {});
     check(isRunning(session.latestTick().tick), "a second control.runUntil changes nothing");

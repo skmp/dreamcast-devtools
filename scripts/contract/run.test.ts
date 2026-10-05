@@ -664,6 +664,36 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(reusedWatchIds.invariantViolations).toEqual([]);
   });
 
+  it("S03: periodic running ticks that are never full", async () => {
+    const BASE = ["dc.sh4.cpu", "dc.aica.arm7", "dc.aica.dsp", "dc.timing"];
+    const summary = await run(
+      () => {
+        // the tick that follows a describe response stays full, every other running tick carries the base paths
+        let afterDescribe = false;
+        return {
+          toClient: (frame) => {
+            if (!isTick(frame)) {
+              afterDescribe = Boolean((frame.result as Json | undefined)?.deviceTree);
+              return frame;
+            }
+            if (afterDescribe || frame.params.executionState.state !== "running") {
+              afterDescribe = false;
+              return frame;
+            }
+            const registers = Object.fromEntries(Object.entries(frame.params.registers).filter(([path]) => BASE.includes(path)));
+            return { ...frame, params: { ...frame.params, registers } };
+          },
+        };
+      },
+      ["S01", "S02", "S03"],
+    );
+    expect(reportOf(summary).slice(0, 2)).toEqual(["S01 passed ", "S02 passed "]);
+    expect(statusOf(summary, "S03")).toBe("failed");
+    expect(detailsOf(summary, "S03")).toMatch(/no running tick in the 2000 ms after the resume carries every described path; every fifth periodic tick is full\. The last one lacks dc, /);
+    // no invariant says so: a running tick may be partial
+    expect(summary.invariantViolations).toEqual([]);
+  }, 30_000);
+
   it("S08: a stored expression that is added twice", async () => {
     const { url, direct } = await startServer({
       // the request that adds nothing adds something
