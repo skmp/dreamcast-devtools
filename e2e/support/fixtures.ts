@@ -262,6 +262,15 @@ export interface CanvasStats {
   colours: number;
   /** FNV-1a hash of the pixel data, to tell two drawings apart */
   hash: number;
+  /**
+   * Pixels in the colours of the SGC waveform bars (SgcWaveformCanvas.tsx), which nothing else
+   * on that canvas uses: the envelope curves are green and yellow, the cursor is orange.
+   * - blue: the Pre-VolPan waveform, and the left channel of Post-VolPan
+   * - pink: the right channel of Post-VolPan
+   * - purple: the Input waveform
+   * A canvas whose bars were not drawn has 0 of each, whatever else is on it.
+   */
+  bars: { blue: number; pink: number; purple: number };
 }
 
 /** Reads back a 2D canvas. A cleared or never-drawn canvas has `nonBackground === 0` and `colours === 1`. */
@@ -273,9 +282,27 @@ export const canvasStats = (canvas: Locator): Promise<CanvasStats> =>
       throw new Error("canvas has no 2d context");
     }
     if (source.width === 0 || source.height === 0) {
-      return { width: source.width, height: source.height, nonBackground: 0, inkRows: 0, colours: 0, hash: 0 };
+      return { width: source.width, height: source.height, nonBackground: 0, inkRows: 0, colours: 0, hash: 0, bars: { blue: 0, pink: 0, purple: 0 } };
     }
-    const pixels = new Uint32Array(context.getImageData(0, 0, source.width, source.height).data.buffer);
+    const bytes = context.getImageData(0, 0, source.width, source.height).data;
+    // Measured on the drawn canvas (alpha varies with the overlap of the bars): blue is about
+    // (31, 147, 255), pink (255, 31, 149), purple (196, 50, 221). The envelopes are (112, 247, 112)
+    // and (255, 215, 0), the cursor (255, 172, 0).
+    const bars = { blue: 0, pink: 0, purple: 0 };
+    for (let offset = 0; offset < bytes.length; offset += 4) {
+      const [red, green, blue, alpha] = [bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]];
+      if (alpha === 0) {
+        continue;
+      }
+      if (red <= 90 && green >= 100 && green <= 200 && blue >= 200) {
+        bars.blue++;
+      } else if (red >= 200 && green <= 90 && blue >= 100 && blue <= 200) {
+        bars.pink++;
+      } else if (red >= 150 && red <= 235 && green <= 100 && blue >= 180) {
+        bars.purple++;
+      }
+    }
+    const pixels = new Uint32Array(bytes.buffer);
     const histogram = new Map<number, number>();
     let hash = 0x811c9dc5;
     for (const pixel of pixels) {
@@ -297,6 +324,7 @@ export const canvasStats = (canvas: Locator): Promise<CanvasStats> =>
       inkRows,
       colours: histogram.size,
       hash,
+      bars,
     };
   });
 

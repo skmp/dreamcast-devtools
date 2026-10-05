@@ -5,6 +5,12 @@ const RECORD = "Run the emulator and record 1024 frames";
 // 8 MiB of capture are generated, sent and scanned; be generous on a busy machine
 const SLOW = { timeout: 60_000 };
 
+/**
+ * An active channel of the mock draws thousands of bar pixels (the quietest of a capture a
+ * few hundred); a canvas without bars has none.
+ */
+const BARS = 200;
+
 const record = async (view: Locator) => {
   await tooltipButton(view, RECORD).click();
   await expect(view.getByRole("button", { name: "Active (8)" })).toBeVisible(SLOW);
@@ -48,15 +54,21 @@ test("Record captures 1024 frames, pauses the target and draws a waveform for ev
 
   for (let index = 0; index < 8; index++) {
     await canvases.nth(index).scrollIntoViewIfNeeded();
-    // waveform bars, two envelope curves and the playback cursor. A blank canvas has 0
-    // non-background pixels, a silent channel (flat lines only) about 500.
+    // The waveform bars themselves, by their colour: the two envelope curves and the playback
+    // cursor are on the canvas as well, and with them alone a canvas has more than a thousand
+    // pixels that are not background.
     await expect
-      .poll(async () => (await canvasStats(canvases.nth(index))).nonBackground, { message: `canvas ${index} has no waveform` })
-      .toBeGreaterThan(1000);
+      .poll(async () => (await canvasStats(canvases.nth(index))).bars.blue, { message: `canvas ${index} has no waveform bars` })
+      .toBeGreaterThan(BARS);
     const stats = await canvasStats(canvases.nth(index));
     expect(stats.width).toBeGreaterThan(100);
     expect(stats.height).toBeGreaterThan(50);
     expect(stats.colours).toBeGreaterThan(10);
+    // Pre-VolPan is the default view: no bar of another view
+    expect(stats.bars.pink).toBe(0);
+    expect(stats.bars.purple).toBe(0);
+    // and the rest of the drawing is there too: envelopes and cursor
+    expect(stats.nonBackground).toBeGreaterThan(stats.bars.blue + 300);
   }
 });
 
@@ -71,11 +83,21 @@ test("All (64) also lists the silent channels, whose waveform is flat", async ({
   await expect(canvases).toHaveCount(64);
   await expect(view.getByRole("button", { name: "All (64)" })).toHaveAttribute("aria-pressed", "true");
 
+  expect(active.bars.blue).toBeGreaterThan(BARS);
+
   // find a silent channel: envelope 000, drawn as flat lines only
   const all = await Promise.all(Array.from({ length: 8 }, (_, index) => canvasStats(canvases.nth(index))));
+  const silent = all.filter((stats) => stats.bars.blue === 0);
+  expect(silent.length).toBeGreaterThan(0);
+  for (const stats of silent) {
+    // not blank: the flat envelope lines and the cursor, and not a single bar
+    expect(stats.nonBackground).toBeGreaterThan(100);
+    expect(stats.bars).toEqual({ blue: 0, pink: 0, purple: 0 });
+    expect(stats.nonBackground).toBeLessThan(active.nonBackground / 2);
+  }
+  // the first eight of all 64 channels are not all silent only if one of them is active
   const quietest = Math.min(...all.map((stats) => stats.nonBackground));
-  expect(quietest).toBeGreaterThan(0); // not blank: flat envelope lines and the cursor
-  expect(quietest).toBeLessThan(active.nonBackground / 2);
+  expect(quietest).toBeGreaterThan(0);
 
   await view.getByRole("button", { name: "Active (8)" }).click();
   await expect(canvases).toHaveCount(8);
@@ -87,19 +109,29 @@ test("the view-mode buttons redraw a channel and fullscreen shows it alone", asy
   const canvases = view.locator("canvas");
   await expect(canvases).toHaveCount(8);
   const canvas = canvases.first();
-  await expect.poll(async () => (await canvasStats(canvas)).nonBackground).toBeGreaterThan(1000);
+  await expect.poll(async () => (await canvasStats(canvas)).bars.blue).toBeGreaterThan(BARS);
   const preVolPan = await canvasStats(canvas);
+  expect(preVolPan.bars).toMatchObject({ pink: 0, purple: 0 });
 
-  // Post-VolPan: three stacked waveforms (left, right, DSP send)
+  // Post-VolPan: three stacked waveforms (left in blue, right in pink, DSP send in orange)
   await tooltipButton(view, "Post-VolPan (L/R/DSP)").first().click();
   await expect.poll(async () => (await canvasStats(canvas)).hash).not.toBe(preVolPan.hash);
+  await expect.poll(async () => (await canvasStats(canvas)).bars.pink).toBeGreaterThan(20);
   const postVolPan = await canvasStats(canvas);
-  expect(postVolPan.nonBackground).toBeGreaterThan(1000);
+  expect(postVolPan.bars.blue).toBeGreaterThan(20);
+  expect(postVolPan.bars.purple).toBe(0);
+  // each of the three is a third as tall as the single waveform was
+  expect(postVolPan.bars.blue).toBeLessThan(preVolPan.bars.blue);
 
-  // Input: the unprocessed samples
+  // Input: the unprocessed samples, in purple, louder than after the envelope and the volume
   await tooltipButton(view, "Input Waveform").first().click();
   await expect.poll(async () => (await canvasStats(canvas)).hash).not.toBe(postVolPan.hash);
-  expect((await canvasStats(canvas)).hash).not.toBe(preVolPan.hash);
+  await expect.poll(async () => (await canvasStats(canvas)).bars.purple).toBeGreaterThan(preVolPan.bars.blue);
+  const input = await canvasStats(canvas);
+  expect(input.hash).not.toBe(preVolPan.hash);
+  expect(input.bars.blue).toBe(0);
+  // (where a purple bar crosses the orange cursor or envelope, a few pixels blend into pink)
+  expect(input.bars.pink).toBeLessThan(input.bars.purple / 20);
 
   await tooltipButton(view, "Pre-VolPan").first().click();
   await expect.poll(async () => (await canvasStats(canvas)).hash).toBe(preVolPan.hash);
@@ -115,7 +147,7 @@ test("hovering and clicking a waveform moves the cursor and the header follows t
   const view = panel(page, "sgc");
   await record(view);
   const canvas = view.locator("canvas").first();
-  await expect.poll(async () => (await canvasStats(canvas)).nonBackground).toBeGreaterThan(1000);
+  await expect.poll(async () => (await canvasStats(canvas)).bars.blue).toBeGreaterThan(BARS);
   const head = view.getByText(/^HEAD:/).first();
   // the mock stores the frame number in the channel's play position
   await expect(head).toHaveText(/HEAD:\s+0:/);
