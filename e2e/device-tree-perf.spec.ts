@@ -1,10 +1,12 @@
 import { writeFileSync } from "node:fs";
 import { test, expect, panel, registerRow, treeItem, treeItemRow, treeRows } from "./support/fixtures";
+import { installLongTaskRecorder, takeLongTasks } from "./support/longTasks";
 import { installRenderCounter, readRenderCounts, resetRenderCounts, type RenderCounts } from "./support/renderCounter";
 import { serveSyntheticDebugger } from "./support/syntheticDebugger";
 
-// Render-cost measurement of the device tree on a synthetic tree of 100 nodes with 25
-// registers each (2500 registers), served by the test itself.
+// Cost of the device tree on a synthetic tree of 100 nodes with 25 registers each (2500
+// registers), served by the test itself: what a tick re-renders, and for how long the page
+// is blocked when most of the tree is mounted or removed at once.
 //
 //   E2E_DEVICETREE_REPORT=<file>  also write the numbers as JSON
 //   E2E_MEASURE_ONLY=1            measure without asserting (used to measure older builds)
@@ -13,11 +15,30 @@ const REGISTERS = 25;
 const ALL_ROWS = 1 + NODES + NODES * REGISTERS;
 const MEASURE_ONLY = !!process.env.E2E_MEASURE_ONLY;
 
+/** Mounting or removing most of the tree may not block the page for longer than this (its longest task). */
+const BLOCK_LIMIT_MS = 1000;
+/**
+ * Every such step is measured this often and the best attempt counts: the suite runs four
+ * tests in parallel, which can make a single measurement several times slower. An attempt
+ * that is ten times over the limit is not that, and fails at once.
+ */
+const ATTEMPTS = MEASURE_ONLY ? 1 : 3;
+/** Builds measured with E2E_MEASURE_ONLY need a minute for one step. */
+const STEP_TIMEOUT_MS = MEASURE_ONLY ? 300_000 : 30_000;
+
 interface TickCost {
   rendered: number;
   mounted: number;
   commits: number;
   messageToCommitMs: number | null;
+}
+
+interface Blocking {
+  /** from the input until the tree showed the result, as the test saw it */
+  elapsedMs: number;
+  /** the longest of `longTasks`, 0 when no task took 50 ms */
+  longestTaskMs: number;
+  longTasks: number[];
 }
 
 const summarise = (counts: RenderCounts): TickCost => ({
@@ -29,12 +50,15 @@ const summarise = (counts: RenderCounts): TickCost => ({
     : null,
 });
 
-test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => {
+const best = (attempts: Blocking[]) => Math.min(...attempts.map((attempt) => attempt.longestTaskMs));
+
+test("device tree render and blocking cost on 100 nodes x 25 registers", async ({ page }) => {
   // Takes under a minute. A build that renders every register as a tree item (measured
   // with E2E_MEASURE_ONLY) mounts 2500 of them in some 6 s and needs a minute to remove them.
   test.setTimeout(MEASURE_ONLY ? 1_200_000 : 300_000);
   const synthetic = await serveSyntheticDebugger(page, { nodes: NODES, registersPerNode: REGISTERS });
   await installRenderCounter(page, '[data-panel-id="device-tree"]');
+  await installLongTaskRecorder(page);
   await page.goto("/#/workspace/sh4-debugger");
   await synthetic.ready;
 
@@ -85,36 +109,90 @@ test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => 
     tenNodesChanged: await measureTick([0, 10, 20, 30, 40, 50, 60, 70, 80, 90], visible),
   });
 
+  /**
+   * Does `input`, waits until the tree shows `expectedRows` rows and reports how long the
+   * page was blocked on the way. The render counts start at zero with the input.
+   */
+  const measureBlocking = async (
+    step: string,
+    input: () => Promise<void>,
+    expectedRows?: number,
+  ): Promise<Blocking> => {
+    await settle();
+    await takeLongTasks(page);
+    const startedAt = Date.now();
+    await input();
+    if (expectedRows !== undefined) {
+      await expect(rows).toHaveCount(expectedRows, { timeout: STEP_TIMEOUT_MS });
+    }
+    const elapsedMs = Date.now() - startedAt;
+    // a long task is reported after it has ended
+    await page.waitForTimeout(500);
+    const longTasks = await takeLongTasks(page);
+    const blocking = { elapsedMs, longestTaskMs: Math.max(0, ...longTasks), longTasks };
+    if (!MEASURE_ONLY) {
+      expect(blocking.longestTaskMs, `"${step}" blocked the page: ${JSON.stringify(blocking)}`).toBeLessThan(
+        10 * BLOCK_LIMIT_MS,
+      );
+    }
+    return blocking;
+  };
+
   // --- 1. as opened ---
   const defaultRows = await rows.count();
   const defaultState = await measureTicks(defaultRows === ALL_ROWS);
 
   // --- 2. every node expanded: all 2500 register rows are mounted ---
-  if ((await rows.count()) !== ALL_ROWS) {
+  let expandAll: Blocking | null = null;
+  if (defaultRows !== ALL_ROWS) {
     // "*" expands all siblings of the focused tree item
     await treeItemRow(page, synthetic.nodePath(0)).click();
-    await page.keyboard.press("*");
+    expandAll = await measureBlocking("expand every node", () => page.keyboard.press("*"), ALL_ROWS);
   }
-  await expect(rows).toHaveCount(ALL_ROWS, { timeout: 60_000 });
+  await expect(rows).toHaveCount(ALL_ROWS);
   const allExpanded = await measureTicks(true);
 
-  // --- 3. a search that matches every node ---
+  // --- 3. a search that matches every node, typed while all 2601 rows are mounted, and back ---
   const search = tree.getByPlaceholder("Search components...");
-  await settle();
-  await resetRenderCounts(page);
-  await search.fill("n0");
-  await expect(treeItem(page, synthetic.nodePath(0))).toBeVisible();
-  await page.waitForTimeout(1500);
-  const searchRows = await rows.count();
-  const searchCost = summarise(await readRenderCounts(page));
-  const refineNotice = await tree.getByText(/refine your search/i).count();
-  const searchTicks = await measureTicks(false);
+  const searchFromAllExpanded: Blocking[] = [];
+  const clearSearch: Blocking[] = [];
+  let searchRows = 0;
+  let searchCost: TickCost | null = null;
+  let refineNotice = 0;
+  let searchTicks: Awaited<ReturnType<typeof measureTicks>> | null = null;
+  let rowsAfterSearch = 0;
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+    // the input event is handled, and the tree rendered, before fill() returns
+    searchFromAllExpanded.push(
+      await measureBlocking("search from the fully expanded tree", () => search.fill("n0")),
+    );
+    await expect(treeItem(page, synthetic.nodePath(0))).toBeVisible();
+    if (attempt === 0) {
+      await page.waitForTimeout(1000);
+      searchRows = await rows.count();
+      searchCost = summarise(await readRenderCounts(page));
+      refineNotice = await tree.getByText(/refine your search/i).count();
+      searchTicks = await measureTicks(false);
+    }
 
-  // --- 4. back from the search ---
-  await search.fill("");
-  await expect(treeItem(page, synthetic.nodePath(NODES - 1))).toBeVisible();
-  await page.waitForTimeout(1500);
-  const rowsAfterSearch = await rows.count();
+    clearSearch.push(await measureBlocking("clear the search", () => search.fill("")));
+    await expect(treeItem(page, synthetic.nodePath(NODES - 1))).toBeVisible();
+    if (attempt === 0) {
+      await page.waitForTimeout(1000);
+      rowsAfterSearch = await rows.count();
+    }
+  }
+
+  // --- 4. the root collapsed, which removes every other row, and expanded again ---
+  const collapseRoot: Blocking[] = [];
+  const expandRoot: Blocking[] = [];
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+    // the rows are removed when the collapse animation is over
+    collapseRoot.push(await measureBlocking("collapse the root", () => treeItemRow(page, "dc").click(), 1));
+    expandRoot.push(
+      await measureBlocking("expand the root", () => treeItemRow(page, "dc").click(), rowsAfterSearch),
+    );
+  }
 
   // --- 5. the watch expression suggestions ---
   const watchInput = panel(page, "watches").getByPlaceholder("Enter expression");
@@ -132,6 +210,15 @@ test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => 
     watchSuggestionsForDcN: watchOptions,
     searchCost,
     componentRendersPerTick: { asOpened: defaultState, allNodesExpanded: allExpanded, duringSearch: searchTicks },
+    blocking: {
+      limitMs: BLOCK_LIMIT_MS,
+      attempts: ATTEMPTS,
+      expandEveryNode: expandAll,
+      searchFromAllExpanded,
+      clearSearch,
+      collapseRoot,
+      expandRoot,
+    },
   };
   console.log(JSON.stringify(report, null, 2));
   if (process.env.E2E_DEVICETREE_REPORT) {
@@ -158,4 +245,8 @@ test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => 
   expect(rowsAfterSearch).toBe(ALL_ROWS);
   // The suggestions are capped
   expect(watchOptions).toBeLessThanOrEqual(50);
+  // Removing 2400 or all 2600 rows, and mounting them again, does not block the page
+  for (const [step, attempts] of Object.entries({ searchFromAllExpanded, clearSearch, collapseRoot, expandRoot })) {
+    expect(best(attempts), `${step}: longest task in ms, best of ${ATTEMPTS} attempts`).toBeLessThan(BLOCK_LIMIT_MS);
+  }
 });
