@@ -20,6 +20,8 @@ export interface Toast {
   id: number;
   type: "error" | "warning";
   message: string;
+  /** how often it was raised while it was up: a notice that is on screen is counted, not shown again */
+  count: number;
 }
 
 /** Messages of the server that the client could not use and dropped. */
@@ -92,12 +94,27 @@ const messageOf = (error: unknown, fallback: string): string => (error instanceo
 let generation = 0;
 let unsubscribe: (() => void) | undefined;
 let nextToastId = 1;
+/** what takes each notice away again, by its id */
+const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
 export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
+  // A notice that says what one on screen says is not put next to it: that one counts it, and
+  // stays for another five seconds. A refusal that is repeated (a step button held down on a
+  // target that cannot step, a breakpoint hit again and again) would otherwise put up a notice
+  // each time, and two hundred of them cover the page.
   const notify = (type: Toast["type"], message: string) => {
-    const id = nextToastId++;
-    set((state) => ({ toasts: [...state.toasts, { id, type, message }] }));
-    setTimeout(() => get().dismissToast(id), TOAST_MS);
+    const shown = get().toasts.find((toast) => toast.type === type && toast.message === message);
+    const id = shown ? shown.id : nextToastId++;
+    set((state) => ({
+      toasts: shown
+        ? state.toasts.map((toast) => (toast.id === id ? { ...toast, count: toast.count + 1 } : toast))
+        : [...state.toasts, { id, type, message, count: 1 }],
+    }));
+    clearTimeout(toastTimers.get(id));
+    toastTimers.set(
+      id,
+      setTimeout(() => get().dismissToast(id), TOAST_MS),
+    );
   };
 
   /**
@@ -416,6 +433,8 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
     },
 
     dismissToast(id) {
+      clearTimeout(toastTimers.get(id));
+      toastTimers.delete(id);
       if (get().toasts.some((toast) => toast.id === id)) {
         set((state) => ({ toasts: state.toasts.filter((toast) => toast.id !== id) }));
       }

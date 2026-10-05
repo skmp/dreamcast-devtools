@@ -664,6 +664,8 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
             sx={{ pointerEvents: "auto" }}
           >
             {toast.message}
+            {/* raised again while it was up: counted here instead of shown again */}
+            {toast.count > 1 && ` (×${toast.count})`}
           </Alert>
         ))}
       </Box>

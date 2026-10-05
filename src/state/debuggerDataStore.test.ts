@@ -258,6 +258,59 @@ describe("ticks", () => {
   });
 });
 
+describe("notices", () => {
+  const shown = () => store().toasts.map(({ type, message, count }) => `${type}: ${message} x${count}`);
+
+  it("a notice that repeats one that is up is counted in it, and the notice stays five seconds from the last time", async () => {
+    vi.useFakeTimers();
+    for (let index = 0; index < 200; index++) {
+      store().showError("Step: cannot step: undefined opcode");
+    }
+    expect(shown()).toEqual(["error: Step: cannot step: undefined opcode x200"]);
+    const { id } = store().toasts[0];
+
+    // another text is another notice; the first one goes on counting, wherever it is in the list
+    await vi.advanceTimersByTimeAsync(3000);
+    store().showError("Run: emulator busy");
+    store().showError("Step: cannot step: undefined opcode");
+    expect(shown()).toEqual(["error: Step: cannot step: undefined opcode x201", "error: Run: emulator busy x1"]);
+    expect(store().toasts[0].id).toBe(id);
+
+    // five seconds after it was first raised it is still up: it was raised again two seconds ago
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(shown()).toEqual(["error: Step: cannot step: undefined opcode x201", "error: Run: emulator busy x1"]);
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(shown()).toEqual([]);
+
+    // once it is gone, the same text is a new notice
+    store().showError("Step: cannot step: undefined opcode");
+    expect(shown()).toEqual(["error: Step: cannot step: undefined opcode x1"]);
+    expect(store().toasts[0].id).not.toBe(id);
+  });
+
+  it("an error and a warning with the same text are two notices; one that is put away starts again at one", async () => {
+    const { transport } = await initialise(tickFrame({ state: "running", stopId: 1 }));
+    const breakpoints = { "4": { id: 4, event: "dc.sh4.cpu.pc", address: 0x8c0000a6, kind: "code", enabled: true } };
+    const hit = (stopId: number) => tickFrame({ state: "paused", stopId, reason: "breakpoint", breakpointId: 4 }, { breakpoints });
+    // the same breakpoint, hit by three stops in a row
+    transport.deliver(hit(2));
+    transport.deliver(hit(3));
+    transport.deliver(hit(4));
+    store().showError("Breakpoint hit: dc.sh4.cpu.pc == 0x8C0000A6");
+    expect(shown()).toEqual([
+      "warning: Breakpoint hit: dc.sh4.cpu.pc == 0x8C0000A6 x3",
+      "error: Breakpoint hit: dc.sh4.cpu.pc == 0x8C0000A6 x1",
+    ]);
+
+    store().dismissToast(store().toasts[0].id);
+    transport.deliver(hit(5));
+    expect(shown()).toEqual([
+      "error: Breakpoint hit: dc.sh4.cpu.pc == 0x8C0000A6 x1",
+      "warning: Breakpoint hit: dc.sh4.cpu.pc == 0x8C0000A6 x1",
+    ]);
+  });
+});
+
 describe("watches", () => {
   it("are sent in lower case, and not sent when the server has the expression", async () => {
     const { transport } = await initialise(

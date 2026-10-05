@@ -197,8 +197,11 @@ test("every control request is checked: an in-band error and a JSON-RPC error ar
   server.answer("control.runUntil", () => inBandError(-32000, "emulator busy"));
   await tooltipButton(page, "Run").click();
   await expect.poll(notices).toEqual(["Run: emulator busy"]);
+  await expect(shown("Run: emulator busy")).toHaveText("Run: emulator busy");
+  // the same refusal while its notice is up: that notice counts it
   await tooltipButton(page, "Run to next breakpoint").click();
-  await expect.poll(notices).toEqual(["Run: emulator busy", "Run: emulator busy"]);
+  await expect(shown("Run: emulator busy")).toHaveText("Run: emulator busy (×2)");
+  expect(await notices()).toEqual(["Run: emulator busy"]);
 
   server.answer("control.step", () => inBandError(-32005, "cannot step: undefined opcode"));
   await tooltipButton(view, "Step In").click();
@@ -221,13 +224,50 @@ test("every control request is checked: an in-band error and a JSON-RPC error ar
   // the buttons are as the ticks say: nothing was assumed to have worked
   await expect(tooltipButton(page, "Pause")).toBeEnabled();
   await expect(tooltipButton(page, "Run")).toBeDisabled();
-  // one notice per refusal, and none for anything else
+  // one notice per refusal that was not on screen already, and none for anything else
   expect(await notices()).toEqual([
-    "Run: emulator busy",
     "Run: emulator busy",
     "Step: cannot step: undefined opcode",
     "Step over: internal error",
     "Step out: not supported: control.stepOut",
     "Pause: emulator stopped by host UI",
   ]);
+});
+
+test("a refusal that is repeated is one notice that counts, not a column of them", async ({ page }) => {
+  const server = await serveScriptedDebugger(page);
+  server.answer("control.step", () => inBandError(-32005, "cannot step: undefined opcode"));
+  server.answer("control.stepOut", () => inBandError(-32005, "cannot step: undefined opcode"));
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  const view = panel(page, "sh4-disassembly");
+  await expect(view.locator(".current-instruction")).toHaveCount(1);
+  const alerts = page.getByRole("alert");
+
+  // somebody in a hurry: two hundred clicks on a button the server refuses
+  await tooltipButton(view, "Step In").evaluate((button) => {
+    for (let index = 0; index < 200; index++) {
+      (button as HTMLButtonElement).click();
+    }
+  });
+  await expect.poll(() => server.requestsOf("control.step").length).toBe(200);
+  await expect(alerts).toHaveText(["Step: cannot step: undefined opcode (×200)"]);
+  // it is in the corner of the page, and the page is not covered
+  const box = (await alerts.boundingBox())!;
+  expect(box.height).toBeLessThan(80);
+  expect(box.y).toBeGreaterThan(900);
+  await expect(page.getByRole("button", { name: "Disconnect", exact: true })).toBeVisible();
+
+  // another refusal is another notice, and the first goes on counting
+  await tooltipButton(view, "Step Out").click();
+  await expect(alerts).toHaveText(["Step: cannot step: undefined opcode (×200)", "Step out: cannot step: undefined opcode"]);
+  await tooltipButton(view, "Step In").click();
+  await expect(alerts).toHaveText(["Step: cannot step: undefined opcode (×201)", "Step out: cannot step: undefined opcode"]);
+
+  // put away, it starts again at one
+  await alerts.first().getByRole("button", { name: "Close" }).click();
+  await expect(alerts).toHaveText(["Step out: cannot step: undefined opcode"]);
+  await tooltipButton(view, "Step In").click();
+  await expect(alerts).toHaveText(["Step out: cannot step: undefined opcode", "Step: cannot step: undefined opcode"]);
 });
