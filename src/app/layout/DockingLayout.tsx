@@ -10,6 +10,7 @@ import { Box, IconButton } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { LoadingPlaceholder } from "../components/LoadingPlaceholder";
+import { useLazyImportArrivals } from "../components/lazyImport";
 import AddIcon from "@mui/icons-material/Add";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { PanelSelectorModal } from "./PanelSelectorModal";
@@ -36,6 +37,24 @@ const panelComponentsMap = new Map<string, ReactElement>();
 const panelDefinitionsMap = new Map<string, PanelDefinition>();
 const dockviewApisMap = new Map<string, DockviewApi>();
 
+/** What every dock panel is rendered in: its id for the tests, an error boundary and the loading state. */
+const PanelFrame = ({ panel }: { panel: PanelDefinition }) => {
+  // rendered again when the code of a lazily loaded panel has arrived (see lazyImport)
+  useLazyImportArrivals();
+  return (
+    <Box
+      data-panel-id={panel.id}
+      sx={{ height: "100%", width: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}
+    >
+      {/* an exception in one panel must not take the workspace down */}
+      <ErrorBoundary scope="panel" name={panel.title} testId={`panel:${panel.id}`}>
+        {/* some panels are loaded on first use */}
+        <Suspense fallback={<LoadingPlaceholder scope="panel" />}>{panel.component}</Suspense>
+      </ErrorBoundary>
+    </Box>
+  );
+};
+
 export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, defaultLayoutMode = 'tabs' }: DockingLayoutProps) => {
   const apiRef = useRef<DockviewApi | null>(null);
   const { mode } = useThemeMode();
@@ -60,18 +79,7 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
     const comps: Record<string, FunctionComponent<IDockviewPanelProps>> = {};
 
     availablePanels.forEach((panel) => {
-      comps[panel.id] = () => (
-        <Box
-          data-panel-id={panel.id}
-          sx={{ height: "100%", width: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}
-        >
-          {/* an exception in one panel must not take the workspace down */}
-          <ErrorBoundary scope="panel" name={panel.title} testId={`panel:${panel.id}`}>
-            {/* some panels are loaded on first use */}
-            <Suspense fallback={<LoadingPlaceholder scope="panel" />}>{panel.component}</Suspense>
-          </ErrorBoundary>
-        </Box>
-      );
+      comps[panel.id] = () => <PanelFrame panel={panel} />;
     });
 
     return comps;
