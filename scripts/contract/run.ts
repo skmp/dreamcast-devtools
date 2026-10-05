@@ -1,10 +1,10 @@
 import { MockDebugger } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
 import type { MockListener } from "../../server/mockWebSocket";
-import type { BreakpointCategoryState, DebuggerTick } from "../../src/lib/debuggerSchema";
+import type { DebuggerTick } from "../../src/lib/debuggerSchema";
 import { resolveAddress } from "./elfSymbols";
 import type { ElfSymbols } from "./elfSymbols";
-import { SCENARIOS, cleanUp, runScenario } from "./scenarios";
+import { SCENARIOS, baselineOf, cleanUp, runScenario } from "./scenarios";
 import type { Profile, RunContext, ScenarioResult } from "./scenarios";
 import { ContractFailure, ContractSession, describeState } from "./session";
 
@@ -149,10 +149,8 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
     const initial: DebuggerTick = options.profile === "emulator" ? await awaitStartStop(session, say) : session.latestTick().tick;
     // (read after the start stop: awaitStartStop can have replaced what describe said at connect time)
     const shape = session.shape;
-    const initialState = initial.executionState.state;
-    const initialCategories = initial.categories
-      ? (JSON.parse(JSON.stringify(initial.categories)) as Record<string, BreakpointCategoryState>)
-      : undefined;
+    // what the run leaves behind is compared with this tick
+    const baseline = baselineOf(initial);
     say(`initial state: ${describeState(initial)}; profile ${options.profile}, timeouts x${timeoutFactor}`);
     say("");
 
@@ -162,8 +160,6 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
       session,
       openSession,
       elf: options.elf,
-      breakpoints: new Set(),
-      watches: new Set(),
       note: () => undefined,
     };
 
@@ -178,30 +174,16 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
         const result = await runScenario(scenario, context);
         if (result.status === "failed") {
           // leave nothing of a failed scenario behind for the next one
-          const leftovers = await cleanUp(context, initialCategories);
-          result.details.push(...leftovers.map((problem) => `clean-up: ${problem}`));
+          const leftovers = await cleanUp(context, baseline, false);
+          result.details.push(...leftovers.problems.map((problem) => `clean-up: ${problem}`));
         }
         results.push(result);
       }
       formatScenario(results.at(-1)!).forEach(say);
     }
 
-    // remove what is left, restore the categories and the run state
-    const problems = await cleanUp(context, initialCategories);
-    if (!context.session.isClosed) {
-      const last = context.session.latestTick().tick;
-      if (last.executionState.state !== initialState) {
-        try {
-          // the tick can arrive in the same turn as the response: look from before the request
-          const mark = context.session.mark();
-          await context.session.call(initialState === "paused" ? "control.pause" : "control.runUntil", {});
-          await context.session.waitForTick((tick) => tick.executionState.state === initialState, 2000, `the server is ${initialState} again`, mark);
-        } catch (error) {
-          problems.push(`restoring the run state: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-    }
-    const final = context.session.isClosed ? undefined : context.session.latestTick().tick;
+    // remove what is left, restore the categories and the run state, and look at what the server then says
+    const { problems, tick: final } = await cleanUp(context, baseline, true);
 
     const violations = Array.from(new Set(sessions.flatMap((entry) => entry.violations)));
     const ticksChecked = sessions.reduce((sum, entry) => sum + entry.ticksChecked, 0);

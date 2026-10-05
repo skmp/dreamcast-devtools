@@ -17,8 +17,9 @@ import { ContractFailure } from "./contract/session";
  * against that. It talks to the server with the client's own JsonRpcClient and
  * WebSocketTransport, validates every response and every tick with the strict copy of the
  * schema, checks the invariants I1 to I5 on every tick, and runs the scenarios S00 to S18
- * (scripts/contract/). It removes what it added, restores the run state it found, and exits
- * with 1 when a scenario failed or an invariant was violated (2: the run could not be made).
+ * (scripts/contract/). It leaves the server with the breakpoints, watches, categories and run
+ * state it found, and exits with 1 when a scenario failed, an invariant was violated or the
+ * server could not be put back (2: the run could not be made).
  */
 
 const USAGE = `usage: npm run contract -- [options]

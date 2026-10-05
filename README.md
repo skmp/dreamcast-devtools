@@ -201,9 +201,11 @@ clients, and also steps the ARM7 and the DSP, records SGC frames and writes regi
 `JsonRpcClient` and `WebSocketTransport`, validates every response and every tick with the
 strict copy of the schema (unknown keys fail, the v3 fields are required, `null` is an error),
 checks the tick invariants on every tick, and runs the scenarios S00 to S18
-(`scripts/contract/scenarios.ts`). It removes the breakpoints and watches it added, restores the
-breakpoint categories and the run state, and exits with 1 when a scenario failed or an invariant
-was violated.
+(`scripts/contract/scenarios.ts`). It leaves the server with the breakpoints, watches, breakpoint
+categories and run state it found: after a failed scenario and at the end of the run it removes
+every breakpoint and watch that was not there when it connected (so nobody else should add any
+while it runs), and it reports what it could not put back. It exits with 1 when a scenario
+failed, an invariant was violated or the server was left changed.
 
 ```
 npm run contract                                  # the mock, started in the same process

@@ -35,13 +35,20 @@ afterEach(async () => {
   }
 });
 
-/** The mock on a WebSocket, optionally behind a proxy that applies `faults`. Returns the URL to test. */
-const startServer = async (source?: FaultSource, options?: MockDebuggerOptions | MockDebugger): Promise<{ url: string; mock: MockDebugger }> => {
+/**
+ * The mock on a WebSocket, optionally behind a proxy that applies `faults`. Returns the URL
+ * to test, and `direct`, the URL of the mock itself (what a client sees that is not behind
+ * the proxy).
+ */
+const startServer = async (
+  source?: FaultSource,
+  options?: MockDebuggerOptions | MockDebugger,
+): Promise<{ url: string; direct: string; mock: MockDebugger }> => {
   const mock = options instanceof MockDebugger ? options : new MockDebugger(options);
   const listener = await listenMockDebugger(mock);
   closers.push(() => listener.close());
   if (!source) {
-    return { url: listener.url, mock };
+    return { url: listener.url, direct: listener.url, mock };
   }
 
   const proxy = new WebSocketServer({ port: 0, host: "127.0.0.1" });
@@ -90,12 +97,34 @@ const startServer = async (source?: FaultSource, options?: MockDebuggerOptions |
     upstream.on("close", () => client.close());
     upstream.on("error", () => client.close());
   });
-  return { url: `ws://127.0.0.1:${(proxy.address() as AddressInfo).port}/ws`, mock };
+  return { url: `ws://127.0.0.1:${(proxy.address() as AddressInfo).port}/ws`, direct: listener.url, mock };
 };
 
 const run = async (faults: FaultSource | undefined, only?: string[], options?: MockDebuggerOptions): Promise<ContractSummary> => {
   const { url } = await startServer(faults, options);
   return runContract({ url, profile: "mock", only: only ? new Set(only) : undefined });
+};
+
+/** What a new client of the server sees: the tick that follows its debugger.describe. */
+const stateOf = async (url: string): Promise<Json & { executionState: Json; breakpoints: Record<string, Json>; watches: Json[]; categories: Record<string, Json> }> => {
+  const probe = new WebSocket(url);
+  try {
+    return await new Promise((resolve, reject) => {
+      probe.on("error", reject);
+      probe.on("open", () => probe.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "debugger.describe", params: {} })));
+      let described = false;
+      probe.on("message", (data) => {
+        const frame = JSON.parse(data.toString()) as Json;
+        if (frame.id === 1) {
+          described = true;
+        } else if (described && isTick(frame)) {
+          resolve(frame.params as never);
+        }
+      });
+    });
+  } finally {
+    probe.close();
+  }
 };
 
 /** Sends requests to the server as another client would, and resolves when the last one is answered. */
@@ -214,6 +243,27 @@ const staleTickBeforeEveryAnswer = (): Faults => {
   };
 };
 
+/** Drops the one tick that follows the response to a request for which `matches` is true. One per connection. */
+const noTickAfter = (matches: (request: Json) => boolean): Faults => {
+  const ids = new Set<unknown>();
+  let drop = false;
+  return {
+    toServer: (frame) => {
+      if (matches(frame)) ids.add(frame.id);
+      return frame;
+    },
+    toClient: (frame) => {
+      if (isTick(frame)) {
+        const dropped = drop;
+        drop = false;
+        return dropped ? undefined : frame;
+      }
+      drop = ids.delete(frame.id);
+      return frame;
+    },
+  };
+};
+
 describe("the contract runner against the mock", () => {
   it("passes every scenario the mock's milestone covers, reports the rest as not applicable, and leaves the server as it found it", async () => {
     const { url, mock } = await startServer();
@@ -242,22 +292,12 @@ describe("the contract runner against the mock", () => {
     // nothing of the run is left: no breakpoints, no watches, nothing muted, running as before
     const after = await runContract({ url, profile: "mock", only: new Set(["S01"]) });
     expect(after.finalState).toMatch(/running/);
-    const probe = new WebSocket(url);
-    const tick = await new Promise<Json>((resolve) => {
-      probe.on("open", () => probe.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "debugger.describe", params: {} })));
-      probe.on("message", (data) => {
-        const frame = JSON.parse(data.toString()) as Json;
-        if (isTick(frame)) {
-          resolve(frame.params);
-        }
-      });
-    });
-    probe.close();
+    const tick = await stateOf(url);
     expect(tick.breakpoints).toEqual({});
     expect(tick.watches).toEqual([]);
     const unmuted = { muted: false, soloed: false };
     expect(tick.categories).toEqual({ events: unmuted, sh4: unmuted, arm7: unmuted, dsp: unmuted });
-    expect((tick.executionState as Json).state).toBe("running");
+    expect(tick.executionState.state).toBe("running");
     expect(mock.clientCount).toBeLessThanOrEqual(1);
   }, 60_000);
 
@@ -678,6 +718,77 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(summary, "S17")).toBe("failed");
     expect(detailsOf(summary, "S17")).toMatch(/sgc capture: binaryId is 99 in the header and 1 in the result/);
   });
+});
+
+describe("what a failing run leaves behind", () => {
+  it("removes a breakpoint that no tick ever showed to it", async () => {
+    // the server stores the breakpoint and sends no tick after breakpoints.add
+    const { url, direct } = await startServer(() => noTickAfter((frame) => frame.method === "breakpoints.add"));
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S05"]) });
+    expect(statusOf(summary, "S05")).toBe("failed");
+    expect(detailsOf(summary, "S05")).toBe("breakpoints.add: no tick within 1000 ms of the request");
+
+    expect(summary.cleanUpProblems).toEqual([]);
+    expect(summary.finalState).toMatch(/running/);
+    // (an enabled breakpoint in the mock's loop would have stopped it by now)
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const after = await stateOf(direct);
+    expect(after.breakpoints).toEqual({});
+    expect(after.executionState.state).toBe("running");
+  }, 30_000);
+
+  it("removes the breakpoint of an error probe that the server did not refuse", async () => {
+    const { url, direct } = await startServer({
+      // the odd address of S12 is accepted
+      toServer: (frame) => {
+        const params = frame.params as Json;
+        return frame.method === "breakpoints.add" && params.address === 0x8c010001 ? { ...frame, params: { ...params, address: 0x8c010000 } } : frame;
+      },
+    });
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S12"]) });
+    expect(statusOf(summary, "S12")).toBe("failed");
+    expect(detailsOf(summary, "S12")).toMatch(/breakpoints\.add \{"event":"dc\.sh4\.cpu\.pc","address":2348875777\}: expected the error -32602, got the result \{\}/);
+    expect(summary.cleanUpProblems).toEqual([]);
+    expect((await stateOf(direct)).breakpoints).toEqual({});
+  }, 30_000);
+
+  it("says what it could not put back, and reports the state the server is really in", async () => {
+    const { url, direct } = await startServer({
+      // the server answers breakpoints.remove with {} and keeps the breakpoint
+      toServer: (frame) => (frame.method === "breakpoints.remove" ? { ...frame, method: "state.unwatch", params: { watchIds: [0x7fffffff] } } : frame),
+    });
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S05"]) });
+    expect(statusOf(summary, "S05")).toBe("failed");
+    expect(detailsOf(summary, "S05")).toMatch(/^breakpoints\.remove: breakpoint 1 is still listed \(1 tick within 1000 ms of the request/);
+    expect(detailsOf(summary, "S05")).toMatch(/clean-up: breakpoint 1 \(dc\.sh4\.cpu\.pc at 0x8C0000A[0-9A-E]\) is left behind/);
+
+    // the run found the server running; it is resumed, and stops at the breakpoint that is still there
+    expect(summary.cleanUpProblems).toEqual([
+      expect.stringMatching(/^breakpoint 1 \(dc\.sh4\.cpu\.pc at 0x8C0000A[0-9A-E]\) is left behind$/),
+      "the target is paused, it was running",
+    ]);
+    expect(summary.finalState).toMatch(/paused stop \d+ breakpoint bp 1$/);
+    expect(summary.ok).toBe(false);
+    const after = await stateOf(direct);
+    expect(Object.keys(after.breakpoints)).toEqual(["1"]);
+    expect(after.executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
+  }, 30_000);
+
+  it("says so when the ticks do not show what is left", async () => {
+    // the server stores watches and its ticks have no watches
+    const { url, direct } = await startServer({
+      toClient: (frame) => {
+        if (!isTick(frame)) return frame;
+        const { watches: _watches, ...params } = frame.params;
+        return { ...frame, params };
+      },
+    });
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S08"]) });
+    expect(statusOf(summary, "S08")).toBe("failed");
+    expect(detailsOf(summary, "S08")).toMatch(/^state\.watch: no tick lists a new watch /);
+    expect(summary.cleanUpProblems).toEqual(["the tick lists no watches: what is left of them is not known"]);
+    expect((await stateOf(direct)).watches).toHaveLength(1);
+  }, 30_000);
 });
 
 describe("the emulator profile", () => {

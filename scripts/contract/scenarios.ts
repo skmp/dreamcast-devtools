@@ -53,9 +53,6 @@ export interface RunContext {
   session: ContractSession;
   openSession: () => Promise<ContractSession>;
   elf?: ElfSymbols;
-  /** breakpoints and watches the runner added and has not removed yet */
-  breakpoints: Set<number>;
-  watches: Set<number>;
   note: (text: string) => void;
 }
 
@@ -217,7 +214,6 @@ const addBreakpoint = async (
   const added = newIn(next.tick);
   check(added.length === 1, `breakpoints.add: the tick that shows it lists ${added.length} new breakpoints, expected the one that was added`);
   const breakpoint = added[0];
-  context.breakpoints.add(breakpoint.id);
   check(breakpoint.event === params.event, `breakpoints.add: the tick lists event "${breakpoint.event}"`);
   check(breakpoint.address === params.address, `breakpoints.add: the tick lists address ${String(breakpoint.address)}, the request gave ${String(params.address)}`);
   // kind defaults to "code" when an address is given, else "event"; enabled defaults to true
@@ -231,7 +227,6 @@ const removeBreakpoint = async (context: RunContext, id: number): Promise<void> 
   const { session } = context;
   const mark = session.mark();
   await session.call("breakpoints.remove", { id });
-  context.breakpoints.delete(id);
   await tickShowing(session, mark, "breakpoints.remove", (tick) => (String(id) in tick.breakpoints ? `breakpoint ${id} is still listed` : undefined));
 };
 
@@ -277,7 +272,6 @@ const addWatch = async (context: RunContext, expression: string, expected: strin
   const next = await tickShowing(session, mark, "state.watch", (tick) => (newIn(tick).length > 0 ? undefined : "no tick lists a new watch"));
   const added = newIn(next.tick);
   check(added.length === 1, `state.watch: the tick that shows it lists ${added.length} new watches, expected the one that was added`);
-  context.watches.add(added[0].id);
   // the stored expression is normalised to lower case
   check(added[0].expression === expected, `state.watch "${expression}": listed as "${added[0].expression}", expected "${expected}"`);
   check(added[0].id >= 1, "watch ids are allocated from 1");
@@ -288,7 +282,6 @@ const unwatch = async (context: RunContext, id: number): Promise<void> => {
   const { session } = context;
   const mark = session.mark();
   await session.call("state.unwatch", { watchIds: [id] });
-  context.watches.delete(id);
   await tickShowing(session, mark, "state.unwatch", (tick) => ((tick.watches ?? []).some((watch) => watch.id === id) ? `watch ${id} is still listed` : undefined));
 };
 
@@ -1367,13 +1360,95 @@ export const runScenario = async (scenario: Scenario, context: RunContext): Prom
   return { id: scenario.id, title: scenario.title, status, durationMs: Date.now() - started, details, ...(parts ? { parts } : {}) };
 };
 
-/** Removes what the runner added and has not removed (after a failed scenario), and restores the categories. */
-export const cleanUp = async (context: RunContext, categories: Record<string, BreakpointCategoryState> | undefined): Promise<string[]> => {
-  const problems: string[] = [];
-  const { session } = context;
-  if (session.isClosed) {
-    return ["the connection is closed; nothing could be cleaned up"];
+/** What the run compares the server with when it cleans up: the state it found. */
+export interface Baseline {
+  state: "running" | "paused";
+  breakpoints: BreakpointDescriptor[];
+  watches: Array<{ id: number; expression: string }>;
+  categories: Record<string, BreakpointCategoryState> | undefined;
+}
+
+export const baselineOf = (tick: DebuggerTick): Baseline =>
+  JSON.parse(
+    JSON.stringify({
+      state: tick.executionState.state,
+      breakpoints: Object.values(tick.breakpoints ?? {}),
+      watches: (tick.watches ?? []).map((watch) => ({ id: watch.id, expression: watch.expression })),
+      categories: tick.categories,
+    }),
+  ) as Baseline;
+
+/** How a tick differs from the state the run found; the run state counts only when `withState` is set. */
+const differencesFrom = (baseline: Baseline, tick: DebuggerTick, withState: boolean): string[] => {
+  const differences: string[] = [];
+  // a tick that does not say what the server has cannot show that nothing is left
+  if (typeof tick.breakpoints !== "object" || tick.breakpoints === null) {
+    differences.push("the tick lists no breakpoints: what is left of them is not known");
   }
+  if (!Array.isArray(tick.watches)) {
+    differences.push("the tick lists no watches: what is left of them is not known");
+  }
+  // (by the id of the descriptor, not by the key it is listed under: I3 is somebody else's check)
+  const breakpoints = new Map(Object.values(tick.breakpoints ?? {}).map((breakpoint) => [breakpoint.id, breakpoint]));
+  const known = new Map(baseline.breakpoints.map((breakpoint) => [breakpoint.id, breakpoint]));
+  for (const [id, breakpoint] of breakpoints) {
+    const was = known.get(id);
+    if (!was) {
+      differences.push(`breakpoint ${id} (${breakpoint.event}${breakpoint.address === undefined ? "" : ` at ${hex(breakpoint.address)}`}) is left behind`);
+    } else if (JSON.stringify(sortKeys(breakpoint)) !== JSON.stringify(sortKeys(was))) {
+      differences.push(`breakpoint ${id} is ${JSON.stringify(breakpoint)}, it was ${JSON.stringify(was)}`);
+    }
+  }
+  for (const id of known.keys()) {
+    if (!breakpoints.has(id)) {
+      differences.push(`breakpoint ${id}, which the run found, is gone`);
+    }
+  }
+  const watches = new Map((tick.watches ?? []).map((watch) => [watch.id, watch.expression]));
+  const found = new Map(baseline.watches.map((watch) => [watch.id, watch.expression]));
+  for (const [id, expression] of watches) {
+    if (!found.has(id)) {
+      differences.push(`watch ${id} (${expression}) is left behind`);
+    } else if (found.get(id) !== expression) {
+      differences.push(`watch ${id} is ${expression}, it was ${found.get(id)}`);
+    }
+  }
+  for (const [id, expression] of found) {
+    if (!watches.has(id)) {
+      differences.push(`watch ${id} (${expression}), which the run found, is gone`);
+    }
+  }
+  if (baseline.categories && JSON.stringify(sortKeys(tick.categories)) !== JSON.stringify(sortKeys(baseline.categories))) {
+    differences.push(`the categories are ${JSON.stringify(tick.categories)}, they were ${JSON.stringify(baseline.categories)}`);
+  }
+  if (withState && tick.executionState?.state !== baseline.state) {
+    differences.push(`the target is ${tick.executionState?.state}, it was ${baseline.state}`);
+  }
+  return differences;
+};
+
+/**
+ * Puts the server back as the run found it, by difference: every breakpoint and every watch
+ * that `baseline` does not list is removed, whoever added it and whether or not a tick ever
+ * confirmed it to a scenario; the categories are restored; with `restoreState` (the end of
+ * the run) so is the run state. Then a fresh tick is compared with the baseline. Returns
+ * what could not be done and what still differs, and that tick.
+ */
+export const cleanUp = async (
+  context: RunContext,
+  baseline: Baseline,
+  restoreState: boolean,
+): Promise<{ problems: string[]; tick: DebuggerTick | undefined }> => {
+  const problems: string[] = [];
+  if (context.session.isClosed) {
+    // a scenario lost the connection (S14 closes one on purpose): clean up on a new one
+    try {
+      context.session = await context.openSession();
+    } catch (error) {
+      return { problems: [`the connection is closed and a new one failed, nothing could be cleaned up: ${error instanceof Error ? error.message : String(error)}`], tick: undefined };
+    }
+  }
+  const { session } = context;
   const attempt = async (what: string, action: () => Promise<unknown>) => {
     try {
       await action();
@@ -1381,17 +1456,42 @@ export const cleanUp = async (context: RunContext, categories: Record<string, Br
       problems.push(`${what}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
-  for (const id of Array.from(context.breakpoints)) {
-    await attempt(`removing breakpoint ${id}`, () => session.call("breakpoints.remove", { id }));
-    context.breakpoints.delete(id);
+
+  // what the server has now: the tick that follows a describe, not the last tick a scenario happened to see
+  let current: DebuggerTick | undefined;
+  await attempt("reading the state of the server", async () => {
+    current = (await session.describe()).tick;
+  });
+  if (!current) {
+    return { problems, tick: session.ticks.at(-1)?.tick };
   }
-  if (context.watches.size > 0) {
-    await attempt("removing watches", () => session.call("state.unwatch", { watchIds: Array.from(context.watches) }));
-    context.watches.clear();
+  const now: DebuggerTick = current;
+  const known = new Set(baseline.breakpoints.map((breakpoint) => breakpoint.id));
+  for (const { id } of Object.values(now.breakpoints ?? {})) {
+    if (!known.has(id)) {
+      await attempt(`removing breakpoint ${id}`, () => session.call("breakpoints.remove", { id }));
+    }
   }
-  if (categories) {
+  const found = new Set(baseline.watches.map((watch) => watch.id));
+  const watchIds = (now.watches ?? []).map((watch) => watch.id).filter((id) => !found.has(id));
+  if (watchIds.length > 0) {
+    await attempt(`removing the watches ${watchIds.join(", ")}`, () => session.call("state.unwatch", { watchIds }));
+  }
+  if (baseline.categories) {
+    const categories = baseline.categories;
     await attempt("restoring the categories", () => session.call("breakpoints.setCategoryStates", { categories }));
   }
-  await sleep(50);
-  return problems;
+  if (restoreState && now.executionState?.state !== baseline.state) {
+    await attempt("restoring the run state", () => session.call(baseline.state === "paused" ? "control.pause" : "control.runUntil", {}));
+  }
+
+  // the proof: a tick, newer than all of the above, that shows the state the run found
+  const after = session.mark();
+  await attempt("reading the state of the server after the clean-up", () => session.describe());
+  const clean = await session
+    .waitForTick((tick) => differencesFrom(baseline, tick, restoreState).length === 0, 2000, "a tick with the state the run found", after)
+    .catch(() => undefined);
+  const final = clean?.tick ?? session.latestTick().tick;
+  problems.push(...differencesFrom(baseline, final, restoreState));
+  return { problems, tick: final };
 };
