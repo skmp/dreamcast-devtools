@@ -113,6 +113,31 @@ test("entering an address highlights its row", async ({ page }) => {
   await expect(view.locator(".target-address")).toHaveCount(1);
 });
 
+test("what is being typed into the address box survives a change of the URL", async ({ page }) => {
+  // regression: the box was rewritten with the address on screen whenever the panel's
+  // callbacks changed identity, which they do with every change of the URL. The URL of a
+  // submitted address is committed late while ticks arrive (5 per second from a running
+  // server), i.e. while the next address is being typed: Enter then submitted the old one.
+  // Here the URL changes for another reason, at a known moment: the About dialog is part of it.
+  await openWorkspace(page, "sh4-debugger");
+  const view = panel(page, "sh4-memory");
+  const box = view.getByRole("textbox");
+  await expect(box).toHaveValue(hex8(0x8c010000 + 10 * 16));
+
+  await box.fill(hex8(0x8c00a040));
+  await page.getByRole("button", { name: "About", exact: true }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page).toHaveURL(/\?about=1$/);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toBeHidden();
+  await expect(page).toHaveURL(/#\/workspace\/sh4-debugger$/);
+  // two changes of the URL later the box still holds what was typed, and Enter submits it
+  await expect(box).toHaveValue(hex8(0x8c00a040));
+  await box.press("Enter");
+  await expect(rowAt(view, 0x8c00a040)).toHaveClass(/target-address/);
+  await expect(page).toHaveURL(/\?address=0x8C00A040$/);
+});
+
 test("an address in the URL is shown again after a reload", async ({ page }) => {
   // regression: on load the ?address= value was used as the first fetched row while the box
   // still printed "first row + 10 rows": 0x8C0081C0 for ?address=0x8C008120, without context

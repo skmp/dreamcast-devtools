@@ -135,16 +135,21 @@ export const MemoryView = ({
     [callbacks, config.length],
   );
 
+  // The box follows the view when the view moves (a submit, the wheel) and is rewritten for
+  // no other reason: what is being typed has to survive a render in which only the callbacks
+  // changed identity, which they do whenever the URL changes.
   useEffect(() => {
     const normalized = clampAddress(address, config.maxAddress, BYTES_PER_ROW);
     // Display the address 10 rows down (the intended target), not the fetch start
     const displayAddress = Math.min(0xffffffff - (BYTES_PER_ROW - 1), normalized + BYTES_PER_ROW * 10);
     setAddressInput(config.formatAddress(displayAddress));
+  }, [address, config]);
 
+  useEffect(() => {
     if (initialized) {
-      void fetchSlice(normalized);
+      void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
     }
-  }, [address, fetchSlice, config, initialized]);
+  }, [address, fetchSlice, config.maxAddress, initialized]);
 
   // Trigger highlight effect when loaded from URL
   useEffect(() => {
