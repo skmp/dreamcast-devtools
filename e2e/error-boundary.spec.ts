@@ -5,6 +5,7 @@ import {
   disassemblyRows,
   panel,
   pauseFromToolbar,
+  registerRow,
   saveScreenshot,
   statusBar,
   tooltipButton,
@@ -79,13 +80,13 @@ for (const phase of ["render", "effect"] as const) {
     await tooltipButton(disassembly, "Step In").click();
     const next = 0x8c0000a0 + ((pc - 0x8c0000a0 + 2) % 16);
     await expect(disassembly.locator(".current-instruction")).toHaveAttribute("data-address", String(next));
-    await expect(treeItemRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(`PC = 0x${next.toString(16).toUpperCase()}`);
+    await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(`PC = 0x${next.toString(16).toUpperCase()}`);
     await expect(panel(page, "sh4-callstack").getByRole("listitem").first()).toContainText(
       `0x${next.toString(16).toUpperCase()}`,
     );
     // including the watch the failed panel would show: the device tree can still add one
-    await tooltipButton(treeItemRow(page, "dc.sh4.cpu.reg.PR"), "Add to watch").click();
-    await expect(tooltipButton(treeItemRow(page, "dc.sh4.cpu.reg.PR"), "Already in watch")).toBeDisabled();
+    await tooltipButton(registerRow(page, "dc.sh4.cpu.reg.PR"), "Add to watch").click();
+    await expect(tooltipButton(registerRow(page, "dc.sh4.cpu.reg.PR"), "Already in watch")).toBeDisabled();
 
     // Reload panel mounts the panel again, with current data
     await alert.getByRole("button", { name: "Reload panel" }).click();

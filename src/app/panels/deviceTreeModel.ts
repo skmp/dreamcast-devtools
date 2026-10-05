@@ -1,7 +1,7 @@
 import type { DeviceNodeDescriptor, RegisterValue } from "../../lib/debuggerSchema";
 
 // Pure helpers of the device tree panel: filtering, row budgets and default expansion.
-// A "row" is one tree item on screen: a node or a register.
+// A "row" is one line of the tree on screen: a node or a register.
 
 /** A search never mounts more rows than this; the rest is cut and the panel says so. */
 export const MAX_SEARCH_ROWS = 200;
@@ -12,7 +12,7 @@ export const MAX_DEFAULT_ROWS = 200;
 /** The watch expression of a register, as the server resolves it. */
 export const watchExpression = (nodePath: string, registerName: string) => `${nodePath}.${registerName.toLowerCase()}`;
 
-/** Tree item id of a register row. Node rows use the node path. */
+/** Id of a register row (its data-register attribute). Node rows are tree items with the node path as their id. */
 export const registerItemId = (nodePath: string, registerName: string) => `${nodePath}.reg.${registerName}`;
 
 /**

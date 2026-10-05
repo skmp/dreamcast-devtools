@@ -1,15 +1,15 @@
 import { memo, useCallback, useMemo, useState } from "react";
-import type { SyntheticEvent } from "react";
+import type { KeyboardEvent, SyntheticEvent } from "react";
 import { SimpleTreeView } from "@mui/x-tree-view/SimpleTreeView";
 import { TreeItem } from "@mui/x-tree-view/TreeItem";
 import { useShallow } from "zustand/react/shallow";
 import { Panel } from "../layout/Panel";
 import type { DeviceNodeDescriptor, RegisterValue, PanelId } from "../../lib/debuggerSchema";
 import { Box, Divider, IconButton, Stack, TextField, Typography } from "@mui/material";
+import { alpha, type Theme } from "@mui/material/styles";
 import { HideOnHoverTooltip as Tooltip } from "../components";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
-import AddIcon from "@mui/icons-material/Add";
 import SearchIcon from "@mui/icons-material/Search";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { PANEL_REGISTRY, type PanelRegistryEntry } from "../layout/panelRegistry";
@@ -32,6 +32,20 @@ import {
 // - RegisterRow (memoised) re-renders only when its own value or watched flag changed.
 //
 // Collapsed nodes do not mount their children at all (the tree view unmounts them).
+//
+// Only the nodes are items of the tree view. The registers of a node are a plain list
+// inside its item: every TreeItem writes to the tree view's store when it mounts and when
+// it unmounts, and each of those writes notifies every item that is mounted, so removing n
+// items in one go costs n * n. With a TreeItem per register, leaving a tree of 2600 rows
+// (a search, a collapse, closing the panel) blocked the page for a minute.
+//
+// The rows must not get role="treeitem": the tree view collects the children of an item
+// from the DOM by that role and does not survive one it did not render.
+
+/** Indentation of one tree level in px (the tree view's default, given to it explicitly). */
+const INDENT_PX = 12;
+/** Where the label starts in a row of the tree view: padding, expander icon, gap. */
+const LABEL_OFFSET_PX = 8 + 16 + 8;
 
 const ITEM_SX = {
   "& .MuiTreeItem-content": {
@@ -40,7 +54,7 @@ const ITEM_SX = {
   },
 } as const;
 
-const TREE_SX = {
+const treeSx = (theme: Theme) => ({
   px: 1,
   py: 0.5,
   flex: 1,
@@ -52,56 +66,122 @@ const TREE_SX = {
   "& .MuiTreeItem-content": {
     marginBottom: 0,
   },
-} as const;
+  "& .device-tree-registers": {
+    listStyle: "none",
+    margin: 0,
+    padding: 0,
+  },
+  // RegisterRow, laid out like the content of a tree item
+  "& .device-tree-register": {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "4px",
+    boxSizing: "border-box",
+    minHeight: "24px",
+    paddingRight: "8px",
+    borderRadius: 1,
+    "&:hover": {
+      backgroundColor: theme.palette.action.hover,
+      "@media (hover: none)": {
+        backgroundColor: "transparent",
+      },
+    },
+  },
+  "& .device-tree-register-text": {
+    fontFamily: "monospace",
+    fontSize: "0.813rem",
+    lineHeight: 1.4,
+  },
+  "& .device-tree-watch": {
+    display: "inline-flex",
+    flexShrink: 0,
+    margin: 0,
+    padding: "2px",
+    border: 0,
+    borderRadius: "50%",
+    backgroundColor: "transparent",
+    color: theme.palette.primary.main,
+    cursor: "pointer",
+    "& svg": {
+      width: "0.875rem",
+      height: "0.875rem",
+      fill: "currentColor",
+    },
+    "&:hover": {
+      backgroundColor: alpha(theme.palette.primary.main, theme.palette.action.hoverOpacity),
+    },
+    "&:focus-visible": {
+      outline: "2px solid currentColor",
+    },
+    "&:disabled": {
+      backgroundColor: "transparent",
+      color: theme.palette.action.disabled,
+      cursor: "default",
+    },
+  },
+});
 
 const TREE_SLOTS = { collapseIcon: ExpandMoreIcon, expandIcon: ChevronRightIcon };
 
+// the path of @mui/icons-material/Add
+const ADD_ICON = (
+  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+    <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z" />
+  </svg>
+);
+
 interface RegisterRowProps {
+  /** Left padding in px that puts the text where the label of a tree item at this depth starts. */
+  indent: number;
   nodePath: string;
   name: string;
   value: string;
   watched: boolean;
 }
 
-const RegisterRow = memo(({ nodePath, name, value, watched }: RegisterRowProps) => (
-  <TreeItem
-    itemId={registerItemId(nodePath, name)}
-    label={
-      <Stack direction="row" spacing={0.5} alignItems="center" justifyContent="space-between" sx={{ py: 0 }}>
-        <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.813rem", lineHeight: 1.4 }}>
-          {name} = {value}
-        </Typography>
-        <Tooltip title={watched ? "Already in watch" : "Add to watch"}>
-          <span>
-            <IconButton
-              size="small"
-              color="primary"
-              disabled={watched}
-              onClick={(event) => {
-                event.stopPropagation();
-                // addWatch ignores expressions that are already watched
-                void useDebuggerDataStore.getState().addWatch(watchExpression(nodePath, name));
-              }}
-              sx={{ padding: "2px" }}
-            >
-              <AddIcon sx={{ fontSize: "0.875rem" }} />
-            </IconButton>
-          </span>
-        </Tooltip>
-      </Stack>
-    }
-    sx={ITEM_SX}
-  />
-));
+/** A register of a node. The tree view does not know it: the arrow keys skip it and it cannot be selected. */
+const RegisterRow = memo(({ indent, nodePath, name, value, watched }: RegisterRowProps) => {
+  const title = watched ? "Already in watch" : "Add to watch";
+  return (
+    <li className="device-tree-register" data-register={registerItemId(nodePath, name)} style={{ paddingLeft: indent }}>
+      <span className="device-tree-register-text">{`${name} = ${value}`}</span>
+      <button
+        type="button"
+        className="device-tree-watch"
+        aria-label={title}
+        title={title}
+        disabled={watched}
+        onClick={() => {
+          // addWatch ignores expressions that are already watched
+          void useDebuggerDataStore.getState().addWatch(watchExpression(nodePath, name));
+        }}
+      >
+        {ADD_ICON}
+      </button>
+    </li>
+  );
+});
 RegisterRow.displayName = "RegisterRow";
+
+/**
+ * A key pressed inside the register list bubbles to the item of the node, and the tree
+ * view would act on it as a key of that item: Enter would collapse the node instead of
+ * pressing the button. This is how an event is kept from the handlers of MUI X.
+ */
+const keepKeyFromTreeView = (event: KeyboardEvent<HTMLElement> & { defaultMuiPrevented?: boolean }) => {
+  event.defaultMuiPrevented = true;
+};
 
 interface NodeRegistersProps {
   nodePath: string;
+  /** Depth of the node in the tree; its registers are one level below it. */
+  depth: number;
   /** The registers to show, as described (a search may have filtered them). */
   registers: RegisterValue[];
 }
 
-const NodeRegisters = memo(({ nodePath, registers }: NodeRegistersProps) => {
+const NodeRegisters = memo(({ nodePath, depth, registers }: NodeRegistersProps) => {
   const values = useDebuggerDataStore(
     useShallow((state) => liveRegisterValues(registers, state.registersByPath[nodePath])),
   );
@@ -113,24 +193,32 @@ const NodeRegisters = memo(({ nodePath, registers }: NodeRegistersProps) => {
     useShallow((state) => expressions.map((expression) => state.watches.some((watch) => watch.expression === expression))),
   );
 
-  return registers.map((register, index) => (
-    <RegisterRow
-      key={register.name}
-      nodePath={nodePath}
-      name={register.name}
-      value={values[index]}
-      watched={watched[index]}
-    />
-  ));
+  const indent = LABEL_OFFSET_PX + INDENT_PX * (depth + 1);
+  return (
+    <ul className="device-tree-registers" onKeyDown={keepKeyFromTreeView}>
+      {registers.map((register, index) => (
+        <RegisterRow
+          key={register.name}
+          indent={indent}
+          nodePath={nodePath}
+          name={register.name}
+          value={values[index]}
+          watched={watched[index]}
+        />
+      ))}
+    </ul>
+  );
 });
 NodeRegisters.displayName = "NodeRegisters";
 
 interface DeviceNodeItemProps {
   node: DeviceNodeDescriptor;
+  /** 0 for the roots of the tree */
+  depth: number;
   onOpenPanel?: (panelId: PanelId) => void;
 }
 
-const DeviceNodeItem = memo(({ node, onOpenPanel }: DeviceNodeItemProps) => {
+const DeviceNodeItem = memo(({ node, depth, onOpenPanel }: DeviceNodeItemProps) => {
   const actions = node.actions ?? [];
   const hasActions = actions.length > 0;
   const hasRegisters = node.registers !== undefined && node.registers.length > 0;
@@ -191,9 +279,9 @@ const DeviceNodeItem = memo(({ node, onOpenPanel }: DeviceNodeItemProps) => {
       {/* undefined, not an empty list: the tree view shows an expander for any children */}
       {hasRegisters || hasChildren ? (
         <>
-          {hasRegisters && <NodeRegisters nodePath={node.path} registers={node.registers!} />}
+          {hasRegisters && <NodeRegisters nodePath={node.path} depth={depth} registers={node.registers!} />}
           {node.children?.map((child) => (
-            <DeviceNodeItem key={child.path} node={child} onOpenPanel={onOpenPanel} />
+            <DeviceNodeItem key={child.path} node={child} depth={depth + 1} onOpenPanel={onOpenPanel} />
           ))}
         </>
       ) : undefined}
@@ -284,11 +372,12 @@ export const DeviceTreePanel = ({ onOpenPanel }: DeviceTreePanelProps = {}) => {
             expandedItems={expandedItems}
             onExpandedItemsChange={handleExpandedItemsChange}
             slots={TREE_SLOTS}
+            itemChildrenIndentation={INDENT_PX}
             multiSelect
-            sx={TREE_SX}
+            sx={treeSx}
           >
             {nodes.map((node) => (
-              <DeviceNodeItem key={node.path} node={node} onOpenPanel={onOpenPanel} />
+              <DeviceNodeItem key={node.path} node={node} depth={0} onOpenPanel={onOpenPanel} />
             ))}
           </SimpleTreeView>
         </Box>

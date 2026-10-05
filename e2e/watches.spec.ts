@@ -1,4 +1,13 @@
-import { test, expect, openWorkspace, panel, pauseFromToolbar, tooltipButton, treeItemRow } from "./support/fixtures";
+import {
+  test,
+  expect,
+  openWorkspace,
+  panel,
+  pauseFromToolbar,
+  registerRow,
+  tooltipButton,
+  treeItemRow,
+} from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
 
 const watchRow = (page: Page, expression: string): Locator =>
@@ -77,8 +86,8 @@ test("a watch picked from the suggestions shows the register's live value", asyn
 
   // the device tree agrees that both registers are watched now
   await treeItemRow(page, "dc.holly.dmac").click();
-  await expect(tooltipButton(treeItemRow(page, "dc.holly.dmac.reg.CHCR0"), "Already in watch")).toBeDisabled();
-  await expect(tooltipButton(treeItemRow(page, "dc.holly.dmac.reg.DMAOR"), "Already in watch")).toBeDisabled();
+  await expect(tooltipButton(registerRow(page, "dc.holly.dmac.reg.CHCR0"), "Already in watch")).toBeDisabled();
+  await expect(tooltipButton(registerRow(page, "dc.holly.dmac.reg.DMAOR"), "Already in watch")).toBeDisabled();
 });
 
 test("double-clicking the expression renames a watch", async ({ page }) => {
@@ -114,7 +123,7 @@ test("double-clicking the value writes the register behind a watch", async ({ pa
   await editor.press("Enter");
 
   await expect(watchRow(page, "dc.sh4.cpu.pc")).toHaveText(/dc\.sh4\.cpu\.pc = 0x8C0000AC/);
-  await expect(treeItemRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(/PC = 0x8C0000AC/);
+  await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(/PC = 0x8C0000AC/);
 });
 
 test("a rejected edit keeps the editor open and shows the server's error", async ({ page, diagnostics }) => {

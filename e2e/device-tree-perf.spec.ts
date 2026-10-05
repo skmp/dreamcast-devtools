@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import { test, expect, panel, treeItem, treeItemRow } from "./support/fixtures";
+import { test, expect, panel, registerRow, treeItem, treeItemRow, treeRows } from "./support/fixtures";
 import { installRenderCounter, readRenderCounts, resetRenderCounts, type RenderCounts } from "./support/renderCounter";
 import { serveSyntheticDebugger } from "./support/syntheticDebugger";
 
@@ -30,21 +30,22 @@ const summarise = (counts: RenderCounts): TickCost => ({
 });
 
 test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => {
-  // mounting 2500 register rows (step 2) takes most of a minute on a busy machine
-  test.setTimeout(600_000);
+  // Takes under a minute. A build that renders every register as a tree item (measured
+  // with E2E_MEASURE_ONLY) mounts 2500 of them in some 6 s and needs a minute to remove them.
+  test.setTimeout(MEASURE_ONLY ? 1_200_000 : 300_000);
   const synthetic = await serveSyntheticDebugger(page, { nodes: NODES, registersPerNode: REGISTERS });
   await installRenderCounter(page, '[data-panel-id="device-tree"]');
   await page.goto("/#/workspace/sh4-debugger");
   await synthetic.ready;
 
   const tree = panel(page, "device-tree");
-  const rows = tree.getByRole("treeitem");
+  const rows = treeRows(page);
   await expect(treeItem(page, "dc")).toBeVisible();
   await expect(treeItem(page, synthetic.nodePath(NODES - 1))).toBeVisible();
 
   /**
    * Waits until the tree has stopped rendering by itself: mounting thousands of rows takes
-   * a while, and a tooltip under the mouse pointer opens and closes with a delay.
+   * a moment, and a tooltip under the mouse pointer opens and closes with a delay.
    */
   const settle = async () => {
     await page.mouse.move(1, 1);
@@ -68,7 +69,9 @@ test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => 
     synthetic.tick(change);
     if (visible) {
       for (const node of change) {
-        await expect(treeItemRow(page, `${synthetic.nodePath(node)}.reg.R00`)).toHaveText(
+        const register = `${synthetic.nodePath(node)}.reg.R00`;
+        // builds before the register rows became plain rows (E2E_MEASURE_ONLY) render a tree item
+        await expect(registerRow(page, register).or(treeItem(page, register))).toHaveText(
           new RegExp(`R00 = ${synthetic.value(node, 0)}`),
         );
       }
@@ -141,9 +144,10 @@ test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => 
   // A tick that changes nothing renders nothing in the tree, however much of it is mounted
   expect(allExpanded.unchanged.rendered).toBe(0);
   expect(defaultState.unchanged.rendered).toBe(0);
-  // One changed node: that node and its changed register row, not the other 99 nodes
-  expect(allExpanded.oneNodeChanged.rendered).toBeLessThan(60);
-  expect(allExpanded.tenNodesChanged.rendered).toBeLessThan(10 * 60);
+  // One changed node: its register list and the row that changed, not its other 24 rows
+  // and not the other 99 nodes
+  expect(allExpanded.oneNodeChanged.rendered).toBe(2);
+  expect(allExpanded.tenNodesChanged.rendered).toBe(10 * 2);
   expect(allExpanded.oneNodeChanged.mounted).toBe(0);
   // A tree this big is not expanded two levels deep when it is opened
   expect(defaultRows).toBeLessThanOrEqual(1 + NODES);

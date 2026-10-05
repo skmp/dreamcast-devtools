@@ -4,6 +4,7 @@ import {
   currentInstructionAddress,
   openWorkspace,
   panel,
+  registerRow,
   tooltipButton,
   treeItemRow,
 } from "./support/fixtures";
@@ -43,7 +44,7 @@ test("the target really runs between Run and Pause", async ({ page }) => {
   await treeItemRow(page, "dc.sh4.cpu").click();
   await tooltipButton(page, "Pause").click();
   await expect(tooltipButton(page, "Run")).toBeEnabled();
-  const pr = treeItemRow(page, "dc.sh4.cpu.reg.PR");
+  const pr = registerRow(page, "dc.sh4.cpu.reg.PR");
   const before = Number.parseInt((await pr.innerText()).replace("PR = ", ""), 16);
 
   // paused: a tick caused by something else shows the same value

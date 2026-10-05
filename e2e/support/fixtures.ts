@@ -211,13 +211,24 @@ export const saveScreenshot = async (page: Page, testInfo: TestInfo, name: strin
   await page.screenshot({ path: join(directory, `${name}.png`) });
 };
 
-/** A node or register row of the device tree by its path, e.g. "dc.sh4.cpu" or "dc.sh4.cpu.reg.PC". */
+/** A node of the device tree by its path, e.g. "dc.sh4.cpu". */
 export const treeItem = (page: Page, itemId: string): Locator =>
   panel(page, "device-tree").locator(`[role="treeitem"][id$="-${itemId}"]`);
 
-/** The clickable row (label + buttons) of a tree item, without its children. */
+/** The clickable row (label + buttons) of a node, without its registers and child nodes. */
 export const treeItemRow = (page: Page, itemId: string): Locator =>
   treeItem(page, itemId).locator(".MuiTreeItem-content").first();
+
+/**
+ * A register row of the device tree (text and "+" button) by the path of its node, ".reg."
+ * and its name, e.g. "dc.sh4.cpu.reg.PC". Registers are not items of the tree view.
+ */
+export const registerRow = (page: Page, registerId: string): Locator =>
+  panel(page, "device-tree").locator(`[data-register="${registerId}"]`);
+
+/** Every row the device tree has mounted: nodes and registers. */
+export const treeRows = (page: Page): Locator =>
+  panel(page, "device-tree").locator('[role="treeitem"], [data-register]');
 
 /** Rows of a disassembly view (DisassemblyLineItem renders `data-address` with the numeric address). */
 export const disassemblyRows = (view: Locator): Locator => view.locator("[data-address]");
