@@ -22,7 +22,13 @@ test("the first request is debugger.describe and the tick that follows populates
   await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
 
   // wire order: describe request, its response, then the event.tick notification
-  expect(rpc.sent[0]).toMatchObject({ jsonrpc: "2.0", id: 1, method: "debugger.describe", params: {} });
+  // the client says which protocol it speaks and who it is
+  expect(rpc.sent[0]).toEqual({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "debugger.describe",
+    params: { protocol: 3, client: expect.stringMatching(/^nullDC DevTools 3\.\d+\.\d+/) },
+  });
   expect(rpc.received[0]).toMatchObject({ id: 1 });
   expect(rpc.received[0].method).toBeUndefined();
   expect(rpc.received[1]).toMatchObject({ method: "event.tick" });

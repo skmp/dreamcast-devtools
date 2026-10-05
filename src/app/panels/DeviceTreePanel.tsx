@@ -4,6 +4,7 @@ import { SimpleTreeView } from "@mui/x-tree-view/SimpleTreeView";
 import { TreeItem } from "@mui/x-tree-view/TreeItem";
 import { useShallow } from "zustand/react/shallow";
 import { Panel } from "../layout/Panel";
+import { isPanelId } from "../../lib/debuggerSchema";
 import type { DeviceNodeDescriptor, RegisterValue, PanelId } from "../../lib/debuggerSchema";
 import { Box, Divider, IconButton, Stack, TextField, Typography } from "@mui/material";
 import { alpha, type Theme } from "@mui/material/styles";
@@ -251,6 +252,9 @@ const DeviceNodeItem = memo(({ node, depth, onOpenPanel }: DeviceNodeItemProps) 
             <Stack direction="row" spacing={0.25} alignItems="center">
               {actions.map((panelId) => {
                 // the server may name a panel this build does not have
+                if (!isPanelId(panelId)) {
+                  return null;
+                }
                 const panelInfo: PanelRegistryEntry | undefined = PANEL_REGISTRY[panelId];
                 if (!panelInfo) {
                   return null;

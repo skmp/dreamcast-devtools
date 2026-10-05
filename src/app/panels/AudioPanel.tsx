@@ -35,7 +35,7 @@ export const AudioPanel = () => {
     const fetchData = async () => {
       if (!client || !initialized) return;
       try {
-        const arrayBuffer = await client.fetchSgcFrameData();
+        const { data: arrayBuffer } = await client.fetchSgcFrameData();
         setSgcBinaryData(arrayBuffer);
         setNoDataAvailable(false);
 
@@ -95,7 +95,7 @@ export const AudioPanel = () => {
       await client.recordSgcFrames();
 
       // Fetch the new data
-      const arrayBuffer = await client.fetchSgcFrameData();
+      const { data: arrayBuffer } = await client.fetchSgcFrameData();
       setSgcBinaryData(arrayBuffer);
       setNoDataAvailable(false);
 

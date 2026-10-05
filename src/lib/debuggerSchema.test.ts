@@ -1,0 +1,386 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import type { z } from "zod";
+import {
+  ConformanceSchemas,
+  DEBUGGER_ERROR_MESSAGES,
+  DebuggerErrorCode,
+  DebuggerRpcMethodSchemas,
+  IN_BAND_ERROR_METHODS,
+  PANEL_IDS,
+  PROTOCOL_VERSION,
+  RpcMethod,
+  RpcMethodNameSchema,
+  StrictDebuggerRpcMethodSchemas,
+  isPanelId,
+} from "./debuggerSchema";
+
+interface Frame {
+  id?: number;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: unknown;
+}
+
+const loadFrames = (name: string): Frame[] =>
+  JSON.parse(readFileSync(new URL(`./test-fixtures/${name}`, import.meta.url), "utf8")) as Frame[];
+
+type MethodName = keyof typeof DebuggerRpcMethodSchemas;
+
+const issuePaths = (result: { success: boolean; error?: z.ZodError }) =>
+  result.success ? [] : result.error!.issues.map((issue) => issue.path.join("."));
+
+describe("protocol constants", () => {
+  it("is protocol version 3", () => {
+    expect(PROTOCOL_VERSION).toBe(3);
+  });
+
+  it("has a schema for every method name, in both sets", () => {
+    const names = Object.values(RpcMethod).sort();
+    expect(RpcMethodNameSchema.options.slice().sort()).toEqual(names);
+    expect(Object.keys(DebuggerRpcMethodSchemas).sort()).toEqual(names);
+    expect(Object.keys(StrictDebuggerRpcMethodSchemas).sort()).toEqual(names);
+  });
+
+  it("lists the in-band methods: exactly those whose result is RpcError", () => {
+    for (const [method, schemas] of Object.entries(DebuggerRpcMethodSchemas)) {
+      if (method === RpcMethod.EVENT_TICK) {
+        continue;
+      }
+      const acceptsInBandError = schemas.result.safeParse({ error: { code: -32602, message: "invalid params: x" } }).success;
+      const acceptsEmpty = schemas.result.safeParse({}).success;
+      expect(acceptsInBandError && acceptsEmpty, method).toBe(IN_BAND_ERROR_METHODS.has(method));
+    }
+  });
+
+  it("has a message for every error code", () => {
+    for (const code of Object.values(DebuggerErrorCode)) {
+      expect(DEBUGGER_ERROR_MESSAGES[code], String(code)).toBeInstanceOf(RegExp);
+    }
+    expect(DEBUGGER_ERROR_MESSAGES[DebuggerErrorCode.NOT_SUPPORTED].test("not supported: control.reset")).toBe(true);
+    expect(DEBUGGER_ERROR_MESSAGES[DebuggerErrorCode.NOT_PAUSED].test("Not paused")).toBe(false);
+  });
+
+  it("recognises the panel ids", () => {
+    expect(isPanelId(PANEL_IDS.SH4_DISASSEMBLY)).toBe(true);
+    expect(isPanelId("sh4-registers")).toBe(false);
+  });
+});
+
+describe("a v2 server (captured from the mock before protocol v3)", () => {
+  const frames = loadFrames("protocol-v2-frames.json");
+  // the requests of the capture, by id
+  const methods: Record<number, MethodName> = {
+    1: "debugger.describe",
+    2: "control.pause",
+    3: "breakpoints.add",
+    4: "breakpoints.add",
+    5: "state.getMemorySlice",
+    6: "state.getDisassembly",
+    7: "state.getCallstack",
+    8: "state.watch",
+    9: "breakpoints.remove",
+    11: "control.runUntil",
+  };
+
+  it("is accepted by the client schemas, frame by frame", () => {
+    let responses = 0;
+    let ticks = 0;
+    for (const frame of frames) {
+      if (frame.method === "event.tick") {
+        const parsed = DebuggerRpcMethodSchemas["event.tick"].params.safeParse(frame.params);
+        expect(issuePaths(parsed)).toEqual([]);
+        ticks++;
+      } else if (frame.id !== undefined && methods[frame.id]) {
+        const parsed = DebuggerRpcMethodSchemas[methods[frame.id]].result.safeParse(frame.result);
+        expect(issuePaths(parsed), methods[frame.id]).toEqual([]);
+        responses++;
+      }
+    }
+    expect(responses).toBe(Object.keys(methods).length);
+    expect(ticks).toBeGreaterThanOrEqual(6);
+  });
+
+  it("selects the v2 behaviour: no protocol, targets, stopId or categories", () => {
+    const shape = DebuggerRpcMethodSchemas["debugger.describe"].result.parse(frames[0].result);
+    expect(shape.protocol).toBeUndefined();
+    expect(shape.targets).toBeUndefined();
+    // the v2 mock's own, unlisted capabilities pass as open strings
+    expect(shape.capabilities).toEqual(["watches", "step", "breakpoints", "frame-log"]);
+    const tick = DebuggerRpcMethodSchemas["event.tick"].params.parse(frames[1].params);
+    expect(tick.executionState.stopId).toBeUndefined();
+    expect(tick.categories).toBeUndefined();
+    // the breakpoint id is only in the tick of the hit
+    const hit = DebuggerRpcMethodSchemas["event.tick"].params.parse(frames.at(-1)!.params);
+    expect(hit.executionState).toEqual({ state: "paused", breakpointId: 1 });
+  });
+
+  it("is not a v3 server: the strict copy says what is missing", () => {
+    const shape = StrictDebuggerRpcMethodSchemas["debugger.describe"].result.safeParse(frames[0].result);
+    expect(issuePaths(shape)).toEqual(expect.arrayContaining(["protocol", "ui", "targets"]));
+    const tick = StrictDebuggerRpcMethodSchemas["event.tick"].params.safeParse(frames[3].params);
+    expect(issuePaths(tick)).toEqual(expect.arrayContaining(["executionState.stopId", "categories", "eventLog.0.metadata"]));
+  });
+});
+
+describe("the strict copy", () => {
+  const tick = () => ({
+    tickId: 12,
+    timestamp: 1791150000000,
+    executionState: { state: "paused", stopId: 3, reason: "breakpoint", breakpointId: 1 },
+    registers: { "dc.sh4.cpu": [{ name: "PC", value: "0x8C0000A0", width: 32 }] },
+    breakpoints: { "1": { id: 1, event: "dc.sh4.cpu.pc", address: 0x8c0000a0, kind: "code", enabled: true } },
+    eventLog: [
+      {
+        eventId: "41",
+        timestamp: 1791150000000,
+        subsystem: "gdrom",
+        severity: "info",
+        message: "command 0x30",
+        metadata: { event: "dc.gdrom.command", cycles: "123456789012345" },
+      },
+    ],
+    watches: [{ id: 1, expression: "dc.sh4.cpu.pc", value: "0x8C0000A0" }],
+    callstacks: { sh4: [{ index: 0, pc: 0x8c0000a0 }], arm7: [] },
+    categories: {
+      events: { muted: false, soloed: false },
+      sh4: { muted: false, soloed: false },
+      arm7: { muted: false, soloed: false },
+      dsp: { muted: false, soloed: false },
+    },
+  });
+  const strict = StrictDebuggerRpcMethodSchemas["event.tick"].params;
+  const paths = (value: unknown) => issuePaths(strict.safeParse(value));
+
+  it("accepts a complete v3 tick, and so does the client", () => {
+    expect(paths(tick())).toEqual([]);
+    expect(DebuggerRpcMethodSchemas["event.tick"].params.safeParse(tick()).success).toBe(true);
+  });
+
+  it("fails on unknown keys at every level; the client strips them", () => {
+    const value = tick() as Record<string, unknown> & ReturnType<typeof tick>;
+    value.extra = 1;
+    (value.executionState as Record<string, unknown>).extra = 1;
+    (value.registers["dc.sh4.cpu"][0] as Record<string, unknown>).extra = 1;
+    (value.eventLog[0].metadata as Record<string, unknown>).extra = 1;
+    (value.callstacks as Record<string, unknown>).dsp = [];
+    (value.categories as Record<string, unknown>).gdrom = { muted: false, soloed: false };
+    const result = strict.safeParse(value);
+    expect(result.success).toBe(false);
+    expect(result.error!.issues.every((issue) => issue.code === "unrecognized_keys")).toBe(true);
+    expect(result.error!.issues.map((issue) => issue.path.join(".")).sort()).toEqual(
+      ["", "callstacks", "categories", "eventLog.0.metadata", "executionState", "registers.dc.sh4.cpu.0"].sort(),
+    );
+
+    const stripped = DebuggerRpcMethodSchemas["event.tick"].params.parse(value);
+    expect(Object.keys(stripped)).not.toContain("extra");
+    expect(stripped.executionState).toEqual(tick().executionState);
+  });
+
+  it("requires what a v3 server always sends", () => {
+    for (const key of ["watches", "callstacks", "categories"] as const) {
+      const value: Record<string, unknown> = tick();
+      delete value[key];
+      expect(paths(value), key).toEqual([key]);
+    }
+    const noStopId = tick() as { executionState: Record<string, unknown> };
+    delete noStopId.executionState.stopId;
+    expect(paths(noStopId)).toEqual(["executionState.stopId"]);
+    const threeCategories = tick() as { categories: Record<string, unknown> };
+    delete threeCategories.categories.dsp;
+    expect(paths(threeCategories)).toEqual(["categories.dsp"]);
+    const oneCallstack = tick() as { callstacks: Record<string, unknown> };
+    delete oneCallstack.callstacks.arm7;
+    expect(paths(oneCallstack)).toEqual(["callstacks.arm7"]);
+  });
+
+  it("ties reason and breakpointId to the state", () => {
+    const pausedWithoutReason = tick() as { executionState: Record<string, unknown> };
+    delete pausedWithoutReason.executionState.reason;
+    expect(paths(pausedWithoutReason)).toEqual(["executionState.reason"]);
+
+    const running = tick();
+    running.executionState = { state: "running", stopId: 3, reason: "breakpoint", breakpointId: 1 };
+    expect(paths(running).sort()).toEqual(["executionState.breakpointId", "executionState.reason"]);
+    (running as { executionState: unknown }).executionState = { state: "running", stopId: 3 };
+    expect(paths(running)).toEqual([]);
+  });
+
+  it("limits the open enums to the values a v3 server sends; the client takes any string", () => {
+    const value = tick();
+    value.executionState.reason = "watchpoint";
+    value.eventLog[0].subsystem = "pvr";
+    value.eventLog[0].severity = "debug";
+    expect(paths(value).sort()).toEqual(["eventLog.0.severity", "eventLog.0.subsystem", "executionState.reason"]);
+    expect(DebuggerRpcMethodSchemas["event.tick"].params.safeParse(value).success).toBe(true);
+  });
+
+  it("checks registersStale, the notice, the event log and the breakpoints", () => {
+    const stale = tick() as { executionState: Record<string, unknown> };
+    stale.executionState.registersStale = false;
+    expect(paths(stale)).toEqual(["executionState.registersStale"]);
+    stale.executionState.registersStale = true;
+    stale.executionState.notice = "SH4 runs on the interpreter while breakpoints are armed\nDSP forced";
+    expect(paths(stale)).toEqual([]);
+    stale.executionState.notice = `ok\n${"x".repeat(201)}`;
+    expect(paths(stale)).toEqual(["executionState.notice"]);
+
+    const events = tick();
+    events.eventLog[0].eventId = "e-41";
+    events.eventLog[0].metadata.cycles = "0x10";
+    expect(paths(events).sort()).toEqual(["eventLog.0.eventId", "eventLog.0.metadata.cycles"]);
+    const many = tick();
+    many.eventLog = Array.from({ length: 201 }, (_, index) => ({ ...tick().eventLog[0], eventId: String(index) }));
+    expect(paths(many)).toEqual(["eventLog"]);
+
+    const breakpoint = tick() as { breakpoints: Record<string, Record<string, unknown>> };
+    delete breakpoint.breakpoints["1"].address;
+    expect(paths(breakpoint)).toEqual(["breakpoints.1.address"]);
+    breakpoint.breakpoints["1"].address = -1;
+    expect(paths(breakpoint)).toEqual(["breakpoints.1.address"]);
+  });
+
+  it("never accepts null for an optional field (both sets)", () => {
+    const value = tick() as { executionState: Record<string, unknown> };
+    value.executionState.breakpointId = null;
+    expect(paths(value)).toEqual(["executionState.breakpointId"]);
+    expect(DebuggerRpcMethodSchemas["event.tick"].params.safeParse(value).success).toBe(false);
+  });
+
+  const sh4Target = {
+    id: "sh4",
+    label: "SH4",
+    pcPath: "dc.sh4.cpu",
+    pcRegister: "PC",
+    breakpointEvent: "dc.sh4.cpu.pc",
+    instructionSize: 2,
+    addressMax: 0xffffffff,
+    addressRadix: 16,
+    addressDigits: 8,
+    defaultDisassemblyAddress: 0x8c010000,
+    defaultMemoryAddress: 0x8c010000,
+    memory: true,
+    stepping: true,
+  };
+  const shape = () => ({
+    emulator: { name: "nullDC", version: "3.0.0", build: "native" },
+    protocol: 3,
+    ui: "none",
+    capabilities: ["event-breakpoints", "callstack", "sh4-debug-native"],
+    targets: [sh4Target],
+    deviceTree: [
+      {
+        path: "dc",
+        label: "Dreamcast",
+        description: "",
+        children: [
+          {
+            path: "dc.sh4.cpu",
+            label: "Core",
+            description: "SH4 CPU core",
+            registers: [{ name: "PC", value: "0x8C0000A0", width: 32 }],
+            actions: ["sh4-disassembly"],
+          },
+        ],
+      },
+    ],
+  });
+  const strictShape = StrictDebuggerRpcMethodSchemas["debugger.describe"].result;
+
+  it("accepts a v3 describe result", () => {
+    expect(issuePaths(strictShape.safeParse(shape()))).toEqual([]);
+    expect(ConformanceSchemas.TargetSchema.safeParse(sh4Target).success).toBe(true);
+  });
+
+  it("checks the device tree: no empty arrays, no unknown actions, no unknown keys in nested nodes", () => {
+    const value = shape();
+    const node = value.deviceTree[0].children[0] as Record<string, unknown>;
+    node.actions = ["sh4-registers"];
+    node.events = [];
+    node.children = [{ path: "dc.sh4.cpu.x", label: "X", description: "", note: "unknown key" }];
+    expect(issuePaths(strictShape.safeParse(value)).sort()).toEqual([
+      "deviceTree.0.children.0.actions.0",
+      "deviceTree.0.children.0.children.0",
+      "deviceTree.0.children.0.events",
+    ]);
+    // the client ignores an unknown action instead of dropping the message
+    const lenient = DebuggerRpcMethodSchemas["debugger.describe"].result.parse(value);
+    expect(lenient.deviceTree[0].children?.[0].actions).toEqual(["sh4-registers"]);
+  });
+
+  it("ties defaultMemoryAddress to memory", () => {
+    const noMemory = { ...sh4Target, id: "dsp", memory: false };
+    expect(issuePaths(ConformanceSchemas.TargetSchema.safeParse(noMemory))).toEqual(["defaultMemoryAddress"]);
+    const { defaultMemoryAddress: _omitted, ...withoutDefault } = sh4Target;
+    expect(issuePaths(ConformanceSchemas.TargetSchema.safeParse(withoutDefault))).toEqual(["defaultMemoryAddress"]);
+    expect(ConformanceSchemas.TargetSchema.safeParse({ ...withoutDefault, memory: false }).success).toBe(true);
+    expect(issuePaths(ConformanceSchemas.TargetSchema.safeParse({ ...sh4Target, addressRadix: 8 }))).toEqual(["addressRadix"]);
+  });
+
+  it("checks results: memory, in-band errors without data, SGC geometry", () => {
+    const memory = StrictDebuggerRpcMethodSchemas["state.getMemorySlice"].result;
+    expect(memory.safeParse({ baseAddress: 0x21fff0, data: [1, 0], validity: "ok", unreadable: [[1, 1]] }).success).toBe(true);
+    expect(issuePaths(memory.safeParse({ baseAddress: 0, data: [256], validity: "tlb-miss", unreadable: [] })).sort()).toEqual([
+      "data.0",
+      "unreadable",
+      "validity",
+    ]);
+
+    const rpcError = StrictDebuggerRpcMethodSchemas["control.step"].result;
+    expect(rpcError.safeParse({}).success).toBe(true);
+    expect(rpcError.safeParse({ error: { code: -32003, message: "not paused" } }).success).toBe(true);
+    expect(issuePaths(rpcError.safeParse({ error: { code: -32003, message: "not paused", data: { stack: "" } } }))).toEqual(["error"]);
+    expect(rpcError.safeParse(null).success).toBe(false);
+
+    const sgc = StrictDebuggerRpcMethodSchemas["state.getSgcFrameData"].result;
+    expect(sgc.safeParse({ frameCount: 64, channelsPerFrame: 64, bytesPerChannel: 128, totalBytes: 524288, binaryId: 1 }).success).toBe(true);
+    expect(issuePaths(sgc.safeParse({ frameCount: 64, channelsPerFrame: 32, bytesPerChannel: 128, totalBytes: 524288 })).sort()).toEqual([
+      "binaryId",
+      "channelsPerFrame",
+    ]);
+    // "no capture" is the JSON-RPC error -32011 for a v3 server; only the client schema takes the v2 mock's in-band object
+    const inBand = { error: { code: -32001, message: "No SGC frame data available. Record some data first." } };
+    expect(sgc.safeParse(inBand).success).toBe(false);
+    expect(DebuggerRpcMethodSchemas["state.getSgcFrameData"].result.safeParse(inBand).success).toBe(true);
+  });
+});
+
+describe("request parameters carry the bounds of the protocol", () => {
+  const accepts = (method: MethodName, params: unknown) => DebuggerRpcMethodSchemas[method].params.safeParse(params).success;
+
+  it("bounds lengths and counts", () => {
+    expect(accepts("state.getMemorySlice", { address: 0, length: 65536 })).toBe(true);
+    expect(accepts("state.getMemorySlice", { address: 0, length: 65537 })).toBe(false);
+    expect(accepts("state.getMemorySlice", { address: 0, length: 0 })).toBe(false);
+    expect(accepts("state.getMemoryBinary", { address: 0, length: 16777216 })).toBe(true);
+    expect(accepts("state.getMemoryBinary", { address: 0, length: 16777217 })).toBe(false);
+    expect(accepts("state.getDisassembly", { address: 0, count: 1024 })).toBe(true);
+    expect(accepts("state.getDisassembly", { address: 0, count: 1025 })).toBe(false);
+    expect(accepts("state.getCallstack", { target: "sh4", maxFrames: 64 })).toBe(true);
+    expect(accepts("state.getCallstack", { target: "sh4", maxFrames: 65 })).toBe(false);
+    expect(accepts("state.getCallstack", { target: "dsp" })).toBe(false);
+    expect(accepts("state.recordSgcFrames", {})).toBe(true);
+    expect(accepts("state.recordSgcFrames", { frames: 4097 })).toBe(false);
+    expect(accepts("state.writeMemory", { target: "sh4", address: 0, data: [] })).toBe(false);
+    expect(accepts("state.writeMemory", { target: "sh4", address: 0, data: [256] })).toBe(false);
+    expect(accepts("state.writeMemory", { target: "arm7", address: 0, data: [255] })).toBe(true);
+  });
+
+  it("bounds addresses to unsigned 32 bits and watch expressions to 256 characters, 64 per call", () => {
+    expect(accepts("state.getMemorySlice", { address: 0xffffffff, length: 1 })).toBe(true);
+    expect(accepts("state.getMemorySlice", { address: 0x100000000, length: 1 })).toBe(false);
+    expect(accepts("state.getMemorySlice", { address: -1, length: 1 })).toBe(false);
+    expect(accepts("state.getMemorySlice", { address: 1.5, length: 1 })).toBe(false);
+    expect(accepts("breakpoints.add", { event: "dc.sh4.cpu.pc", address: 0x8c010000 })).toBe(true);
+    expect(accepts("breakpoints.add", { event: "dc.sh4.interrupt" })).toBe(true);
+    expect(accepts("state.watch", { expressions: ["x".repeat(256)] })).toBe(true);
+    expect(accepts("state.watch", { expressions: ["x".repeat(257)] })).toBe(false);
+    expect(accepts("state.watch", { expressions: Array.from({ length: 65 }, () => "dc.sh4.cpu.pc") })).toBe(false);
+    expect(accepts("state.getTable", { id: "sq" })).toBe(true);
+    expect(accepts("state.getTable", { id: "vram" })).toBe(false);
+    expect(accepts("state.captureHolly", { what: "ta" })).toBe(true);
+    expect(accepts("debugger.describe", { protocol: 3, client: "nullDC DevTools" })).toBe(true);
+    expect(accepts("debugger.describe", {})).toBe(true);
+  });
+});
