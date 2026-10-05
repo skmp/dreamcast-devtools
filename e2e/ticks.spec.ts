@@ -120,11 +120,9 @@ test("a stop is acted on once: the views follow it, read again and announce its 
     disassembly: server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4").length,
     memory: server.requestsOf("state.getMemorySlice").length,
   });
-  const hits = (address: number) => page.getByRole("alert").filter({ hasText: `Breakpoint hit: dc.sh4.cpu.pc == ${hex8(address)}` });
 
   // the first paused tick of a connection counts as a stop: the client learns why the target is stopped
-  await expect(hits(0x8c001000)).toBeVisible();
-  expect(await announced()).toEqual(["Breakpoint hit: dc.sh4.cpu.pc == 0x8C001000"]);
+  await expect.poll(announced).toEqual(["Breakpoint hit: dc.sh4.cpu.pc == 0x8C001000"]);
   await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
   await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c001000));
   await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
@@ -166,7 +164,7 @@ test("a stop is acted on once: the views follow it, read again and announce its 
   await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c002002));
   await expect(rows.first()).toHaveAttribute("data-address", String(0x8c002000 - 20));
   await expect.poll(fetches).toEqual({ disassembly: 4, memory: 3 });
-  await expect(hits(0x8c002002)).toBeVisible();
+  await expect.poll(async () => (await announced()).length).toBe(2);
   // the stop is repeated in every paused tick of it, and announced once
   await tickAndWait(page, server);
   await tickAndWait(page, server);

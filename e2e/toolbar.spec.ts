@@ -5,6 +5,7 @@ import {
   gotoRoute,
   openWorkspace,
   panel,
+  recordAlerts,
   registerRow,
   saveScreenshot,
   statusBar,
@@ -185,6 +186,8 @@ test("the reason of a stop is an open string, and the notice of the server is sh
 
 test("every control request is checked: an in-band error and a JSON-RPC error are both shown", async ({ page }) => {
   const server = await serveScriptedDebugger(page);
+  // every notice the page shows (one stays for five seconds)
+  const notices = await recordAlerts(page);
   await gotoRoute(page, "/workspace/sh4-debugger");
   await expect(statusBar(page)).toContainText("Connection: connected");
   const view = panel(page, "sh4-disassembly");
@@ -193,9 +196,9 @@ test("every control request is checked: an in-band error and a JSON-RPC error ar
 
   server.answer("control.runUntil", () => inBandError(-32000, "emulator busy"));
   await tooltipButton(page, "Run").click();
-  await expect(shown("Run: emulator busy")).toBeVisible();
+  await expect.poll(notices).toEqual(["Run: emulator busy"]);
   await tooltipButton(page, "Run to next breakpoint").click();
-  await expect(shown("Run: emulator busy")).toHaveCount(2);
+  await expect.poll(notices).toEqual(["Run: emulator busy", "Run: emulator busy"]);
 
   server.answer("control.step", () => inBandError(-32005, "cannot step: undefined opcode"));
   await tooltipButton(view, "Step In").click();
@@ -218,4 +221,13 @@ test("every control request is checked: an in-band error and a JSON-RPC error ar
   // the buttons are as the ticks say: nothing was assumed to have worked
   await expect(tooltipButton(page, "Pause")).toBeEnabled();
   await expect(tooltipButton(page, "Run")).toBeDisabled();
+  // one notice per refusal, and none for anything else
+  expect(await notices()).toEqual([
+    "Run: emulator busy",
+    "Run: emulator busy",
+    "Step: cannot step: undefined opcode",
+    "Step over: internal error",
+    "Step out: not supported: control.stepOut",
+    "Pause: emulator stopped by host UI",
+  ]);
 });
