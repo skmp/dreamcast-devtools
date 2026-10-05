@@ -206,7 +206,10 @@ checks the tick invariants on every tick, and runs the scenarios S00 to S18
 categories and run state it found: after a failed scenario and at the end of the run it removes
 every breakpoint and watch that was not there when it connected (so nobody else should add any
 while it runs), and it reports what it could not put back. It exits with 1 when a scenario
-failed, an invariant was violated or the server was left changed.
+failed, an invariant was violated or the server was left changed, and with 2 when there was no
+run: a wrong option, or a server it could not connect to. Whatever a connected server answers is
+a result, with the summary of `--json`: a `debugger.describe` result that does not follow the
+schema is S01 failed, with every issue, and the run goes on with what the client reads from it.
 
 ```
 npm run contract                                  # the mock, started in the same process

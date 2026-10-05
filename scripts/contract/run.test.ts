@@ -8,6 +8,7 @@ import { listenMockDebugger } from "../../server/mockWebSocket";
 import { isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
 import { runContract } from "./run";
 import type { ContractSummary } from "./run";
+import { ContractFailure } from "./session";
 
 /**
  * The runner against the mock, and against the mock behind a proxy that breaks the
@@ -527,6 +528,91 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
     expect(statusOf(summary, "S01")).toBe("failed");
     expect(detailsOf(summary, "S01")).toMatch(/the tick after describe is full; it lacks dc/);
+  });
+
+  it("S01: a describe result that fails the strict schema is S01 failed, with every issue, and the run goes on", async () => {
+    const summary = await run(
+      {
+        toClient: (frame) => {
+          const result = frame.result as (Json & { emulator: Json; deviceTree: Array<Json & { children: Json[] }> }) | undefined;
+          if (!result?.deviceTree) return frame;
+          // five things the strict schema refuses and the client's own schema reads past
+          const { ui: _ui, ...rest } = result;
+          const [dc, ...others] = result.deviceTree;
+          const [sh4, ...siblings] = dc.children;
+          return {
+            ...frame,
+            result: {
+              ...rest,
+              build: "debug",
+              emulator: { ...result.emulator, commit: "0123abc" },
+              deviceTree: [{ ...dc, actions: ["no-such-panel"], children: [{ ...sh4, registers: [] }, ...siblings] }, ...others],
+            },
+          };
+        },
+      },
+      ["S01", "S02", "S13"],
+    );
+    expect(statusOf(summary, "S01")).toBe("failed");
+    expect(summary.scenarios[0].details.slice(0, 6)).toEqual([
+      "the debugger.describe result does not follow the schema of protocol v3 (5 issues):",
+      '  emulator: Unrecognized key: "commit"',
+      "  ui: Invalid input: expected string, received undefined",
+      expect.stringMatching(/^ {2}deviceTree\.0\.actions\.0: Invalid option: expected one of "/),
+      "  deviceTree.0.children.0.registers: Too small: expected array to have >=1 items",
+      '  Unrecognized key: "build"',
+    ]);
+    // what S01 itself looks for is still looked for
+    expect(detailsOf(summary, "S01")).toMatch(/^dc: action "no-such-panel" is not a panel id$/m);
+    expect(detailsOf(summary, "S01")).toMatch(/^dc\.sh4: an empty "registers" array is omitted, not sent$/m);
+    // every response is validated: the run reports the result of each debugger.describe it sends
+    expect(summary.invariantViolations).toEqual([expect.stringMatching(/^I1: Response validation failed for debugger\.describe: emulator: Unrecognized key: "commit"; .* \(and 2 more\)/)]);
+    expect(reportOf(summary).slice(1)).toEqual([
+      "S02 passed ",
+      // (its second connection asks debugger.describe too)
+      expect.stringMatching(/^S13 failed invariant: I1: Response validation failed for debugger\.describe: /),
+    ]);
+    expect(summary.server).toMatchObject({ protocol: 3, ui: undefined, emulator: { name: "nullDC (mock)" } });
+    expect(summary.ok).toBe(false);
+    expect(summary.cleanUpProblems).toEqual([]);
+  }, 30_000);
+
+  it("S01: a server that answers debugger.describe with nothing the client can read, or sends no tick after it, fails S01; nothing else is run", async () => {
+    const lines: string[] = [];
+    const refused = await startServer({
+      toClient: (frame) => ((frame.result as Json | undefined)?.deviceTree ? { jsonrpc: "2.0", id: frame.id, error: { code: -32601, message: "method not found: debugger.describe" } } : frame),
+    });
+    const noDescribe = await runContract({ url: refused.url, profile: "mock", only: new Set(["S01", "S02"]), say: (line) => lines.push(line) });
+    expect(reportOf(noDescribe)).toEqual([
+      'S01 failed debugger.describe {"protocol":3,"client":"nullDC contract runner"}: JSON-RPC error -32601 "method not found: debugger.describe"',
+      'S02 failed not run: debugger.describe {"protocol":3,"client":"nullDC contract runner"}: JSON-RPC error -32601 "method not found: debugger.describe"',
+    ]);
+    expect(noDescribe).toMatchObject({ ok: false, passed: 0, failed: 2, cleanUpProblems: [] });
+    // (the mock runs, and its ticks arrive whatever the proxy made of the describe response)
+    expect(noDescribe.finalState).toMatch(/running/);
+    expect(noDescribe.server).toEqual({ emulator: { name: "unknown", version: "unknown", build: "unknown" }, protocol: undefined, ui: undefined, capabilities: [], targets: [] });
+    expect(lines.at(-1)).toBe("contract: FAILED");
+
+    // a paused server sends no periodic tick: without the tick that follows the response there is none at all
+    const silent = await startServer(() => noTickAfter((frame) => frame.method === "debugger.describe"), { startPaused: true });
+    const noTick = await runContract({ url: silent.url, profile: "mock", only: new Set(["S01", "S05"]) });
+    expect(reportOf(noTick)).toEqual([
+      "S01 failed the tick that follows debugger.describe: not seen within 2000 ms; ticks since then: 0",
+      "S05 failed not run: the tick that follows debugger.describe: not seen within 2000 ms; ticks since then: 0",
+    ]);
+    expect(noTick).toMatchObject({ ok: false, finalState: "unknown", server: { protocol: 3, emulator: { name: "nullDC (mock)" } } });
+    // nothing was asked of it but debugger.describe
+    expect(silent.mock.clientCount).toBeLessThanOrEqual(1);
+    expect((await stateOf(silent.direct)).executionState).toMatchObject({ state: "paused", reason: "start" });
+  }, 30_000);
+
+  it("a server that cannot be connected to is not a failed run: the error leaves the runner", async () => {
+    // a port nothing listens on any more
+    const gone = await listenMockDebugger(new MockDebugger());
+    await gone.close();
+    const attempt = runContract({ url: gone.url, profile: "mock", only: new Set(["S01"]) });
+    await expect(attempt).rejects.toThrow(/^Could not connect to ws:\/\/127\.0\.0\.1:\d+\/ws/);
+    await expect(attempt).rejects.not.toBeInstanceOf(ContractFailure);
   });
 
   it("S04: a running tick before the paused tick of a step", async () => {

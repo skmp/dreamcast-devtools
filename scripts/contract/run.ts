@@ -1,7 +1,7 @@
 import { MockDebugger } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
 import type { MockListener } from "../../server/mockWebSocket";
-import type { DebuggerTick } from "../../src/lib/debuggerSchema";
+import type { DebuggerShape, DebuggerTick } from "../../src/lib/debuggerSchema";
 import { resolveAddress } from "./elfSymbols";
 import type { ElfSymbols } from "./elfSymbols";
 import { SCENARIOS, baselineOf, cleanUp, runScenario } from "./scenarios";
@@ -140,6 +140,9 @@ const awaitStartStop = async (session: ContractSession, say: (line: string) => v
 
 const describeServer = (session: ContractSession): string => {
   const shape = session.shape;
+  if (!shape) {
+    return "server: debugger.describe gave no result";
+  }
   return (
     `server: ${shape.emulator.name} ${shape.emulator.version} (${shape.emulator.build}), protocol ${shape.protocol}, ui ${shape.ui}; ` +
     `capabilities: ${shape.capabilities?.join(", ") || "none"}; ` +
@@ -154,49 +157,79 @@ const describeServer = (session: ContractSession): string => {
 export const runContract = async (options: ContractOptions): Promise<ContractSummary> => {
   const { url, timeoutFactor, sessions, seen, openSession, close, say } = await prepare(options);
   try {
-    const session = await openSession();
-    say(describeServer(session));
-
-    const initial: DebuggerTick = options.profile === "emulator" ? await awaitStartStop(session, say) : session.latestTick().tick;
-    // (read after the start stop: awaitStartStop can have replaced what describe said at connect time)
-    const shape = session.shape;
-    // what the run leaves behind is compared with this tick
-    const baseline = baselineOf(initial);
-    say(`initial state: ${describeState(initial)}; profile ${options.profile}, timeouts x${timeoutFactor}`);
-    say("");
-
-    const context: RunContext = {
-      profile: options.profile,
-      url,
-      session,
-      openSession,
-      elf: options.elf,
-      seen,
-      note: () => undefined,
-    };
-
-    const results: ScenarioResult[] = [];
-    for (const scenario of SCENARIOS) {
-      if (options.only && !options.only.has(scenario.id)) {
-        continue;
+    // A server that cannot be connected to cannot be tested: that error leaves this function.
+    // A server that is connected to and does not get as far as the first scenario (no usable
+    // answer to debugger.describe, no tick after it) is a server that fails S01.
+    let session: ContractSession | undefined;
+    let initial: DebuggerTick | undefined;
+    let unusable: ContractFailure | undefined;
+    try {
+      session = await openSession();
+      say(describeServer(session));
+      initial = options.profile === "emulator" ? await awaitStartStop(session, say) : session.latestTick().tick;
+    } catch (error) {
+      if (!(error instanceof ContractFailure)) {
+        throw error;
       }
-      if (context.session.isClosed) {
-        results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: ["the connection is closed"] });
-      } else {
-        const result = await runScenario(scenario, context);
-        if (result.status === "failed") {
-          // leave nothing of a failed scenario behind for the next one
-          const leftovers = await cleanUp(context, baseline, false);
-          result.details.push(...leftovers.problems.map((problem) => `clean-up: ${problem}`));
-        }
-        results.push(result);
-      }
-      formatScenario(results.at(-1)!).forEach(say);
+      unusable = error;
     }
 
-    // remove what is left, restore the categories and the run state, and look at what the server then says
-    const { problems, tick: final } = await cleanUp(context, baseline, true);
+    const results: ScenarioResult[] = [];
+    let problems: string[] = [];
+    let final: DebuggerTick | undefined;
+    if (session && initial) {
+      // what the run leaves behind is compared with this tick
+      const baseline = baselineOf(initial);
+      say(`initial state: ${describeState(initial)}; profile ${options.profile}, timeouts x${timeoutFactor}`);
+      say("");
 
+      const context: RunContext = {
+        profile: options.profile,
+        url,
+        session,
+        openSession,
+        elf: options.elf,
+        seen,
+        note: () => undefined,
+      };
+
+      for (const scenario of SCENARIOS) {
+        if (options.only && !options.only.has(scenario.id)) {
+          continue;
+        }
+        if (context.session.isClosed) {
+          results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: ["the connection is closed"] });
+        } else {
+          const result = await runScenario(scenario, context);
+          if (result.status === "failed") {
+            // leave nothing of a failed scenario behind for the next one
+            const leftovers = await cleanUp(context, baseline, false);
+            result.details.push(...leftovers.problems.map((problem) => `clean-up: ${problem}`));
+          }
+          results.push(result);
+        }
+        formatScenario(results.at(-1)!).forEach(say);
+      }
+
+      // remove what is left, restore the categories and the run state, and look at what the server then says
+      ({ problems, tick: final } = await cleanUp(context, baseline, true));
+    } else {
+      // S01 with what was found; nothing else can be asked of this server, and nothing was changed on it
+      say("");
+      const found = unusable ? [unusable.message, ...unusable.more] : ["debugger.describe gave no result"];
+      for (const scenario of SCENARIOS) {
+        if (options.only && !options.only.has(scenario.id)) {
+          continue;
+        }
+        const details = scenario.id === "S01" ? found : [`not run: ${found[0]}`];
+        results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details });
+        formatScenario(results.at(-1)!).forEach(say);
+      }
+      final = sessions[0]?.ticks.at(-1)?.tick;
+    }
+
+    // (read here: awaitStartStop can have replaced what describe said at connect time)
+    const shape: DebuggerShape | undefined = sessions[0]?.shape;
     const violations = Array.from(new Set(sessions.flatMap((entry) => entry.violations)));
     const ticksChecked = sessions.reduce((sum, entry) => sum + entry.ticksChecked, 0);
     const count = (status: ScenarioResult["status"]) => results.filter((result) => result.status === status).length;
@@ -207,11 +240,11 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
       profile: options.profile,
       timeoutFactor,
       server: {
-        emulator: shape.emulator,
-        protocol: shape.protocol,
-        ui: shape.ui,
-        capabilities: shape.capabilities ?? [],
-        targets: (shape.targets ?? []).map((target) => ({ id: target.id, memory: target.memory, stepping: target.stepping })),
+        emulator: shape?.emulator ?? { name: "unknown", version: "unknown", build: "unknown" },
+        protocol: shape?.protocol,
+        ui: shape?.ui,
+        capabilities: shape?.capabilities ?? [],
+        targets: (shape?.targets ?? []).map((target) => ({ id: target.id, memory: target.memory, stepping: target.stepping })),
       },
       passed: count("passed"),
       failed: count("failed"),
@@ -220,7 +253,7 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
       ticksChecked,
       invariantViolations: violations,
       cleanUpProblems: problems,
-      finalState: final ? describeState(final) : "connection closed",
+      finalState: final ? describeState(final) : initial ? "connection closed" : "unknown",
       scenarios: results,
     };
 

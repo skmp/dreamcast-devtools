@@ -1,21 +1,30 @@
 import { JsonRpcException } from "../../src/lib/jsonRpc";
 import {
   DEBUGGER_ERROR_MESSAGES,
+  DebuggerRpcMethodSchemas,
   IN_BAND_ERROR_METHODS,
   PROTOCOL_VERSION,
+  RpcMethod,
   StrictDebuggerRpcMethodSchemas,
 } from "../../src/lib/debuggerSchema";
 import type { DebuggerRpcSchema, DebuggerShape, DebuggerTick } from "../../src/lib/debuggerSchema";
-import { JsonRpcClient } from "../../src/services/jsonRpcClient";
+import { JsonRpcClient, RpcValidationError } from "../../src/services/jsonRpcClient";
 import { WebSocketTransport } from "../../src/services/transport";
 import { checkResponseEnvelope, checkTick, indexDescribe } from "./invariants";
 import type { DescribeIndex, TickTracking } from "./invariants";
 
-/** An assertion of a scenario that did not hold. */
-export class ContractFailure extends Error {}
+/** An assertion of a scenario that did not hold. `more`: further lines of the same finding, one each. */
+export class ContractFailure extends Error {
+  public readonly more: string[];
 
-export const fail = (message: string): never => {
-  throw new ContractFailure(message);
+  constructor(message: string, more: string[] = []) {
+    super(message);
+    this.more = more;
+  }
+}
+
+export const fail = (message: string, more?: string[]): never => {
+  throw new ContractFailure(message, more);
 };
 
 export const check = (condition: unknown, message: string): void => {
@@ -74,6 +83,12 @@ export class ContractSession {
   public readonly violations: string[] = [];
   public shape!: DebuggerShape;
   public index: DescribeIndex | undefined;
+  /**
+   * Every issue the strict schema has with the latest debugger.describe result, as
+   * `<path>: <message>`; empty when the result is valid. Such a result does not end the run:
+   * it is what S01 reports, and `shape` is then what the client's own schema makes of it.
+   */
+  public describeProblems: string[] = [];
   public ticksChecked = 0;
   private readonly options: SessionOptions;
   private readonly transport: WebSocketTransport;
@@ -129,7 +144,10 @@ export class ContractSession {
     });
   }
 
-  /** Connects, sends debugger.describe and waits for the tick that follows it. */
+  /**
+   * Connects (an error that is not a ContractFailure: there is no server to test), sends
+   * debugger.describe and waits for the tick that follows it.
+   */
   async open(): Promise<void> {
     await this.rpc.connect(this.url);
     await this.describe();
@@ -141,12 +159,37 @@ export class ContractSession {
    * so what was read before the machine had started is not what holds afterwards.
    */
   async describe(): Promise<TickRecord> {
+    const response = await this.requestDescribe();
+    // A periodic tick can arrive before the response; the one to wait for comes after it.
+    return this.waitForTick(() => true, 2000, "the tick that follows debugger.describe", response.seq);
+  }
+
+  /**
+   * Sends debugger.describe and returns the response frame. A result that fails the strict
+   * schema is kept in `describeProblems` (and is an I1 violation, as for every response) and
+   * the session goes on with what the client's schema reads from it; only a describe without
+   * a result the client can use fails here.
+   */
+  async requestDescribe(): Promise<RecordedFrame> {
     const mark = this.mark();
-    this.shape = await this.call("debugger.describe", { protocol: PROTOCOL_VERSION, client: this.options.clientName });
+    const params = { protocol: PROTOCOL_VERSION, client: this.options.clientName };
+    this.describeProblems = [];
+    try {
+      this.shape = await this.rpc.call(RpcMethod.DEBUGGER_DESCRIBE, params);
+    } catch (error) {
+      const lenient =
+        error instanceof RpcValidationError
+          ? DebuggerRpcMethodSchemas[RpcMethod.DEBUGGER_DESCRIBE].result.safeParse(this.responseSince(mark)?.json.result)
+          : undefined;
+      if (!(error instanceof RpcValidationError) || !lenient?.success) {
+        return fail(callFailure(RpcMethod.DEBUGGER_DESCRIBE, params, error));
+      }
+      this.describeProblems = error.issues.map((issue) => (issue.path ? `${issue.path}: ${issue.message}` : issue.message));
+      this.shape = lenient.data;
+    }
     this.index = indexDescribe(this.shape);
     // (the tap has indexed the same result already, before the tick that follows it)
-    // A periodic tick can arrive before the response; the one to wait for comes after it.
-    return this.waitForTick(() => true, 2000, "the tick that follows debugger.describe", this.responseSince(mark)?.seq ?? mark);
+    return this.responseSince(mark) ?? fail("the debugger.describe response was not recorded");
   }
 
   get isClosed(): boolean {
@@ -208,10 +251,7 @@ export class ContractSession {
     try {
       result = await this.rpc.call(method, params as never);
     } catch (error) {
-      if (error instanceof JsonRpcException) {
-        return fail(`${method} ${JSON.stringify(params)}: JSON-RPC error ${error.code} "${error.message}"`);
-      }
-      return fail(`${method} ${JSON.stringify(params)}: ${error instanceof Error ? error.message : String(error)}`);
+      return fail(callFailure(method, params, error));
     }
     if (IN_BAND_ERROR_METHODS.has(method)) {
       const inBand = (result as InBandResult).error;
@@ -389,6 +429,12 @@ export class ContractSession {
     this.wake();
   }
 }
+
+/** Why a request that had to succeed did not. */
+const callFailure = (method: string, params: unknown, error: unknown): string =>
+  error instanceof JsonRpcException
+    ? `${method} ${JSON.stringify(params)}: JSON-RPC error ${error.code} "${error.message}"`
+    : `${method} ${JSON.stringify(params)}: ${error instanceof Error ? error.message : String(error)}`;
 
 export const describeState = (tick: DebuggerTick): string => {
   const state = tick.executionState;

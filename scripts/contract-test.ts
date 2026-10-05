@@ -19,7 +19,9 @@ import { ContractFailure } from "./contract/session";
  * schema, checks the invariants I1 to I5 on every tick, and runs the scenarios S00 to S18
  * (scripts/contract/). It leaves the server with the breakpoints, watches, categories and run
  * state it found, and exits with 1 when a scenario failed, an invariant was violated or the
- * server could not be put back (2: the run could not be made).
+ * server could not be put back. 2 means that there was no run: a wrong option, or a server
+ * that could not be connected to. What a connected server answers is always a result, with
+ * the summary: a debugger.describe that cannot be used is S01 failed.
  */
 
 const USAGE = `usage: npm run contract -- [options]

@@ -378,19 +378,39 @@ const s01: Scenario = {
   title: "describe",
   async run(context) {
     const { session } = context;
-    const mark = session.mark();
-    // validated with the strict schema by the session
-    const shape = await session.call("debugger.describe", { protocol: 3, client: "nullDC contract runner" });
-    check(shape.protocol === 3, `protocol is ${shape.protocol}, expected 3`);
-    check(Array.isArray(shape.targets), "targets is present");
+    // S01 reports everything it finds about the describe result, not the first thing
+    const findings: string[] = [];
+    const expectThat = (condition: unknown, message: string): void => {
+      if (!condition) {
+        findings.push(message);
+      }
+    };
+
+    // The result is valid: the session validates it with the strict schema and keeps every
+    // issue. (A describe without a result the client can read fails here: there is nothing to look at.)
+    const response = await session.requestDescribe();
+    const shape = session.shape;
+    const issues = session.describeProblems;
+    if (issues.length > 0) {
+      findings.push(
+        `the debugger.describe result does not follow the schema of protocol v3 (${issues.length} issue${issues.length === 1 ? "" : "s"}):`,
+        ...issues.map((issue) => `  ${issue}`),
+      );
+    }
+    expectThat(shape.protocol === 3, `protocol is ${shape.protocol}, expected 3`);
+    expectThat(Array.isArray(shape.targets), "targets is present");
 
     // the first notification after the response is a full tick (response first, tick second)
-    const response = session.frames.find((frame) => frame.seq >= mark && frame.kind === "response") ?? fail("the describe response was not recorded");
-    const following = await session.waitForTick(() => true, 2000, "the tick that follows the debugger.describe response", response.seq);
-    const first = following.tick;
-    const missing = missingPaths(session, first);
-    if (first.executionState.reason !== "no-game") {
-      check(missing.length === 0, `the tick after describe is full; it lacks ${missing.slice(0, 5).join(", ")}`);
+    try {
+      const following = await session.waitForTick(() => true, 2000, "the tick that follows the debugger.describe response", response.seq);
+      const first = following.tick;
+      const missing = missingPaths(session, first);
+      expectThat(first.executionState.reason === "no-game" || missing.length === 0, `the tick after describe is full; it lacks ${missing.slice(0, 5).join(", ")}`);
+    } catch (error) {
+      if (!(error instanceof ContractFailure)) {
+        throw error;
+      }
+      findings.push(error.message);
     }
 
     // unique paths, unique register names per node, actions within PanelId, no empty arrays
@@ -398,19 +418,19 @@ const s01: Scenario = {
     const panelIds = new Set<string>(PanelIdSchema.options);
     const visit = (nodes: DeviceNodeDescriptor[]) => {
       for (const node of nodes) {
-        check(!paths.has(node.path), `the path ${node.path} appears twice in the device tree`);
+        expectThat(!paths.has(node.path), `the path ${node.path} appears twice in the device tree`);
         paths.add(node.path);
-        check(node.path === node.path.toLowerCase(), `the path ${node.path} is not lower case`);
+        expectThat(node.path === node.path.toLowerCase(), `the path ${node.path} is not lower case`);
         const names = (node.registers ?? []).map((register) => register.name);
-        check(new Set(names).size === names.length, `${node.path} lists a register name twice`);
+        expectThat(new Set(names).size === names.length, `${node.path} lists a register name twice`);
         for (const name of names) {
-          check(name === name.toUpperCase(), `register ${node.path}.${name} is not upper case`);
+          expectThat(name === name.toUpperCase(), `register ${node.path}.${name} is not upper case`);
         }
         for (const key of ["registers", "events", "actions", "children"] as const) {
-          check(node[key] === undefined || node[key]!.length > 0, `${node.path}: an empty "${key}" array is omitted, not sent`);
+          expectThat(node[key] === undefined || node[key]!.length > 0, `${node.path}: an empty "${key}" array is omitted, not sent`);
         }
         for (const action of node.actions ?? []) {
-          check(panelIds.has(action), `${node.path}: action "${action}" is not a panel id`);
+          expectThat(panelIds.has(action), `${node.path}: action "${action}" is not a panel id`);
         }
         visit(node.children ?? []);
       }
@@ -418,13 +438,18 @@ const s01: Scenario = {
     visit(shape.deviceTree);
 
     // every target points into the tree
-    const ids = shape.targets!.map((target) => target.id);
-    check(new Set(ids).size === ids.length, "a target is listed twice");
-    for (const target of shape.targets!) {
+    const targets = shape.targets ?? [];
+    const ids = targets.map((target) => target.id);
+    expectThat(new Set(ids).size === ids.length, "a target is listed twice");
+    for (const target of targets) {
       const registers = session.index!.registers.get(target.pcPath);
-      check(registers?.some((register) => register.name === target.pcRegister), `target ${target.id}: ${target.pcPath}.${target.pcRegister} is not in the device tree`);
+      expectThat(registers?.some((register) => register.name === target.pcRegister), `target ${target.id}: ${target.pcPath}.${target.pcRegister} is not in the device tree`);
     }
-    check(ids.includes("sh4"), "the SH4 target is listed");
+    expectThat(ids.includes("sh4"), "the SH4 target is listed");
+
+    if (findings.length > 0) {
+      fail(findings[0], findings.slice(1));
+    }
   },
 };
 
@@ -1435,7 +1460,7 @@ export const runScenario = async (scenario: Scenario, context: RunContext): Prom
   } catch (error) {
     status = "failed";
     if (error instanceof ContractFailure) {
-      details.unshift(error.message);
+      details.unshift(error.message, ...error.more);
     } else {
       details.unshift(`the runner failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
     }
