@@ -39,6 +39,13 @@ export interface TickRecord {
   tick: DebuggerTick;
 }
 
+/** A binary frame as it arrived. `seq` is its position among the text frames of the connection. */
+export interface BinaryRecord {
+  seq: number;
+  at: number;
+  data: ArrayBuffer;
+}
+
 export interface SessionOptions {
   /** the emulator profile multiplies every timeout of the scenarios by 5 */
   timeoutFactor: number;
@@ -63,7 +70,7 @@ export class ContractSession {
   public readonly url: string;
   public readonly frames: RecordedFrame[] = [];
   public readonly ticks: TickRecord[] = [];
-  public readonly binary: ArrayBuffer[] = [];
+  public readonly binary: BinaryRecord[] = [];
   public readonly violations: string[] = [];
   public shape!: DebuggerShape;
   public index: DescribeIndex | undefined;
@@ -95,8 +102,10 @@ export class ContractSession {
     // the client drops. It is also what makes the runner independent of when the client
     // dispatches: both frames of "response, then tick" can arrive in one turn.
     this.transport.subscribe((payload) => this.onText(payload));
-    this.transport.subscribeBinary((frame) => {
-      this.binary.push(frame);
+    this.transport.subscribeBinary((data) => {
+      // binary frames are numbered with the text frames: "response first, binary frame second" is an order
+      this.binary.push({ seq: this.seq++, at: Date.now() - this.openedAt, data });
+      this.options.trace?.(`<- binary frame, ${data.byteLength} bytes`);
       this.wake();
     });
     this.rpc = new JsonRpcClient<DebuggerRpcSchema>(this.transport, {
@@ -296,7 +305,7 @@ export class ContractSession {
   }
 
   /** The next binary frame at or after index `from` of `binary`, or undefined after `timeoutMs` (not scaled). */
-  async waitForBinary(from: number, timeoutMs: number): Promise<ArrayBuffer | undefined> {
+  async waitForBinary(from: number, timeoutMs: number): Promise<BinaryRecord | undefined> {
     const deadline = Date.now() + timeoutMs;
     while (this.binary.length <= from) {
       const remaining = deadline - Date.now();

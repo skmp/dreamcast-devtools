@@ -15,7 +15,7 @@ import type {
 import { MOCK_SH4_RING, mockNextAddress } from "../../server/mockDebugger";
 import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
 import { ContractFailure, ContractSession, check, describeState, fail } from "./session";
-import type { TickRecord } from "./session";
+import type { BinaryRecord, TickRecord } from "./session";
 import type { ElfSymbols } from "./elfSymbols";
 
 export type Profile = "mock" | "emulator";
@@ -1091,6 +1091,12 @@ const runParts = async (parts: Array<{ name: string; applicable: boolean; why: s
   return { parts: results };
 };
 
+/** The JSON response is sent first, the binary frame second. `request` is a `mark()` taken before the request. */
+const checkBinaryAfterResponse = (session: ContractSession, request: number, binary: BinaryRecord, method: string): void => {
+  const response = session.responseSince(request) ?? fail(`the ${method} response was not recorded`);
+  check(binary.seq > response.seq, `the binary frame of ${method} arrived before its JSON response; the response is sent first, the binary frame second`);
+};
+
 /** A step and a code breakpoint of a target other than the SH4. */
 const stepAndBreakpoint = async (context: RunContext, targetId: "arm7" | "dsp"): Promise<void> => {
   const { session } = context;
@@ -1272,13 +1278,16 @@ const s17: Scenario = {
           check(session.ticksSince(mark).some((record) => record.seq < stopped.seq && isRunning(record.tick)), "a running tick while the capture runs");
 
           const from = session.binary.length;
+          const request = session.mark();
           const info = await session.call("state.getSgcFrameData", {});
           if ("error" in info) {
             return fail("state.getSgcFrameData answered with an in-band error object");
           }
           check(info.frameCount === 64, `frameCount is ${info.frameCount}, 64 frames were recorded`);
           check(info.totalBytes === 64 * SGC_BYTES_PER_FRAME, `totalBytes is ${info.totalBytes}, expected ${64 * SGC_BYTES_PER_FRAME}`);
-          const frame = (await session.waitForBinary(from, session.scale(10_000))) ?? fail("no binary frame within 10 s of the state.getSgcFrameData response");
+          const binary = (await session.waitForBinary(from, session.scale(10_000))) ?? fail("no binary frame within 10 s of the state.getSgcFrameData response");
+          checkBinaryAfterResponse(session, request, binary, "state.getSgcFrameData");
+          const frame = binary.data;
           check(frame.byteLength === BINARY_FRAME_HEADER_BYTES + info.totalBytes, `the binary frame has ${frame.byteLength} bytes, expected 16 + ${info.totalBytes}`);
           const parsed = parseBinaryFrame(frame);
           if (!parsed.ok) {
@@ -1340,10 +1349,12 @@ const s18: Scenario = {
         async run() {
           const { session } = context;
           const from = session.binary.length;
+          const request = session.mark();
           const info = await session.call("state.captureHolly", { what: "ta" });
           check(info.what === "ta" && info.format === "taframe4", `state.captureHolly {ta} answered ${JSON.stringify(info)}`);
-          const frame = (await session.waitForBinary(from, session.scale(10_000))) ?? fail("no binary frame within 10 s of the state.captureHolly response");
-          const parsed = parseBinaryFrame(frame);
+          const binary = (await session.waitForBinary(from, session.scale(10_000))) ?? fail("no binary frame within 10 s of the state.captureHolly response");
+          checkBinaryAfterResponse(session, request, binary, "state.captureHolly");
+          const parsed = parseBinaryFrame(binary.data);
           if (!parsed.ok) {
             return fail(`the binary frame: ${parsed.reason}`);
           }

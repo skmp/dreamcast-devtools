@@ -22,6 +22,10 @@ interface Faults {
   toServer?: (frame: Json) => Json;
   /** frames the client receives after it has sent a request and before the server sees that request */
   beforeRequest?: (request: Json) => Json[];
+  /** rewrites a binary frame of the server */
+  toClientBinary?: (frame: Buffer) => Buffer;
+  /** a frame of the server for which this is true is held back until the next binary frame has been sent */
+  afterNextBinary?: (frame: Json) => boolean;
 }
 
 /** One set of faults for every connection, or a function that makes one per connection (faults that keep state). */
@@ -64,6 +68,7 @@ const startServer = async (
     const faults = typeof source === "function" ? source() : source;
     const upstream = new WebSocket(listener.url);
     const early: string[] = [];
+    const held: Json[] = [];
     client.on("message", (data) => {
       let text = data.toString();
       try {
@@ -84,10 +89,16 @@ const startServer = async (
     upstream.on("open", () => early.splice(0).forEach((text) => upstream.send(text)));
     upstream.on("message", (data, isBinary) => {
       if (isBinary) {
-        client.send(data, { binary: true });
+        const frame = Buffer.from(data as Buffer);
+        client.send(faults.toClientBinary ? faults.toClientBinary(frame) : frame, { binary: true });
+        held.splice(0).forEach((late) => client.send(JSON.stringify(late)));
         return;
       }
       const frame = JSON.parse(data.toString()) as Json;
+      if (faults.afterNextBinary?.(frame)) {
+        held.push(frame);
+        return;
+      }
       const rewritten = faults.toClient ? faults.toClient(frame) : frame;
       for (const out of rewritten === undefined ? [] : Array.isArray(rewritten) ? rewritten : [rewritten]) {
         client.send(JSON.stringify(out));
@@ -836,37 +847,26 @@ describe("the contract runner against a server that breaks the protocol", () => 
   });
 
   it("S17: a binary frame whose header does not belong to the result", async () => {
-    const { url } = await startServer();
-    // a proxy for binary frames only: the binaryId of the header is changed
-    const proxy = new WebSocketServer({ port: 0, host: "127.0.0.1" });
-    await new Promise<void>((resolve) => proxy.once("listening", resolve));
-    closers.unshift(
-      () =>
-        new Promise<void>((resolve) => {
-          proxy.clients.forEach((client) => client.terminate());
-          proxy.close(() => resolve());
-        }),
-    );
-    proxy.on("connection", (client) => {
-      const upstream = new WebSocket(url);
-      const early: string[] = [];
-      client.on("message", (data) => (upstream.readyState === WebSocket.OPEN ? upstream.send(data.toString()) : early.push(data.toString())));
-      upstream.on("open", () => early.splice(0).forEach((text) => upstream.send(text)));
-      upstream.on("message", (data, isBinary) => {
-        if (isBinary) {
-          const frame = Buffer.from(data as Buffer);
+    const summary = await run(
+      {
+        // the binaryId of the header is changed
+        toClientBinary: (frame) => {
           frame.writeUInt32LE(99, 8);
-          client.send(frame, { binary: true });
-        } else {
-          client.send(data.toString());
-        }
-      });
-      client.on("close", () => upstream.close());
-      upstream.on("close", () => client.close());
-    });
-    const summary = await runContract({ url: `ws://127.0.0.1:${(proxy.address() as AddressInfo).port}/ws`, profile: "mock", only: new Set(["S17"]) });
+          return frame;
+        },
+      },
+      ["S17"],
+    );
     expect(statusOf(summary, "S17")).toBe("failed");
     expect(detailsOf(summary, "S17")).toMatch(/sgc capture: binaryId is 99 in the header and 1 in the result/);
+  });
+
+  it("S17: a binary frame that is sent before the response it belongs to", async () => {
+    const summary = await run({ afterNextBinary: (frame) => typeof (frame.result as Json | undefined)?.frameCount === "number" }, ["S17"]);
+    expect(statusOf(summary, "S17")).toBe("failed");
+    expect(detailsOf(summary, "S17")).toMatch(
+      /sgc capture: the binary frame of state\.getSgcFrameData arrived before its JSON response; the response is sent first, the binary frame second/,
+    );
   });
 });
 
