@@ -2,9 +2,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { MockDebugger } from "../../server/mockDebugger";
+import { MOCK_SH4_RING, MockDebugger } from "../../server/mockDebugger";
 import type { MockClient, MockConnection, MockDebuggerOptions } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
+import { isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
 import { runContract } from "./run";
 import type { ContractSummary } from "./run";
 
@@ -155,6 +156,15 @@ const request = async (url: string, requests: Array<[method: string, params: Jso
   } finally {
     socket.close();
   }
+};
+
+/** One request to the mock as a client of its own (no socket), and what it answered. */
+const ask = (mock: MockDebugger, method: string, params: Json): Json => {
+  const frames: Json[] = [];
+  const client = mock.connect({ sendText: (text) => frames.push(JSON.parse(text) as Json), sendBinary: () => undefined });
+  client.receive(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
+  client.close();
+  return frames.find((frame) => frame.id === 1)!;
 };
 
 const isTick = (frame: Json): frame is Json & { params: Json & { executionState: Json; registers: Record<string, Json[]> } } =>
@@ -1024,6 +1034,59 @@ describe("the emulator profile", () => {
     expect(statusOf(noNotFound, "S15")).toBe("failed");
     expect(detailsOf(noNotFound, "S15")).toBe("a missing asset is 200, expected 404");
   });
+
+  it("S04: a step that executes two instructions fails, wherever the target happens to be paused", async () => {
+    /** The mock parked at its StartPaused stop with the SH4 at `pc`; with `skip` its step executes two instructions. */
+    const parkedAt = async (pc: number, skip: boolean) => {
+      const mock = new MockDebugger({ startPaused: true });
+      if (skip) {
+        const machine = mock as unknown as { advance(target: string): { wrapped: boolean }; running: boolean };
+        const advance = machine.advance.bind(mock);
+        machine.advance = (target) => {
+          const result = advance(target);
+          // (a paused machine advances only in a step)
+          return target === "sh4" && !machine.running ? advance(target) : result;
+        };
+      }
+      ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: String(pc) });
+      const { url } = await startServer(undefined, mock);
+      return { url, mock };
+    };
+    const stepFrom = async (pc: number, skip: boolean) => {
+      const { url } = await parkedAt(pc, skip);
+      const summary = await runContract({ url, profile: "emulator", timeoutFactor: 1, only: new Set(["S04"]) });
+      await closers.pop()!();
+      return summary;
+    };
+
+    // The eight addresses of the mock's loop, whose last line is its branch, and 24 outside of
+    // it, where the mock disassembles branches of every kind and walks straight on.
+    const starts = [
+      ...Array.from({ length: MOCK_SH4_RING.length }, (_, index) => MOCK_SH4_RING.base + index * 2),
+      ...Array.from({ length: 24 }, (_, index) => 0x8c00ffc0 + index * 2),
+    ];
+    const kinds = { plain: 0, controlFlow: 0, afterDelayedBranch: 0 };
+    for (const pc of starts) {
+      const { mock } = await parkedAt(pc, false);
+      await closers.pop()!();
+      const [previous, line] = (ask(mock, "state.getDisassembly", { target: "sh4", address: pc - 2, count: 2 }).result as { lines: Array<{ disassembly: string }> }).lines;
+      kinds[isSh4ControlFlow(line.disassembly) ? "controlFlow" : isSh4DelayedBranch(previous.disassembly) ? "afterDelayedBranch" : "plain"]++;
+
+      // the server that follows the protocol passes from here ...
+      expect(reportOf(await stepFrom(pc, false)), `from 0x${pc.toString(16)}`).toEqual(["S04 passed "]);
+      // ... and the one whose step skips an instruction does not
+      const skipping = await stepFrom(pc, true);
+      expect(statusOf(skipping, "S04"), `from 0x${pc.toString(16)}`).toBe("failed");
+      expect(detailsOf(skipping, "S04")).toMatch(
+        /^".+" at 0x8C0[0-9A-F]{5} is not control flow, and the step ended at 0x8C0[0-9A-F]{5}, not at 0x8C0[0-9A-F]{5} or an exception vector$/,
+      );
+      expect(skipping.ok).toBe(false);
+    }
+    // the PC of the first step cannot be checked on a control-flow line or in the slot of a delayed branch: the runner steps on from there
+    expect(kinds.plain).toBeGreaterThan(0);
+    expect(kinds.controlFlow).toBeGreaterThan(0);
+    expect(kinds.afterDelayedBranch).toBeGreaterThan(0);
+  }, 120_000);
 
   it("S00: reports a server that is not at its StartPaused stop, and one whose program does not reach the entry point", async () => {
     // a running mock is not an emulator at its start stop

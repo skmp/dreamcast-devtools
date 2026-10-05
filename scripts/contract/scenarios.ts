@@ -503,35 +503,72 @@ const s04: Scenario = {
   title: "step",
   async run(context) {
     const sh4 = requireTarget(context, "sh4");
-    const before = await ensurePaused(context);
-    const pc0 = pcOf(before.tick, sh4);
-    const cycles0 = cyclesOf(before.tick);
-    const lines = pc0 >= 2 ? await disassemble(context, "sh4", pc0 - 2, 2) : [];
-    const stepped = await stepOnce(context, "sh4");
-    const pc1 = pcOf(stepped.tick, sh4);
-    const cycles1 = cyclesOf(stepped.tick);
+    let record = await ensurePaused(context);
 
-    const vbr = registerOf(stepped.tick, sh4.pcPath, "VBR");
-    const vectorBase = vbr !== undefined && /^0x[0-9A-F]+$/.test(vbr) ? Number.parseInt(vbr, 16) : undefined;
-    const vectors = vectorBase === undefined ? [] : [0x100, 0x400, 0x600].map((offset) => (vectorBase + offset) >>> 0);
-    const atVector = vectors.includes(pc1) || pc1 === 0xa0000000;
+    /** One step from where the target is, with what holds for every step; `atVector`: it ended at an exception vector. */
+    const step = async (): Promise<{ pc0: number; pc1: number; atVector: boolean }> => {
+      const pc0 = pcOf(record.tick, sh4);
+      const cycles0 = cyclesOf(record.tick);
+      record = await stepOnce(context, "sh4");
+      const pc1 = pcOf(record.tick, sh4);
+      const cycles1 = cyclesOf(record.tick);
 
-    if (cycles0 !== undefined && cycles1 !== undefined) {
-      check(cycles1 >= cycles0, `dc.timing.SH4_CYCLES went back from ${cycles0} to ${cycles1} in a step`);
-      // a deferred interrupt can end the step before an instruction runs
-      check(cycles1 > cycles0 || atVector, "dc.timing.SH4_CYCLES did not increase in a step that did not end at an exception vector");
-    } else {
-      check(context.profile === "mock", "dc.timing.SH4_CYCLES is in every paused tick");
-    }
-    if (lines.length === 2 && !isSh4ControlFlow(lines[1].disassembly) && !isSh4DelayedBranch(lines[0].disassembly)) {
-      check(
-        pc1 === ((pc0 + 2) >>> 0) || atVector,
-        `"${lines[1].disassembly}" at ${hex(pc0)} is not control flow, and the step ended at ${hex(pc1)}, not at ${hex(pc0 + 2)} or an exception vector`,
-      );
-    }
-    if (context.profile === "mock") {
-      check(pc1 === mockNextAddress("sh4", pc0), `mock: the step from ${hex(pc0)} ended at ${hex(pc1)}, the next address of its loop is ${hex(mockNextAddress("sh4", pc0))}`);
-      check(pc0 >= MOCK_SH4_RING.base && pc0 < MOCK_SH4_RING.base + MOCK_SH4_RING.length * 2, "mock: the PC is in the loop");
+      const vbr = registerOf(record.tick, sh4.pcPath, "VBR");
+      const vectorBase = vbr !== undefined && /^0x[0-9A-F]+$/.test(vbr) ? Number.parseInt(vbr, 16) : undefined;
+      const vectors = vectorBase === undefined ? [] : [0x100, 0x400, 0x600].map((offset) => (vectorBase + offset) >>> 0);
+      const atVector = vectors.includes(pc1) || pc1 === 0xa0000000;
+
+      if (cycles0 !== undefined && cycles1 !== undefined) {
+        check(cycles1 >= cycles0, `dc.timing.SH4_CYCLES went back from ${cycles0} to ${cycles1} in a step`);
+        // a deferred interrupt can end the step before an instruction runs
+        check(cycles1 > cycles0 || atVector, "dc.timing.SH4_CYCLES did not increase in a step that did not end at an exception vector");
+      } else {
+        check(context.profile === "mock", "dc.timing.SH4_CYCLES is in every paused tick");
+      }
+      if (context.profile === "mock") {
+        check(pc1 === mockNextAddress("sh4", pc0), `mock: the step from ${hex(pc0)} ended at ${hex(pc1)}, the next address of its loop is ${hex(mockNextAddress("sh4", pc0))}`);
+        check(pc0 >= MOCK_SH4_RING.base && pc0 < MOCK_SH4_RING.base + MOCK_SH4_RING.length * 2, "mock: the PC is in the loop");
+      }
+      return { pc0, pc1, atVector };
+    };
+
+    /**
+     * Where a step ends is known only for a line that is not control flow and that is not the
+     * slot of a delayed branch. The PC of a pause is anywhere, so the target is stepped to such
+     * a line first (at most 64 steps, as S05 does). Returns the text of that line.
+     */
+    const stepToPlainLine = async (): Promise<string> => {
+      for (let steps = 0; ; steps++) {
+        const pc = pcOf(record.tick, sh4);
+        const lines = pc >= 2 ? await disassemble(context, "sh4", pc - 2, 2) : [undefined, ...(await disassemble(context, "sh4", pc, 1))];
+        const [previous, line] = lines;
+        if (line && !isSh4ControlFlow(line.disassembly) && !(previous && isSh4DelayedBranch(previous.disassembly))) {
+          return line.disassembly;
+        }
+        if (steps === 64) {
+          return fail("no sh4 PC whose line is not control flow and does not follow a delayed branch within 64 steps");
+        }
+        await step();
+      }
+    };
+
+    // One instruction per step. A step that an interrupt ended at its vector shows nothing about
+    // that, so the next plain line is tried, a few times.
+    const attempts = 4;
+    for (let attempt = 1; ; attempt++) {
+      const text = await stepToPlainLine();
+      const { pc0, pc1, atVector } = await step();
+      if (!atVector) {
+        check(
+          pc1 === ((pc0 + 2) >>> 0),
+          `"${text}" at ${hex(pc0)} is not control flow, and the step ended at ${hex(pc1)}, not at ${hex(pc0 + 2)} or an exception vector`,
+        );
+        break;
+      }
+      if (attempt === attempts) {
+        context.note(`${attempts} steps from lines that are not control flow ended at an exception vector each: that a step executes one instruction was not seen`);
+        break;
+      }
     }
 
     // a step while running is refused, in-band
