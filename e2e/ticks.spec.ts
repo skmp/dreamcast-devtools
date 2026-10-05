@@ -15,7 +15,7 @@ import {
   type WorkspaceId,
 } from "./support/fixtures";
 import type { Page } from "@playwright/test";
-import { inBandError, jsonRpcError, serveScriptedDebugger, type ScriptedDebugger } from "./support/scriptedDebugger";
+import { defaultAnswer, inBandError, jsonRpcError, serveScriptedDebugger, type Json, type ScriptedDebugger } from "./support/scriptedDebugger";
 
 // What the client does with a tick, against a server that sends exactly the ticks the test
 // asks for (the mock sends its own): registers are merged per path, a stop is acted on once,
@@ -192,6 +192,93 @@ test("a stop is acted on once: the views follow it, read again and announce its 
   await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c008000));
   await expect.poll(fetches).toEqual({ disassembly: 5, memory: 4 });
   expect(await announced()).toHaveLength(2);
+});
+
+test("two stops close together: the second is followed from where the view is going, not from what is still on screen", async ({
+  page,
+}) => {
+  const server = await open(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const marked = view.locator(".current-instruction");
+  await expect(marked).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  const listings = () => server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4");
+
+  // A server that takes its time over the lines of one address: they are held back until `release`.
+  const hold = (address: number) => {
+    const held: Array<() => void> = [];
+    let holding = true;
+    server.answer("state.getDisassembly", (params: Json) =>
+      holding && params.address === address
+        ? new Promise((resolve) => held.push(() => resolve(defaultAnswer("state.getDisassembly", params))))
+        : defaultAnswer("state.getDisassembly", params),
+    );
+    return {
+      held: () => held.length,
+      release: () => {
+        holding = false;
+        held.splice(0).forEach((answer) => answer());
+      },
+    };
+  };
+  let stopId = 1;
+  /** A new stop at `pc`. It has been applied when the toolbar names it. */
+  const stopAt = async (pc: number) => {
+    server.state.execution = { state: "paused", stopId: ++stopId, reason: "step" };
+    server.setRegister("dc.sh4.cpu", "PC", hex8(pc));
+    server.tick();
+    await expect(page.getByRole("status", { name: "Execution state" })).toContainText(`stop ${stopId}`);
+  };
+
+  // 1. A stop far away, and before its lines are in, a stop back on a line that is still on
+  //    screen. That line is about to be replaced: the view has to go back for it.
+  const far = 0x8c200000;
+  let lines = hold(far - 20);
+  await stopAt(far);
+  await expect.poll(lines.held).toBe(1);
+  const back = 0x8c001002;
+  await expect(disassemblyRow(view, back)).toBeInViewport();
+  await stopAt(back);
+  // without waiting for the lines of the first stop
+  await expect.poll(() => listings().at(-1)).toEqual({ target: "sh4", address: back - 20, count: 64 });
+  await expect(marked).toHaveAttribute("data-address", String(back));
+  lines.release();
+  // the late answer changes nothing (the tick is behind it on the connection)
+  await tickAndWait(page, server);
+  await expect(rows.first()).toHaveAttribute("data-address", String(back - 20));
+  await expect(marked).toHaveAttribute("data-address", String(back));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await expect(view.getByRole("textbox")).toHaveValue(hex8(back));
+
+  // 2. The second stop is on a line of the lines that are on their way, near their top: the
+  //    view reads them again (they were asked for before this stop) and stays.
+  const second = 0x8c300000;
+  lines = hold(second - 20);
+  await stopAt(second);
+  await expect.poll(lines.held).toBe(1);
+  await stopAt(second + 2);
+  await expect.poll(lines.held).toBe(2);
+  expect(listings().at(-1)).toEqual({ target: "sh4", address: second - 20, count: 64 });
+  lines.release();
+  await expect(marked).toHaveAttribute("data-address", String(second + 2));
+  await expect(rows.first()).toHaveAttribute("data-address", String(second - 20));
+
+  // 3. The second stop is among the lines that are on their way, but below what the panel
+  //    shows of them. That is seen when they are in, and then the view goes there.
+  const third = 0x8c400000;
+  const below = third - 20 + 2 * 60;
+  lines = hold(third - 20);
+  await stopAt(third);
+  await expect.poll(lines.held).toBe(1);
+  await stopAt(below);
+  await expect.poll(lines.held).toBe(2);
+  expect(listings().at(-1)).toEqual({ target: "sh4", address: third - 20, count: 64 });
+  lines.release();
+  await expect.poll(() => listings().at(-1)).toEqual({ target: "sh4", address: below - 20, count: 64 });
+  await expect(marked).toHaveAttribute("data-address", String(below));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(below - 20));
 });
 
 test("a breakpoint set or removed in a disassembly view makes it read again, where it is", async ({ page }) => {

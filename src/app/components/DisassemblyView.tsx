@@ -17,6 +17,8 @@ import type { DisassemblyLine } from "../../lib/debuggerSchema";
 
 const WHEEL_PIXEL_THRESHOLD = 60;
 const INSTRUCTIONS_PER_TICK = 6;
+/** How many lines a view asks for, from the address it starts at. */
+const LINES_PER_FETCH = 64;
 
 export interface DisassemblyViewConfig {
   /** Instruction size in bytes (e.g., 2 for SH4, 4 for ARM7, 1 for DSP) */
@@ -258,6 +260,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   const [lines, setLines] = useState<DisassemblyLine[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  // The request whose answer (lines, or an error) is on screen, and the address it asked for.
+  const [answered, setAnswered] = useState<{ requestId: number; address: number } | undefined>(undefined);
 
   // Initialize address from default
   const [address, setAddress] = useState(defaultAddress);
@@ -280,8 +284,14 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   const lineRefsMap = useRef<Map<number, HTMLDivElement>>(new Map());
   // what the line elements are marked from when they mount (see handleLineRef)
   const markerRef = useRef({ currentPc, executionState });
-  /** The program counter of a stop that is being followed: its line has to end up on screen. Moving the view by hand ends that. */
-  const revealRef = useRef<{ pc: number; adjusted: boolean } | undefined>(undefined);
+  /**
+   * The program counter of a stop that is being followed: its line has to end up on screen.
+   * Moving the view by hand ends that. What has been done for it so far:
+   * - "read": the view stayed where it was and reads its lines again;
+   * - "moved": the view went to ten instructions above it;
+   * - "adjusted": that did not show the line, and the view went to where it fits.
+   */
+  const revealRef = useRef<{ pc: number; stage: "read" | "moved" | "adjusted" } | undefined>(undefined);
 
   // Track previous execution state for detecting pauses
   const prevExecutionStateRef = useRef(executionState);
@@ -383,16 +393,18 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         // Calculate how many instructions can fit before hitting max address
         const remainingAddressSpace = config.maxAddress - addr;
         const maxPossibleInstructions = Math.floor(remainingAddressSpace / config.instructionSize) + 1;
-        const count = Math.min(64, Math.max(1, maxPossibleInstructions));
+        const count = Math.min(LINES_PER_FETCH, Math.max(1, maxPossibleInstructions));
 
         const result = await callbacks.onFetchDisassembly(addr, count);
         if (requestIdRef.current !== requestId) {
           return;
         }
         setLines(result);
+        setAnswered({ requestId, address: addr });
       } catch (err) {
         if (requestIdRef.current === requestId) {
           setError(err instanceof Error ? err.message : String(err));
+          setAnswered({ requestId, address: addr });
         }
       } finally {
         if (requestIdRef.current === requestId) {
@@ -505,44 +517,82 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     return line.top >= visible.top && line.bottom <= visible.bottom;
   }, []);
 
+  /**
+   * Whether the lines on screen are the ones the view asked for last. They are not while a
+   * request is out, and not from the moment the view is moved until the lines of its new
+   * place are rendered: until then the screen shows lines that are about to be replaced.
+   */
+  const isUpToDate = useCallback(
+    () =>
+      answered !== undefined &&
+      answered.requestId === requestIdRef.current &&
+      answered.address === normalizeAddress(targetRef.current, config.maxAddress, config.instructionSize),
+    [answered, config.maxAddress, config.instructionSize],
+  );
+
   const followPc = useCallback(
     (pc: number | undefined) => {
-      if (pc !== undefined && !isLineOnScreen(pc)) {
-        revealRef.current = { pc, adjusted: false };
-        const start = normalizeAddress(Math.max(0, pc - config.instructionSize * 10), config.maxAddress, config.instructionSize);
-        if (start !== address) {
-          // the effect on `address` fetches
-          moveTo(start);
-          return;
+      revealRef.current = undefined;
+      if (pc !== undefined) {
+        const size = config.instructionSize;
+        const at = normalizeAddress(targetRef.current, config.maxAddress, size);
+        // Whether the line of the stop is on screen can be seen on the screen only while it
+        // shows the lines the view asked for last. When others are on their way (the view is
+        // still reading for the stop before this one), what they replace says nothing: then
+        // the line is not going to be on screen if it is not among the lines asked for, and
+        // if it is, that is seen when they are in.
+        const upToDate = isUpToDate();
+        const away = upToDate ? !isLineOnScreen(pc) : pc < at || pc >= at + size * LINES_PER_FETCH;
+        if (away) {
+          revealRef.current = { pc, stage: "moved" };
+          const start = normalizeAddress(Math.max(0, pc - size * 10), config.maxAddress, size);
+          if (start !== at) {
+            // the effect on `address` fetches
+            moveTo(start);
+            return;
+          }
+        } else if (!upToDate) {
+          revealRef.current = { pc, stage: "read" };
         }
       }
       // what the lines say can have changed with the stop (code that was just loaded or written)
       handleRefresh();
     },
-    [address, config.instructionSize, config.maxAddress, handleRefresh, isLineOnScreen, moveTo],
+    [config.instructionSize, config.maxAddress, handleRefresh, isLineOnScreen, isUpToDate, moveTo],
   );
 
-  // The lines of a followed stop have been rendered. Ten instructions of context do not fit
-  // above the program counter in a panel that is short, or whose lines wrap: then as many as
-  // fit are shown above it, and none if even that leaves it outside.
+  // The lines of a followed stop have been rendered. A view that stayed where it was goes to
+  // the program counter if its line is not on screen after all. Ten instructions of context
+  // do not fit above it in a panel that is short, or whose lines wrap: then as many as fit
+  // are shown above it, and none if even that leaves it outside.
   useEffect(() => {
     const reveal = revealRef.current;
-    if (!reveal || loading) {
-      return;
-    }
-    const index = lines.findIndex((line) => line.address === reveal.pc);
-    if (index < 0) {
+    if (!reveal || loading || !isUpToDate()) {
       return;
     }
     if (isLineOnScreen(reveal.pc)) {
       revealRef.current = undefined;
       return;
     }
+    const size = config.instructionSize;
+    if (reveal.stage === "read") {
+      revealRef.current = { pc: reveal.pc, stage: "moved" };
+      const start = normalizeAddress(Math.max(0, reveal.pc - size * 10), config.maxAddress, size);
+      if (start !== normalizeAddress(targetRef.current, config.maxAddress, size)) {
+        moveTo(start);
+        return;
+      }
+    }
+    const index = lines.findIndex((line) => line.address === reveal.pc);
+    if (index < 0) {
+      return;
+    }
     const fitting = lines.filter((line) => isLineOnScreen(line.address)).length;
-    const context = reveal.adjusted ? 0 : Math.min(index, Math.max(0, Math.floor((fitting - 1) / 2)));
-    revealRef.current = reveal.adjusted ? undefined : { pc: reveal.pc, adjusted: true };
-    moveTo(normalizeAddress(reveal.pc - context * config.instructionSize, config.maxAddress, config.instructionSize));
-  }, [lines, loading, isLineOnScreen, config.instructionSize, config.maxAddress, moveTo]);
+    const adjusted = reveal.stage === "adjusted";
+    const context = adjusted ? 0 : Math.min(index, Math.max(0, Math.floor((fitting - 1) / 2)));
+    revealRef.current = adjusted ? undefined : { pc: reveal.pc, stage: "adjusted" };
+    moveTo(normalizeAddress(reveal.pc - context * size, config.maxAddress, size));
+  }, [lines, loading, isLineOnScreen, isUpToDate, config.instructionSize, config.maxAddress, moveTo]);
 
   // Expose methods via ref
   useImperativeHandle(ref, () => ({

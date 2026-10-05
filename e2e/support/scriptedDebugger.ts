@@ -70,9 +70,11 @@ export interface ScriptedDebugger {
   /** Sends any JSON message, or any text, as a frame. */
   send(message: unknown): void;
   /**
-   * How a method is answered from now on: the handler returns the result, or `jsonRpcError()`.
-   * Without a handler debugger.describe answers `shape` and sends a tick, the three reads
-   * answer generated data, and everything else answers {}.
+   * How a method is answered from now on: the handler returns the result, or `jsonRpcError()`,
+   * or a promise of either, and the request is then answered when the promise resolves (a
+   * server that takes its time). Without a handler debugger.describe answers `shape` and
+   * sends a tick, the three reads answer generated data (`defaultAnswer`), and everything
+   * else answers {}.
    */
   answer(method: string, handler: (params: Json) => unknown): void;
   /** Every request received, in order. */
@@ -135,6 +137,31 @@ export const V3_TARGETS: Json[] = [
 ];
 
 const INSTRUCTION_SIZES: Record<string, number> = { sh4: 2, arm7: 4, dsp: 1 };
+
+const DEFAULT_ANSWERS: Record<string, (params: Json) => unknown> = {
+  "state.getDisassembly": (params) => {
+    const size = INSTRUCTION_SIZES[String(params.target ?? "sh4")] ?? 2;
+    const address = Number(params.address);
+    return {
+      lines: Array.from({ length: Number(params.count) }, (_, index) => ({
+        address: address + index * size,
+        bytes: size === 1 ? "00" : size === 2 ? "09 00" : "00 00 A0 E1",
+        // short enough for one line of a narrow panel
+        disassembly: "nop",
+      })),
+    };
+  },
+  "state.getMemorySlice": (params) => ({
+    baseAddress: Number(params.address),
+    data: Array.from({ length: Number(params.length) }, (_, index) => (Number(params.address) + index) & 0xff),
+    validity: "ok",
+  }),
+  "state.getCallstack": (params) => ({ target: params.target, frames: [] }),
+};
+
+/** What the scripted server answers to one of the three reads when the test gave it no handler: generated data. */
+export const defaultAnswer = (method: "state.getDisassembly" | "state.getMemorySlice" | "state.getCallstack", params: Json): unknown =>
+  DEFAULT_ANSWERS[method](params);
 
 const initialRegisters = (): Record<string, ScriptedRegister[]> => ({
   dc: [{ name: "SYSCLK", value: "200MHz", width: 0 }],
@@ -269,27 +296,6 @@ export const serveScriptedDebugger = async (page: Page): Promise<ScriptedDebugge
     },
   };
 
-  const defaults: Record<string, (params: Json) => unknown> = {
-    "state.getDisassembly": (params) => {
-      const size = INSTRUCTION_SIZES[String(params.target ?? "sh4")] ?? 2;
-      const address = Number(params.address);
-      return {
-        lines: Array.from({ length: Number(params.count) }, (_, index) => ({
-          address: address + index * size,
-          bytes: size === 1 ? "00" : size === 2 ? "09 00" : "00 00 A0 E1",
-          // short enough for one line of a narrow panel
-          disassembly: "nop",
-        })),
-      };
-    },
-    "state.getMemorySlice": (params) => ({
-      baseAddress: Number(params.address),
-      data: Array.from({ length: Number(params.length) }, (_, index) => (Number(params.address) + index) & 0xff),
-      validity: "ok",
-    }),
-    "state.getCallstack": (params) => ({ target: params.target, frames: [] }),
-  };
-
   await page.routeWebSocket(/\/ws$/, (route) => {
     socket = route;
     connections++;
@@ -304,7 +310,12 @@ export const serveScriptedDebugger = async (page: Page): Promise<ScriptedDebugge
       };
       const handler = handlers.get(request.method);
       if (handler) {
-        respond(handler(params));
+        const answer = handler(params);
+        if (answer instanceof Promise) {
+          void answer.then(respond);
+        } else {
+          respond(answer);
+        }
       } else if (request.method === "debugger.describe") {
         // the response first, then a full tick to this client
         respond(server.shape);
@@ -315,8 +326,8 @@ export const serveScriptedDebugger = async (page: Page): Promise<ScriptedDebugge
         }
         describedOn = connection;
         waiters.splice(0).forEach((resolve) => resolve());
-      } else if (defaults[request.method]) {
-        respond(defaults[request.method](params));
+      } else if (DEFAULT_ANSWERS[request.method]) {
+        respond(DEFAULT_ANSWERS[request.method](params));
       } else {
         respond({});
       }
