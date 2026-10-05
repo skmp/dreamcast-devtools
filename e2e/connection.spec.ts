@@ -1,6 +1,16 @@
-import { test, expect, gotoRoute, openWorkspace, panel, statusBar, tooltipButton } from "./support/fixtures";
+import {
+  test,
+  expect,
+  gotoRoute,
+  openWorkspace,
+  panel,
+  saveScreenshot,
+  statusBar,
+  tooltipButton,
+} from "./support/fixtures";
 import type { Page } from "@playwright/test";
 import { startMockServer } from "./support/mockServer";
+import { serveScriptedDebugger } from "./support/scriptedDebugger";
 
 const connectButton = (page: Page) => page.getByRole("button", { name: "Connect", exact: true });
 const disconnectButton = (page: Page) => page.getByRole("button", { name: "Disconnect", exact: true });
@@ -79,79 +89,152 @@ test("Disconnect goes idle and Connect reconnects", async ({ page }) => {
   await expect(tooltipButton(page, "Pause")).toBeEnabled();
 });
 
-test("killing the server mid-session shows an error state; after a restart Connect brings the session back", async ({
+test("killing the server mid-session: nothing stays on screen as if it were live, and the session comes back by itself", async ({
   page,
   mock,
   diagnostics,
-}) => {
+  rpc,
+}, testInfo) => {
   await openWorkspace(page, "sh4-debugger");
   const tree = panel(page, "device-tree");
   await expect(tree.getByText("SYSCLK = 200MHz")).toBeVisible();
-  // paused, so that the panels have a callstack to keep
+  // paused, so that the panels have a callstack to lose
   await tooltipButton(page, "Pause").click();
   await expect(panel(page, "sh4-callstack")).toContainText("_main_loop+0x");
+  expect(rpc.requests("debugger.describe")).toHaveLength(1);
 
   // --- the emulator dies ---
+  diagnostics.allow(
+    /^console\.error: WebSocket connection to 'ws:\/\/127\.0\.0\.1:\d+\/ws' failed/,
+    "the server is down on purpose, and the page keeps trying to reach it",
+  );
   await mock.stop("SIGKILL");
 
-  await expect(statusBar(page)).toContainText("Connection: error");
-  await expect(page.getByLabel("Connection: error")).toBeVisible();
-  await expect(page.getByRole("alert").filter({ hasText: "Connection closed" })).toBeVisible();
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
+  await expect(page.getByLabel("Connection: reconnecting")).toBeVisible();
+  // why, and what happens next
+  const notice = page.getByRole("alert").filter({ hasText: "Reconnecting to" });
+  await expect(notice).toContainText(/Connection closed|Could not connect to/);
+  await expect(notice).toContainText(`Reconnecting to ${mock.wsURL}`);
   await expect(connectButton(page)).toBeVisible();
   // run control is disabled
   await expect(tooltipButton(page, "Pause")).toBeDisabled();
   await expect(tooltipButton(page, "Run")).toBeDisabled();
-  // TODAY: the data store is not reset, so every panel keeps showing the last
-  // values as if they were live, and the per-panel buttons stay enabled.
-  await expect(tree.getByText("SYSCLK = 200MHz")).toBeVisible();
-  await expect(panel(page, "sh4-callstack")).toContainText("_main_loop+0x");
-  await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
-  await expect(tooltipButton(panel(page, "sh4-disassembly"), "Refresh")).toBeEnabled();
+  // the data of the lost connection is gone, the callstack with it: the panels say so
+  for (const id of ["device-tree", "sh4-callstack", "watches", "sh4-disassembly", "sh4-memory"]) {
+    await expect(panel(page, id), id).toContainText("No Data");
+  }
+  await expect(tree.getByText("SYSCLK = 200MHz")).toHaveCount(0);
+  await expect(panel(page, "sh4-callstack").getByRole("listitem")).toHaveCount(0);
+  await expect(panel(page, "watches")).not.toContainText("dc.sh4.cpu.pc =");
+  await expect(tooltipButton(panel(page, "sh4-disassembly"), "Step In")).toBeDisabled();
+  await saveScreenshot(page, testInfo, "session-reconnecting");
 
-  // TODAY: there is no automatic reconnect. With the server still down, Connect fails.
-  diagnostics.allow(
-    /^console\.error: WebSocket connection to 'ws:\/\/127\.0\.0\.1:\d+\/ws' failed/,
-    "the server is down on purpose",
-  );
-  diagnostics.allow(/^console\.error: Failed to connect/, "sessionStore logs the failed attempt while the server is down");
-  await connectButton(page).click();
-  await expect(statusBar(page)).toContainText("Connection: error");
-  await expect(page.getByRole("alert")).toBeVisible();
+  // with the server still down the attempts fail, and say so in words
+  await expect(notice).toContainText(`Could not connect to ${mock.wsURL}: the server is not running`);
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
+  const attempts = rpc.sockets.length;
+  expect(attempts).toBeGreaterThanOrEqual(2);
 
-  // --- the emulator comes back on the same port ---
+  // --- the emulator comes back on the same port: nobody has to click anything ---
   const restarted = await startMockServer({ port: mock.port });
   try {
-    // TODAY: nothing happens until the user asks for it
-    await page.waitForTimeout(1500);
-    await expect(statusBar(page)).toContainText("Connection: error");
-
-    await connectButton(page).click();
-    await expect(statusBar(page)).toContainText("Connection: connected");
+    // the attempts are at most 10 s apart
+    await expect(statusBar(page)).toContainText("Connection: connected", { timeout: 20_000 });
     await expect(page.getByRole("alert")).toHaveCount(0);
     await expect(disconnectButton(page)).toBeVisible();
-    // the new session is described again and live: pausing produces a tick that the UI follows
+    expect(rpc.sockets.length).toBeGreaterThan(attempts);
+    // the new connection is described again, and it is live: pausing produces a tick that the UI follows
+    await expect.poll(() => rpc.requests("debugger.describe").length).toBe(2);
+    await expect(tree.getByText("SYSCLK = 200MHz")).toBeVisible();
+    await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
     await tooltipButton(page, "Pause").click();
     await expect(tooltipButton(page, "Run")).toBeEnabled();
-    await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
+    await expect(panel(page, "sh4-callstack")).toContainText("_main_loop+0x");
+    // the views kept their place and show the new server's bytes
+    await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+    await expect(panel(page, "sh4-disassembly").locator(".current-instruction")).toHaveCount(1);
   } finally {
     await restarted.stop();
   }
 });
 
+test("while the server is down the page tries again after 1, 2 and 5 seconds; Stop ends that, Connect starts over", async ({
+  page,
+  mock,
+  diagnostics,
+  rpc,
+}) => {
+  diagnostics.allow(/^console\.error: WebSocket connection to/, "the server is down on purpose");
+  await openWorkspace(page, "sh4-debugger");
+  await mock.stop("SIGKILL");
+  const notice = page.getByRole("alert").filter({ hasText: "Reconnecting to" });
+  await expect(notice).toContainText("in 1 s (attempt 1)");
+  const lost = Date.now();
+  const sockets = rpc.sockets.length;
+
+  // attempt 1 at about +1 s, attempt 2 at about +3 s; attempt 3 is not before +8 s
+  await expect(notice).toContainText("in 2 s (attempt 2)");
+  await expect(notice).toContainText("in 5 s (attempt 3)");
+  const second = Date.now() - lost;
+  expect(second).toBeGreaterThanOrEqual(2500);
+  expect(second).toBeLessThan(7000);
+  expect(rpc.sockets.length).toBe(sockets + 2);
+
+  // Stop: the session is over, nothing is tried any more
+  await notice.getByRole("button", { name: "Stop" }).click();
+  await expect(statusBar(page)).toContainText("Connection: idle");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.waitForTimeout(6000);
+  expect(rpc.sockets.length).toBe(sockets + 2);
+
+  // Connect: a new session, whose attempts start at 1 s again
+  await connectButton(page).click();
+  await expect(notice).toContainText("in 1 s (attempt 1)");
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
+  // Retry now does not wait for the timer
+  const before = rpc.sockets.length;
+  await notice.getByRole("button", { name: "Retry now" }).click();
+  await expect.poll(() => rpc.sockets.length).toBeGreaterThan(before);
+});
+
+test("a connection the server closes is taken up again, and the server is described again", async ({ page }) => {
+  // the server inside the test: it ends the connection at a known moment, and counts
+  const server = await serveScriptedDebugger(page);
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  expect(server.connections()).toBe(1);
+  await expect(panel(page, "device-tree").getByRole("treeitem").first()).toBeVisible();
+
+  server.drop();
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
+  await expect(panel(page, "device-tree")).toContainText("No Data");
+  // one second later the page is back, without a click
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  expect(server.connections()).toBe(2);
+  expect(server.requestsOf("debugger.describe")).toHaveLength(2);
+  await expect(panel(page, "device-tree").getByRole("treeitem").first()).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
 test("a failed connection attempt shows a readable error", async ({ page, mock, diagnostics }) => {
   // regression: WebSocketTransport.connect rejected with the DOM `Event` of the socket, which
   // the session store turned into the text "[object Event]"
-  diagnostics.allow(/^console\.error: (WebSocket connection to|Failed to connect)/, "the server is down on purpose");
+  diagnostics.allow(/^console\.error: WebSocket connection to/, "the server is down on purpose");
   await openWorkspace(page, "sh4-debugger");
   await mock.stop("SIGKILL");
-  await expect(statusBar(page)).toContainText("Connection: error");
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
   await connectButton(page).click();
   // the browser tells the page nothing about the failure, so the text names the endpoint and what it can be
   const alert = page.getByRole("alert").filter({ hasText: "Could not connect" });
   await expect(alert).toBeVisible();
   await expect(alert).toContainText(`Could not connect to ${mock.wsURL}: the server is not running, is not reachable or refused the connection`);
+  // a refusal by the server's Host/Origin check (403) is not visible to a page: the text says that it can be one
+  await expect(alert).toContainText("a refusal by the server's Host/Origin check looks the same to the page");
   await expect(page.getByRole("alert").filter({ hasText: "[object" })).toHaveCount(0);
-  await expect(statusBar(page)).toContainText("Connection: error");
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
 });
 
 test("the endpoint in the status bar opens the connection picker with the same-origin endpoint", async ({ page, mock }) => {

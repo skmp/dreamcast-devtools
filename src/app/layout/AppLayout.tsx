@@ -150,6 +150,7 @@ const connectionIcons = {
   idle: <CloudOffIcon fontSize="small" />,
   error: <CloudOffIcon fontSize="small" />,
   connecting: <SyncIcon fontSize="small" className="spin" />,
+  reconnecting: <SyncIcon fontSize="small" className="spin" />,
   connected: <CloudDoneIcon fontSize="small" />,
 };
 
@@ -165,16 +166,14 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const connectionState = useSessionStore((state) => state.connectionState);
   const connectionError = useSessionStore((state) => state.connectionError);
   const endpoint = useSessionStore((state) => state.endpoint);
-  const client = useSessionStore((state) => state.client);
-  // the run state is what the last tick said; before the first one it is not known
-  const execution = useDebuggerDataStore((state) => state.executionState);
-  const initialized = useDebuggerDataStore((state) => state.initialized);
+  const retry = useSessionStore((state) => state.retry);
   const showConnectionModal = useSessionStore((state) => state.showConnectionModal);
   const setShowConnectionModal = useSessionStore((state) => state.setShowConnectionModal);
-  const initializeData = useDebuggerDataStore((state) => state.initialize);
+  const execution = useDebuggerDataStore((state) => state.executionState);
   const control = useDebuggerDataStore((state) => state.control);
   const toasts = useDebuggerDataStore((state) => state.toasts);
   const dismissToast = useDebuggerDataStore((state) => state.dismissToast);
+  const initialized = useDebuggerDataStore((state) => state.initialized);
   const [leftPanelOpen, setLeftPanelOpen] = useState(() => loadLayoutPrefs(workspaceId).leftPanelOpen);
   const [rightPanelOpen, setRightPanelOpen] = useState(() => loadLayoutPrefs(workspaceId).rightPanelOpen);
   const [isNarrow, setIsNarrow] = useState(window.innerWidth < 1200);
@@ -348,17 +347,11 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
     };
   }, [startDiscovery, stopDiscovery]);
 
-  // Auto-connect once discovery is ready
+  // Connect to the endpoint of this page: ?ws=, the last manual entry, VITE_WS_URL, same-origin
+  // /ws. The session store describes the server whenever a connection opens.
   useEffect(() => {
     void connect();
   }, [connect]);
-
-  useEffect(() => {
-    if (connectionState === "connected" && client) {
-      void initializeData(client);
-    }
-  }, [client, connectionState, initializeData]);
-
 
   const handleToggleConnection = useCallback(() => {
     if (connectionState === "connected") {
@@ -397,13 +390,12 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   }, [workspaceId]);
 
   // The server answers a control request as soon as it is armed; the ticks report what then
-  // happens. A refusal is shown (by `control`).
+  // happens. A refusal (no game loaded, stopped in the emulator's window, ...) is shown.
   const handleRun = useCallback(() => void control("run"), [control]);
   const handlePause = useCallback(() => void control("pause", "sh4"), [control]);
 
   const connected = connectionState === "connected";
   const runState = connected ? execution?.state : undefined;
-  // in the stops of the emulator's own window the server refuses run control
   const resumable = runState === "paused" && canResume(execution?.reason);
 
   return (
@@ -467,7 +459,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                 </Tooltip>
               </Stack>
               <Tooltip title={`Connection: ${connectionState}`}>
-                <IconButton color={connectionState === "connected" ? "primary" : "inherit"}>
+                <IconButton color={connected ? "primary" : "inherit"}>
                   {connectionIcons[connectionState]}
                 </IconButton>
               </Tooltip>
@@ -477,16 +469,40 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                 onClick={handleToggleConnection}
                 startIcon={<PowerSettingsNewIcon fontSize="small" />}
               >
-                {connectionState === "connected" ? "Disconnect" : "Connect"}
+                {connected ? "Disconnect" : "Connect"}
               </Button>
             </Stack>
           }
         />
       </AppBar>
-      {connectionError && (
-        <Alert severity="error" sx={{ borderRadius: 0 }}>
-          {connectionError}
+      {connectionState === "reconnecting" ? (
+        <Alert
+          severity="warning"
+          sx={{ borderRadius: 0 }}
+          action={
+            <>
+              <Button color="inherit" size="small" onClick={() => void connect({ force: true })}>
+                Retry now
+              </Button>
+              <Button color="inherit" size="small" onClick={disconnect}>
+                Stop
+              </Button>
+            </>
+          }
+        >
+          {connectionError ?? "Connection lost"}.{" "}
+          {retry?.waitingForAnnouncement
+            ? "Waiting for the emulator to announce itself."
+            : retry?.delayMs !== undefined
+              ? `Reconnecting to ${endpoint ?? "the server"} in ${retry.delayMs / 1000} s (attempt ${retry.attempt}).`
+              : `Reconnecting to ${endpoint ?? "the server"} (attempt ${retry?.attempt ?? 1}).`}
         </Alert>
+      ) : (
+        connectionError && (
+          <Alert severity="error" sx={{ borderRadius: 0 }}>
+            {connectionError}
+          </Alert>
+        )
       )}
       <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <Box

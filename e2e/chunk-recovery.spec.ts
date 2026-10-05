@@ -68,7 +68,6 @@ const allowServerDown = (diagnostics: Diagnostics) => {
     "React logs the failed import that was caught",
   );
   diagnostics.allow(/^console\.error: WebSocket connection to 'ws:\/\/127\.0\.0\.1:\d+\/ws' failed/, "the server is down on purpose");
-  diagnostics.allow(/^console\.error: Failed to connect/, "sessionStore logs the failed attempt while the server is down");
 };
 
 test("a panel whose code could not be downloaded offers Reload page, which loads it", async ({ page, diagnostics }, testInfo) => {
@@ -193,7 +192,7 @@ test("a panel first opened while the server is down is loaded by Reload page onc
 
   // --- the emulator is closed; the SGC panel was never shown in this tab ---
   await mock.stop("SIGKILL");
-  await expect(statusBar(page)).toContainText("Connection: error");
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
   await addPanelFromSelector(page, 1, "SGC");
   const sgc = panel(page, "sgc");
   const alert = failure(sgc);
@@ -206,7 +205,9 @@ test("a panel first opened while the server is down is loaded by Reload page onc
   await expect(alert.getByRole("status")).toHaveText(NO_ANSWER);
   await expect(reloadPage(alert)).toBeEnabled();
   expect(await isSameDocument(page)).toBe(true);
-  await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
+  // the other panels are as they were: without a connection, they have no data
+  await expect(panel(page, "watches")).toContainText("No Data");
+  await expect(panel(page, "watches").getByRole("button", { name: "Add Watch" })).toBeVisible();
   await expect(failure(page)).toHaveCount(1);
   await saveScreenshot(page, testInfo, "chunk-recovery-server-down-panel");
 

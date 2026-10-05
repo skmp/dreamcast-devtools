@@ -9,8 +9,10 @@ import {
   type AvailableConnection,
   type EndpointSource,
 } from "../services/transport";
+import { useDebuggerDataStore } from "./debuggerDataStore";
+import { SessionController, type ConnectionState, type RetryInfo, type SessionEndpoint } from "./sessionController";
 
-export type ConnectionState = "idle" | "connecting" | "connected" | "error";
+export type { ConnectionState };
 
 /** An endpoint the connection picker offers. `source` says where a WebSocket endpoint comes from. */
 export interface ConnectionCandidate extends AvailableConnection {
@@ -25,11 +27,14 @@ interface ConnectOptions {
 }
 
 interface SessionStore {
+  /** the client of the open connection; undefined while there is none */
   client?: DebuggerClient;
   mode: "native" | "wasm";
   endpoint?: string;
   connectionState: ConnectionState;
   connectionError?: string;
+  /** while reconnecting: which attempt comes next, and when */
+  retry?: RetryInfo;
   connectionDiscovery?: ConnectionDiscovery;
   availableConnections: ConnectionCandidate[];
   selectedConnectionId?: string;
@@ -89,6 +94,39 @@ const webSocketCandidates = (): ConnectionCandidate[] =>
   }));
 
 export const useSessionStore = create<SessionStore>()((set, get) => {
+  const controller = new SessionController<DebuggerClient>({
+    createClient: (endpoint) =>
+      new DebuggerClient({
+        mode: endpoint.mode,
+        endpoint: endpoint.id,
+        transportOptions: endpoint.mode === "wasm" ? { channelName: endpoint.id } : undefined,
+      }),
+    publish: (snapshot) =>
+      set({
+        connectionState: snapshot.connectionState,
+        connectionError: snapshot.connectionError,
+        client: snapshot.client,
+        retry: snapshot.retry,
+        ...(snapshot.endpoint ? { endpoint: snapshot.endpoint.id } : {}),
+      }),
+    // every connection is described: after a reconnect the server can be another one
+    onConnected: (client) => void useDebuggerDataStore.getState().initialize(client),
+    onDisconnected: () => useDebuggerDataStore.getState().reset(),
+    // The emulator of a BroadcastChannel session is another tab. When it is reloaded it has a
+    // new id and the old one never answers again, so a reconnect waits for an announcement:
+    // of the same emulator, or of the only one there is.
+    announcedSince:
+      appConfig.mode === "wasm"
+        ? (endpoint, since) => {
+            const announced = (get().connectionDiscovery?.getAvailableConnections() ?? []).filter(
+              (connection) => connection.lastSeen > since,
+            );
+            const target = announced.find((connection) => connection.id === endpoint.id) ?? (announced.length === 1 ? announced[0] : undefined);
+            return target ? { id: target.id, mode: "wasm" } : undefined;
+          }
+        : undefined,
+  });
+
   return {
     mode: appConfig.mode,
     connectionState: "idle",
@@ -126,15 +164,13 @@ export const useSessionStore = create<SessionStore>()((set, get) => {
     },
     async connect({ force, connectionId } = {}) {
       const current = get();
-      if (!force && (current.connectionState === "connecting" || current.connectionState === "connected")) {
+      if (!force && current.connectionState !== "idle" && current.connectionState !== "error") {
         return;
       }
 
-      current.client?.disconnect();
-
       const native = appConfig.mode === "native";
       const candidates = native ? webSocketCandidates() : current.availableConnections;
-      let target: { id: string; mode: "native" | "wasm" } | undefined;
+      let target: SessionEndpoint | undefined;
 
       const wanted = connectionId?.trim() || current.selectedConnectionId;
       if (wanted) {
@@ -149,7 +185,7 @@ export const useSessionStore = create<SessionStore>()((set, get) => {
           // not in the list: an endpoint entered by hand
           const url = parseWebSocketUrl(wanted);
           if (!url) {
-            set({ connectionState: "error", connectionError: `"${wanted}" is not a ws:// or wss:// URL`, client: undefined });
+            controller.fail(`"${wanted}" is not a ws:// or wss:// URL`);
             return;
           }
           target = { id: url.href, mode: "native" };
@@ -171,52 +207,15 @@ export const useSessionStore = create<SessionStore>()((set, get) => {
         return;
       }
 
-      const endpoint = target.id;
-      const client = new DebuggerClient({
-        mode: target.mode,
-        endpoint,
-        transportOptions: target.mode === "wasm" ? { channelName: endpoint } : undefined,
-      });
-
-      // Subscribe to transport state changes to keep connectionState in sync
-      client.onTransportStateChange((state) => {
-        if (get().client !== client) {
-          // no longer the client of the session
-          return;
-        }
-        if (state === "closed") {
-          set({ connectionState: "error", connectionError: "Connection closed" });
-        } else if (state === "open") {
-          set({ connectionState: "connected" });
-        }
-      });
-
       set({
-        connectionState: "connecting",
-        connectionError: undefined,
-        endpoint,
-        client,
         selectedConnectionId: target.id,
         showConnectionModal: false,
         ...(native ? { availableConnections: webSocketCandidates() } : {}),
       });
-
-      try {
-        await client.connect();
-        set({ connectionState: "connected" });
-      } catch (error) {
-        console.error("Failed to connect", error);
-        client.disconnect();
-        set({
-          connectionState: "error",
-          connectionError: error instanceof Error ? error.message : String(error),
-          client: undefined,
-        });
-      }
+      await controller.start(target);
     },
     disconnect() {
-      get().client?.disconnect();
-      set({ connectionState: "idle", connectionError: undefined, client: undefined });
+      controller.stop();
     },
   };
 });

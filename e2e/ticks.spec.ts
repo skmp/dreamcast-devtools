@@ -67,6 +67,33 @@ test("registers are merged per path: a path a tick does not carry keeps what it 
   await expect(tcnt).toHaveText("TCNT0 = 0x00001234");
 });
 
+test("nothing of a connection is left in the next one: registers and callstack start empty", async ({ page }) => {
+  const server = await open(page, "sh4-debugger", (scripted) => {
+    scripted.state.callstacks = { sh4: [{ index: 0, pc: 0x8c001000, symbol: "_first_session+0x0" }], arm7: [] };
+  });
+  await treeItemRow(page, "dc.sh4.tmu").click();
+  server.setRegister("dc.sh4.tmu", "TCNT0", "0x11111111");
+  await tickAndWait(page, server);
+  await expect(registerRow(page, "dc.sh4.tmu.reg.TCNT0")).toHaveText("TCNT0 = 0x11111111");
+  await expect(panel(page, "sh4-callstack")).toContainText("_first_session+0x0");
+
+  // The next connection is to a server that describes the timer with another value and then
+  // sends a tick without the timer and without callstacks. What the client shows for both is
+  // what this connection said, not what the last one left behind.
+  server.setRegister("dc.sh4.tmu", "TCNT0", "0x22222222");
+  server.describeAgain();
+  server.afterDescribe = { paths: ["dc", "dc.sh4.cpu"], patch: { callstacks: undefined } };
+  server.drop();
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  expect(server.connections()).toBe(2);
+
+  await expect(registerRow(page, "dc.sh4.tmu.reg.TCNT0")).toHaveText("TCNT0 = 0x22222222");
+  await expect(panel(page, "sh4-callstack")).toContainText("Empty callstack.");
+  await expect(panel(page, "sh4-callstack")).not.toContainText("_first_session");
+});
+
 test("mute and solo are the server's state: the buttons show what the ticks say, whoever changed it", async ({ page }) => {
   const server = await open(page, "mixed-mode-debugger", (scripted) => {
     // somebody muted the SH4 category before this page connected

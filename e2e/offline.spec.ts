@@ -229,11 +229,11 @@ test.describe("served as plain files from a sub-path (python3 -m http.server)", 
       await expect(page.getByText("Drop your refsw2 log here")).toBeVisible();
 
       // a workspace renders too; there is no debugger behind a file server, so it reports
-      // the failed connection and shows empty panels
+      // the failed connection (and keeps trying) and shows empty panels
       diagnostics.allow(/^console\.error: WebSocket connection to 'ws:\/\/127\.0\.0\.1:\d+\/ws' failed/, "a file server has no /ws");
-      diagnostics.allow(/^console\.error: Failed to connect/, "a file server has no /ws");
       await page.goto(`${server.url}#/workspace/sh4-debugger`);
-      await expect(statusBar(page)).toContainText("Connection: error");
+      await expect(statusBar(page)).toContainText("Connection: reconnecting");
+      await expect(page.getByRole("alert").filter({ hasText: "Could not connect to ws://127.0.0.1" })).toBeVisible();
       await expect(panel(page, "sh4-disassembly")).toContainText("No Data");
       await expect(panel(page, "device-tree")).toContainText("No Data");
       await page.waitForLoadState("networkidle");
