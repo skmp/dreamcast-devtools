@@ -128,6 +128,7 @@ Build time:
 | Variable | Description | Default |
 | --- | --- | --- |
 | `VITE_TRANSPORT_MODE` | `native` (WebSocket) or `wasm` (BroadcastChannel). `build:wasm` sets it to `wasm`. | `native` |
+| `VITE_WS_URL` | WebSocket endpoint of a native build that is not served by the emulator, e.g. `ws://localhost:55543/ws` (see [Connecting](#connecting)). | unset |
 
 Mock server, at run time:
 
@@ -151,15 +152,57 @@ The version shown in the status bar and the About dialog is the `package.json` v
 
 ## Connecting
 
-- `native` builds open one WebSocket to `/ws` on the host that served the page (`wss:` when the
-  page was loaded over https). There is nothing to configure.
+- `native` builds open one WebSocket. The endpoint is the first of these that is a `ws://` or
+  `wss://` URL:
+  1. `?ws=ws://host:port/ws` in the address bar, in front of the `#`
+     (`http://localhost:5173/?ws=ws://localhost:55543/ws#/workspace/sh4-debugger`: a dev server
+     attached to an emulator). The routes and the memory panel only rewrite what follows the `#`.
+  2. the last endpoint entered by hand in the connection picker (kept in localStorage, per origin);
+  3. `VITE_WS_URL` of the build;
+  4. `/ws` on the host that served the page (`wss:` when the page was loaded over https).
+
+  Served by the emulator, there is nothing to configure: the fourth applies.
 - `wasm` builds use BroadcastChannel. The UI listens on `nulldc-debugger-announce` for
   `{ id, name, timestamp }` announcements and talks to the selected emulator on
   `nulldc-debugger-<id>`. It posts `ping` every second and treats three seconds without a `pong`
-  as a lost connection.
+  as a lost connection. With exactly one announced emulator the UI connects on its own;
+  otherwise it shows the connection picker.
 
-With exactly one available connection the UI connects on its own; otherwise it shows a connection
-picker. The status bar of a workspace shows the connection state and the endpoint.
+The status bar of a workspace shows the connection state and the endpoint. A click on the
+endpoint opens the connection picker: the endpoints above with where each comes from, and a box
+for any other `ws://` or `wss://` URL. An endpoint picked from the list replaces a remembered
+manual entry.
+
+When a connection is lost, or cannot be made, the state is `reconnecting`: the page says why,
+shows `No Data` instead of the last values, and tries again 1, 2, 5 and then every 10 seconds
+after each failure. `Stop` ends that, `Connect` and `Retry now` try at once. A `wasm` build
+waits for an announcement instead of a clock, because an emulator tab that was reloaded has a
+new id. Every connection that opens is described again (`debugger.describe`). A browser tells
+a page nothing about why a WebSocket did not open, so the text lists what it can be; a refusal
+by the emulator's Host/Origin check is one of them.
+
+## What the UI does with a session
+
+- **Run state.** Next to the run controls: `Running`, or `Paused`, why (`reason` of the tick)
+  and which stop it is (`stopId`), and below it the `notice` of the server when it has one. In
+  the stops of the emulator's own window (`host-stopped`, `guest-exit`, `no-game`) Run and the
+  step buttons are off, because the server refuses them there. The answer of every
+  `control.*` request is checked, and a refusal is shown.
+- **Stops.** A stop is a paused tick whose `stopId` the client has not acted on (for a v2
+  server: the change from running to paused). On a stop the disassembly views scroll to the
+  program counter if its line is not on screen, the disassembly and memory views read again,
+  and a breakpoint that caused it is announced. No other tick does any of that. The views
+  also read again after their own actions, and when a game is loaded where there was none.
+- **Registers.** `registers` of a tick is merged per path (`src/state/tickState.ts`); nothing
+  of a connection is kept for the next. `dc.sh4.cpu` is dimmed while `registersStale` is set.
+- **Targets.** Instruction size, address format, default addresses and what works come from
+  `targets` of `debugger.describe` (`src/state/targets.ts`); for a v2 server the values that
+  were built in before protocol v3 are used. A target the server does not list, stepping or
+  memory it does not have, and a capability it lacks (`event-breakpoints`, `callstack`,
+  `register-write`, `sgc-capture`) are said in the panel concerned, in place of its controls.
+- **Problems.** A server of another protocol version, a `debugger.describe` that failed and
+  every message that was dropped because it does not match the schema (with the path of what
+  is wrong) are shown in a bar under the toolbar.
 
 ## Protocol
 

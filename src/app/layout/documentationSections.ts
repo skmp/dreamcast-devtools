@@ -53,10 +53,11 @@ export const documentationSections: DocumentationSection[] = [
         title: "Connecting to the Emulator",
         level: 2,
         items: [
-          "Native builds open one WebSocket to `/ws` on the host that served the page. There is nothing to configure.",
-          "WASM builds use BroadcastChannel: the UI listens for emulator announcements and connects to the announced instance.",
-          "With exactly one available connection the UI connects on its own; otherwise it shows a connection picker.",
-          "The status bar of a workspace shows the connection state and the endpoint. Click the endpoint to pick another connection.",
+          "Native builds open one WebSocket. Its endpoint is the first of: `?ws=ws://host:port/ws` in the address bar (in front of the `#`), the last endpoint entered by hand, `VITE_WS_URL` of the build, and `/ws` on the host that served the page. Served by the emulator, there is nothing to configure.",
+          "WASM builds use BroadcastChannel: the UI listens for emulator announcements and connects to the announced instance; with several it shows a connection picker.",
+          "The status bar of a workspace shows the connection state and the endpoint. Click the endpoint to pick another one, or to enter any `ws://` or `wss://` URL by hand; that URL is remembered and used first from then on.",
+          "When the connection is lost the UI says so, shows no data as if it were live, and tries again after 1, 2, 5 and then every 10 seconds. `Stop` ends that; `Connect` and `Retry now` try at once. Every new connection is described again.",
+          "Next to the run controls the UI shows whether the target runs and why it is stopped. What a server cannot do (`targets` and `capabilities` of `debugger.describe`) is said in the panel concerned, in place of its controls.",
         ],
       },
     ],
@@ -87,8 +88,8 @@ export const documentationSections: DocumentationSection[] = [
         items: [
           "In a disassembly view, click the gutter to add or remove a breakpoint at that address.",
           "Ctrl, Cmd or Shift + click an existing breakpoint to enable or disable it. A filled red circle is enabled, an outlined one is disabled.",
-          "Events: Breakpoints takes the event names of the device tree, such as `dc.holly.core.vblank`; SH4: Breakpoints and ARM7: Breakpoints take hex addresses such as `0x8C0000A0`.",
-          "Breakpoints live on the server. Every tick carries the full list, so all connected clients show the same set.",
+          "Events: Breakpoints takes the event names of the device tree, such as `dc.holly.core.vblank`; SH4: Breakpoints and ARM7: Breakpoints take hex addresses such as `0x8C0000A0`, DSP: Breakpoints a step in decimal (or hex after `0x`).",
+          "Breakpoints live on the server, and so do the mute and solo states of their categories. Every tick carries all of it, so all connected clients show the same.",
         ],
       },
       {
