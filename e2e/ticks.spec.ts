@@ -281,6 +281,62 @@ test("two stops close together: the second is followed from where the view is go
   await expect(rows.first()).toHaveAttribute("data-address", String(below - 20));
 });
 
+test("stops that arrive faster than the page renders them: everything ends at the last, and the views read for the latest only", async ({
+  page,
+}) => {
+  const server = await open(page, "sh4-debugger", (scripted) => {
+    scripted.state.watches = [{ id: 1, expression: "dc.sh4.cpu.pc", value: "0x8C001000" }];
+  });
+  const view = panel(page, "sh4-disassembly");
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+  const requests = () => ({
+    listings: server.requestsOf("state.getDisassembly").length,
+    slices: server.requestsOf("state.getMemorySlice").length,
+  });
+  const before = requests();
+
+  // Three hundred stops without a pause between them, each far from the one before: what a
+  // script that steps through another client does to this page. The ticks queue up in it.
+  const STOPS = 300;
+  let pc = 0x8c001000;
+  let stopId = 1;
+  for (let index = 0; index < STOPS; index++) {
+    pc += 0x1000;
+    stopId++;
+    server.state.execution = { state: "paused", stopId, reason: "step" };
+    server.setRegister("dc.sh4.cpu", "PC", hex8(pc));
+    server.setRegister("dc", "SYSCLK", `tick-${stopId}`);
+    server.state.watches = [{ id: 1, expression: "dc.sh4.cpu.pc", value: hex8(pc) }];
+    server.state.callstacks = { sh4: [{ index: 0, pc, symbol: `_at_stop_${stopId}` }], arm7: [] };
+    server.tick();
+  }
+
+  // Every part of the page is of the last tick. (React refuses a fifty-first render in a row
+  // with an exception; the page fixture fails the test on any error of the page.)
+  await expect(page.getByRole("status", { name: "Execution state" })).toHaveText(`Paused · step completed · stop ${stopId}`);
+  await expect(registerRow(page, "dc.reg.SYSCLK")).toHaveText(`SYSCLK = tick-${stopId}`);
+  await expect(panel(page, "watches")).toContainText(`dc.sh4.cpu.pc = ${hex8(pc)}`);
+  await expect(panel(page, "sh4-callstack")).toContainText(`_at_stop_${stopId}`);
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(pc));
+  await expect(disassemblyRows(view).first()).toHaveAttribute("data-address", String(pc - 20));
+  await expect(view.getByRole("textbox")).toHaveValue(hex8(pc));
+  // a tick of the same stop goes through the whole page: nothing is left behind that failed
+  await tickAndWait(page, server);
+  await expect(page.locator("[data-error-boundary]")).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+
+  // The views did not read for stops that were overtaken while their ticks were queued: the
+  // last one is read for, and few of those before it.
+  const after = requests();
+  expect(server.requestsOf("state.getDisassembly").at(-1)).toEqual({ target: "sh4", address: pc - 20, count: 64 });
+  expect(after.listings - before.listings).toBeGreaterThan(0);
+  expect(after.slices - before.slices).toBeGreaterThan(0);
+  expect(after.listings - before.listings).toBeLessThan(STOPS / 4);
+  expect(after.slices - before.slices).toBeLessThan(STOPS / 4);
+  console.log(`[burst of ${STOPS} stops] state.getDisassembly ${after.listings - before.listings}, state.getMemorySlice ${after.slices - before.slices}`);
+});
+
 test("a breakpoint set or removed in a disassembly view makes it read again, where it is", async ({ page }) => {
   const server = await open(page, "sh4-debugger");
   const view = panel(page, "sh4-disassembly");

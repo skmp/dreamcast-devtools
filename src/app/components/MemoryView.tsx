@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Button, CircularProgress, IconButton, InputAdornment, Stack, TextField, Typography } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "./HideOnHoverTooltip";
 import RefreshIcon from "@mui/icons-material/Refresh";
@@ -159,18 +159,35 @@ export const MemoryView = ({
     }
   }, [address, fetchSlice, config.maxAddress, initialized]);
 
+  const handleRefresh = useCallback(() => {
+    void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
+  }, [fetchSlice, address, config.maxAddress]);
+
+  // What a timer calls: the view as it is when the timer runs, not as it was when it was set.
+  const latest = useRef({ initialized, refresh: handleRefresh });
+  useLayoutEffect(() => {
+    latest.current = { initialized, refresh: handleRefresh };
+  });
+
   // The target stopped somewhere new: what is on screen is read again, where it is. Ticks do
   // not do that; a stop and the panel's own buttons do.
+  //
+  // Not in the render of the tick, but from a timer that the next stop cancels: when stops
+  // arrive faster than the page renders them, their ticks are queued, the timer of each is
+  // behind the tick of the next, and the bytes are read once, for the latest. The render of a
+  // tick then sets no state either (React throws at the fifty-first render in a row).
   const seenRefreshSignal = useRef(refreshSignal);
   useEffect(() => {
     if (seenRefreshSignal.current === refreshSignal) {
       return;
     }
-    seenRefreshSignal.current = refreshSignal;
-    if (initialized) {
-      void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only a new signal fetches here; a new address or connection is the effect above
+    const timer = setTimeout(() => {
+      seenRefreshSignal.current = refreshSignal;
+      if (latest.current.initialized) {
+        latest.current.refresh();
+      }
+    }, 0);
+    return () => clearTimeout(timer);
   }, [refreshSignal]);
 
   // Trigger highlight effect when loaded from URL
@@ -303,10 +320,6 @@ export const MemoryView = ({
       applyPendingHighlight();
     }
   }, [addressInput, config, callbacks, address, applyPendingHighlight, lastRow]);
-
-  const handleRefresh = useCallback(() => {
-    void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
-  }, [fetchSlice, address, config.maxAddress]);
 
   return (
     <Box

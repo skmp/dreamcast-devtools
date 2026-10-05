@@ -66,16 +66,30 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
   // fetch again, and scroll to the program counter if its line is not on screen. Ticks that are
   // not a new stop, such as the one that follows a breakpoint or a watch being added, move
   // nothing and fetch nothing.
+  //
+  // Not in the render of the tick, but from a timer that the next stop cancels. A server can
+  // send stops faster than the page renders them (somebody steps through another client, or
+  // a script does), and then their ticks are queued in the page: the timer of each is behind
+  // the tick of the next, so the view goes to the latest stop only, once the queue is worked
+  // off. It also keeps the render of a tick from setting state: React counts renders that
+  // follow each other without a pause, and throws at the fifty-first.
   useEffect(() => {
-    if (firstAddress === undefined || !initialized || !viewRef.current) {
+    if (firstAddress === undefined || !initialized) {
       return;
     }
     const current = `${epoch}:${refresh}`;
     if (followed.current === current) {
       return;
     }
-    followed.current = current;
-    viewRef.current.followPc(programCounter(useDebuggerDataStore.getState().registersByPath, info));
+    const timer = setTimeout(() => {
+      const view = viewRef.current;
+      if (!view) {
+        return;
+      }
+      followed.current = current;
+      view.followPc(programCounter(useDebuggerDataStore.getState().registersByPath, info));
+    }, 0);
+    return () => clearTimeout(timer);
   }, [firstAddress, refresh, epoch, initialized, info]);
 
   // Map addresses to breakpoints
