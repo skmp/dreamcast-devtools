@@ -345,24 +345,38 @@ describe("run control", () => {
     expect(store().toasts).toEqual([]);
   });
 
-  it("shows an in-band error, a JSON-RPC error and a lost connection, and resolves to false", async () => {
+  // The server refuses in one of two ways: in the result (`{ error }`, the in-band channel of
+  // the methods whose success is {}) or with a JSON-RPC error. Every action reads both.
+  it.each([
+    ["run", undefined, "Run"],
+    ["pause", "sh4", "Pause"],
+    ["step", "sh4", "Step"],
+    ["stepOver", "arm7", "Step over"],
+    ["stepOut", "sh4", "Step out"],
+  ] as const)("%s: an in-band error and a JSON-RPC error are both shown, and resolve to false", async (action, target, label) => {
     const { transport } = await initialise();
-    const refused = store().control("step", "sh4");
-    transport.respond({ error: { code: -32005, message: "cannot step: pc is odd" } });
+    const refused = store().control(action, target);
+    transport.respond({ error: { code: -32005, message: "refused in the result" } });
     await expect(refused).resolves.toBe(false);
+    expect(store().toasts.map(({ type, message }) => `${type}: ${message}`)).toEqual([`error: ${label}: refused in the result`]);
 
-    const failed = store().control("run");
+    const failed = store().control(action, target);
     transport.respondError(-32603, "internal error");
     await expect(failed).resolves.toBe(false);
+    expect(store().toasts.map(({ type, message }) => `${type}: ${message}`)).toEqual([
+      `error: ${label}: refused in the result`,
+      `error: ${label}: internal error`,
+    ]);
+  });
 
+  it("shows a lost connection, and resolves to false", async () => {
+    const { transport } = await initialise();
     const lost = store().control("pause", "sh4");
     transport.close();
     await expect(lost).resolves.toBe(false);
     await settle();
 
     expect(store().toasts.map(({ type, message }) => `${type}: ${message}`)).toEqual([
-      "error: Step: cannot step: pc is odd",
-      "error: Run: internal error",
       "error: Pause: Connection closed before control.pause was answered",
     ]);
   });
