@@ -46,6 +46,8 @@ export interface SessionOptions {
   clientName: string;
   /** receives one line per frame when --verbose is given */
   trace?: (line: string) => void;
+  /** receives every tick of the connection as it arrives (the run keeps the ids it has seen) */
+  onTick?: (tick: DebuggerTick) => void;
 }
 
 type InBandResult = { error?: { code: number; message: string } };
@@ -352,6 +354,7 @@ export class ContractSession {
       this.frames.push({ seq, at, kind: "tick", json });
       // Ticks the strict schema rejected are still ticks for the scenarios: they report what they need
       this.ticks.push({ seq, at, tick: json.params as DebuggerTick });
+      this.options.onTick?.(json.params as DebuggerTick);
       this.options.trace?.(`<- tick ${describeState(json.params as DebuggerTick)}`);
     } else if (typeof json.method === "string") {
       // the server sends no requests, and event.tick is the only notification

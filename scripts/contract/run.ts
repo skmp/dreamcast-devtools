@@ -87,11 +87,22 @@ const prepare = async (options: ContractOptions) => {
   const target = url;
   const timeoutFactor = options.timeoutFactor ?? (options.profile === "emulator" ? 5 : 1);
   const sessions: ContractSession[] = [];
+  // every id any tick of the run lists, on any connection (ticks the schema rejected included)
+  const seen = { breakpoints: new Set<number>(), watches: new Set<number>() };
+  const onTick = (tick: DebuggerTick) => {
+    for (const breakpoint of Object.values(tick?.breakpoints ?? {})) {
+      seen.breakpoints.add(breakpoint?.id);
+    }
+    for (const watch of Array.isArray(tick?.watches) ? tick.watches : []) {
+      seen.watches.add(watch?.id);
+    }
+  };
   const openSession = async (): Promise<ContractSession> => {
     const session = new ContractSession(target, {
       timeoutFactor,
       clientName: "nullDC contract runner",
       trace: options.verbose ? (line) => say(`    ${line}`) : undefined,
+      onTick,
     });
     sessions.push(session);
     await session.open();
@@ -101,7 +112,7 @@ const prepare = async (options: ContractOptions) => {
     sessions.forEach((session) => session.close());
     await listener?.close();
   };
-  return { url: target, timeoutFactor, sessions, openSession, close, say };
+  return { url: target, timeoutFactor, sessions, seen, openSession, close, say };
 };
 
 /**
@@ -141,7 +152,7 @@ const describeServer = (session: ContractSession): string => {
  * breakpoints, watches, categories and run state it had.
  */
 export const runContract = async (options: ContractOptions): Promise<ContractSummary> => {
-  const { url, timeoutFactor, sessions, openSession, close, say } = await prepare(options);
+  const { url, timeoutFactor, sessions, seen, openSession, close, say } = await prepare(options);
   try {
     const session = await openSession();
     say(describeServer(session));
@@ -160,6 +171,7 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
       session,
       openSession,
       elf: options.elf,
+      seen,
       note: () => undefined,
     };
 

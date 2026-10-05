@@ -571,6 +571,83 @@ describe("the contract runner against a server that breaks the protocol", () => 
     // (a request without effect is waited for, for a second)
   }, 30_000);
 
+  it("S05, S08: ids that are used again: a new breakpoint, or a new watch, under the lowest free id", async () => {
+    /** The server's ids, shown to the client as the lowest id that nothing listed has. */
+    const lowestFree = () => {
+      const shown = new Map<number, number>();
+      const real = new Map<number, number>();
+      const last = new Map<number, number>();
+      return {
+        show: (ids: number[]) => {
+          Array.from(shown.keys())
+            .filter((id) => !ids.includes(id))
+            .forEach((id) => shown.delete(id));
+          for (const id of [...ids].sort((a, b) => a - b)) {
+            if (!shown.has(id)) {
+              const taken = new Set(shown.values());
+              let free = 1;
+              while (taken.has(free)) free++;
+              shown.set(id, free);
+              real.set(free, id);
+              last.set(id, free);
+            }
+          }
+        },
+        shown: (id: number) => shown.get(id) ?? last.get(id) ?? id,
+        real: (id: unknown) => (typeof id === "number" ? (real.get(id) ?? id) : id),
+      };
+    };
+
+    const breakpointIds = lowestFree();
+    const reusedBreakpointIds = await run(
+      {
+        toClient: (frame) => {
+          if (!isTick(frame)) return frame;
+          const listed = Object.values(frame.params.breakpoints as Record<string, Json & { id: number }>);
+          breakpointIds.show(listed.map((breakpoint) => breakpoint.id));
+          const breakpoints = Object.fromEntries(listed.map((breakpoint) => [String(breakpointIds.shown(breakpoint.id)), { ...breakpoint, id: breakpointIds.shown(breakpoint.id) }]));
+          const executionState = { ...frame.params.executionState };
+          if (typeof executionState.breakpointId === "number") executionState.breakpointId = breakpointIds.shown(executionState.breakpointId);
+          return { ...frame, params: { ...frame.params, breakpoints, executionState } };
+        },
+        toServer: (frame) =>
+          frame.method === "breakpoints.remove" || frame.method === "breakpoints.toggle"
+            ? { ...frame, params: { ...(frame.params as Json), id: breakpointIds.real((frame.params as Json).id) } }
+            : frame,
+      },
+      ["S05", "S06"],
+    );
+    // the breakpoint of S05 was 1, and so is the first one of S06
+    expect(statusOf(reusedBreakpointIds, "S05")).toBe("passed");
+    expect(statusOf(reusedBreakpointIds, "S06")).toBe("failed");
+    expect(detailsOf(reusedBreakpointIds, "S06")).toMatch(/breakpoints\.add: the new breakpoint has id 1, which an earlier breakpoint of this run had; ids are never reused/);
+    expect(reusedBreakpointIds.invariantViolations).toEqual([]);
+
+    const watchIds = lowestFree();
+    const reusedWatchIds = await run(
+      {
+        toClient: (frame) => {
+          if (!isTick(frame)) return frame;
+          const listed = frame.params.watches as Array<Json & { id: number }>;
+          watchIds.show(listed.map((watch) => watch.id));
+          const watches = listed.map((watch) => ({ ...watch, id: watchIds.shown(watch.id) })).sort((a, b) => a.id - b.id);
+          return { ...frame, params: { ...frame.params, watches } };
+        },
+        toServer: (frame) => {
+          const params = frame.params as Json;
+          if (frame.method === "state.unwatch") return { ...frame, params: { watchIds: (params.watchIds as unknown[]).map(watchIds.real) } };
+          if (frame.method === "state.modifyWatchExpression") return { ...frame, params: { ...params, watchId: watchIds.real(params.watchId) } };
+          return frame;
+        },
+      },
+      ["S05", "S08"],
+    );
+    expect(statusOf(reusedWatchIds, "S05")).toBe("passed");
+    expect(statusOf(reusedWatchIds, "S08")).toBe("failed");
+    expect(detailsOf(reusedWatchIds, "S08")).toMatch(/state\.watch: the new watch has id 1, which an earlier watch of this run had; ids are never reused/);
+    expect(reusedWatchIds.invariantViolations).toEqual([]);
+  });
+
   it("S14: a server that forgets, or lets go, when its last client disconnects", async () => {
     const reconnect = async (forget: (tick: Json) => Array<[string, Json]>) => {
       const { url } = await startServer(undefined, new ForgetfulMock(forget));

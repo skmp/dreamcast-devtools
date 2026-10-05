@@ -53,6 +53,11 @@ export interface RunContext {
   session: ContractSession;
   openSession: () => Promise<ContractSession>;
   elf?: ElfSymbols;
+  /**
+   * Every breakpoint id and watch id that any tick of the run listed, on any connection: an
+   * id that is in here has been used, and the server gives it to nothing new.
+   */
+  seen: { breakpoints: Set<number>; watches: Set<number> };
   note: (text: string) => void;
 }
 
@@ -200,13 +205,17 @@ const tickShowing = async (
   }
 };
 
-/** Adds a breakpoint and returns its descriptor from the tick that shows it: that tick lists exactly one breakpoint more. */
+/**
+ * Adds a breakpoint and returns its descriptor from the tick that shows it: that tick lists
+ * exactly one breakpoint more, under an id that no breakpoint of the run has had.
+ */
 const addBreakpoint = async (
   context: RunContext,
   params: { event: string; address?: number; kind?: "code" | "event"; enabled?: boolean },
 ): Promise<BreakpointDescriptor> => {
   const { session } = context;
   const listed = new Set(Object.keys(session.latestTick().tick.breakpoints));
+  const used = new Set(context.seen.breakpoints);
   const newIn = (tick: DebuggerTick) => Object.values(tick.breakpoints).filter((breakpoint) => !listed.has(String(breakpoint.id)));
   const mark = session.mark();
   await session.call("breakpoints.add", params);
@@ -214,6 +223,10 @@ const addBreakpoint = async (
   const added = newIn(next.tick);
   check(added.length === 1, `breakpoints.add: the tick that shows it lists ${added.length} new breakpoints, expected the one that was added`);
   const breakpoint = added[0];
+  check(
+    !used.has(breakpoint.id),
+    `breakpoints.add: the new breakpoint has id ${breakpoint.id}, which an earlier breakpoint of this run had; ids are never reused`,
+  );
   check(breakpoint.event === params.event, `breakpoints.add: the tick lists event "${breakpoint.event}"`);
   check(breakpoint.address === params.address, `breakpoints.add: the tick lists address ${String(breakpoint.address)}, the request gave ${String(params.address)}`);
   // kind defaults to "code" when an address is given, else "event"; enabled defaults to true
@@ -266,12 +279,14 @@ const unwatchedRegister = (context: RunContext, path: string, preferred: string[
 const addWatch = async (context: RunContext, expression: string, expected: string): Promise<{ id: number; record: TickRecord }> => {
   const { session } = context;
   const listed = new Set((session.latestTick().tick.watches ?? []).map((watch) => watch.id));
+  const used = new Set(context.seen.watches);
   const newIn = (tick: DebuggerTick) => (tick.watches ?? []).filter((watch) => !listed.has(watch.id));
   const mark = session.mark();
   await session.call("state.watch", { expressions: [expression] });
   const next = await tickShowing(session, mark, "state.watch", (tick) => (newIn(tick).length > 0 ? undefined : "no tick lists a new watch"));
   const added = newIn(next.tick);
   check(added.length === 1, `state.watch: the tick that shows it lists ${added.length} new watches, expected the one that was added`);
+  check(!used.has(added[0].id), `state.watch: the new watch has id ${added[0].id}, which an earlier watch of this run had; ids are never reused`);
   // the stored expression is normalised to lower case
   check(added[0].expression === expected, `state.watch "${expression}": listed as "${added[0].expression}", expected "${expected}"`);
   check(added[0].id >= 1, "watch ids are allocated from 1");
