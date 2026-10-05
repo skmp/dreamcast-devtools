@@ -40,7 +40,8 @@ import type { MockSgcCapture } from "./mockSgc";
  *
  * What it implements is milestone M1 of the protocol, plus what the mock could do before
  * protocol v3: ARM7 and DSP stepping and code breakpoints, the SGC capture, and register
- * writes (state.setRegister and state.editWatch). Everything else answers -32004.
+ * writes (state.setRegister and state.editWatch). Everything else answers -32004. The option
+ * `supports` takes away from that, down to what a server of milestone M1 implements.
  *
  * The machine: each target walks a ring of instructions, one instruction per emulation
  * step (16 ms). The last instruction of the SH4 and ARM7 rings is the branch back to the
@@ -72,9 +73,46 @@ export interface MockDebuggerOptions {
   sliceContext?: boolean;
   /** `ui` of debugger.describe: "none" or the version of the bundle the host serves */
   ui?: string;
+  /**
+   * What debugger.describe reports as `protocol`. The mock speaks protocol 3 whatever this
+   * says: another number makes it a server of another protocol version for the version check
+   * of a client.
+   */
+  protocol?: number;
+  /**
+   * What the server implements; without it, everything the mock can do. For a mock of a server
+   * of an earlier milestone, or of one without a target. See `MOCK_M1_SUPPORT`.
+   */
+  supports?: MockSupport;
   /** called with one line per connection event and per request the mock refuses to parse */
   log?: (line: string) => void;
 }
+
+export interface MockSupport {
+  /**
+   * The targets debugger.describe lists (default: all three). A target that is not listed is
+   * unsupported: every request that names it answers -32004, and its callstack is empty.
+   */
+  targets?: TargetProcessor[];
+  /**
+   * The listed targets whose `stepping` is true (default: all of them). control.step* and the
+   * code breakpoints of the others answer -32004.
+   */
+  stepping?: TargetProcessor[];
+  /**
+   * The capabilities of optional methods (default: all four the mock has): "event-breakpoints",
+   * "callstack", "register-write", "sgc-capture". The methods behind a missing one answer
+   * -32004, and without "callstack" the ticks carry no frames.
+   */
+  capabilities?: string[];
+}
+
+/** What the emulator implements in milestone M1: SH4 debugging, event breakpoints, callstack. */
+export const MOCK_M1_SUPPORT: Readonly<Required<MockSupport>> = {
+  targets: ["sh4", "arm7", "dsp"],
+  stepping: ["sh4"],
+  capabilities: [CAPABILITIES.EVENT_BREAKPOINTS, CAPABILITIES.CALLSTACK],
+};
 
 /** One client connection, as the host gives it to the mock. */
 export interface MockConnection {
@@ -468,6 +506,14 @@ const TARGETS: DebuggerTarget[] = [
 
 const targetById = (id: TargetProcessor): DebuggerTarget => TARGETS.find((target) => target.id === id)!;
 
+/** The capabilities of optional methods the mock has: M1's, and what it could do before protocol v3. */
+const OPTIONAL_CAPABILITIES: string[] = [
+  CAPABILITIES.EVENT_BREAKPOINTS,
+  CAPABILITIES.CALLSTACK,
+  CAPABILITIES.REGISTER_WRITE,
+  CAPABILITIES.SGC_CAPTURE,
+];
+
 // ---------------------------------------------------------------------------------------
 // Memory and disassembly
 // ---------------------------------------------------------------------------------------
@@ -712,7 +758,11 @@ const categorize = (breakpoint: BreakpointDescriptor): BreakpointCategory => {
 };
 
 export class MockDebugger {
-  private readonly options: Required<Omit<MockDebuggerOptions, "log">> & Pick<MockDebuggerOptions, "log">;
+  private readonly options: Required<Omit<MockDebuggerOptions, "log" | "supports">> & Pick<MockDebuggerOptions, "log">;
+  /** the targets debugger.describe lists, with what this server implements of them */
+  private readonly targets: DebuggerTarget[];
+  /** the capabilities of optional methods this server has */
+  private readonly optionalCapabilities: string[];
   private readonly nodes = new Map<string, NodeSpec>();
   private readonly values = new Map<string, Map<string, RegisterContent>>();
   private readonly clients = new Map<number, ClientState>();
@@ -763,8 +813,18 @@ export class MockDebugger {
       forceFallback: options.forceFallback ?? false,
       sliceContext: options.sliceContext ?? true,
       ui: options.ui ?? "none",
+      protocol: options.protocol ?? PROTOCOL_VERSION,
       log: options.log,
     };
+    const listed = options.supports?.targets;
+    const stepping = options.supports?.stepping;
+    this.targets = TARGETS.filter((target) => !listed || listed.includes(target.id)).map((target) => ({
+      ...target,
+      stepping: stepping ? stepping.includes(target.id) : target.stepping,
+    }));
+    this.optionalCapabilities = OPTIONAL_CAPABILITIES.filter(
+      (capability) => !options.supports?.capabilities || options.supports.capabilities.includes(capability),
+    );
 
     const visit = (node: NodeSpec) => {
       this.nodes.set(node.path, node);
@@ -851,10 +911,7 @@ export class MockDebugger {
   /** `debugger.describe` capabilities of this mock, at the moment of the call. */
   get capabilities(): string[] {
     return [
-      CAPABILITIES.EVENT_BREAKPOINTS,
-      CAPABILITIES.CALLSTACK,
-      CAPABILITIES.REGISTER_WRITE,
-      CAPABILITIES.SGC_CAPTURE,
+      ...this.optionalCapabilities,
       // neither of the two before an SH4 backend is selected, i.e. while no game is loaded
       ...(this.lifetime === "no-machine" ? [] : [this.options.forceFallback ? CAPABILITIES.SH4_DEBUG_FALLBACK : CAPABILITIES.SH4_DEBUG_NATIVE]),
     ];
@@ -1144,7 +1201,8 @@ export class MockDebugger {
     }
 
     const notice = this.options.forceFallback && (this.fallbackSelected || this.fallbackStep) ? FALLBACK_NOTICE : undefined;
-    const showCallstacks = paused && this.lifetime !== "no-machine";
+    const showCallstacks = paused && this.lifetime !== "no-machine" && this.has(CAPABILITIES.CALLSTACK);
+    const listed = (target: TargetProcessor) => this.targets.some((candidate) => candidate.id === target);
 
     return {
       tickId: this.tickId++,
@@ -1162,8 +1220,8 @@ export class MockDebugger {
       eventLog: this.eventLog.slice(),
       watches,
       callstacks: {
-        sh4: showCallstacks ? this.callstack("sh4", PROTOCOL_BOUNDS.callstackFramesPerTick) : [],
-        arm7: showCallstacks ? this.callstack("arm7", PROTOCOL_BOUNDS.callstackFramesPerTick) : [],
+        sh4: showCallstacks && listed("sh4") ? this.callstack("sh4", PROTOCOL_BOUNDS.callstackFramesPerTick) : [],
+        arm7: showCallstacks && listed("arm7") ? this.callstack("arm7", PROTOCOL_BOUNDS.callstackFramesPerTick) : [],
       },
       categories,
     };
@@ -1327,6 +1385,25 @@ export class MockDebugger {
     }
   }
 
+  /** The target as this server lists it; -32004 when it does not. */
+  private supportedTarget(id: TargetProcessor): DebuggerTarget {
+    const target = this.targets.find((candidate) => candidate.id === id);
+    if (!target) {
+      throw notSupported(`target ${id}`);
+    }
+    return target;
+  }
+
+  private has(capability: string): boolean {
+    return this.optionalCapabilities.includes(capability);
+  }
+
+  private requireCapability(capability: string, what: string): void {
+    if (!this.has(capability)) {
+      throw notSupported(what);
+    }
+  }
+
   /** Queues the tick that follows a successful mutating request. */
   private tickAfter(context: RequestContext): void {
     context.afterResponse.push(() => this.broadcastTick());
@@ -1355,10 +1432,10 @@ export class MockDebugger {
     });
     return {
       emulator: { name: "nullDC (mock)", version: "3.0.0", build: "native" },
-      protocol: PROTOCOL_VERSION,
+      protocol: this.options.protocol,
       ui: this.options.ui,
       capabilities: this.capabilities,
-      targets: TARGETS.map((target) => ({ ...target })),
+      targets: this.targets.map((target) => ({ ...target })),
       deviceTree: DEVICE_TREE.map(build),
     };
   }
@@ -1368,6 +1445,7 @@ export class MockDebugger {
     if (target === "dsp") {
       throw notSupported("target dsp has no memory");
     }
+    this.supportedTarget(target);
     return target;
   }
 
@@ -1397,7 +1475,7 @@ export class MockDebugger {
 
   private getDisassembly(params: Record<string, unknown>): { lines: DisassemblyLine[] } {
     const targetId = (params.target as TargetProcessor | undefined) ?? "sh4";
-    const target = targetById(targetId);
+    const target = this.supportedTarget(targetId);
     const address = params.address as number;
     const count = params.count as number;
     if (address % target.instructionSize !== 0) {
@@ -1420,6 +1498,8 @@ export class MockDebugger {
 
   private getCallstack(params: Record<string, unknown>): { target: "sh4" | "arm7"; frames: CallstackFrame[] } {
     const target = params.target as "sh4" | "arm7";
+    this.requireCapability(CAPABILITIES.CALLSTACK, RpcMethod.STATE_GET_CALLSTACK);
+    this.supportedTarget(target);
     const maxFrames = (params.maxFrames as number | undefined) ?? PROTOCOL_BOUNDS.callstackMaxFrames.default;
     return { target, frames: this.callstack(target, maxFrames) };
   }
@@ -1477,6 +1557,7 @@ export class MockDebugger {
   }
 
   private editWatch(params: Record<string, unknown>, context: RequestContext): Record<string, never> {
+    this.requireCapability(CAPABILITIES.REGISTER_WRITE, RpcMethod.STATE_EDIT_WATCH);
     const watch = this.watchById(params.watchId as number);
     this.writeRegister(watch.path, watch.register, params.value as string);
     this.tickAfter(context);
@@ -1484,6 +1565,7 @@ export class MockDebugger {
   }
 
   private setRegister(params: Record<string, unknown>, context: RequestContext): Record<string, never> {
+    this.requireCapability(CAPABILITIES.REGISTER_WRITE, RpcMethod.STATE_SET_REGISTER);
     const path = params.path as string;
     const name = params.name as string;
     const register = this.nodes.get(path)?.registers?.find((candidate) => candidate.name === name);
@@ -1546,7 +1628,7 @@ export class MockDebugger {
     if (this.running) {
       throw new MockRpcError(DebuggerErrorCode.NOT_PAUSED, "not paused");
     }
-    if (!targetById(targetId).stepping) {
+    if (!this.supportedTarget(targetId).stepping) {
       throw notSupported(`stepping target ${targetId}`);
     }
     if (targetId === "dsp" && kind !== "step") {
@@ -1605,6 +1687,7 @@ export class MockDebugger {
 
     let breakpoint: Omit<BreakpointDescriptor, "id">;
     if (kind === "event") {
+      this.requireCapability(CAPABILITIES.EVENT_BREAKPOINTS, "event breakpoints");
       // the event has to be one the server raises
       if (!(event in MOCK_EVENTS)) {
         throw notSupported(`event ${event}`);
@@ -1615,7 +1698,7 @@ export class MockDebugger {
       if (!targetId) {
         throw notSupported(`code breakpoints on ${event}`);
       }
-      const target = targetById(targetId);
+      const target = this.supportedTarget(targetId);
       if (!target.stepping) {
         throw notSupported(`code breakpoints of target ${targetId}`);
       }
@@ -1671,6 +1754,7 @@ export class MockDebugger {
    * with reason "capture".
    */
   private recordSgcFrames(params: Record<string, unknown>, context: RequestContext): void {
+    this.requireCapability(CAPABILITIES.SGC_CAPTURE, RpcMethod.STATE_RECORD_SGC_FRAMES);
     const frames = (params.frames as number | undefined) ?? PROTOCOL_BOUNDS.sgcFrames.default;
     const wasPaused = !this.running;
     context.deferred = true;
@@ -1691,6 +1775,7 @@ export class MockDebugger {
   }
 
   private getSgcFrameData(context: RequestContext): unknown {
+    this.requireCapability(CAPABILITIES.SGC_CAPTURE, RpcMethod.STATE_GET_SGC_FRAME_DATA);
     const capture = this.capture;
     if (!capture) {
       throw new MockRpcError(DebuggerErrorCode.NO_CAPTURE, "no capture available");

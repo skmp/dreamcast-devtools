@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { MOCK_SH4_RING, MockDebugger } from "../../server/mockDebugger";
+import { MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger } from "../../server/mockDebugger";
 import type { MockClient, MockConnection, MockDebuggerOptions } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
 import { isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
@@ -325,6 +325,15 @@ describe("the contract runner against the mock", () => {
     expect(tick.categories).toEqual({ events: unmuted, sh4: unmuted, arm7: unmuted, dsp: unmuted });
     expect(tick.executionState.state).toBe("running");
     expect(mock.clientCount).toBeLessThanOrEqual(1);
+  }, 60_000);
+
+  it("passes the mock that implements only milestone M1: S16 and S17 are not applicable to it", async () => {
+    const summary = await run(undefined, undefined, { supports: MOCK_M1_SUPPORT });
+    expect(summary.invariantViolations).toEqual([]);
+    expect(summary.cleanUpProblems).toEqual([]);
+    expect(statusesOf(summary)).toEqual({ ...MOCK_STATUSES, S16: "not-applicable", S17: "not-applicable" });
+    expect(summary.ok).toBe(true);
+    expect(summary.server.capabilities).toEqual(["event-breakpoints", "callstack", "sh4-debug-native"]);
   }, 60_000);
 
   it("restores a paused server to paused, and keeps the watches it found", async () => {

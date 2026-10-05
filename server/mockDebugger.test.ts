@@ -6,7 +6,7 @@ import {
   StrictDebuggerRpcMethodSchemas,
 } from "../src/lib/debuggerSchema";
 import type { DebuggerShape, DebuggerTick } from "../src/lib/debuggerSchema";
-import { MOCK_SH4_RING, MockDebugger, mockNextAddress } from "./mockDebugger";
+import { MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger, mockNextAddress } from "./mockDebugger";
 import type { MockDebuggerOptions } from "./mockDebugger";
 
 interface Frame {
@@ -680,6 +680,92 @@ describe("tick policy", () => {
     const fallback = createMock({ forceFallback: true });
     fallback.setLifetime("no-machine");
     expect(connect(fallback).describe().capabilities!.filter((capability) => capability.startsWith("sh4-debug-"))).toEqual([]);
+  });
+});
+
+describe("a server that implements less (the option `supports`)", () => {
+  it("as milestone M1: lists the three targets, steps only the SH4, and has neither register writes nor the SGC capture", async () => {
+    const mock = createMock({ supports: MOCK_M1_SUPPORT });
+    const session = connect(mock);
+    const shape = session.describe();
+    expect(shape.targets!.map(({ id, stepping, memory }) => ({ id, stepping, memory }))).toEqual([
+      { id: "sh4", stepping: true, memory: true },
+      { id: "arm7", stepping: false, memory: true },
+      { id: "dsp", stepping: false, memory: false },
+    ]);
+    expect(shape.capabilities).toEqual(["event-breakpoints", "callstack", "sh4-debug-native"]);
+
+    session.ok("control.pause");
+    // what M1 has
+    session.ok("control.step", { target: "sh4" });
+    session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: 0x8c0000a4 });
+    session.ok("breakpoints.add", { event: "dc.sh4.exception" });
+    session.ok("state.getDisassembly", { target: "arm7", address: 0x00200010, count: 2 });
+    session.ok("state.getDisassembly", { target: "dsp", address: 0, count: 2 });
+    session.ok("state.getMemorySlice", { target: "arm7", address: 0, length: 4 });
+    session.ok("state.getCallstack", { target: "arm7" });
+    session.ok("state.watch", { expressions: ["dc.sh4.cpu.pc"] });
+    expect(session.lastTick().callstacks!.sh4.length).toBeGreaterThan(0);
+    expect(session.lastTick().callstacks!.arm7.length).toBeGreaterThan(0);
+
+    // what it has not: -32004, on the channel of the method
+    for (const [method, params] of [
+      ["control.step", { target: "arm7" }],
+      ["control.stepOver", { target: "arm7" }],
+      ["control.stepOut", { target: "arm7" }],
+      ["control.step", { target: "dsp" }],
+      ["breakpoints.add", { event: "dc.aica.arm7.pc", address: 0x00200010 }],
+      ["breakpoints.add", { event: "dc.aica.dsp.step", address: 5 }],
+      ["state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" }],
+      ["state.editWatch", { watchId: 1, value: "1" }],
+      ["state.recordSgcFrames", {}],
+      ["state.getSgcFrameData", {}],
+    ] as const) {
+      session.fail(method, params, -32004);
+    }
+    expect(Object.keys(session.lastTick().breakpoints)).toHaveLength(2);
+
+    // a step is still refused while running before anything else is looked at
+    session.ok("control.runUntil");
+    session.fail("control.step", { target: "arm7" }, -32003);
+  });
+
+  it("without a target: it is not listed, its requests answer -32004 and its callstack is empty", () => {
+    const mock = createMock({ supports: { targets: ["sh4", "dsp"] } });
+    const session = connect(mock);
+    expect(session.describe().targets!.map((target) => target.id)).toEqual(["sh4", "dsp"]);
+    session.ok("control.pause");
+    for (const [method, params] of [
+      ["state.getDisassembly", { target: "arm7", address: 0, count: 1 }],
+      ["state.getMemorySlice", { target: "arm7", address: 0, length: 1 }],
+      ["state.getCallstack", { target: "arm7" }],
+      ["control.step", { target: "arm7" }],
+      ["breakpoints.add", { event: "dc.aica.arm7.pc", address: 0x00200010 }],
+    ] as const) {
+      expect(session.fail(method, params, -32004).message).toMatch(/arm7/);
+    }
+    expect(session.lastTick().callstacks!.sh4.length).toBeGreaterThan(0);
+    expect(session.lastTick().callstacks!.arm7).toEqual([]);
+    // the targets it lists step as before
+    session.ok("control.step", { target: "dsp" });
+  });
+
+  it("without a capability: the methods behind it answer -32004, and without callstack the ticks carry no frames", () => {
+    const mock = createMock({ supports: { capabilities: ["register-write"] } });
+    const session = connect(mock);
+    expect(session.describe().capabilities).toEqual(["register-write", "sh4-debug-native"]);
+    session.ok("control.pause");
+    expect(session.lastTick().callstacks).toEqual({ sh4: [], arm7: [] });
+    session.fail("state.getCallstack", { target: "sh4" }, -32004);
+    expect(session.fail("breakpoints.add", { event: "dc.sh4.exception" }, -32004).message).toBe("not supported: event breakpoints");
+    // code breakpoints and register writes are what it has
+    session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: 0x8c0000a4 });
+    session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" });
+  });
+
+  it("reports the protocol version it is told to report", () => {
+    expect(connect(createMock()).call("debugger.describe").result).toMatchObject({ protocol: 3 });
+    expect(connect(createMock({ protocol: 4 })).call("debugger.describe").result).toMatchObject({ protocol: 4 });
   });
 });
 

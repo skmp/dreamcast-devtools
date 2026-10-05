@@ -138,6 +138,7 @@ Mock server, on the command line (`npm run mock:serve -- --start-paused`):
 | `--start-paused` | Start in the `StartPaused` stop (`reason: "start"`) instead of running. |
 | `--force-fallback` | Behave like an SH4 backend without native breakpoints: `notice` in the ticks while SH4 breakpoints are active, `dc.timing.SH4_DEBUG_ENGINE` reads `interpreter-fallback`, capability `sh4-debug-fallback`. |
 | `--stale-registers` | Behave like a backend whose running ticks cannot carry `dc.sh4.cpu`: they omit it and say `registersStale`, and watches on `dc.sh4.cpu.*` read `n/a` until the target is paused. |
+| `--m1` | Implement what the emulator does in milestone M1 and nothing more: no ARM7 or DSP stepping and code breakpoints, no register writes, no SGC capture (`targets[].stepping`, `capabilities`; the requests answer -32004). |
 
 The version shown in the status bar and the About dialog is the `package.json` version, followed by
 `+<git describe --tags --always --dirty>` when the build runs inside a git checkout.
