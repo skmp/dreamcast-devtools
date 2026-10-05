@@ -66,7 +66,8 @@ export interface MockDebuggerOptions {
   forceFallback?: boolean;
   /**
    * false: behave like a backend without a complete context at the slice hook; running
-   * ticks omit `dc.sh4.cpu` and carry `registersStale: true`.
+   * ticks omit `dc.sh4.cpu`, carry `registersStale: true`, and watches on `dc.sh4.cpu.*`
+   * read "n/a" in them.
    */
   sliceContext?: boolean;
   /** `ui` of debugger.describe: "none" or the version of the bundle the host serves */
@@ -1127,9 +1128,15 @@ export class MockDebugger {
       breakpoints[String(id)] = { ...breakpoint };
     }
 
+    // evaluated in every tick, whatever paths it carries; what cannot be read is "n/a", and
+    // without a context at the slice hook that is the SH4's registers while it runs
     const watches: WatchDescriptor[] = Array.from(this.watches.values())
       .sort((a, b) => a.id - b.id)
-      .map((watch) => ({ id: watch.id, expression: watch.expression, value: this.formatRegister(watch.path, watch.register).value }));
+      .map((watch) => ({
+        id: watch.id,
+        expression: watch.expression,
+        value: stale && watch.path === "dc.sh4.cpu" ? "n/a" : this.formatRegister(watch.path, watch.register).value,
+      }));
 
     const categories: Record<string, BreakpointCategoryState> = {};
     for (const key of CATEGORY_KEYS) {

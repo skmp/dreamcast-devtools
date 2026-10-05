@@ -546,6 +546,44 @@ describe("tick policy", () => {
     expect(session.lastTick().registers["dc.sh4.cpu"]).toBeDefined();
   });
 
+  it("without a context at the slice hook, watches on dc.sh4.cpu read n/a while running, and the register once paused", async () => {
+    const mock = createMock({ sliceContext: false });
+    const session = connect(mock);
+    session.describe();
+    session.ok("state.watch", { expressions: ["dc.sh4.cpu.pc", "dc.aica.arm7.pc", "dc.sh4.cpu.r15", "dc.timing.sh4_cycles"] });
+    const values = (tick: DebuggerTick) => Object.fromEntries(tick.watches!.map((watch) => [watch.expression, watch.value]));
+    const live = /^0x[0-9A-F]{8}$/;
+    // the tick of the request, a periodic tick, and the full one among them
+    await vi.advanceTimersByTimeAsync(1000);
+    const running = session.ticks().slice(-6);
+    expect(running.map((tick) => tick.executionState.registersStale)).toEqual(new Array(6).fill(true));
+    for (const tick of running) {
+      expect(values(tick)).toEqual({
+        "dc.sh4.cpu.pc": "n/a",
+        "dc.sh4.cpu.r15": "n/a",
+        // what is not the SH4's context is read as ever
+        "dc.aica.arm7.pc": expect.stringMatching(live),
+        "dc.timing.sh4_cycles": expect.stringMatching(/^0x[0-9A-F]{16}$/),
+      });
+    }
+
+    // after Run() has returned the context is valid
+    session.ok("control.pause");
+    const paused = session.lastTick();
+    expect(paused.executionState.registersStale).toBeUndefined();
+    expect(values(paused)["dc.sh4.cpu.pc"]).toBe(paused.registers["dc.sh4.cpu"].find((register) => register.name === "PC")!.value);
+    expect(values(paused)["dc.sh4.cpu.pc"]).toMatch(live);
+    expect(values(paused)["dc.sh4.cpu.r15"]).toBe("0x8CFFF000");
+
+    // and a mock with a context at the slice hook reads the PC while it runs
+    const other = connect(createMock());
+    other.describe();
+    other.ok("state.watch", { expressions: ["dc.sh4.cpu.pc"] });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(other.lastTick().executionState.state).toBe("running");
+    expect(values(other.lastTick())["dc.sh4.cpu.pc"]).toMatch(live);
+  });
+
   it("with ForceFallback, says so: capability, dc.timing, and the notice while SH4 breakpoints are active or after a step", async () => {
     const mock = createMock({ forceFallback: true });
     const session = connect(mock);
