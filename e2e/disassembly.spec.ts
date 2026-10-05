@@ -208,7 +208,8 @@ for (const target of TARGETS) {
 
       // enabled breakpoint: marker in the gutter, entry in the panel
       await expect(gutter).toHaveAttribute("data-breakpoint", "enabled");
-      const entry = breakpoints.getByRole("listitem").filter({ hasText: `${target.event} == ${hex8(address)}` });
+      // in the address format of the target
+      const entry = breakpoints.getByRole("listitem").filter({ hasText: `${target.event} == ${target.format(address)}` });
       await expect(entry).toBeVisible();
       await expect(entry.getByText("code", { exact: true })).toBeVisible();
       await expect(entry.getByRole("switch")).toBeChecked();

@@ -3,6 +3,7 @@ import {
   expect,
   addPanelFromSelector,
   breakpointGutter,
+  dockTab,
   disassemblyRow,
   openWorkspace,
   panel,
@@ -138,7 +139,8 @@ test("DSP: Breakpoints adds a step breakpoint, toggles and removes it", async ({
 
   await input.fill("5");
   await input.press("Enter");
-  const item = entry(view, "dc.aica.dsp.step == 0x00000005");
+  // a DSP step is decimal everywhere: in the box, in the list and in the disassembly view
+  const item = entry(view, "dc.aica.dsp.step == 005");
   await expect(item).toBeVisible();
   // the DSP was paused at any of its 128 steps: bring step 5 into the disassembly view
   await showDspStep(page, 5);
@@ -412,4 +414,46 @@ test("mute and solo are kept by the server: a reload shows them again, and so do
   await expect(panel(page, "arm7-disassembly").getByRole("button", { name: "Solo category" })).toBeVisible();
   // the page sent nothing for that
   expect(rpc.requests("breakpoints.setCategoryStates")).toHaveLength(2);
+});
+
+test("the list of a target has that target's code breakpoints, each in the address format of its target", async ({
+  page,
+  diagnostics,
+}) => {
+  diagnostics.allow(...KNOWN.sgcNoData);
+  await openWorkspace(page, "audio-debugger");
+  await pauseFromToolbar(page);
+  const dsp = panel(page, "dsp-breakpoints");
+  const step = dsp.getByPlaceholder("Step value (e.g., 0, 5, 0x10)");
+
+  // a DSP step, in hex ...
+  await step.fill("0x7F");
+  await step.press("Enter");
+  // ... is listed in decimal, three digits: as the DSP disassembly view numbers its steps
+  await expect(entry(dsp, "dc.aica.dsp.step == 127")).toBeVisible();
+  // a step that is not a number in the DSP's radix is not sent
+  await step.fill("1f");
+  await step.press("Enter");
+  await expect(dsp.getByRole("listitem")).toHaveCount(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await step.fill("");
+
+  // two events whose names say "dsp" and "aica", in the panel of all breakpoints (a tab of the same group)
+  const events = await openEventsBreakpoints(page);
+  const input = events.getByPlaceholder("Event name (e.g., dc.aica.channel[0].step)");
+  for (const event of ["dc.debugger.dsp_forced", "dc.aica.timer"]) {
+    await input.fill(event);
+    await input.press("Enter");
+    await expect(entry(events, event)).toBeVisible();
+  }
+  await expect(events.getByRole("listitem")).toHaveCount(3);
+  await expect(entry(events, "dc.aica.dsp.step == 127")).toBeVisible();
+  await expect(events.getByRole("heading", { name: "DSP", exact: true })).toBeVisible();
+  await expect(events.getByRole("heading", { name: "Events", exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+
+  // the panel of the DSP lists the code breakpoints of the DSP, and events are not that
+  await dockTab(page, "DSP: Breakpoints").click();
+  await expect(dsp.getByRole("listitem")).toHaveCount(1);
+  await expect(entry(dsp, "dc.aica.dsp.step == 127")).toBeVisible();
 });

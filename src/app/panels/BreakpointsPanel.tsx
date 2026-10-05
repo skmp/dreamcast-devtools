@@ -22,39 +22,15 @@ import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
 import RadioButtonCheckedIcon from "@mui/icons-material/RadioButtonChecked";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { isCategoryActive, type BreakpointCategory } from "../../state/breakpointCategoryState";
-import { useCallback, useState } from "react";
-import type { BreakpointDescriptor } from "../../lib/debuggerSchema";
-
-const categorizeBreakpoint = (bp: BreakpointDescriptor): BreakpointCategory => {
-  // All event breakpoints go to "events" category
-  if (bp.kind === "event") {
-    return "events";
-  }
-
-  // Code breakpoints are categorized by processor
-  const lower = bp.event.toLowerCase();
-  if (lower.includes("sh4")) return "sh4";
-  if (lower.includes("arm7")) return "arm7";
-  if (lower.includes("aica") || lower.includes("dsp")) return "dsp";
-
-  // Default to events if we can't determine
-  return "events";
-};
-
-const formatBreakpointDisplay = (bp: BreakpointDescriptor): string => {
-  if (bp.kind === "event") {
-    return bp.event;
-  }
-  // For code breakpoints, show event == address
-  const addressStr = bp.address !== undefined ? `0x${bp.address.toString(16).toUpperCase().padStart(8, "0")}` : "?";
-  return `${bp.event} == ${addressStr}`;
-};
+import { useCapability, useTarget } from "../../state/debuggerSelectors";
+import { breakpointCategory, describeBreakpoint, parseAddress } from "../../state/targets";
+import { PanelNotice } from "../components/PanelNotice";
+import { useCallback, useMemo, useState } from "react";
+import { CAPABILITIES, type BreakpointDescriptor, type TargetProcessor } from "../../lib/debuggerSchema";
 
 interface BreakpointsViewProps {
-  title: string;
-  filter?: (bp: BreakpointDescriptor) => boolean;
-  addMode: "pc-sh4" | "pc-arm7" | "event" | "dsp";
-  showCategoryControls?: boolean;
+  /** "event": event breakpoints, and the list of every breakpoint by category; otherwise the code breakpoints of a target */
+  mode: "event" | TargetProcessor;
 }
 
 const CategoryControls = ({
@@ -84,19 +60,45 @@ const CategoryControls = ({
   );
 };
 
-const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: BreakpointsViewProps) => {
+const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
+  const addMode = mode;
+  const showCategoryControls = mode === "event";
   const breakpoints = useDebuggerDataStore((state) => state.breakpoints);
   const availableEvents = useDebuggerDataStore((state) => state.availableEvents);
+  const shape = useDebuggerDataStore((state) => state.shape);
+  const initialized = useDebuggerDataStore((state) => state.initialized);
+  // mute and solo are the server's state: every tick carries them, whoever changed them
+  const categoryStates = useDebuggerDataStore((state) => state.categories);
   const removeBreakpoint = useDebuggerDataStore((state) => state.removeBreakpoint);
   const addBreakpoint = useDebuggerDataStore((state) => state.addBreakpoint);
   const toggleBreakpoint = useDebuggerDataStore((state) => state.toggleBreakpoint);
-  // mute and solo are the server's state: every tick carries them, whoever changed them
-  const categoryStates = useDebuggerDataStore((state) => state.categories);
   const toggleCategoryMute = useDebuggerDataStore((state) => state.toggleCategoryMute);
   const toggleCategorySolo = useDebuggerDataStore((state) => state.toggleCategorySolo);
+  // address format and breakpoint event of the target, as debugger.describe said
+  const target = useTarget(mode === "event" ? "sh4" : mode);
+  const eventBreakpoints = useCapability(CAPABILITIES.EVENT_BREAKPOINTS);
   const [newBreakpoint, setNewBreakpoint] = useState("");
 
-  const filteredBreakpoints = filter ? breakpoints.filter(filter) : breakpoints;
+  // the panel of a target lists the code breakpoints of that target
+  const filteredBreakpoints = useMemo(
+    () => (mode === "event" ? breakpoints : breakpoints.filter((bp) => breakpointCategory(shape, bp) === mode)),
+    [breakpoints, mode, shape],
+  );
+  const formatBreakpointDisplay = useCallback((bp: BreakpointDescriptor) => describeBreakpoint(shape, bp), [shape]);
+  const categorizeBreakpoint = useCallback((bp: BreakpointDescriptor) => breakpointCategory(shape, bp), [shape]);
+
+  // what the server cannot do is said, in place of the box that would ask for it
+  const unsupported = !initialized
+    ? undefined
+    : mode === "event"
+      ? eventBreakpoints
+        ? undefined
+        : "This server has no event breakpoints."
+      : !target.supported
+        ? `This server does not support the ${target.label} target.`
+        : !target.stepping
+          ? `This server cannot set code breakpoints on the ${target.label}.`
+          : undefined;
 
   const handleRemove = useCallback(
     async (id: number) => {
@@ -140,31 +142,21 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
       event = trimmed;
       address = undefined;
       kind = "event";
-    } else if (addMode === "dsp") {
-      // DSP steps are decimal, as in the DSP disassembly view; hex needs the 0x prefix
-      const parsed = /^0x/i.test(trimmed) ? Number.parseInt(trimmed.slice(2), 16) : Number.parseInt(trimmed, 10);
-      if (Number.isNaN(parsed)) {
-        return;
-      }
-      event = "dc.aica.dsp.step";
-      address = parsed;
-      kind = "code";
     } else {
-      // Parse address for PC breakpoints
-      const normalized = trimmed.replace(/^0x/i, "");
-      const parsed = Number.parseInt(normalized, 16);
-      if (Number.isNaN(parsed)) {
+      // In the radix of the target, as its disassembly view prints addresses (DSP steps are
+      // decimal); hex after "0x" for every target
+      const parsed = parseAddress(target, trimmed);
+      if (parsed === undefined) {
         return;
       }
-      const target = addMode === "pc-sh4" ? "dc.sh4.cpu" : addMode === "pc-arm7" ? "dc.aica.arm7" : "dc.sh4.cpu";
-      event = `${target}.pc`;
+      event = target.breakpointEvent;
       address = parsed;
       kind = "code";
     }
 
     await addBreakpoint(event, address, kind);
     setNewBreakpoint("");
-  }, [newBreakpoint, addBreakpoint, addMode]);
+  }, [newBreakpoint, addBreakpoint, addMode, target]);
 
   const placeholder =
     addMode === "event"
@@ -197,6 +189,11 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
 
   return (
     <Panel>
+      {unsupported !== undefined ? (
+        <Box sx={{ borderBottom: "1px solid", borderColor: "divider" }}>
+          <PanelNotice>{unsupported}</PanelNotice>
+        </Box>
+      ) : (
       <Box sx={{ p: 1.5, borderBottom: "1px solid", borderColor: "divider" }}>
         <Stack direction="row" spacing={1}>
           {addMode === "event" ? (
@@ -249,6 +246,7 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
           </Button>
         </Stack>
       </Box>
+      )}
 
       {showCategoryControls ? (
         // Show grouped view with category controls
@@ -389,20 +387,10 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
   );
 };
 
-export const EventsBreakpointsPanel = () => <BreakpointsView title="Events: Breakpoints" addMode="event" showCategoryControls={true} />;
+export const EventsBreakpointsPanel = () => <BreakpointsView mode="event" />;
 
-export const Sh4BreakpointsPanel = () => (
-  <BreakpointsView title="SH4: Breakpoints" filter={(bp) => bp.event.toLowerCase().includes("sh4")} addMode="pc-sh4" />
-);
+export const Sh4BreakpointsPanel = () => <BreakpointsView mode="sh4" />;
 
-export const Arm7BreakpointsPanel = () => (
-  <BreakpointsView title="ARM7: Breakpoints" filter={(bp) => bp.event.toLowerCase().includes("arm7")} addMode="pc-arm7" />
-);
+export const Arm7BreakpointsPanel = () => <BreakpointsView mode="arm7" />;
 
-export const DspBreakpointsPanel = () => (
-  <BreakpointsView
-    title="DSP: Breakpoints"
-    filter={(bp) => bp.event.toLowerCase().includes("dsp")}
-    addMode="dsp"
-  />
-);
+export const DspBreakpointsPanel = () => <BreakpointsView mode="dsp" />;
