@@ -20,7 +20,12 @@ interface Faults {
   toClient?: (frame: Json) => Json | Json[] | undefined;
   /** rewrites a request of the client */
   toServer?: (frame: Json) => Json;
+  /** frames the client receives after it has sent a request and before the server sees that request */
+  beforeRequest?: (request: Json) => Json[];
 }
+
+/** One set of faults for every connection, or a function that makes one per connection (faults that keep state). */
+type FaultSource = Faults | (() => Faults);
 
 const closers: Array<() => Promise<void>> = [];
 
@@ -31,11 +36,11 @@ afterEach(async () => {
 });
 
 /** The mock on a WebSocket, optionally behind a proxy that applies `faults`. Returns the URL to test. */
-const startServer = async (faults?: Faults, options?: MockDebuggerOptions): Promise<{ url: string; mock: MockDebugger }> => {
+const startServer = async (source?: FaultSource, options?: MockDebuggerOptions): Promise<{ url: string; mock: MockDebugger }> => {
   const mock = new MockDebugger(options);
   const listener = await listenMockDebugger(mock);
   closers.push(() => listener.close());
-  if (!faults) {
+  if (!source) {
     return { url: listener.url, mock };
   }
 
@@ -49,16 +54,19 @@ const startServer = async (faults?: Faults, options?: MockDebuggerOptions): Prom
       }),
   );
   proxy.on("connection", (client) => {
+    const faults = typeof source === "function" ? source() : source;
     const upstream = new WebSocket(listener.url);
     const early: string[] = [];
     client.on("message", (data) => {
       let text = data.toString();
-      if (faults.toServer) {
-        try {
-          text = JSON.stringify(faults.toServer(JSON.parse(text) as Json));
-        } catch {
-          // not JSON: the runner's malformed frame goes through as it is
+      try {
+        const request = JSON.parse(text) as Json;
+        faults.beforeRequest?.(request).forEach((frame) => client.send(JSON.stringify(frame)));
+        if (faults.toServer) {
+          text = JSON.stringify(faults.toServer(request));
         }
+      } catch {
+        // not JSON: the runner's malformed frame goes through as it is
       }
       if (upstream.readyState === WebSocket.OPEN) {
         upstream.send(text);
@@ -85,7 +93,7 @@ const startServer = async (faults?: Faults, options?: MockDebuggerOptions): Prom
   return { url: `ws://127.0.0.1:${(proxy.address() as AddressInfo).port}/ws`, mock };
 };
 
-const run = async (faults: Faults | undefined, only?: string[], options?: MockDebuggerOptions): Promise<ContractSummary> => {
+const run = async (faults: FaultSource | undefined, only?: string[], options?: MockDebuggerOptions): Promise<ContractSummary> => {
   const { url } = await startServer(faults, options);
   return runContract({ url, profile: "mock", only: only ? new Set(only) : undefined });
 };
@@ -96,6 +104,53 @@ const isTick = (frame: Json): frame is Json & { params: Json & { executionState:
 const statusOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.status;
 const detailsOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.details.join("\n") ?? "";
 
+/** What a run of every scenario against the mock reports, when the mock follows the protocol. */
+const MOCK_STATUSES = {
+  S00: "not-applicable", // emulator only
+  S01: "passed",
+  S02: "passed",
+  S03: "passed",
+  S04: "passed",
+  S05: "passed",
+  S06: "passed",
+  S07: "passed",
+  S08: "passed",
+  S09: "passed",
+  S10: "passed",
+  S11: "passed",
+  S12: "passed",
+  S13: "passed",
+  S14: "passed",
+  S15: "not-applicable", // emulator only
+  S16: "partial", // the mock steps the ARM7 and writes registers; it has no memory write and no reset
+  S17: "passed",
+  S18: "not-applicable", // no tables, no Holly capture
+};
+
+const statusesOf = (summary: ContractSummary) => Object.fromEntries(summary.scenarios.map((scenario) => [scenario.id, scenario.status]));
+/** One line per scenario that did not pass as a whole, for a readable failure of a test. */
+const reportOf = (summary: ContractSummary) => summary.scenarios.map((scenario) => `${scenario.id} ${scenario.status} ${scenario.details.join(" | ")}`);
+
+/**
+ * A tick that the server built before it handled a request, and that arrives after the
+ * client has sent that request: a copy of the last tick, under the next tickId, in front of
+ * the answer to every request. Nothing in the protocol forbids it (a periodic tick, or one
+ * more tick of a stop, built on another thread). One per connection.
+ */
+const staleTickBeforeEveryAnswer = (): Faults => {
+  let tickId = 0;
+  let last: (Json & { params: Json }) | undefined;
+  const renumbered = (frame: Json & { params: Json }) => ({ ...frame, params: { ...frame.params, tickId: tickId++ } });
+  return {
+    toClient: (frame) => {
+      if (!isTick(frame)) return frame;
+      last = frame;
+      return renumbered(frame);
+    },
+    beforeRequest: () => (last ? [renumbered(last)] : []),
+  };
+};
+
 describe("the contract runner against the mock", () => {
   it("passes every scenario the mock's milestone covers, reports the rest as not applicable, and leaves the server as it found it", async () => {
     const { url, mock } = await startServer();
@@ -104,27 +159,7 @@ describe("the contract runner against the mock", () => {
 
     expect(summary.invariantViolations).toEqual([]);
     expect(summary.cleanUpProblems).toEqual([]);
-    expect(Object.fromEntries(summary.scenarios.map((scenario) => [scenario.id, scenario.status]))).toEqual({
-      S00: "not-applicable", // emulator only
-      S01: "passed",
-      S02: "passed",
-      S03: "passed",
-      S04: "passed",
-      S05: "passed",
-      S06: "passed",
-      S07: "passed",
-      S08: "passed",
-      S09: "passed",
-      S10: "passed",
-      S11: "passed",
-      S12: "passed",
-      S13: "passed",
-      S14: "passed",
-      S15: "not-applicable", // emulator only
-      S16: "partial", // the mock steps the ARM7 and writes registers; it has no memory write and no reset
-      S17: "passed",
-      S18: "not-applicable", // no tables, no Holly capture
-    });
+    expect(statusesOf(summary)).toEqual(MOCK_STATUSES);
     expect(summary.ok).toBe(true);
     expect(summary).toMatchObject({ passed: 15, failed: 0, partial: 1, notApplicable: 3, profile: "mock", timeoutFactor: 1 });
     expect(summary.scenarios.find((scenario) => scenario.id === "S16")?.parts).toEqual([
@@ -196,6 +231,20 @@ describe("the contract runner against the mock", () => {
     expect((tick.watches as Json[]).map((watch) => watch.expression)).toEqual(["dc.sh4.cpu.pc", "dc.sh4.cpu.pr"]);
     expect(Object.values(tick.breakpoints as Record<string, Json>).map((breakpoint) => breakpoint.event)).toEqual(["dc.system.reset"]);
     expect((tick.categories as Record<string, Json>).events).toEqual({ muted: true, soloed: false });
+  }, 60_000);
+
+  it("does not take a tick that was built before a request, and arrives after it, for the tick of that request", async () => {
+    const summary = await run(staleTickBeforeEveryAnswer);
+    expect(reportOf(summary).filter((line) => / failed /.test(line))).toEqual([]);
+    expect(statusesOf(summary)).toEqual(MOCK_STATUSES);
+    expect(summary.invariantViolations).toEqual([]);
+    expect(summary.cleanUpProblems).toEqual([]);
+    expect(summary.ok).toBe(true);
+
+    // S13 alone, i.e. on a running server: there the tick in front of the answer is a periodic one
+    const running = await run(staleTickBeforeEveryAnswer, ["S13"]);
+    expect(reportOf(running)).toEqual(["S13 passed "]);
+    expect(running.ok).toBe(true);
   }, 60_000);
 });
 
@@ -407,8 +456,9 @@ describe("the contract runner against a server that breaks the protocol", () => 
       ["S06"],
     );
     expect(statusOf(echoOnly, "S06")).toBe("failed");
-    expect(detailsOf(echoOnly, "S06")).toMatch(/the next tick echoes sh4 as \{"muted":false,"soloed":false\}/);
-  });
+    expect(detailsOf(echoOnly, "S06")).toMatch(/breakpoints\.setCategoryStates: the tick echoes sh4 as \{"muted":false,"soloed":false\}, expected \{"muted":true,"soloed":false\}/);
+    // (a request without effect is waited for, for a second)
+  }, 30_000);
 
   it("S08: a watch expression that is not stored in lower case", async () => {
     const summary = await run(

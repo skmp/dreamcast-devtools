@@ -173,18 +173,49 @@ const findBreakpointSite = async (context: RunContext, targetId: TargetProcessor
   return fail(`no ${targetId} PC whose line and next line are not control flow within 64 steps`);
 };
 
-/** Adds a breakpoint and returns its descriptor from the tick that follows: the first tick after the response lists it with a new id. */
+/**
+ * The tick that shows the effect of a request: the first one at or after `since` (a `mark()`
+ * taken before the request) in which `problem` finds nothing, within `timeoutMs`. It need
+ * not be the first tick after the request: a periodic tick, or one more tick of a stop, can
+ * have been built before the server handled the request and arrive after it. When no tick
+ * shows the effect in time, the scenario fails with what the last tick lacked.
+ */
+const tickShowing = async (
+  session: ContractSession,
+  since: number,
+  what: string,
+  problem: (tick: DebuggerTick) => string | undefined,
+  timeoutMs = 1000,
+): Promise<TickRecord> => {
+  try {
+    return await session.waitForTick((tick) => problem(tick) === undefined, timeoutMs, what, since);
+  } catch (error) {
+    if (!(error instanceof ContractFailure)) {
+      throw error;
+    }
+    const seen = session.ticksSince(since);
+    const last = seen.at(-1);
+    return fail(
+      last
+        ? `${what}: ${problem(last.tick)} (${seen.length} tick${seen.length === 1 ? "" : "s"} within ${session.scale(timeoutMs)} ms of the request, the last one is ${describeState(last.tick)})`
+        : `${what}: no tick within ${session.scale(timeoutMs)} ms of the request`,
+    );
+  }
+};
+
+/** Adds a breakpoint and returns its descriptor from the tick that shows it: that tick lists exactly one breakpoint more. */
 const addBreakpoint = async (
   context: RunContext,
   params: { event: string; address?: number; kind?: "code" | "event"; enabled?: boolean },
 ): Promise<BreakpointDescriptor> => {
   const { session } = context;
-  const known = new Set(Object.keys(session.latestTick().tick.breakpoints));
+  const listed = new Set(Object.keys(session.latestTick().tick.breakpoints));
+  const newIn = (tick: DebuggerTick) => Object.values(tick.breakpoints).filter((breakpoint) => !listed.has(String(breakpoint.id)));
   const mark = session.mark();
   await session.call("breakpoints.add", params);
-  const next = await session.waitForTick(() => true, 1000, "a tick after breakpoints.add", mark);
-  const added = Object.values(next.tick.breakpoints).filter((breakpoint) => !known.has(String(breakpoint.id)));
-  check(added.length === 1, `breakpoints.add: the next tick lists ${added.length} new breakpoints, expected the one that was added`);
+  const next = await tickShowing(session, mark, "breakpoints.add", (tick) => (newIn(tick).length > 0 ? undefined : "no tick lists a new breakpoint"));
+  const added = newIn(next.tick);
+  check(added.length === 1, `breakpoints.add: the tick that shows it lists ${added.length} new breakpoints, expected the one that was added`);
   const breakpoint = added[0];
   context.breakpoints.add(breakpoint.id);
   check(breakpoint.event === params.event, `breakpoints.add: the tick lists event "${breakpoint.event}"`);
@@ -201,8 +232,7 @@ const removeBreakpoint = async (context: RunContext, id: number): Promise<void> 
   const mark = session.mark();
   await session.call("breakpoints.remove", { id });
   context.breakpoints.delete(id);
-  const next = await session.waitForTick(() => true, 1000, "a tick after breakpoints.remove", mark);
-  check(!(String(id) in next.tick.breakpoints), `breakpoints.remove: the next tick still lists breakpoint ${id}`);
+  await tickShowing(session, mark, "breakpoints.remove", (tick) => (String(id) in tick.breakpoints ? `breakpoint ${id} is still listed` : undefined));
 };
 
 const categoriesOf = (tick: DebuggerTick): Record<string, BreakpointCategoryState> =>
@@ -212,15 +242,15 @@ const setCategories = async (context: RunContext, categories: Record<string, Bre
   const { session } = context;
   const mark = session.mark();
   await session.call("breakpoints.setCategoryStates", { categories });
-  const next = await session.waitForTick(() => true, 1000, "a tick after breakpoints.setCategoryStates", mark);
-  for (const [key, state] of Object.entries(categories)) {
-    const echoed = next.tick.categories?.[key];
-    check(
-      echoed?.muted === state.muted && echoed?.soloed === state.soloed,
-      `breakpoints.setCategoryStates: the next tick echoes ${key} as ${JSON.stringify(echoed)}, expected ${JSON.stringify(state)}`,
-    );
-  }
-  return next;
+  return tickShowing(session, mark, "breakpoints.setCategoryStates", (tick) => {
+    for (const [key, state] of Object.entries(categories)) {
+      const echoed = tick.categories?.[key];
+      if (echoed?.muted !== state.muted || echoed?.soloed !== state.soloed) {
+        return `the tick echoes ${key} as ${JSON.stringify(echoed)}, expected ${JSON.stringify(state)}`;
+      }
+    }
+    return undefined;
+  });
 };
 
 /** A register of `path` that no watch names yet, preferring the given names; as the expression `<path>.<name lower case>`. */
@@ -240,12 +270,13 @@ const unwatchedRegister = (context: RunContext, path: string, preferred: string[
 
 const addWatch = async (context: RunContext, expression: string, expected: string): Promise<{ id: number; record: TickRecord }> => {
   const { session } = context;
-  const known = new Set((session.latestTick().tick.watches ?? []).map((watch) => watch.id));
+  const listed = new Set((session.latestTick().tick.watches ?? []).map((watch) => watch.id));
+  const newIn = (tick: DebuggerTick) => (tick.watches ?? []).filter((watch) => !listed.has(watch.id));
   const mark = session.mark();
   await session.call("state.watch", { expressions: [expression] });
-  const next = await session.waitForTick(() => true, 1000, "a tick after state.watch", mark);
-  const added = (next.tick.watches ?? []).filter((watch) => !known.has(watch.id));
-  check(added.length === 1, `state.watch: the next tick lists ${added.length} new watches, expected the one that was added`);
+  const next = await tickShowing(session, mark, "state.watch", (tick) => (newIn(tick).length > 0 ? undefined : "no tick lists a new watch"));
+  const added = newIn(next.tick);
+  check(added.length === 1, `state.watch: the tick that shows it lists ${added.length} new watches, expected the one that was added`);
   context.watches.add(added[0].id);
   // the stored expression is normalised to lower case
   check(added[0].expression === expected, `state.watch "${expression}": listed as "${added[0].expression}", expected "${expected}"`);
@@ -258,19 +289,20 @@ const unwatch = async (context: RunContext, id: number): Promise<void> => {
   const mark = session.mark();
   await session.call("state.unwatch", { watchIds: [id] });
   context.watches.delete(id);
-  const next = await session.waitForTick(() => true, 1000, "a tick after state.unwatch", mark);
-  check(!(next.tick.watches ?? []).some((watch) => watch.id === id), `state.unwatch: the next tick still lists watch ${id}`);
+  await tickShowing(session, mark, "state.unwatch", (tick) => ((tick.watches ?? []).some((watch) => watch.id === id) ? `watch ${id} is still listed` : undefined));
 };
 
 /** Resumes, expects only running ticks for 600 ms, then pauses again. */
 const expectToKeepRunning = async (context: RunContext, why: string): Promise<void> => {
   const { session } = context;
+  const before = stopIdOf(session.latestTick().tick);
   const mark = session.mark();
   await session.call("control.runUntil", {});
-  await session.waitForTick(isRunning, 1000, "a running tick after control.runUntil", mark);
+  const resumed = await session.waitForTick(isRunning, 1000, "a running tick after control.runUntil", mark);
   await session.collectTicks(600);
   const window = session.ticksSince(mark);
-  const stopped = window.find((record) => isPaused(record.tick));
+  // (one more tick of the stop that was left can still arrive before the running tick: that is not a stop)
+  const stopped = window.find((record) => isPaused(record.tick) && (record.seq > resumed.seq || stopIdOf(record.tick) > before));
   check(!stopped, `${why}: the target stopped (${stopped ? describeState(stopped.tick) : ""})`);
   check(window.length >= 2, `${why}: only ${window.length} tick(s) in 600 ms of running; the running tick is periodic`);
   await ensurePaused(context);
@@ -553,8 +585,9 @@ const s07: Scenario = {
 
     const mark = session.mark();
     await session.call("breakpoints.toggle", { id: breakpoint.id, enabled: false });
-    const toggled = await session.waitForTick(() => true, 1000, "a tick after breakpoints.toggle", mark);
-    check(toggled.tick.breakpoints[String(breakpoint.id)]?.enabled === false, "the next tick lists the breakpoint as disabled");
+    await tickShowing(session, mark, "breakpoints.toggle", (tick) =>
+      tick.breakpoints[String(breakpoint.id)]?.enabled === false ? undefined : `breakpoint ${breakpoint.id} is not listed as disabled`,
+    );
     await expectToKeepRunning(context, "a disabled breakpoint on the next instruction");
 
     await removeBreakpoint(context, breakpoint.id);
@@ -592,7 +625,9 @@ const s08: Scenario = {
     const second = unwatchedRegister(context, sh4.pcPath, ["PR", "GBR", "VBR"]);
     const renameMark = session.mark();
     await session.call("state.modifyWatchExpression", { watchId: id, newExpression: `${sh4.pcPath}.${second.name}` });
-    const renamed = await session.waitForTick(() => true, 1000, "a tick after state.modifyWatchExpression", renameMark);
+    const renamed = await tickShowing(session, renameMark, "state.modifyWatchExpression", (tick) =>
+      tick.watches?.find((watch) => watch.id === id)?.expression === first.expression ? `watch ${id} is still listed as "${first.expression}"` : undefined,
+    );
     const after = renamed.tick.watches!.find((watch) => watch.id === id);
     check(after !== undefined, "state.modifyWatchExpression keeps the id");
     check(after!.expression === second.expression, `the renamed watch is listed as "${after!.expression}", expected "${second.expression}"`);
@@ -1087,8 +1122,9 @@ const s16: Scenario = {
           const write = async (value: string, expected: string) => {
             const mark = session.mark();
             await session.call("state.setRegister", { path: sh4.pcPath, name: "R0", value });
-            const next = await session.waitForTick(() => true, 1000, "a tick after state.setRegister", mark);
-            check(registerOf(next.tick, sh4.pcPath, "R0") === expected, `R0 reads ${registerOf(next.tick, sh4.pcPath, "R0")} after writing ${value}, expected ${expected}`);
+            const next = await tickShowing(session, mark, "state.setRegister", (tick) =>
+              registerOf(tick, sh4.pcPath, "R0") === expected ? undefined : `R0 reads ${registerOf(tick, sh4.pcPath, "R0")} after writing ${value}, expected ${expected}`,
+            );
             check(isPaused(next.tick) && stopIdOf(next.tick) === stopIdOf(paused.tick), "a register write is not a new stop");
           };
           try {
@@ -1115,8 +1151,9 @@ const s16: Scenario = {
           if (id !== undefined) {
             const mark = session.mark();
             await session.call("state.editWatch", { watchId: id, value: "0x00C0FFEE" });
-            const edited = await session.waitForTick(() => true, 1000, "a tick after state.editWatch", mark);
-            check(registerOf(edited.tick, sh4.pcPath, "R0") === "0x00C0FFEE", "state.editWatch writes the watched register");
+            await tickShowing(session, mark, "state.editWatch", (tick) =>
+              registerOf(tick, sh4.pcPath, "R0") === "0x00C0FFEE" ? undefined : `R0 reads ${registerOf(tick, sh4.pcPath, "R0")}; state.editWatch writes the watched register`,
+            );
             await write(original, original);
             await unwatch(context, id);
           } else {
