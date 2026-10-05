@@ -14,6 +14,8 @@ import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import SearchIcon from "@mui/icons-material/Search";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { PANEL_REGISTRY, type PanelRegistryEntry } from "../layout/panelRegistry";
+import { targetInfo } from "../../state/targets";
+import { NO_GAME } from "../../state/tickState";
 import {
   defaultExpansion,
   liveRegisterValues,
@@ -71,6 +73,10 @@ const treeSx = (theme: Theme) => ({
     listStyle: "none",
     margin: 0,
     padding: 0,
+  },
+  // values of the last stop, shown while the running core does not report them
+  "& .device-tree-registers[data-stale]": {
+    opacity: 0.45,
   },
   // RegisterRow, laid out like the content of a tree item
   "& .device-tree-register": {
@@ -184,7 +190,9 @@ interface NodeRegistersProps {
 
 const NodeRegisters = memo(({ nodePath, depth, registers }: NodeRegistersProps) => {
   const values = useDebuggerDataStore(
-    useShallow((state) => liveRegisterValues(registers, state.registersByPath[nodePath])),
+    useShallow((state) =>
+      liveRegisterValues(registers, state.registersByPath[nodePath], state.executionState?.reason === NO_GAME),
+    ),
   );
   const expressions = useMemo(
     () => registers.map((register) => watchExpression(nodePath, register.name)),
@@ -194,9 +202,20 @@ const NodeRegisters = memo(({ nodePath, depth, registers }: NodeRegistersProps) 
     useShallow((state) => expressions.map((expression) => state.watches.some((watch) => watch.expression === expression))),
   );
 
+  // A core without a complete context while it runs sends running ticks without its registers
+  // and says so (`registersStale`): what is on screen for it is from the last stop.
+  const stale = useDebuggerDataStore(
+    (state) => state.executionState?.registersStale === true && nodePath === targetInfo(state.shape, "sh4").pcPath,
+  );
+
   const indent = LABEL_OFFSET_PX + INDENT_PX * (depth + 1);
   return (
-    <ul className="device-tree-registers" onKeyDown={keepKeyFromTreeView}>
+    <ul
+      className="device-tree-registers"
+      data-stale={stale ? "" : undefined}
+      title={stale ? "Values of the last stop: the running core does not report its registers" : undefined}
+      onKeyDown={keepKeyFromTreeView}
+    >
       {registers.map((register, index) => (
         <RegisterRow
           key={register.name}
@@ -231,19 +250,18 @@ const DeviceNodeItem = memo(({ node, depth, onOpenPanel }: DeviceNodeItemProps) 
       label={
         <Stack direction="row" spacing={0.5} alignItems="center" justifyContent="space-between" sx={{ py: 0, width: "100%" }}>
           <Stack direction="row" spacing={0.5} alignItems="center" sx={{ flex: 1, minWidth: 0 }}>
-            {hasActions ? (
-              <Tooltip title={node.description} placement="right">
-                <Typography variant="body2" fontWeight={500} sx={{ fontSize: "0.813rem", lineHeight: 1.4 }}>
-                  {node.label}
-                </Typography>
-              </Tooltip>
-            ) : (
-              <Typography variant="body2" fontWeight={500} sx={{ fontSize: "0.813rem", lineHeight: 1.4 }}>
-                {node.label}
-              </Typography>
-            )}
-            {!node.actions && (
-              <Typography variant="caption" color="text.secondary" sx={{ fontSize: "0.688rem", lineHeight: 1.4 }}>
+            <Typography variant="body2" fontWeight={500} sx={{ fontSize: "0.813rem", lineHeight: 1.4, flexShrink: 0 }}>
+              {node.label}
+            </Typography>
+            {/* next to the label for every node; the buttons of a node with actions take what they need first */}
+            {node.description && (
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                noWrap
+                title={node.description}
+                sx={{ fontSize: "0.688rem", lineHeight: 1.4, minWidth: 0 }}
+              >
                 {node.description}
               </Typography>
             )}

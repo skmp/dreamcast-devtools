@@ -1,15 +1,20 @@
 import {
   test,
   expect,
+  disassemblyRows,
+  gotoRoute,
   openWorkspace,
   panel,
   pauseFromToolbar,
   registerRow,
+  saveScreenshot,
+  statusBar,
   tooltipButton,
   treeItem,
   treeItemRow,
   treeRows,
 } from "./support/fixtures";
+import { serveScriptedDebugger } from "./support/scriptedDebugger";
 
 test("the device tree shows the described nodes, expanded two levels deep", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
@@ -202,4 +207,105 @@ test("nodes the user expanded stay expanded after a search", async ({ page }) =>
   await expect(treeItem(page, "dc.sh4.cpu")).toHaveAttribute("aria-expanded", "true");
   await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toBeVisible();
   await expect(treeItem(page, "dc.holly")).toHaveAttribute("aria-expanded", "false");
+});
+
+test("every node shows its description, whether it has buttons or not", async ({ page }) => {
+  await openWorkspace(page, "sh4-debugger");
+  // without actions
+  await expect(treeItemRow(page, "dc.sh4.pbus")).toHaveText("PBUSPeripherals Bus");
+  await expect(treeItemRow(page, "dc.holly.intc")).toHaveText("INTCInterrupt Controller");
+  // with actions: the description is in the row as well (it was a tooltip only), in front of the buttons
+  await expect(treeItemRow(page, "dc.sh4.cpu").getByText("SuperH4 CPU Core", { exact: true })).toBeVisible();
+  await expect(treeItemRow(page, "dc.sh4.cpu").getByLabel("Open SH4: Disassembly")).toBeVisible();
+  await expect(treeItemRow(page, "dc.sh4.cpu").getByLabel("Open SH4: Memory")).toBeVisible();
+  await expect(treeItemRow(page, "dc.aica.sgc").getByText("Sound Generation Core", { exact: true })).toBeVisible();
+  await expect(treeItemRow(page, "dc.aica.sgc").getByLabel("Open SGC")).toBeVisible();
+  // one that is too long for the dock is cut, and can be read in full
+  await treeItemRow(page, "dc.sh4.pbus").click();
+  await expect(treeItemRow(page, "dc.sh4.scif").getByText("Serial Communications Interface w/ FIFO", { exact: true })).toHaveAttribute(
+    "title",
+    "Serial Communications Interface w/ FIFO",
+  );
+  await expect(treeItemRow(page, "dc.sh4.scif").getByLabel("Open SH4: SCIF Registers")).toBeVisible();
+});
+
+test("a panel the server names and this build does not have is no button, and breaks nothing", async ({ page }) => {
+  // `actions` are open strings: a newer server may name panels of a newer UI
+  const server = await serveScriptedDebugger(page);
+  const core = ((server.shape.deviceTree as Array<{ children: Array<{ children: Array<{ path: string; actions: string[] }> }> }>)[0]
+    .children[0].children).find((node) => node.path === "dc.sh4.cpu")!;
+  core.actions = ["sh4-registers", "sh4-disassembly", "hologram-viewer"];
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+
+  const row = treeItemRow(page, "dc.sh4.cpu");
+  await expect(row.getByLabel("Open SH4: Disassembly")).toBeVisible();
+  await expect(row.getByRole("button")).toHaveCount(1);
+  await expect(row.getByText("Core of the scripted server", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test.describe("a core that does not report its registers while it runs", () => {
+  test.use({ mockOptions: { sliceContext: false } });
+
+  test("the SH4 registers are dimmed while they are stale, and the disassembly opens at the default address", async ({
+    page,
+    rpc,
+  }, testInfo) => {
+    await openWorkspace(page, "sh4-debugger");
+    // no tick so far carried dc.sh4.cpu, so nobody knows where the SH4 is: the view opens at
+    // `defaultDisassemblyAddress` of the target
+    const view = panel(page, "sh4-disassembly");
+    await expect(disassemblyRows(view).first()).toHaveAttribute("data-address", String(0x8c010000));
+    const firstTick = rpc.received.find((frame) => frame.method === "event.tick")?.params as {
+      registers: Record<string, unknown>;
+      executionState: Record<string, unknown>;
+    };
+    expect(firstTick.executionState).toMatchObject({ state: "running", registersStale: true });
+    expect(Object.keys(firstTick.registers)).not.toContain("dc.sh4.cpu");
+
+    // the registers of the node are those of debugger.describe, and marked as not live
+    await treeItemRow(page, "dc.sh4.cpu").click();
+    await treeItemRow(page, "dc.aica.arm7").click();
+    const stale = panel(page, "device-tree").locator(".device-tree-registers[data-stale]");
+    await expect(stale).toHaveCount(1);
+    await expect(stale.locator('[data-register="dc.sh4.cpu.reg.PC"]')).toBeVisible();
+    await expect(stale).toHaveCSS("opacity", "0.45");
+    await expect(stale).toHaveAttribute("title", "Values of the last stop: the running core does not report its registers");
+    // the ARM7 is reported as ever
+    await expect(registerRow(page, "dc.aica.arm7.reg.PC").locator("xpath=..")).not.toHaveAttribute("data-stale");
+    // and a watch on such a register reads n/a meanwhile
+    await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = n/a");
+    await saveScreenshot(page, testInfo, "device-tree-stale-registers");
+
+    // stopped, the context is complete: live again, and the view goes where the SH4 is
+    await pauseFromToolbar(page);
+    await expect(panel(page, "device-tree").locator(".device-tree-registers[data-stale]")).toHaveCount(0);
+    await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(/PC = 0x8C0000A[02468ACE]/);
+    await expect(panel(page, "watches")).toContainText(/dc\.sh4\.cpu\.pc = 0x8C0000A/);
+    await expect(view.locator(".current-instruction")).toHaveCount(1);
+
+    // running again: dimmed again, with the values of that stop
+    await tooltipButton(page, "Run").click();
+    await expect(panel(page, "device-tree").locator(".device-tree-registers[data-stale]")).toHaveCount(1);
+    await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(/PC = 0x8C0000A[02468ACE]/);
+  });
+});
+
+test("a search that matches most of the tree shows its first 200 rows, and says how many there are", async ({ page }) => {
+  await openWorkspace(page, "sh4-debugger");
+  const tree = panel(page, "device-tree");
+  const search = tree.getByPlaceholder("Search components...");
+
+  // every node of the mock is under "dc": all of the tree matches
+  await search.fill("dc");
+  await expect(tree.getByRole("status")).toHaveText(/^Showing the first 200 of \d{3} matching rows\. Refine your search to see the rest\.$/);
+  await expect(treeRows(page)).toHaveCount(200);
+  // the values of what is shown are live
+  await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(/PC = 0x8C0000A[0-9A-E]/);
+
+  // a search that matches less has no such notice
+  await search.fill("arm7");
+  await expect(tree.getByRole("status")).toHaveCount(0);
+  expect(await treeRows(page).count()).toBeLessThan(200);
 });

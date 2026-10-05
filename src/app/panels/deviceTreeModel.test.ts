@@ -175,5 +175,12 @@ describe("deviceTreeModel", () => {
       const live = [register("PC", "0x10"), register("PR", "0x20"), register("SR", "0x30")];
       expect(liveRegisterValues([described[2]], live)).toEqual(["0x30"]);
     });
+
+    it("with no game loaded, what the ticks do not carry has no value: the description can be of a machine that is gone", () => {
+      expect(liveRegisterValues(described, undefined, true)).toEqual(["n/a", "n/a", "n/a"]);
+      expect(liveRegisterValues(described, [register("PC", "n/a")], true)).toEqual(["n/a", "n/a", "n/a"]);
+      // what a tick does carry is shown as the server said it
+      expect(liveRegisterValues(described, [register("PC", "0x10")], true)).toEqual(["0x10", "n/a", "n/a"]);
+    });
   });
 });

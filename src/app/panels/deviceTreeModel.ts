@@ -126,16 +126,21 @@ export const defaultExpansion = (tree: DeviceNodeDescriptor[], maxRows: number =
   return rows <= maxRows ? [...firstLevel, ...secondLevel] : firstLevel;
 };
 
+/** What a register reads when it cannot be read. */
+export const NOT_AVAILABLE = "n/a";
+
 /**
  * The values to show for the described registers of a node: the value of the latest tick
- * when the tick carries that register, otherwise the value from debugger.describe.
+ * when the tick carries that register, otherwise the value from debugger.describe. With
+ * `noMachine` (no game is loaded) what the ticks do not carry has no value at all: the
+ * description can be from the time when there was a machine.
  */
-export const liveRegisterValues = (described: RegisterValue[], live: RegisterValue[] | undefined): string[] =>
+export const liveRegisterValues = (described: RegisterValue[], live: RegisterValue[] | undefined, noMachine = false): string[] =>
   described.map((register, index) => {
     if (!live) {
-      return register.value;
+      return noMachine ? NOT_AVAILABLE : register.value;
     }
     // ticks list a node's registers in the described order; fall back to a lookup when they do not
     const candidate = live[index]?.name === register.name ? live[index] : live.find((entry) => entry.name === register.name);
-    return candidate?.value ?? register.value;
+    return candidate?.value ?? (noMachine ? NOT_AVAILABLE : register.value);
   });

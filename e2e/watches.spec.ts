@@ -254,3 +254,19 @@ test("an expression is sent in lower case, whichever way it was added, and one t
   expect(rpc.requests("state.modifyWatchExpression").at(-1)?.params).toMatchObject({ newExpression: "dc.sh4.cpu.sr" });
   await expect(watches.getByRole("listitem").nth(1)).toContainText("dc.sh4.cpu.sr = ");
 });
+
+test("the suggestions are the best fifty matches, and typing narrows them", async ({ page }) => {
+  // the popup is not virtualised, and a real machine has thousands of registers
+  await openWorkspace(page, "sh4-debugger");
+  const input = panel(page, "watches").getByPlaceholder("Enter expression");
+  await input.fill("dc.");
+  const options = page.getByRole("option");
+  await expect(options).toHaveCount(50);
+  await expect(options.first()).toHaveText("dc.sysclk");
+
+  // the SH4 core alone has 69 registers
+  await input.fill("dc.sh4.cpu.");
+  await expect(options).toHaveCount(50);
+  await input.fill("dc.sh4.cpu.xf1");
+  await expect(options).toHaveText(["dc.sh4.cpu.xf1", "dc.sh4.cpu.xf10", "dc.sh4.cpu.xf11", "dc.sh4.cpu.xf12", "dc.sh4.cpu.xf13", "dc.sh4.cpu.xf14", "dc.sh4.cpu.xf15"]);
+});
