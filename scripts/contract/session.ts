@@ -110,13 +110,21 @@ export class ContractSession {
   /** Connects, sends debugger.describe and waits for the tick that follows it. */
   async open(): Promise<void> {
     await this.rpc.connect(this.url);
+    await this.describe();
+  }
+
+  /**
+   * Sends debugger.describe and returns the tick that follows the response. The result
+   * replaces `shape` and `index`: capabilities describe the server at the moment of the call,
+   * so what was read before the machine had started is not what holds afterwards.
+   */
+  async describe(): Promise<TickRecord> {
     const mark = this.mark();
     this.shape = await this.call("debugger.describe", { protocol: PROTOCOL_VERSION, client: this.options.clientName });
     this.index = indexDescribe(this.shape);
     // (the tap has indexed the same result already, before the tick that follows it)
     // A periodic tick can arrive before the response; the one to wait for comes after it.
-    const response = this.frames.find((frame) => frame.seq >= mark && frame.kind === "response");
-    await this.waitForTick(() => true, 2000, "the tick that follows debugger.describe", response?.seq ?? mark);
+    return this.waitForTick(() => true, 2000, "the tick that follows debugger.describe", this.responseSince(mark)?.seq ?? mark);
   }
 
   get isClosed(): boolean {
@@ -137,6 +145,11 @@ export class ContractSession {
   /** The position in the frame sequence; frames with `seq >= mark()` arrive after this call. */
   mark(): number {
     return this.seq;
+  }
+
+  /** The first response at or after `mark`: that of a request sent right after `mark()`, the runner sends one at a time. */
+  responseSince(mark: number): RecordedFrame | undefined {
+    return this.frames.find((frame) => frame.seq >= mark && frame.kind === "response");
   }
 
   scale(ms: number): number {
@@ -320,10 +333,10 @@ export class ContractSession {
       for (const violation of checkResponseEnvelope(json)) {
         this.violations.push(`${violation} (response to request ${String(json.id)})`);
       }
-      // The describe result is the reference for I4 and I5. It is taken here, not when the
-      // call returns: the tick that follows the response can be dispatched before that.
+      // The latest describe result is the reference for I4 and I5. It is taken here, not when
+      // the call returns: the tick that follows the response can be dispatched before that.
       const result = json.result as { deviceTree?: unknown } | undefined;
-      if (!this.index && result && typeof result === "object" && Array.isArray(result.deviceTree)) {
+      if (result && typeof result === "object" && Array.isArray(result.deviceTree)) {
         try {
           this.index = indexDescribe(result as DebuggerShape);
         } catch {

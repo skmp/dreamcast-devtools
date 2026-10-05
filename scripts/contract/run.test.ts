@@ -36,8 +36,8 @@ afterEach(async () => {
 });
 
 /** The mock on a WebSocket, optionally behind a proxy that applies `faults`. Returns the URL to test. */
-const startServer = async (source?: FaultSource, options?: MockDebuggerOptions): Promise<{ url: string; mock: MockDebugger }> => {
-  const mock = new MockDebugger(options);
+const startServer = async (source?: FaultSource, options?: MockDebuggerOptions | MockDebugger): Promise<{ url: string; mock: MockDebugger }> => {
+  const mock = options instanceof MockDebugger ? options : new MockDebugger(options);
   const listener = await listenMockDebugger(mock);
   closers.push(() => listener.close());
   if (!source) {
@@ -96,6 +96,25 @@ const startServer = async (source?: FaultSource, options?: MockDebuggerOptions):
 const run = async (faults: FaultSource | undefined, only?: string[], options?: MockDebuggerOptions): Promise<ContractSummary> => {
   const { url } = await startServer(faults, options);
   return runContract({ url, profile: "mock", only: only ? new Set(only) : undefined });
+};
+
+/** Sends requests to the server as another client would, and resolves when the last one is answered. */
+const request = async (url: string, requests: Array<[method: string, params: Json]>): Promise<void> => {
+  const socket = new WebSocket(url);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.on("error", reject);
+      socket.on("open", () => requests.forEach(([method, params], index) => socket.send(JSON.stringify({ jsonrpc: "2.0", id: index + 1, method, params }))));
+      socket.on("message", (data) => {
+        const frame = JSON.parse(data.toString()) as Json;
+        if (frame.id === requests.length) {
+          resolve();
+        }
+      });
+    });
+  } finally {
+    socket.close();
+  }
 };
 
 const isTick = (frame: Json): frame is Json & { params: Json & { executionState: Json; registers: Record<string, Json[]> } } =>
@@ -588,8 +607,11 @@ describe("the emulator profile", () => {
    * The mock behind an HTTP server that follows the rules of the emulator's own (GET only,
    * the Host check, the Origin check on the upgrade), with one rule optionally left out.
    */
-  const startEmulatorLike = async (flaws: { acceptNullOrigin?: boolean; indexForMissingAssets?: boolean } = {}): Promise<string> => {
-    const { url: mockUrl } = await startServer(undefined, { startPaused: true });
+  const startEmulatorLike = async (
+    flaws: { acceptNullOrigin?: boolean; indexForMissingAssets?: boolean } = {},
+    mock: MockDebuggerOptions | MockDebugger = { startPaused: true },
+  ): Promise<string> => {
+    const { url: mockUrl } = await startServer(undefined, mock);
     const allowedHost = (host: string | undefined) => ["127.0.0.1", "localhost", "[::1]"].includes((host ?? "").replace(/:\d+$/, "").toLowerCase());
     const server = createServer((request, response) => {
       const send = (status: number, type: string, body: string) =>
@@ -679,4 +701,28 @@ describe("the emulator profile", () => {
     expect(noAnchor.cleanUpProblems).toEqual([]);
     expect(noAnchor.finalState).toMatch(/paused/);
   });
+
+  it("S00: a runner that connected before the game had started asks debugger.describe again at the start stop", async () => {
+    // the mock's SH4 walks straight on outside of its loop: from here it reaches the entry point 0x8C010000
+    const mock = new MockDebugger({ startPaused: true });
+    const url = await startEmulatorLike({}, mock);
+    await request(url, [["state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C00FFE0" }]]);
+    // no game yet: the static tree, and neither sh4-debug capability
+    mock.setLifetime("no-machine");
+    const lines: string[] = [];
+    const running = runContract({ url, profile: "emulator", timeoutFactor: 1, only: new Set(["S00"]), say: (line) => lines.push(line) });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    mock.setLifetime("running");
+
+    const summary = await running;
+    expect(lines.filter((line) => /^server: |^waiting /.test(line)).map((line) => line.replace(/; targets: .*/, ""))).toEqual([
+      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, register-write, sgc-capture",
+      expect.stringMatching(/^waiting for the StartPaused stop \(the server is #\d+ paused stop 2 no-game\)$/),
+      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, register-write, sgc-capture, sh4-debug-native",
+    ]);
+    expect(reportOf(summary)).toEqual(["S00 passed SH4 debug engine: native"]);
+    expect(summary.server.capabilities).toContain("sh4-debug-native");
+    expect(summary.ok).toBe(true);
+    expect(summary.finalState).toMatch(/paused/);
+  }, 30_000);
 });

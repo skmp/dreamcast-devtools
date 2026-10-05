@@ -104,6 +104,29 @@ const prepare = async (options: ContractOptions) => {
   return { url: target, timeoutFactor, sessions, openSession, close, say };
 };
 
+/**
+ * The emulator is started with Debugger:StartPaused=yes, and the runner can be connected
+ * before the machine is at that stop: waits for it, and then asks debugger.describe again.
+ * What describe said before (no SH4 backend selected yet: neither sh4-debug capability)
+ * says nothing about the machine that has started since. Returns the tick the run starts from.
+ */
+const awaitStartStop = async (session: ContractSession, say: (line: string) => void): Promise<DebuggerTick> => {
+  const first = session.latestTick().tick;
+  if (first.executionState.reason === "start") {
+    return first;
+  }
+  say(`waiting for the StartPaused stop (the server is ${describeState(first)})`);
+  const start = await session
+    .waitForTick((tick) => tick.executionState.reason === "start", 10_000, 'a paused tick with reason "start"', 0)
+    .catch(() => undefined);
+  if (!start) {
+    return first;
+  }
+  const described = await session.describe();
+  say(describeServer(session));
+  return described.tick;
+};
+
 const describeServer = (session: ContractSession): string => {
   const shape = session.shape;
   return (
@@ -121,18 +144,11 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
   const { url, timeoutFactor, sessions, openSession, close, say } = await prepare(options);
   try {
     const session = await openSession();
-    const shape = session.shape;
     say(describeServer(session));
 
-    let initial: DebuggerTick = session.latestTick().tick;
-    if (options.profile === "emulator" && initial.executionState.reason !== "start") {
-      // the emulator is started with Debugger:StartPaused=yes; the stop can still be on its way
-      say(`waiting for the StartPaused stop (the server is ${describeState(initial)})`);
-      const start = await session
-        .waitForTick((tick) => tick.executionState.reason === "start", 10_000, 'a paused tick with reason "start"', 0)
-        .catch(() => undefined);
-      initial = start?.tick ?? initial;
-    }
+    const initial: DebuggerTick = options.profile === "emulator" ? await awaitStartStop(session, say) : session.latestTick().tick;
+    // (read after the start stop: awaitStartStop can have replaced what describe said at connect time)
+    const shape = session.shape;
     const initialState = initial.executionState.state;
     const initialCategories = initial.categories
       ? (JSON.parse(JSON.stringify(initial.categories)) as Record<string, BreakpointCategoryState>)
@@ -248,13 +264,13 @@ export const runIdleBreakpoint = async (options: ContractOptions, where: string)
     const session = await openSession();
     say(describeServer(session));
     const address = resolveAddress(where, options.elf);
+    const tick = options.profile === "emulator" ? await awaitStartStop(session, say) : session.latestTick().tick;
+    if (options.profile === "emulator" && tick.executionState.reason !== "start") {
+      throw new ContractFailure(`the emulator is not at its StartPaused stop: it is ${describeState(tick)}`);
+    }
     const sh4 = session.shape.targets?.find((target) => target.id === "sh4");
     if (!sh4) {
       throw new ContractFailure("the server lists no sh4 target");
-    }
-    let tick = session.latestTick().tick;
-    if (options.profile === "emulator" && tick.executionState.reason !== "start") {
-      tick = (await session.waitForTick((candidate) => candidate.executionState.reason === "start", 10_000, 'a paused tick with reason "start"', 0)).tick;
     }
     const categories = { ...(tick.categories ?? {}), sh4: { muted: true, soloed: false } };
     await session.call("breakpoints.setCategoryStates", { categories });
