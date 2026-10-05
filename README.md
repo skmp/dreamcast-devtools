@@ -101,10 +101,11 @@ outside the panels replaces the page of that route with the same report and a `R
 button, and is dismissed by navigating elsewhere. Exceptions in event handlers and in promises
 are not caught by error boundaries.
 
-A page or panel whose file under `assets/` could not be downloaded (the emulator was closed
-after the tab was opened) fails the same way. The browser does not ask again for a module that
-failed to load, so the button of such a report is always `Reload page` and reloads the document;
-while the server does not answer it says so and leaves the page as it is
+A page, panel or dialog whose file under `assets/` could not be downloaded (the emulator was
+closed after the tab was opened) fails the same way. The browser does not ask again for a module
+that failed to load, so the button of such a report is always `Reload page` and reloads the
+document; while the server does not answer it says so and leaves the page as it is. A failed
+About dialog is reported in a notice with the same button and does not replace the page
 (`src/app/components/lazyImport.ts`, `ReloadPageButton.tsx`).
 
 ## Configuration

@@ -15,7 +15,7 @@ import type { Locator, Page } from "@playwright/test";
 import { startMockServer } from "./support/mockServer";
 import { expectMonacoReady, monacoEditor, monacoTokenClasses } from "./support/monaco";
 
-// Pages and some panels are downloaded when they are first shown. The
+// Pages, some panels and the About dialog are downloaded when they are first shown. The
 // server is the emulator: it can be closed and started again while the tab stays open, so
 // such a download can fail. The browser does not ask again for a module that failed to
 // load, so what failed offers "Reload page", and that button has to bring it back.
@@ -129,6 +129,57 @@ test("a page whose code could not be downloaded offers Reload page, which loads 
   await expect(failure(page)).toHaveCount(0);
 });
 
+for (const { route, shows } of [
+  { route: "/", shows: (page: Page) => homeHeading(page) },
+  { route: "/docs", shows: (page: Page) => page.getByRole("heading", { name: "Overview", exact: true }) },
+  { route: "/tool/holly-core-log-analyzer", shows: (page: Page) => page.getByText("Drop your refsw2 log here") },
+]) {
+  test(`${route}: an About dialog whose code could not be downloaded leaves the page alone and opens after Reload page`, async ({
+    page,
+    diagnostics,
+  }, testInfo) => {
+    const release = await refuseChunk(page, diagnostics, "AboutDialog");
+    await gotoRoute(page, route);
+    await expect(shows(page)).toBeVisible();
+    const about = page.getByRole("button", { name: route === "/" ? /^About\b/ : "About", exact: route !== "/" });
+    const notice = page.locator("[data-about-failure]");
+
+    await about.click();
+    await expect(notice).toHaveAttribute("role", "alert");
+    await expect(notice).toContainText("The About dialog could not be opened");
+    await expect(notice).toContainText(/TypeError: Failed to fetch dynamically imported module: \S+\/assets\/AboutDialog-/);
+    await expect(notice).toContainText("Its code could not be downloaded.");
+    // the page is still there, and the dialog is closed: its ?about=1 is gone from the URL
+    await expect(shows(page)).toBeVisible();
+    await expect(failure(page)).toHaveCount(0);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page).not.toHaveURL(/about=/);
+    await saveScreenshot(page, testInfo, `chunk-recovery-about${route.replace(/\W+/g, "-").replace(/-$/, "")}`);
+
+    // the notice can be dismissed, and asking for the dialog again shows it again
+    await notice.getByRole("button", { name: "Dismiss" }).click();
+    await expect(notice).toHaveCount(0);
+    await about.click();
+    await expect(notice).toContainText("The About dialog could not be opened");
+    await expect(shows(page)).toBeVisible();
+    await expect(failure(page)).toHaveCount(0);
+    await expect(page).not.toHaveURL(/about=/);
+
+    await release();
+    await clickAndWaitForReload(page, reloadPage(notice));
+    await expect(shows(page)).toBeVisible();
+    await expect(notice).toHaveCount(0);
+    await about.click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.getByRole("heading", { name: "About nullDC DevTools" })).toBeVisible();
+    await expect(page).toHaveURL(/\?about=1$/);
+    await dialog.getByRole("button", { name: "Close" }).click();
+    await expect(dialog).toBeHidden();
+    await expect(shows(page)).toBeVisible();
+    await expect(failure(page)).toHaveCount(0);
+  });
+}
+
 test("a panel first opened while the server is down is loaded by Reload page once the server is back", async ({
   page,
   mock,
@@ -182,8 +233,20 @@ test("a page first opened while the server is down is loaded by Reload page once
   await expect(homeHeading(page)).toBeVisible();
   await page.waitForLoadState("networkidle");
 
-  // --- the emulator is closed; the simulator (and Monaco with its style sheet) was never opened in this tab ---
+  // --- the emulator is closed; neither the About dialog nor the simulator (and Monaco with its style sheet) was
+  // opened in this tab before ---
   await mock.stop("SIGKILL");
+  await page.getByRole("button", { name: /^About\b/ }).click();
+  const notice = page.locator("[data-about-failure]");
+  await expect(notice).toContainText("The About dialog could not be opened");
+  await expect(homeHeading(page)).toBeVisible();
+  await expect(failure(page)).toHaveCount(0);
+  await reloadPage(notice).click();
+  await expect(notice.getByRole("status")).toHaveText(NO_ANSWER);
+  await expect(homeHeading(page)).toBeVisible();
+  await notice.getByRole("button", { name: "Dismiss" }).click();
+  await expect(notice).toHaveCount(0);
+
   await page.getByRole("button", { name: /^SH4 Simulator\b/ }).click();
   const alert = failure(page);
   await expect(alert.getByRole("heading", { name: "The SH4 Simulator page failed" })).toBeVisible();
