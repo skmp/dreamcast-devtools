@@ -1,124 +1,117 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import SubdirectoryArrowRightIcon from "@mui/icons-material/SubdirectoryArrowRight";
+import type { TargetProcessor } from "../../lib/debuggerSchema";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import type { BreakpointCategory } from "../../state/breakpointCategoryState";
+import { useProgramCounter, useRunState, useTarget } from "../../state/debuggerSelectors";
+import { formatAddress, formatAddressInput, parseAddress, programCounter, withContextAbove } from "../../state/targets";
 import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks, type DisassemblyViewRef } from "../components/DisassemblyView";
+import { PanelNotice, PanelPlaceholder } from "../components/PanelNotice";
+import { canResume } from "../../state/stopReasons";
+import { Panel } from "../layout/Panel";
 import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
 import { generateUUID } from "../../lib/uuid";
 
-const formatHexAddress = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
-
-const instructionSizeForTarget = (target: string) => {
-  switch (target) {
-    case "sh4":
-      return 2;
-    case "arm7":
-      return 4;
-    case "dsp":
-      return 1;
-    default:
-      return 2;
-  }
-};
-
-const maxAddressForTarget = (target: string) => (target === "dsp" ? 0x7f : 0xffffffff);
-
-const formatAddressInput = (target: string, value: number) =>
-  target === "dsp" ? value.toString() : formatHexAddress(value);
-
-const formatAddressForDisplay = (target: string, value: number) =>
-  target === "dsp" ? value.toString().padStart(3, "0") : formatHexAddress(value);
-
-const parseAddressInput = (target: string, input: string) => {
-  const trimmed = input.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  if (/^0x/i.test(trimmed)) {
-    const parsed = Number.parseInt(trimmed.replace(/^0x/i, ""), 16);
-    return Number.isNaN(parsed) ? undefined : parsed;
-  }
-  const base = target === "dsp" ? 10 : 16;
-  const parsed = Number.parseInt(trimmed, base);
-  return Number.isNaN(parsed) ? undefined : parsed;
-};
-
 interface DisassemblyPanelProps {
-  target: "sh4" | "arm7" | "dsp";
-  defaultAddress: number;
+  target: TargetProcessor;
 }
 
-const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => {
+const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
+  // instruction size, address format, where the program counter is: what debugger.describe said
+  const info = useTarget(target);
   const client = useSessionStore((state) => state.client);
-  // what the last tick said; a target of which nothing is known yet is not stepped
-  const executionState = useDebuggerDataStore((state) => state.executionState?.state ?? "running");
   const initialized = useDebuggerDataStore((state) => state.initialized);
+  const hasTick = useDebuggerDataStore((state) => state.ticks > 0);
+  const epoch = useDebuggerDataStore((state) => state.epoch);
+  const refresh = useDebuggerDataStore((state) => state.refresh);
+  const steppable = useDebuggerDataStore((state) => canResume(state.executionState?.reason));
   const breakpoints = useDebuggerDataStore((state) => state.breakpoints);
-  const registersByPath = useDebuggerDataStore((state) => state.registersByPath);
+  const categoryState = useDebuggerDataStore((state) => state.categories[target]);
   const addBreakpoint = useDebuggerDataStore((state) => state.addBreakpoint);
   const removeBreakpoint = useDebuggerDataStore((state) => state.removeBreakpoint);
   const toggleBreakpoint = useDebuggerDataStore((state) => state.toggleBreakpoint);
   const toggleCategoryMute = useDebuggerDataStore((state) => state.toggleCategoryMute);
   const toggleCategorySolo = useDebuggerDataStore((state) => state.toggleCategorySolo);
   const control = useDebuggerDataStore((state) => state.control);
+  const runState = useRunState();
+  const currentPc = useProgramCounter(info);
   const viewRef = useRef<DisassemblyViewRef>(null);
   const panelIdRef = useRef(generateUUID());
 
-  // Get current PC/STEP value
-  const currentPc = useMemo(() => {
-    const cpuPath = target === "dsp" ? "dc.aica.dsp" : target === "sh4" ? "dc.sh4.cpu" : "dc.aica.arm7";
-    const counterName = target === "dsp" ? "STEP" : "PC";
-    const registers = registersByPath[cpuPath];
-    const pcReg = registers?.find((r) => r.name === counterName);
-
-    if (pcReg?.value) {
-      const parsed = Number.parseInt(pcReg.value.replace(/^0x/i, ""), 16);
-      return Number.isNaN(parsed) ? undefined : parsed;
+  // Where the view opens: where the target is in the first tick this panel sees, with ten
+  // instructions of context above it, or at the target's default address when that tick does
+  // not say (no game loaded, or a core that does not report its registers while it runs).
+  // Decided once: after that the view moves when the user moves it and when the target stops.
+  // A panel that was there before the connection sees its first tick; one that is opened
+  // later sees what the latest tick said.
+  const [firstAddress, setFirstAddress] = useState<number | undefined>(undefined);
+  const [waitedForConnection] = useState(() => useDebuggerDataStore.getState().ticks === 0);
+  /** what the view was last brought up to date with: connection and `refresh` */
+  const followed = useRef<string | undefined>(undefined);
+  const ready = initialized && hasTick && info.supported;
+  useEffect(() => {
+    if (!ready || firstAddress !== undefined) {
+      return;
     }
-    return undefined;
-  }, [registersByPath, target]);
+    const state = useDebuggerDataStore.getState();
+    const first = waitedForConnection ? state.first : undefined;
+    const pc = programCounter(first ? first.registers : state.registersByPath, info);
+    followed.current = `${state.epoch}:${first ? first.refresh : state.refresh}`;
+    const fallback = Math.min(info.defaultDisassemblyAddress, info.addressMax);
+    setFirstAddress(pc !== undefined ? withContextAbove(info, pc) : fallback - (fallback % info.instructionSize));
+  }, [ready, firstAddress, info, waitedForConnection]);
+
+  // A stop the client has not acted on yet (stopId changed), or a game that was just loaded:
+  // fetch again, and scroll to the program counter if its line is not on screen. Ticks that are
+  // not a new stop, such as the one that follows a breakpoint or a watch being added, move
+  // nothing and fetch nothing.
+  useEffect(() => {
+    if (firstAddress === undefined || !initialized || !viewRef.current) {
+      return;
+    }
+    const current = `${epoch}:${refresh}`;
+    if (followed.current === current) {
+      return;
+    }
+    followed.current = current;
+    viewRef.current.followPc(programCounter(useDebuggerDataStore.getState().registersByPath, info));
+  }, [firstAddress, refresh, epoch, initialized, info]);
 
   // Map addresses to breakpoints
   const breakpointsByAddress = useMemo(() => {
     const map = new Map<number, { id: number; enabled: boolean }>();
-    const cpuPath = target === "dsp" ? "dc.aica.dsp" : target === "sh4" ? "dc.sh4.cpu" : "dc.aica.arm7";
-    const counterName = target === "dsp" ? "step" : "pc";
-    const expectedEvent = `${cpuPath}.${counterName}`;
-
     for (const bp of breakpoints) {
-      if (bp.kind === "code" && bp.event === expectedEvent && bp.address !== undefined) {
+      if (bp.kind === "code" && bp.event === info.breakpointEvent && bp.address !== undefined) {
         map.set(bp.address, { id: bp.id, enabled: bp.enabled });
       }
     }
     return map;
-  }, [breakpoints, target]);
-
-  // Mute and solo of the category are the server's state: the store has what the last tick
-  // said, and sends what a button asks for on the connection of the session.
-  const category: BreakpointCategory = target === "sh4" ? "sh4" : target === "arm7" ? "arm7" : "dsp";
-  const categoryState = useDebuggerDataStore((state) => state.categories[category]);
+  }, [breakpoints, info.breakpointEvent]);
 
   // Build configuration
   const config: DisassemblyViewConfig = useMemo(() => {
     const isDsp = target === "dsp";
     return {
-      instructionSize: instructionSizeForTarget(target),
-      maxAddress: maxAddressForTarget(target),
-      formatAddressInput: (value: number) => formatAddressInput(target, value),
-      formatAddressDisplay: (value: number) => formatAddressForDisplay(target, value),
-      parseAddressInput: (input: string) => parseAddressInput(target, input),
+      instructionSize: info.instructionSize,
+      maxAddress: info.addressMax,
+      formatAddressInput: (value: number) => formatAddressInput(info, value),
+      formatAddressDisplay: (value: number) => formatAddress(info, value),
+      parseAddressInput: (input: string) => parseAddress(info, input),
       gridColumns: isDsp ? "24px 80px 1fr" : "24px 140px 140px 1fr",
       stepLabel: isDsp ? "Step" : "Step Over",
       stepIcon: isDsp ? ArrowForwardIcon : SubdirectoryArrowRightIcon,
       showStepInOut: target === "sh4" || target === "arm7",
       urlParamName: isDsp ? "step" : "address",
       showBytes: !isDsp,
+      steppingNotice: info.stepping
+        ? undefined
+        : `This server cannot step the ${info.label} or set code breakpoints on it.`,
     };
-  }, [target]);
+  }, [target, info]);
 
-  // Build callbacks
+  // Build callbacks. They do not depend on the run state: a view that fetched again whenever
+  // these changed would fetch with every pause and resume.
   const callbacks: DisassemblyViewCallbacks = useMemo(
     () => ({
       onFetchDisassembly: async (address: number, count: number) => {
@@ -128,30 +121,18 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
         const result = await client.fetchDisassembly({ target, address, count });
         return result.lines;
       },
-      // the answer of the server is checked by `control`, which shows a refusal
+      // a refusal of the server is shown by `control`
       onStep: async () => {
-        if (executionState !== "paused") {
-          return;
-        }
         await control(target === "dsp" ? "step" : "stepOver", target);
       },
       onStepIn: async () => {
-        if (executionState !== "paused") {
-          return;
-        }
         await control("step", target);
       },
       onStepOut: async () => {
-        if (executionState !== "paused") {
-          return;
-        }
         await control("stepOut", target);
       },
       onBreakpointAdd: async (address: number) => {
-        const cpuPath = target === "dsp" ? "dc.aica.dsp" : target === "sh4" ? "dc.sh4.cpu" : "dc.aica.arm7";
-        const counterName = target === "dsp" ? "step" : "pc";
-        const event = `${cpuPath}.${counterName}`;
-        await addBreakpoint(event, address, "code");
+        await addBreakpoint(info.breakpointEvent, address, "code");
       },
       onBreakpointRemove: async (id: number) => {
         await removeBreakpoint(id);
@@ -160,86 +141,66 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
         await toggleBreakpoint(id, enabled);
       },
       onMuteToggle: () => {
-        void toggleCategoryMute(category);
+        void toggleCategoryMute(target);
       },
       onSoloToggle: () => {
-        void toggleCategorySolo(category);
+        void toggleCategorySolo(target);
       },
     }),
-    [client, target, executionState, control, addBreakpoint, removeBreakpoint, toggleBreakpoint, toggleCategoryMute, toggleCategorySolo, category],
+    [client, target, info.breakpointEvent, control, addBreakpoint, removeBreakpoint, toggleBreakpoint, toggleCategoryMute, toggleCategorySolo],
   );
 
-  // Register with navigation service
+  // Register with navigation service. The view's handle changes with its state, so what is
+  // registered asks for the current one each time.
   useEffect(() => {
     const panelId = panelIdRef.current;
-    if (viewRef.current) {
-      disassemblyNavigationService.register(panelId, viewRef.current);
-    }
+    disassemblyNavigationService.register(panelId, {
+      scrollToAddress: (address, highlight) => viewRef.current?.scrollToAddress(address, highlight),
+      focus: () => viewRef.current?.focus(),
+      getSize: () => viewRef.current?.getSize() ?? { width: 0, height: 0 },
+      getTarget: () => target,
+    });
     return () => {
       disassemblyNavigationService.unregister(panelId);
     };
-  }, []);
+  }, [target]);
+
+  if (initialized && !info.supported) {
+    return (
+      <Panel>
+        <PanelNotice>This server does not support the {info.label} target.</PanelNotice>
+      </Panel>
+    );
+  }
+  if (firstAddress === undefined) {
+    return (
+      <Panel>
+        <PanelPlaceholder>No Data</PanelPlaceholder>
+      </Panel>
+    );
+  }
 
   return (
     <DisassemblyView
       ref={viewRef}
       config={config}
       callbacks={callbacks}
-      defaultAddress={defaultAddress}
+      defaultAddress={firstAddress}
       currentPc={currentPc}
       breakpointsByAddress={breakpointsByAddress}
       initialized={initialized}
-      executionState={executionState}
+      executionState={runState === "paused" ? "paused" : "running"}
       categoryState={categoryState}
       target={target}
+      followOnPause={false}
+      refetchAfterBreakpointEdit
+      canStep={steppable}
     />
   );
 };
 
-export const Sh4DisassemblyPanel = () => {
-  const registersByPath = useDebuggerDataStore((state) => state.registersByPath);
-  const registers = registersByPath["dc.sh4.cpu"];
-  const pcReg = registers?.find((r) => r.name === "PC");
+export const Sh4DisassemblyPanel = () => <DisassemblyPanel target="sh4" />;
 
-  let defaultAddress = 0x8c010000;
-  if (pcReg?.value) {
-    const pc = Number.parseInt(pcReg.value.replace(/^0x/i, ""), 16);
-    if (!Number.isNaN(pc)) {
-      defaultAddress = Math.max(0, pc - 2 * 10); // 10 instructions before
-    }
-  }
+export const Arm7DisassemblyPanel = () => <DisassemblyPanel target="arm7" />;
 
-  return <DisassemblyPanel target="sh4" defaultAddress={defaultAddress} />;
-};
-
-export const Arm7DisassemblyPanel = () => {
-  const registersByPath = useDebuggerDataStore((state) => state.registersByPath);
-  const registers = registersByPath["dc.aica.arm7"];
-  const pcReg = registers?.find((r) => r.name === "PC");
-
-  let defaultAddress = 0x00200000;
-  if (pcReg?.value) {
-    const pc = Number.parseInt(pcReg.value.replace(/^0x/i, ""), 16);
-    if (!Number.isNaN(pc)) {
-      defaultAddress = Math.max(0, pc - 4 * 10); // 10 instructions before
-    }
-  }
-
-  return <DisassemblyPanel target="arm7" defaultAddress={defaultAddress} />;
-};
-
-export const DspDisassemblyPanel = () => {
-  const registersByPath = useDebuggerDataStore((state) => state.registersByPath);
-  const registers = registersByPath["dc.aica.dsp"];
-  const stepReg = registers?.find((r) => r.name === "STEP");
-
-  let defaultAddress = 0x00000000;
-  if (stepReg?.value) {
-    const step = Number.parseInt(stepReg.value.replace(/^0x/i, ""), 16);
-    if (!Number.isNaN(step)) {
-      defaultAddress = Math.max(0, step - 10); // 10 steps before
-    }
-  }
-
-  return <DisassemblyPanel target="dsp" defaultAddress={defaultAddress} />;
-};
+export const DspDisassemblyPanel = () => <DisassemblyPanel target="dsp" />;

@@ -43,6 +43,11 @@ export interface DisassemblyViewConfig {
   showBytes?: boolean;
   /** Whether to show mute/solo buttons (default: true) */
   showMuteSolo?: boolean;
+  /**
+   * The server cannot step this target or set code breakpoints on it: this is said in place
+   * of the step buttons, the mute/solo buttons and the breakpoint gutter. The listing works.
+   */
+  steppingNotice?: string;
   /** Icon for the run/pause button */
   runPauseIcon?: { paused: typeof ArrowForwardIcon; running: typeof ArrowForwardIcon };
   /** Label for the run/pause button */
@@ -107,9 +112,24 @@ export interface DisassemblyViewProps {
   categoryState?: { muted: boolean; soloed: boolean };
   /** Target CPU type for registration in navigation service */
   target?: "sh4" | "arm7" | "dsp";
+  /**
+   * Scroll to the program counter whenever the state changes from running to paused
+   * (default: true). A caller that knows the stops of its target turns this off and calls
+   * `followPc` for each of them instead.
+   */
+  followOnPause?: boolean;
+  /** Fetch the lines again, without moving, after a breakpoint was added, removed or toggled here (default: false). */
+  refetchAfterBreakpointEdit?: boolean;
+  /** false: the step buttons are disabled although the target is paused (default: true). */
+  canStep?: boolean;
 }
 
 export interface DisassemblyViewRef {
+  /**
+   * The target stopped at `pc`: fetch the lines again, and scroll to it (ten instructions of
+   * context above) unless its line is already on screen.
+   */
+  followPc: (pc: number | undefined) => void;
   scrollToAddress: (address: number, highlight?: boolean) => void;
   focus: () => void;
   getSize: () => { width: number; height: number };
@@ -126,8 +146,6 @@ const normalizeAddress = (value: number, max: number, step: number) => {
 
 interface DisassemblyLineItemProps {
   line: DisassemblyLine;
-  currentPc?: number;
-  executionState: "running" | "paused";
   breakpoint?: { id: number; enabled: boolean };
   config: DisassemblyViewConfig;
   onBreakpointClick: (address: number) => void;
@@ -135,10 +153,11 @@ interface DisassemblyLineItemProps {
   lineRef: (address: number, el: HTMLDivElement | null) => void;
 }
 
+// A line renders again only when its text or its breakpoint changes. The marker of the current
+// instruction is a class the view sets on the element (see the effect on `currentPc`), so a
+// program counter that moves five times a second renders nothing.
 const DisassemblyLineItem = memo(({
   line,
-  currentPc: _currentPc,
-  executionState: _executionState,
   breakpoint,
   config,
   onBreakpointClick,
@@ -147,6 +166,7 @@ const DisassemblyLineItem = memo(({
 }: DisassemblyLineItemProps) => {
   const hasBreakpoint = !!breakpoint;
   const breakpointEnabled = breakpoint?.enabled ?? false;
+  const gutter = config.steppingNotice === undefined;
 
   return (
     <Box
@@ -169,36 +189,41 @@ const DisassemblyLineItem = memo(({
         },
       }}
     >
-      <Box
-        className="breakpoint-gutter"
-        data-breakpoint={hasBreakpoint ? (breakpointEnabled ? "enabled" : "disabled") : "none"}
-        sx={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          opacity: hasBreakpoint ? 1 : 0,
-          cursor: "pointer",
-          transition: "opacity 0.1s",
-          alignSelf: "stretch",
-        }}
-        onClick={(e) => {
-          if ((e.shiftKey || e.ctrlKey || e.metaKey) && hasBreakpoint) {
-            onBreakpointToggle(line.address, e);
-          } else {
-            onBreakpointClick(line.address);
-          }
-        }}
-      >
-        {hasBreakpoint ? (
-          breakpointEnabled ? (
-            <CircleIcon sx={{ fontSize: 16, color: "error.main" }} />
+      {gutter ? (
+        <Box
+          className="breakpoint-gutter"
+          data-breakpoint={hasBreakpoint ? (breakpointEnabled ? "enabled" : "disabled") : "none"}
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            opacity: hasBreakpoint ? 1 : 0,
+            cursor: "pointer",
+            transition: "opacity 0.1s",
+            alignSelf: "stretch",
+          }}
+          onClick={(e) => {
+            if ((e.shiftKey || e.ctrlKey || e.metaKey) && hasBreakpoint) {
+              onBreakpointToggle(line.address, e);
+            } else {
+              onBreakpointClick(line.address);
+            }
+          }}
+        >
+          {hasBreakpoint ? (
+            breakpointEnabled ? (
+              <CircleIcon sx={{ fontSize: 16, color: "error.main" }} />
+            ) : (
+              <RadioButtonUncheckedIcon sx={{ fontSize: 16, color: "error.main" }} />
+            )
           ) : (
-            <RadioButtonUncheckedIcon sx={{ fontSize: 16, color: "error.main" }} />
-          )
-        ) : (
-          <RadioButtonUncheckedIcon sx={{ fontSize: 16, color: "text.disabled", opacity: 0.3 }} />
-        )}
-      </Box>
+            <RadioButtonUncheckedIcon sx={{ fontSize: 16, color: "text.disabled", opacity: 0.3 }} />
+          )}
+        </Box>
+      ) : (
+        // no breakpoints on this target: the column stays, for the alignment of the others
+        <span />
+      )}
       <Typography component="span" sx={{ color: "text.secondary" }}>
         {config.formatAddressDisplay(line.address)}
       </Typography>
@@ -226,6 +251,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   executionState,
   categoryState,
   target,
+  followOnPause = true,
+  refetchAfterBreakpointEdit = false,
+  canStep = true,
 }, ref) => {
   const [lines, setLines] = useState<DisassemblyLine[]>([]);
   const [loading, setLoading] = useState(false);
@@ -242,7 +270,10 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   const currentPcRef = useRef<number | undefined>(currentPc);
   const pendingHighlightRef = useRef<number | undefined>(undefined);
   const lineRefsMap = useRef<Map<number, HTMLDivElement>>(new Map());
-  const [, forceUpdate] = useState(0);
+  // what the line elements are marked from when they mount (see handleLineRef)
+  const markerRef = useRef({ currentPc, executionState });
+  /** The program counter of a stop that is being followed: its line has to end up on screen. Moving the view by hand ends that. */
+  const revealRef = useRef<{ pc: number; adjusted: boolean } | undefined>(undefined);
 
   // Track previous execution state for detecting pauses
   const prevExecutionStateRef = useRef(executionState);
@@ -284,31 +315,6 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     applyPendingHighlight();
   }, [lines, applyPendingHighlight]);
 
-  // Expose methods via ref
-  useImperativeHandle(ref, () => ({
-    scrollToAddress: (targetAddr: number, highlight: boolean = true) => {
-      const contextOffset = config.instructionSize * 10;
-      const scrollAddr = Math.max(0, targetAddr - contextOffset);
-      const normalizedAddr = normalizeAddress(scrollAddr, config.maxAddress, config.instructionSize);
-      setAddress(normalizedAddr);
-
-      if (highlight) {
-        applyHighlight(targetAddr);
-      }
-    },
-    focus: () => {
-      containerRef.current?.focus();
-    },
-    getSize: () => {
-      const rect = containerRef.current?.getBoundingClientRect();
-      return {
-        width: rect?.width ?? 0,
-        height: rect?.height ?? 0,
-      };
-    },
-    getTarget: () => target ?? "unknown",
-  }), [config.instructionSize, config.maxAddress, target, applyHighlight]);
-
   // Update DOM directly when PC or execution state changes
   useEffect(() => {
     const isPaused = executionState === "paused";
@@ -348,7 +354,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     }
 
     // Auto-scroll to current PC when transitioning from running to paused
-    if (isPaused && wasRunning && newPc !== undefined) {
+    if (followOnPause && isPaused && wasRunning && newPc !== undefined) {
       const contextOffset = config.instructionSize * 10;
       const targetAddress = Math.max(0, newPc - contextOffset);
       const normalizedTarget = normalizeAddress(targetAddress, config.maxAddress, config.instructionSize);
@@ -357,7 +363,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
 
     // Update previous execution state
     prevExecutionStateRef.current = executionState;
-  }, [currentPc, executionState, config.instructionSize, config.maxAddress]);
+    markerRef.current = { currentPc, executionState };
+  }, [currentPc, executionState, config.instructionSize, config.maxAddress, followOnPause]);
 
   const fetchDisassembly = useCallback(
     async (addr: number) => {
@@ -410,6 +417,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
 
   const adjustAddress = useCallback(
     (steps: number) => {
+      revealRef.current = undefined;
       setAddress((prev: number) => {
         const newAddr = normalizeAddress(prev + steps * config.instructionSize, config.maxAddress, config.instructionSize);
         return newAddr;
@@ -467,6 +475,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     const targetAddress = Math.max(0, parsed - contextOffset);
     const normalizedTarget = normalizeAddress(targetAddress, config.maxAddress, config.instructionSize);
 
+    revealRef.current = undefined;
     setAddress(normalizedTarget);
 
     // Flash the line once it is on screen (now, or after the fetch)
@@ -474,8 +483,86 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   }, [addressInput, config, applyHighlight]);
 
   const handleRefresh = useCallback(() => {
-    void fetchDisassembly(address);
-  }, [fetchDisassembly, address]);
+    void fetchDisassembly(normalizeAddress(address, config.maxAddress, config.instructionSize));
+  }, [fetchDisassembly, address, config.maxAddress, config.instructionSize]);
+
+  /** Whether the line of an address is rendered and entirely inside what the panel shows. */
+  const isLineOnScreen = useCallback((lineAddress: number) => {
+    const element = lineRefsMap.current.get(lineAddress);
+    const container = containerRef.current;
+    if (!element || !container) {
+      return false;
+    }
+    const line = element.getBoundingClientRect();
+    const visible = container.getBoundingClientRect();
+    return line.top >= visible.top && line.bottom <= visible.bottom;
+  }, []);
+
+  const followPc = useCallback(
+    (pc: number | undefined) => {
+      if (pc !== undefined && !isLineOnScreen(pc)) {
+        revealRef.current = { pc, adjusted: false };
+        const start = normalizeAddress(Math.max(0, pc - config.instructionSize * 10), config.maxAddress, config.instructionSize);
+        if (start !== address) {
+          // the effect on `address` fetches
+          setAddress(start);
+          return;
+        }
+      }
+      // what the lines say can have changed with the stop (code that was just loaded or written)
+      handleRefresh();
+    },
+    [address, config.instructionSize, config.maxAddress, handleRefresh, isLineOnScreen],
+  );
+
+  // The lines of a followed stop have been rendered. Ten instructions of context do not fit
+  // above the program counter in a panel that is short, or whose lines wrap: then as many as
+  // fit are shown above it, and none if even that leaves it outside.
+  useEffect(() => {
+    const reveal = revealRef.current;
+    if (!reveal || loading) {
+      return;
+    }
+    const index = lines.findIndex((line) => line.address === reveal.pc);
+    if (index < 0) {
+      return;
+    }
+    if (isLineOnScreen(reveal.pc)) {
+      revealRef.current = undefined;
+      return;
+    }
+    const fitting = lines.filter((line) => isLineOnScreen(line.address)).length;
+    const context = reveal.adjusted ? 0 : Math.min(index, Math.max(0, Math.floor((fitting - 1) / 2)));
+    revealRef.current = reveal.adjusted ? undefined : { pc: reveal.pc, adjusted: true };
+    setAddress(normalizeAddress(reveal.pc - context * config.instructionSize, config.maxAddress, config.instructionSize));
+  }, [lines, loading, isLineOnScreen, config.instructionSize, config.maxAddress]);
+
+  // Expose methods via ref
+  useImperativeHandle(ref, () => ({
+    followPc,
+    scrollToAddress: (targetAddr: number, highlight: boolean = true) => {
+      const contextOffset = config.instructionSize * 10;
+      const scrollAddr = Math.max(0, targetAddr - contextOffset);
+      const normalizedAddr = normalizeAddress(scrollAddr, config.maxAddress, config.instructionSize);
+      revealRef.current = undefined;
+      setAddress(normalizedAddr);
+
+      if (highlight) {
+        applyHighlight(targetAddr);
+      }
+    },
+    focus: () => {
+      containerRef.current?.focus();
+    },
+    getSize: () => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      return {
+        width: rect?.width ?? 0,
+        height: rect?.height ?? 0,
+      };
+    },
+    getTarget: () => target ?? "unknown",
+  }), [config.instructionSize, config.maxAddress, target, applyHighlight, followPc]);
 
   const handleBreakpointClick = useCallback(
     async (lineAddress: number) => {
@@ -485,8 +572,11 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
       } else {
         await callbacks.onBreakpointAdd(lineAddress);
       }
+      if (refetchAfterBreakpointEdit) {
+        handleRefresh();
+      }
     },
-    [breakpointsByAddress, callbacks],
+    [breakpointsByAddress, callbacks, refetchAfterBreakpointEdit, handleRefresh],
   );
 
   const handleBreakpointToggle = useCallback(
@@ -495,31 +585,32 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
       const existing = breakpointsByAddress.get(lineAddress);
       if (existing) {
         await callbacks.onBreakpointToggle(existing.id, !existing.enabled);
+        if (refetchAfterBreakpointEdit) {
+          handleRefresh();
+        }
       }
     },
-    [breakpointsByAddress, callbacks],
+    [breakpointsByAddress, callbacks, refetchAfterBreakpointEdit, handleRefresh],
   );
 
-  const handleLineRef = useCallback(
-    (address: number, el: HTMLDivElement | null) => {
-      if (el) {
-        lineRefsMap.current.set(address, el);
-        // Apply current styling if this line is the current PC and we're paused
-        if (currentPc === address && executionState === "paused") {
-          el.classList.add("current-instruction");
-        }
-      } else {
-        lineRefsMap.current.delete(address);
-      }
-    },
-    [currentPc, executionState],
-  );
+  // Stable: a line element is marked from what the view knew when the element mounted, and
+  // the effect on `currentPc` keeps the marker where it belongs after that.
+  const handleLineRef = useCallback((lineAddress: number, el: HTMLDivElement | null) => {
+    if (el) {
+      lineRefsMap.current.set(lineAddress, el);
+      const marker = markerRef.current;
+      el.classList.toggle("current-instruction", marker.currentPc === lineAddress && marker.executionState === "paused");
+    } else {
+      lineRefsMap.current.delete(lineAddress);
+    }
+  }, []);
 
   const handleGotoPC = useCallback(() => {
     if (currentPc !== undefined) {
       // Start 10 instructions before for context
       const contextOffset = config.instructionSize * 10;
       const targetAddress = Math.max(0, currentPc - contextOffset);
+      revealRef.current = undefined;
       setAddress(targetAddress);
     }
   }, [currentPc, config.instructionSize]);
@@ -559,12 +650,10 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
 
   const handleMuteToggle = useCallback(() => {
     callbacks.onMuteToggle();
-    forceUpdate((v) => v + 1);
   }, [callbacks]);
 
   const handleSoloToggle = useCallback(() => {
     callbacks.onSoloToggle();
-    forceUpdate((v) => v + 1);
   }, [callbacks]);
 
   const handleRunPauseToggle = useCallback(() => {
@@ -573,7 +662,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     }
   }, [callbacks]);
 
-  const stepDisabled = executionState !== "paused";
+  const stepDisabled = executionState !== "paused" || !canStep;
+  const stepping = config.steppingNotice === undefined;
   const StepIcon = config.stepIcon;
 
   const RunPausedIcon = config.runPauseIcon?.paused ?? PlayArrowIcon;
@@ -636,14 +726,20 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
               </Tooltip>
             );
           })}
-          <Tooltip title={config.stepLabel}>
-            <span>
-              <IconButton size="small" onClick={handleStep} disabled={stepDisabled || !initialized}>
-                <StepIcon fontSize="small" />
-              </IconButton>
-            </span>
-          </Tooltip>
-          {config.showStepInOut && (
+          {stepping ? (
+            <Tooltip title={config.stepLabel}>
+              <span>
+                <IconButton size="small" onClick={handleStep} disabled={stepDisabled || !initialized}>
+                  <StepIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+          ) : (
+            <Typography variant="caption" color="text.secondary" role="note" sx={{ maxWidth: 260, lineHeight: 1.2 }}>
+              {config.steppingNotice}
+            </Typography>
+          )}
+          {stepping && config.showStepInOut && (
             <>
               <Tooltip title="Step In">
                 <span>
@@ -679,7 +775,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
           })}
         </Stack>
         <Stack direction="row" spacing={1} alignItems="center" sx={{ flex: 1, justifyContent: "flex-end" }}>
-          {(config.showMuteSolo ?? true) && (
+          {stepping && (config.showMuteSolo ?? true) && (
             <>
               <Tooltip title={categoryState?.muted ? "Unmute category" : "Mute category"}>
                 <IconButton size="small" onClick={handleMuteToggle} color={categoryState?.muted ? "warning" : "default"}>
@@ -809,8 +905,6 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
                   <DisassemblyLineItem
                     key={line.address}
                     line={line}
-                    currentPc={currentPc}
-                    executionState={executionState}
                     breakpoint={breakpointsByAddress.get(line.address)}
                     config={config}
                     onBreakpointClick={handleBreakpointClick}

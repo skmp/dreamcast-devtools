@@ -62,7 +62,8 @@ test("the first request is debugger.describe and the tick that follows populates
   await expect(tree.getByText("BUILD = nullDC 3.0.0 mock")).toBeVisible();
   // a running target has no callstack
   await expect(panel(page, "sh4-callstack")).toContainText("Empty callstack.");
-  await expect(panel(page, "sh4-disassembly")).toContainText("0x8C010000");
+  // the disassembly opens where the target is in the first tick, the memory at the target's default address
+  await expect(panel(page, "sh4-disassembly")).toContainText("0x8C0000A0");
   await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
   expect(rpc.sent.map((frame) => frame.method)).toEqual(
     expect.arrayContaining(["debugger.describe", "state.getDisassembly", "state.getMemorySlice"]),

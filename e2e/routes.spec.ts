@@ -114,7 +114,8 @@ test("the navigation dropdown switches between workspaces, tools and pages", asy
   await expect(statusBar(page)).toContainText("Connection: connected");
   // (the target runs, and a running target has no callstack)
   await expect(panel(page, "arm7-callstack")).toContainText("Empty callstack.");
-  await expect(panel(page, "arm7-disassembly")).toContainText("0x00200000");
+  // (the view opens around the ARM7's program counter, which is in the mock's loop at 0x00200010)
+  await expect(panel(page, "arm7-disassembly")).toContainText("0x00200010");
 
   await page.getByPlaceholder("Navigate to...").click();
   await page.getByRole("option", { name: "Documentation" }).click();

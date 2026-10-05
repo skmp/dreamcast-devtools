@@ -24,7 +24,8 @@ import type { Locator, Page } from "@playwright/test";
 const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>> = {
   "sh4-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
-    "sh4-disassembly": /0x8C010000/,
+    // a disassembly view opens where its target is: around the mock's loop
+    "sh4-disassembly": /0x8C0000A0/,
     "sh4-memory": /0x8C010000\s*45 BC 32 04/,
     "sh4-breakpoints": /No breakpoints defined\./,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
@@ -32,7 +33,7 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
   },
   "arm7-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
-    "arm7-disassembly": /0x00200000/,
+    "arm7-disassembly": /0x00200010/,
     "arm7-memory": /0x00200000\s*([0-9A-F]{2} ){15}/,
     "arm7-breakpoints": /No breakpoints defined\./,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
@@ -41,14 +42,15 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
   "audio-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
     sgc: /Record some data to display here/,
-    "dsp-disassembly": /000\s*TWT TWA YSEL/,
+    // the DSP is at any of its 128 steps: some lines of the mock's program, numbered in decimal
+    "dsp-disassembly": /\d{3}(TWT|YSEL|XSEL) [A-Z]+.*\d{3}(TWT|YSEL|XSEL) /,
     "dsp-breakpoints": /No breakpoints defined\./,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
   },
   "mixed-mode-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
-    "sh4-disassembly": /0x8C010000/,
-    "arm7-disassembly": /0x00200000/,
+    "sh4-disassembly": /0x8C0000A0/,
+    "arm7-disassembly": /0x00200010/,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
     "sh4-callstack": /Empty callstack\./,
     "arm7-callstack": /Empty callstack\./,
@@ -282,7 +284,7 @@ test("the side docks can be hidden; the choice survives a reload and Reset layou
 
   await page.reload();
   await expect(statusBar(page)).toContainText("Connection: connected");
-  await expect(panel(page, "sh4-disassembly")).toContainText("0x8C010000");
+  await expect(panel(page, "sh4-disassembly")).toContainText("0x8C0000A0");
   await expect(panel(page, "device-tree")).toHaveCount(0);
   await expect(panel(page, "watches")).toHaveCount(0);
 
@@ -299,7 +301,7 @@ test("below 1200px the side docks are hidden and the centre dock keeps working",
   await gotoRoute(page, "/workspace/sh4-debugger");
   await expect(statusBar(page)).toContainText("Connection: connected");
 
-  await expect(panel(page, "sh4-disassembly")).toContainText("0x8C010000");
+  await expect(panel(page, "sh4-disassembly")).toContainText("0x8C0000A0");
   await expect(panel(page, "sh4-memory")).toBeVisible();
   await expect(panel(page, "device-tree")).toHaveCount(0);
   await expect(panel(page, "watches")).toHaveCount(0);

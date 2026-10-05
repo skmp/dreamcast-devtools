@@ -36,6 +36,16 @@ const markDocument = (page: Page) =>
   });
 const isSameDocument = (page: Page) => page.evaluate(() => (window as unknown as Marked).__sameDocument === true);
 
+/**
+ * The DSP disassembly view lists what the server has: 64 lines from where it opened (around
+ * the step the DSP is at), or fewer near the last of the DSP's 128 steps.
+ */
+const expectDspListing = async (page: Page) => {
+  const lines = disassemblyRows(panel(page, "dsp-disassembly"));
+  await expect(lines.first()).toBeVisible();
+  await expect(lines).toHaveCount(Math.min(64, 128 - Number(await lines.first().getAttribute("data-address"))));
+};
+
 /** Clicks a button that reloads the page and waits for the new document. */
 const clickAndWaitForReload = async (page: Page, button: Locator) => {
   await markDocument(page);
@@ -86,7 +96,7 @@ test("a panel whose code could not be downloaded offers Reload page, which loads
   await expect(alert.getByRole("button", { name: "Reload panel" })).toHaveCount(0);
   // only that panel is affected
   await expect(failure(page)).toHaveCount(1);
-  await expect(disassemblyRows(panel(page, "dsp-disassembly"))).toHaveCount(64);
+  await expectDspListing(page);
   await saveScreenshot(page, testInfo, "chunk-recovery-panel-failed");
 
   // while the download keeps failing, a reload ends where it started
@@ -98,7 +108,7 @@ test("a panel whose code could not be downloaded offers Reload page, which loads
   await clickAndWaitForReload(page, reloadPage(alert));
   await expect(sgc).toContainText("Record some data to display here");
   await expect(statusBar(page)).toContainText("Connection: connected");
-  await expect(disassemblyRows(panel(page, "dsp-disassembly"))).toHaveCount(64);
+  await expectDspListing(page);
   await expect(failure(page)).toHaveCount(0);
 });
 

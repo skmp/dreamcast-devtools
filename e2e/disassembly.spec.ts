@@ -22,6 +22,9 @@ interface Target {
   breakpoints: string;
   /** breakpoint event of the target's program counter */
   event: string;
+  /** where the device tree has the program counter */
+  pcPath: string;
+  pcRegister: string;
   /** the mock steps through `loopLength` instructions starting here */
   loopStart: number;
   loopLength: number;
@@ -32,7 +35,6 @@ interface Target {
   input: (address: number) => string;
   bytesPattern?: RegExp;
   stepButtons: string[];
-  defaultFirstAddress: number;
   /** an address far away from the loop, for the address box */
   farAddress: number;
 }
@@ -47,6 +49,8 @@ const TARGETS: Target[] = [
     disassembly: "sh4-disassembly",
     breakpoints: "sh4-breakpoints",
     event: "dc.sh4.cpu.pc",
+    pcPath: "dc.sh4.cpu",
+    pcRegister: "PC",
     loopStart: 0x8c0000a0,
     loopLength: 8,
     instructionSize: 2,
@@ -54,7 +58,6 @@ const TARGETS: Target[] = [
     input: hex8,
     bytesPattern: /^[0-9A-F]{2} [0-9A-F]{2}$/,
     stepButtons: ["Step Over", "Step In", "Step Out"],
-    defaultFirstAddress: 0x8c010000,
     farAddress: 0x8c004000,
   },
   {
@@ -63,6 +66,8 @@ const TARGETS: Target[] = [
     disassembly: "arm7-disassembly",
     breakpoints: "arm7-breakpoints",
     event: "dc.aica.arm7.pc",
+    pcPath: "dc.aica.arm7",
+    pcRegister: "PC",
     loopStart: 0x00200010,
     loopLength: 8,
     instructionSize: 4,
@@ -70,7 +75,6 @@ const TARGETS: Target[] = [
     input: hex8,
     bytesPattern: /^([0-9A-F]{2} ){3}[0-9A-F]{2}$/,
     stepButtons: ["Step Over", "Step In", "Step Out"],
-    defaultFirstAddress: 0x00200000,
     farAddress: 0x00204000,
   },
   {
@@ -79,6 +83,8 @@ const TARGETS: Target[] = [
     disassembly: "dsp-disassembly",
     breakpoints: "dsp-breakpoints",
     event: "dc.aica.dsp.step",
+    pcPath: "dc.aica.dsp",
+    pcRegister: "STEP",
     // the DSP executes its 128 steps once per sample
     loopStart: 0,
     loopLength: 128,
@@ -86,7 +92,6 @@ const TARGETS: Target[] = [
     format: step3,
     input: (address) => String(address),
     stepButtons: ["Step"],
-    defaultFirstAddress: 0,
     farAddress: 60,
   },
 ];
@@ -110,14 +115,26 @@ for (const target of TARGETS) {
       await openWorkspace(page, target.workspace);
     });
 
-    test("shows 64 disassembled lines from the default address", async ({ page }) => {
+    test("shows 64 disassembled lines around where the target is in the first tick", async ({ page, rpc }) => {
       const view = panel(page, target.disassembly);
       const rows = disassemblyRows(view);
-      await expect(rows).toHaveCount(64);
-      await expect(rows.first()).toHaveAttribute("data-address", String(target.defaultFirstAddress));
+      await expect(rows.first()).toBeVisible();
+      // the first tick the page got on this connection says where the target is: the view
+      // opens with ten instructions of context above that
+      const firstTick = rpc.received.find((frame) => frame.method === "event.tick")?.params as {
+        registers: Record<string, Array<{ name: string; value: string }>>;
+      };
+      const pc = Number.parseInt(firstTick.registers[target.pcPath].find((register) => register.name === target.pcRegister)!.value, 16);
+      expect(pc).toBeGreaterThanOrEqual(target.loopStart);
+      const firstAddress = Math.max(0, pc - 10 * target.instructionSize);
+      await expect(rows.first()).toHaveAttribute("data-address", String(firstAddress));
+      await expect(disassemblyRow(view, pc)).toBeVisible();
+      // 64 lines; fewer only where the address space of the target ends (the DSP has 128 steps)
+      const count = target.name === "DSP" ? Math.min(64, target.loopLength - firstAddress) : 64;
+      await expect(rows).toHaveCount(count);
 
       const cells = rows.first().locator("span");
-      await expect(cells.nth(0)).toHaveText(target.format(target.defaultFirstAddress));
+      await expect(cells.nth(0)).toHaveText(target.format(firstAddress));
       if (target.bytesPattern) {
         // address, opcode bytes, mnemonic
         await expect(cells.nth(1)).toHaveText(target.bytesPattern);
@@ -126,10 +143,7 @@ for (const target of TARGETS) {
         await expect(cells.nth(1)).toHaveText(/\S/);
       }
       // consecutive instructions
-      await expect(rows.nth(63)).toHaveAttribute(
-        "data-address",
-        String(target.defaultFirstAddress + 63 * target.instructionSize),
-      );
+      await expect(rows.nth(count - 1)).toHaveAttribute("data-address", String(firstAddress + (count - 1) * target.instructionSize));
 
       // nothing is highlighted and nothing can be stepped while the target runs
       await expect(view.locator(".current-instruction")).toHaveCount(0);
@@ -152,14 +166,11 @@ for (const target of TARGETS) {
         await tooltipButton(view, label).click();
         // Step Over and Step In execute one instruction (the mock's loop has no calls). Step Out
         // resumes until the return, which for the mock is the branch at the end of its loop.
-        const wrapped = label !== "Step Out" && nextInLoop(target, address) < address;
+        // The view follows every stop: the first of the DSP's 128 steps is not among the 64
+        // lines around the last one, and is shown without anything being clicked.
         address = label === "Step Out" ? target.loopStart : nextInLoop(target, address);
-        if (wrapped && target.loopLength > 64) {
-          // TODAY a step does not scroll the view, and the first of the DSP's 128 steps is not
-          // among the 64 lines around the last one
-          await tooltipButton(view, "Go to current PC").click();
-        }
         await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(address));
+        await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
         await expect(tooltipButton(page, "Run")).toBeEnabled();
       }
       // exactly one row is highlighted
@@ -244,7 +255,6 @@ for (const target of TARGETS) {
 
       await tooltipButton(page, "Run").click();
       await expect(
-        // in the address format of the target: a DSP step is decimal
         page.getByRole("alert").filter({ hasText: `Breakpoint hit: ${target.event} == ${target.format(address)}` }),
       ).toBeVisible();
       await expect(tooltipButton(page, "Run")).toBeEnabled();
@@ -321,3 +331,74 @@ for (const target of TARGETS) {
     });
   });
 }
+
+test("a word the debugger cannot read is listed as ?? <unreadable>, between the lines that can be read", async ({ page }) => {
+  await openWorkspace(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  // the flash ROM of the mock ends at 0x0021FFFF; what follows is not mapped
+  await view.getByRole("textbox").fill("0x00220000");
+  await view.getByRole("textbox").press("Enter");
+  const rows = disassemblyRows(view);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x00220000 - 20));
+  await expect(rows).toHaveCount(64);
+
+  const readable = disassemblyRow(view, 0x0021fffe).locator("span");
+  await expect(readable.nth(1)).toHaveText(/^[0-9A-F]{2} [0-9A-F]{2}$/);
+  await expect(readable.nth(2)).not.toHaveText("<unreadable>");
+  for (const address of [0x00220000, 0x00220002, 0x00220000 + 53 * 2]) {
+    const cells = disassemblyRow(view, address).locator("span");
+    await expect(cells.nth(0)).toHaveText(hex8(address));
+    await expect(cells.nth(1)).toHaveText("??");
+    await expect(cells.nth(2)).toHaveText("<unreadable>");
+  }
+});
+
+test("ticks do not make a disassembly view read again or move; a stop does both", async ({ page, rpc }) => {
+  await openWorkspace(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  await expect(rows).toHaveCount(64);
+  const fetches = () => rpc.requests("state.getDisassembly").length;
+  expect(fetches()).toBe(1);
+  const opened = await rows.first().getAttribute("data-address");
+
+  // running: the program counter moves with every tick, and the view stays as it opened
+  await page.waitForTimeout(1200);
+  expect(rpc.received.filter((frame) => frame.method === "event.tick").length).toBeGreaterThan(4);
+  expect(fetches()).toBe(1);
+  await expect(rows.first()).toHaveAttribute("data-address", opened!);
+
+  // looking elsewhere, then a stop: the view comes to the program counter and reads again
+  await view.getByRole("textbox").fill("0x8C004000");
+  await view.getByRole("textbox").press("Enter");
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c004000 - 20));
+  expect(fetches()).toBe(2);
+  await pauseFromToolbar(page);
+  const pc = await currentInstructionAddress(view);
+  await expect(rows.first()).toHaveAttribute("data-address", String(pc - 20));
+  await expect.poll(fetches).toBe(3);
+
+  // a step whose line is on screen: read again, not moved
+  await tooltipButton(view, "Step In").click();
+  await expect(view.locator(".current-instruction")).not.toHaveAttribute("data-address", String(pc));
+  await expect(rows.first()).toHaveAttribute("data-address", String(pc - 20));
+  await expect.poll(fetches).toBe(4);
+  expect(rpc.requests("state.getDisassembly").at(-1)?.params).toEqual({ target: "sh4", address: pc - 20, count: 64 });
+
+  // the user scrolls away while it is paused; a watch is added (a paused tick of the same stop): nothing moves
+  await view.getByRole("textbox").fill("0x8C004000");
+  await view.getByRole("textbox").press("Enter");
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c004000 - 20));
+  const watches = panel(page, "watches");
+  await watches.getByPlaceholder("Enter expression").fill("dc.sh4.cpu.pr");
+  await watches.getByPlaceholder("Enter expression").press("Enter");
+  await expect(watches.getByRole("listitem")).toHaveCount(2);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c004000 - 20));
+  expect(fetches()).toBe(5);
+
+  // the next step is a stop off screen: the view follows it
+  await tooltipButton(view, "Step In").click();
+  await expect(view.locator(".current-instruction")).toHaveCount(1);
+  await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
+  await expect.poll(fetches).toBe(6);
+});

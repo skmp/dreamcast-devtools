@@ -1,6 +1,9 @@
 import {
   test,
   expect,
+  breakpointGutter,
+  disassemblyRow,
+  disassemblyRows,
   gotoRoute,
   panel,
   registerRow,
@@ -94,6 +97,40 @@ test("nothing of a connection is left in the next one: registers and callstack s
   await expect(registerRow(page, "dc.sh4.tmu.reg.TCNT0")).toHaveText("TCNT0 = 0x22222222");
   await expect(panel(page, "sh4-callstack")).toContainText("Empty callstack.");
   await expect(panel(page, "sh4-callstack")).not.toContainText("_first_session");
+});
+
+test("a breakpoint set or removed in a disassembly view makes it read again, where it is", async ({ page }) => {
+  const server = await open(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  const fetches = () => server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4").length;
+  expect(fetches()).toBe(1);
+
+  // the server lists the breakpoint in the tick that follows the request, like a real one
+  server.answer("breakpoints.add", (params) => {
+    server.state.breakpoints = { "1": { id: 1, event: params.event, address: params.address, kind: "code", enabled: true } };
+    setTimeout(() => server.tick(), 0);
+    return {};
+  });
+  server.answer("breakpoints.remove", () => {
+    server.state.breakpoints = {};
+    setTimeout(() => server.tick(), 0);
+    return {};
+  });
+
+  const row = disassemblyRow(view, 0x8c001008);
+  await row.hover();
+  await breakpointGutter(row).click();
+  await expect(breakpointGutter(row)).toHaveAttribute("data-breakpoint", "enabled");
+  await expect.poll(fetches).toBe(2);
+  expect(server.requestsOf("state.getDisassembly").at(-1)).toEqual({ target: "sh4", address: 0x8c001000 - 20, count: 64 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+
+  await breakpointGutter(row).click();
+  await expect(breakpointGutter(row)).toHaveAttribute("data-breakpoint", "none");
+  await expect.poll(fetches).toBe(3);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
 });
 
 test("mute and solo are the server's state: the buttons show what the ticks say, whoever changed it", async ({ page }) => {
