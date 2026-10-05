@@ -168,9 +168,9 @@ The version shown in the status bar and the About dialog is the `package.json` v
   as a lost connection. With exactly one announced emulator the UI connects on its own;
   otherwise it shows the connection picker.
 
-The status bar of a workspace shows the connection state and the endpoint. A click on the
-endpoint opens the connection picker: the endpoints above with where each comes from, and a box
-for any other `ws://` or `wss://` URL. Picking the build default or the page's own endpoint from
+The status bar of a workspace shows the connection state and the endpoint. The endpoint is a
+button (a click, or Enter or Space on it) that opens the connection picker: the endpoints above
+with where each comes from, and a box for any other `ws://` or `wss://` URL. Picking the build default or the page's own endpoint from
 the list puts a remembered manual entry away, so that the next load of the page uses that
 endpoint again.
 
@@ -185,15 +185,22 @@ by the emulator's Host/Origin check is one of them.
 ## What the UI does with a session
 
 - **Run state.** Next to the run controls: `Running`, or `Paused`, why (`reason` of the tick)
-  and which stop it is (`stopId`), and below it the `notice` of the server when it has one. In
-  the stops of the emulator's own window (`host-stopped`, `guest-exit`, `no-game`) Run and the
-  step buttons are off, because the server refuses them there. The answer of every
-  `control.*` request is checked, and a refusal is shown.
+  and which stop it is (`stopId`), and below it the `notice` of the server when it has one. The
+  line wraps where the toolbar has little room, and a window narrower than 1280 px shows both
+  in lines of their own under the toolbar; the title of each has all of its text. In the stops
+  of the emulator's own window (`host-stopped`, `guest-exit`, `no-game`) Run and the step
+  buttons are off, because the server refuses them there. A run control that is off (also
+  while the target runs, and without a connection) keeps the keyboard focus, so that stepping
+  with the keyboard goes on from the same button. The answer of every `control.*` request is
+  checked, and a refusal is shown; one that is repeated while its notice is on screen is
+  counted in that notice (`×n`) instead of shown again.
 - **Stops.** A stop is a paused tick whose `stopId` the client has not acted on (for a v2
   server: the change from running to paused). On a stop the disassembly views scroll to the
   program counter if its line is not on screen, the disassembly and memory views read again,
   and a breakpoint that caused it is announced. No other tick does any of that. The views
   also read again after their own actions, and when a game is loaded where there was none.
+  When stops arrive faster than the page renders them (a script stepping through another
+  client), their ticks are all applied, and the views move and read for the latest only.
 - **Registers.** `registers` of a tick is merged per path (`src/state/tickState.ts`); nothing
   of a connection is kept for the next. `dc.sh4.cpu` is dimmed while `registersStale` is set.
 - **Targets.** Instruction size, address format, default addresses and what works come from

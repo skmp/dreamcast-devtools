@@ -55,7 +55,7 @@ export const documentationSections: DocumentationSection[] = [
         items: [
           "Native builds open one WebSocket. Its endpoint is the first of: `?ws=ws://host:port/ws` in the address bar (in front of the `#`), the last endpoint entered by hand, `VITE_WS_URL` of the build, and `/ws` on the host that served the page. Served by the emulator, there is nothing to configure.",
           "WASM builds use BroadcastChannel: the UI listens for emulator announcements and connects to the announced instance; with several it shows a connection picker.",
-          "The status bar of a workspace shows the connection state and the endpoint. Click the endpoint to pick another one, or to enter any `ws://` or `wss://` URL by hand; that URL is remembered and used first from then on.",
+          "The status bar of a workspace shows the connection state and the endpoint. The endpoint is a button: click it, or press Enter on it, to pick another one, or to enter any `ws://` or `wss://` URL by hand; that URL is remembered and used first from then on.",
           "When the connection is lost the UI says so, shows no data as if it were live, and tries again after 1, 2, 5 and then every 10 seconds. `Stop` ends that; `Connect` and `Retry now` try at once. Every new connection is described again.",
           "Next to the run controls the UI shows whether the target runs and why it is stopped. What a server cannot do (`targets` and `capabilities` of `debugger.describe`) is said in the panel concerned, in place of its controls.",
         ],
