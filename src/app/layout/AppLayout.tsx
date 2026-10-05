@@ -151,13 +151,6 @@ const connectionIcons = {
   connected: <CloudDoneIcon fontSize="small" />,
 };
 
-type Notification = {
-  id: string;
-  type: "error" | "warning";
-  message: string;
-  timestamp: number;
-};
-
 interface AppLayoutProps {
   workspaceId: string;
 }
@@ -171,20 +164,20 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const connectionError = useSessionStore((state) => state.connectionError);
   const endpoint = useSessionStore((state) => state.endpoint);
   const client = useSessionStore((state) => state.client);
-  const executionState = useSessionStore((state) => state.executionState);
+  // the run state is what the last tick said; before the first one it is not known
+  const executionState = useDebuggerDataStore((state) => state.executionState?.state);
   const showConnectionModal = useSessionStore((state) => state.showConnectionModal);
   const setShowConnectionModal = useSessionStore((state) => state.setShowConnectionModal);
   const initializeData = useDebuggerDataStore((state) => state.initialize);
-  const breakpointHit = useDebuggerDataStore((state) => state.breakpointHit);
-  const errorMessage = useDebuggerDataStore((state) => state.errorMessage);
-  const clearError = useDebuggerDataStore((state) => state.clearError);
+  const control = useDebuggerDataStore((state) => state.control);
+  const toasts = useDebuggerDataStore((state) => state.toasts);
+  const dismissToast = useDebuggerDataStore((state) => state.dismissToast);
   const [leftPanelOpen, setLeftPanelOpen] = useState(() => loadLayoutPrefs(workspaceId).leftPanelOpen);
   const [rightPanelOpen, setRightPanelOpen] = useState(() => loadLayoutPrefs(workspaceId).rightPanelOpen);
   const [isNarrow, setIsNarrow] = useState(window.innerWidth < 1200);
   const { open: aboutOpen, show: showAbout, hide: hideAbout } = useAboutModal();
   const { mode, toggleMode } = useThemeMode();
   const isDarkMode = mode === "dark";
-  const [notifications, setNotifications] = useState<Notification[]>([]);
   const [mainPanelApiState, setMainPanelApiState] = useState<DockviewApi | null>(null);
 
   // Use a ref to avoid stale closures
@@ -364,49 +357,6 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   }, [client, connectionState, initializeData]);
 
 
-  // Add error messages to notification stack
-  useEffect(() => {
-    if (errorMessage) {
-      const notification: Notification = {
-        id: `error-${Date.now()}`,
-        type: "error",
-        message: errorMessage,
-        timestamp: Date.now(),
-      };
-      setNotifications((prev) => [...prev, notification]);
-
-      // Auto-remove after 5 seconds
-      setTimeout(() => {
-        setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
-      }, 5000);
-
-      // Clear the error from the store
-      clearError();
-    }
-  }, [errorMessage, clearError]);
-
-  // Add breakpoint hits to notification stack
-  useEffect(() => {
-    if (breakpointHit) {
-      const bpDisplay = breakpointHit.breakpoint.kind === "event"
-        ? breakpointHit.breakpoint.event
-        : `${breakpointHit.breakpoint.event} == 0x${(breakpointHit.breakpoint.address ?? 0).toString(16).toUpperCase().padStart(8, "0")}`;
-      const notification: Notification = {
-        id: `breakpoint-${Date.now()}`,
-        type: "warning",
-        message: `Breakpoint hit: ${bpDisplay}`,
-        timestamp: Date.now(),
-      };
-      setNotifications((prev) => [...prev, notification]);
-
-      // Auto-remove after 5 seconds
-      setTimeout(() => {
-        setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
-      }, 5000);
-    }
-  }, [breakpointHit]);
-
-
   const handleToggleConnection = useCallback(() => {
     if (connectionState === "connected") {
       disconnect();
@@ -443,42 +393,10 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
     }
   }, [workspaceId]);
 
-  const handleRun = useCallback(async () => {
-    if (!client || connectionState !== "connected") {
-      return;
-    }
-    try {
-      await client.runUntil();
-      // State will be updated via notification from server
-    } catch (error) {
-      console.error("Failed to run", error);
-    }
-  }, [client, connectionState]);
-
-  const handlePause = useCallback(async () => {
-    if (!client || connectionState !== "connected") {
-      return;
-    }
-    try {
-      await client.pause("sh4");
-      // State will be updated via notification from server
-    } catch (error) {
-      console.error("Failed to pause", error);
-    }
-  }, [client, connectionState]);
-
-  const handleRunToBreakpoint = useCallback(async () => {
-    if (!client || connectionState !== "connected") {
-      return;
-    }
-    try {
-      // Run until breakpoint
-      await client.runUntil();
-      // State will be updated via notification from server
-    } catch (error) {
-      console.error("Failed to run to breakpoint", error);
-    }
-  }, [client, connectionState]);
+  // The server answers a control request as soon as it is armed; the ticks report what then
+  // happens. A refusal is shown (by `control`).
+  const handleRun = useCallback(() => void control("run"), [control]);
+  const handlePause = useCallback(() => void control("pause", "sh4"), [control]);
 
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
@@ -494,7 +412,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                   <IconButton
                     size="small"
                     color={connectionState === "connected" && executionState === "paused" ? "success" : "default"}
-                    disabled={connectionState !== "connected" || executionState === "running"}
+                    disabled={connectionState !== "connected" || executionState !== "paused"}
                     onClick={handleRun}
                   >
                     <PlayArrowIcon />
@@ -506,7 +424,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                   <IconButton
                     size="small"
                     color={connectionState === "connected" && executionState === "running" ? "warning" : "default"}
-                    disabled={connectionState !== "connected" || executionState === "paused"}
+                    disabled={connectionState !== "connected" || executionState !== "running"}
                     onClick={handlePause}
                   >
                     <PauseIcon />
@@ -518,8 +436,8 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                   <IconButton
                     size="small"
                     color={connectionState === "connected" && executionState === "paused" ? "primary" : "default"}
-                    disabled={connectionState !== "connected" || executionState === "running"}
-                    onClick={handleRunToBreakpoint}
+                    disabled={connectionState !== "connected" || executionState !== "paused"}
+                    onClick={handleRun}
                   >
                     <SkipNextIcon />
                   </IconButton>
@@ -686,15 +604,15 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
           pointerEvents: "none",
         }}
       >
-        {notifications.map((notification) => (
+        {toasts.map((toast) => (
           <Alert
-            key={notification.id}
-            severity={notification.type}
+            key={toast.id}
+            severity={toast.type}
             variant="filled"
-            onClose={() => setNotifications((prev) => prev.filter((n) => n.id !== notification.id))}
+            onClose={() => dismissToast(toast.id)}
             sx={{ pointerEvents: "auto" }}
           >
-            {notification.message}
+            {toast.message}
           </Alert>
         ))}
       </Box>

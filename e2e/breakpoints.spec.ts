@@ -11,6 +11,7 @@ import {
   KNOWN,
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
+import WebSocket from "ws";
 
 const entry = (view: Locator, text: string): Locator => view.getByRole("listitem").filter({ hasText: text });
 
@@ -352,4 +353,63 @@ test("the mute and solo buttons of a disassembly view work without a breakpoints
   await expect(tooltipButton(page, "Pause")).toBeEnabled();
   await page.waitForTimeout(1000);
   await expect(tooltipButton(page, "Pause")).toBeEnabled();
+});
+
+/** One request to the server from a client of its own, as another debugger window would send it. */
+const requestAsAnotherClient = (wsURL: string, method: string, params: unknown): Promise<unknown> =>
+  new Promise((resolve, reject) => {
+    const socket = new WebSocket(wsURL);
+    socket.once("error", reject);
+    socket.once("open", () => socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })));
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as { id?: number; result?: unknown };
+      if (message.id === 1) {
+        socket.close();
+        resolve(message.result);
+      }
+    });
+  });
+
+test("mute and solo are kept by the server: a reload shows them again, and so does a change made elsewhere", async ({
+  page,
+  mock,
+  rpc,
+}) => {
+  // The workspace has no breakpoints panel: nothing but the session itself tells the
+  // category buttons which connection to use, or what the server's state is.
+  await openWorkspace(page, "mixed-mode-debugger");
+  const sh4 = panel(page, "sh4-disassembly");
+  const arm7 = panel(page, "arm7-disassembly");
+  await sh4.getByRole("button", { name: "Mute category" }).click();
+  await expect(sh4.getByRole("button", { name: "Unmute category" })).toBeVisible();
+  await arm7.getByRole("button", { name: "Solo category" }).click();
+  await expect(arm7.getByRole("button", { name: "Unsolo category" })).toBeVisible();
+  // every request names all four categories, so that the server ends up with what the buttons show
+  expect(rpc.requests("breakpoints.setCategoryStates").at(-1)?.params).toEqual({
+    categories: {
+      events: { muted: false, soloed: false },
+      sh4: { muted: true, soloed: false },
+      arm7: { muted: false, soloed: true },
+      dsp: { muted: false, soloed: false },
+    },
+  });
+
+  // a new page of the same server: the buttons are as they were left, from its first tick
+  await page.reload();
+  await expect(panel(page, "sh4-disassembly").getByRole("button", { name: "Unmute category" })).toBeVisible();
+  await expect(panel(page, "arm7-disassembly").getByRole("button", { name: "Unsolo category" })).toBeVisible();
+  await expect(panel(page, "sh4-disassembly").getByRole("button", { name: "Solo category" })).toBeVisible();
+  expect(rpc.requests("breakpoints.setCategoryStates")).toHaveLength(2);
+
+  // another client unmutes the SH4 category and moves the solo to it: this page follows the tick
+  expect(
+    await requestAsAnotherClient(mock.wsURL, "breakpoints.setCategoryStates", {
+      categories: { sh4: { muted: false, soloed: true }, arm7: { muted: false, soloed: false } },
+    }),
+  ).toEqual({});
+  await expect(panel(page, "sh4-disassembly").getByRole("button", { name: "Mute category" })).toBeVisible();
+  await expect(panel(page, "sh4-disassembly").getByRole("button", { name: "Unsolo category" })).toBeVisible();
+  await expect(panel(page, "arm7-disassembly").getByRole("button", { name: "Solo category" })).toBeVisible();
+  // the page sent nothing for that
+  expect(rpc.requests("breakpoints.setCategoryStates")).toHaveLength(2);
 });

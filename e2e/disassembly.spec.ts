@@ -243,7 +243,8 @@ for (const target of TARGETS) {
 
       await tooltipButton(page, "Run").click();
       await expect(
-        page.getByRole("alert").filter({ hasText: `Breakpoint hit: ${target.event} == ${hex8(address)}` }),
+        // in the address format of the target: a DSP step is decimal
+        page.getByRole("alert").filter({ hasText: `Breakpoint hit: ${target.event} == ${target.format(address)}` }),
       ).toBeVisible();
       await expect(tooltipButton(page, "Run")).toBeEnabled();
       await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(address));

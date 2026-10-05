@@ -211,3 +211,46 @@ test("the delete button removes a watch", async ({ page }) => {
   await watches.getByRole("button", { name: "Remove dc.sh4.cpu.pc" }).click();
   await expect(watches.getByText("No watches subscribed.")).toBeVisible();
 });
+
+test("an expression is sent in lower case, whichever way it was added, and one that is watched is not sent again", async ({
+  page,
+  rpc,
+}) => {
+  await openWorkspace(page, "sh4-debugger");
+  const watches = panel(page, "watches");
+  const input = watches.getByPlaceholder("Enter expression");
+  const sent = () => rpc.requests("state.watch").map((frame) => frame.params);
+
+  // typed with the register name as the device tree prints it
+  await input.fill("  dc.sh4.cpu.VBR ");
+  await input.press("Enter");
+  await expect(watchRow(page, "dc.sh4.cpu.vbr")).toHaveText("dc.sh4.cpu.vbr = 0x8C000000");
+  expect(sent()).toEqual([{ expressions: ["dc.sh4.cpu.vbr"] }]);
+
+  // the + button of the device tree
+  await treeItemRow(page, "dc.sh4.cpu").click();
+  await tooltipButton(registerRow(page, "dc.sh4.cpu.reg.GBR"), "Add to watch").click();
+  await expect(watchRow(page, "dc.sh4.cpu.gbr")).toBeVisible();
+  expect(sent().at(-1)).toEqual({ expressions: ["dc.sh4.cpu.gbr"] });
+
+  // what the server has is not asked for again, in any case: dc.sh4.cpu.pc is the watch it started with
+  for (const again of ["DC.SH4.CPU.PC", "dc.sh4.cpu.Vbr", "dc.sh4.cpu.gbr"]) {
+    await input.fill(again);
+    await input.press("Enter");
+    await expect(input).toHaveValue("");
+  }
+  expect(sent()).toHaveLength(2);
+  await expect(watches.getByRole("listitem")).toHaveCount(3);
+  // and the device tree knows all three as watched
+  for (const register of ["PC", "VBR", "GBR"]) {
+    await expect(tooltipButton(registerRow(page, `dc.sh4.cpu.reg.${register}`), "Already in watch")).toBeDisabled();
+  }
+
+  // renaming sends lower case too, and keeps the place of the watch in the list
+  await watches.getByText("dc.sh4.cpu.vbr", { exact: true }).dblclick();
+  await watches.getByRole("listitem").getByRole("textbox").fill("dc.sh4.cpu.SR");
+  await watches.getByRole("listitem").getByRole("textbox").press("Enter");
+  await expect(watchRow(page, "dc.sh4.cpu.sr")).toBeVisible();
+  expect(rpc.requests("state.modifyWatchExpression").at(-1)?.params).toMatchObject({ newExpression: "dc.sh4.cpu.sr" });
+  await expect(watches.getByRole("listitem").nth(1)).toContainText("dc.sh4.cpu.sr = ");
+});

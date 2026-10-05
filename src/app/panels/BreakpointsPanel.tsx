@@ -21,9 +21,8 @@ import VolumeUpIcon from "@mui/icons-material/VolumeUp";
 import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
 import RadioButtonCheckedIcon from "@mui/icons-material/RadioButtonChecked";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import { useSessionStore } from "../../state/sessionStore";
-import { categoryStates, setClient, syncCategoryStatesToServer, type BreakpointCategory } from "../../state/breakpointCategoryState";
-import { useCallback, useState, useEffect } from "react";
+import { isCategoryActive, type BreakpointCategory } from "../../state/breakpointCategoryState";
+import { useCallback, useState } from "react";
 import type { BreakpointDescriptor } from "../../lib/debuggerSchema";
 
 const categorizeBreakpoint = (bp: BreakpointDescriptor): BreakpointCategory => {
@@ -91,15 +90,13 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
   const removeBreakpoint = useDebuggerDataStore((state) => state.removeBreakpoint);
   const addBreakpoint = useDebuggerDataStore((state) => state.addBreakpoint);
   const toggleBreakpoint = useDebuggerDataStore((state) => state.toggleBreakpoint);
-  const client = useSessionStore((state) => state.client);
+  // mute and solo are the server's state: every tick carries them, whoever changed them
+  const categoryStates = useDebuggerDataStore((state) => state.categories);
+  const toggleCategoryMute = useDebuggerDataStore((state) => state.toggleCategoryMute);
+  const toggleCategorySolo = useDebuggerDataStore((state) => state.toggleCategorySolo);
   const [newBreakpoint, setNewBreakpoint] = useState("");
 
   const filteredBreakpoints = filter ? breakpoints.filter(filter) : breakpoints;
-
-  // Set the client for the shared category state module
-  useEffect(() => {
-    setClient(client ?? null);
-  }, [client]);
 
   const handleRemove = useCallback(
     async (id: number) => {
@@ -115,33 +112,19 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
     [toggleBreakpoint],
   );
 
-  const handleMuteToggle = useCallback((category: BreakpointCategory) => {
-    const state = categoryStates.get(category);
-    if (state) {
-      state.muted = !state.muted;
-      if (state.muted) {
-        state.soloed = false; // Can't be both muted and soloed
-      }
-      syncCategoryStatesToServer();
-    }
-  }, []);
+  const handleMuteToggle = useCallback(
+    (category: BreakpointCategory) => {
+      void toggleCategoryMute(category);
+    },
+    [toggleCategoryMute],
+  );
 
-  const handleSoloToggle = useCallback((category: BreakpointCategory) => {
-    const state = categoryStates.get(category);
-    if (state) {
-      state.soloed = !state.soloed;
-      if (state.soloed) {
-        state.muted = false; // Can't be both muted and soloed
-        // Unsolo all other categories
-        for (const [cat, s] of categoryStates.entries()) {
-          if (cat !== category) {
-            s.soloed = false;
-          }
-        }
-      }
-      syncCategoryStatesToServer();
-    }
-  }, []);
+  const handleSoloToggle = useCallback(
+    (category: BreakpointCategory) => {
+      void toggleCategorySolo(category);
+    },
+    [toggleCategorySolo],
+  );
 
   const handleAdd = useCallback(async () => {
     const trimmed = newBreakpoint.trim();
@@ -204,9 +187,6 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
         {} as Record<BreakpointCategory, BreakpointDescriptor[]>,
       )
     : {};
-
-  // Check if any category is soloed
-  const anyCategorySoloed = Array.from(categoryStates.values()).some((s) => s.soloed);
 
   const categoryLabels: Record<BreakpointCategory, string> = {
     events: "Events",
@@ -277,8 +257,8 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
             const categoryBps: BreakpointDescriptor[] = categorizedBreakpoints[category] || [];
             if (categoryBps.length === 0) return null;
 
-            const state = categoryStates.get(category);
-            const isActive = state && !state.muted && (!anyCategorySoloed || state.soloed);
+            const state = categoryStates[category];
+            const isActive = isCategoryActive(categoryStates, category);
 
             return (
               <Box key={category}>
@@ -300,8 +280,8 @@ const BreakpointsView = ({ filter, addMode, showCategoryControls = false }: Brea
                   <CategoryControls
                     onMuteToggle={() => handleMuteToggle(category)}
                     onSoloToggle={() => handleSoloToggle(category)}
-                    muted={state?.muted ?? false}
-                    soloed={state?.soloed ?? false}
+                    muted={state.muted}
+                    soloed={state.soloed}
                   />
                 </Box>
                 <List dense disablePadding>

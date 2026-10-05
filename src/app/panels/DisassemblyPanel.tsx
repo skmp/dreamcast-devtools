@@ -3,7 +3,7 @@ import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import SubdirectoryArrowRightIcon from "@mui/icons-material/SubdirectoryArrowRight";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import { categoryStates, setClient, syncCategoryStatesToServer, type BreakpointCategory } from "../../state/breakpointCategoryState";
+import type { BreakpointCategory } from "../../state/breakpointCategoryState";
 import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks, type DisassemblyViewRef } from "../components/DisassemblyView";
 import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
 import { generateUUID } from "../../lib/uuid";
@@ -52,13 +52,17 @@ interface DisassemblyPanelProps {
 
 const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => {
   const client = useSessionStore((state) => state.client);
-  const executionState = useSessionStore((state) => state.executionState);
+  // what the last tick said; a target of which nothing is known yet is not stepped
+  const executionState = useDebuggerDataStore((state) => state.executionState?.state ?? "running");
   const initialized = useDebuggerDataStore((state) => state.initialized);
   const breakpoints = useDebuggerDataStore((state) => state.breakpoints);
   const registersByPath = useDebuggerDataStore((state) => state.registersByPath);
   const addBreakpoint = useDebuggerDataStore((state) => state.addBreakpoint);
   const removeBreakpoint = useDebuggerDataStore((state) => state.removeBreakpoint);
   const toggleBreakpoint = useDebuggerDataStore((state) => state.toggleBreakpoint);
+  const toggleCategoryMute = useDebuggerDataStore((state) => state.toggleCategoryMute);
+  const toggleCategorySolo = useDebuggerDataStore((state) => state.toggleCategorySolo);
+  const control = useDebuggerDataStore((state) => state.control);
   const viewRef = useRef<DisassemblyViewRef>(null);
   const panelIdRef = useRef(generateUUID());
 
@@ -91,15 +95,10 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
     return map;
   }, [breakpoints, target]);
 
-  // The mute/solo buttons send the category states through this module-level client. The
-  // breakpoints panels register it too, but a workspace does not have to contain one.
-  useEffect(() => {
-    setClient(client ?? null);
-  }, [client]);
-
-  // Get category state
+  // Mute and solo of the category are the server's state: the store has what the last tick
+  // said, and sends what a button asks for on the connection of the session.
   const category: BreakpointCategory = target === "sh4" ? "sh4" : target === "arm7" ? "arm7" : "dsp";
-  const categoryState = categoryStates.get(category);
+  const categoryState = useDebuggerDataStore((state) => state.categories[category]);
 
   // Build configuration
   const config: DisassemblyViewConfig = useMemo(() => {
@@ -129,28 +128,24 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
         const result = await client.fetchDisassembly({ target, address, count });
         return result.lines;
       },
+      // the answer of the server is checked by `control`, which shows a refusal
       onStep: async () => {
-        if (!client || executionState !== "paused") {
+        if (executionState !== "paused") {
           return;
         }
-        const isDsp = target === "dsp";
-        if (isDsp) {
-          await client.step(target);
-        } else {
-          await client.stepOver(target);
-        }
+        await control(target === "dsp" ? "step" : "stepOver", target);
       },
       onStepIn: async () => {
-        if (!client || executionState !== "paused") {
+        if (executionState !== "paused") {
           return;
         }
-        await client.step(target);
+        await control("step", target);
       },
       onStepOut: async () => {
-        if (!client || executionState !== "paused") {
+        if (executionState !== "paused") {
           return;
         }
-        await client.stepOut(target);
+        await control("stepOut", target);
       },
       onBreakpointAdd: async (address: number) => {
         const cpuPath = target === "dsp" ? "dc.aica.dsp" : target === "sh4" ? "dc.sh4.cpu" : "dc.aica.arm7";
@@ -165,33 +160,13 @@ const DisassemblyPanel = ({ target, defaultAddress }: DisassemblyPanelProps) => 
         await toggleBreakpoint(id, enabled);
       },
       onMuteToggle: () => {
-        const state = categoryStates.get(category);
-        if (state) {
-          state.muted = !state.muted;
-          if (state.muted) {
-            state.soloed = false;
-          }
-          syncCategoryStatesToServer();
-        }
+        void toggleCategoryMute(category);
       },
       onSoloToggle: () => {
-        const state = categoryStates.get(category);
-        if (state) {
-          state.soloed = !state.soloed;
-          if (state.soloed) {
-            state.muted = false;
-            // Unsolo all other categories
-            for (const [cat, s] of categoryStates.entries()) {
-              if (cat !== category) {
-                s.soloed = false;
-              }
-            }
-          }
-          syncCategoryStatesToServer();
-        }
+        void toggleCategorySolo(category);
       },
     }),
-    [client, target, executionState, addBreakpoint, removeBreakpoint, toggleBreakpoint, category],
+    [client, target, executionState, control, addBreakpoint, removeBreakpoint, toggleBreakpoint, toggleCategoryMute, toggleCategorySolo, category],
   );
 
   // Register with navigation service

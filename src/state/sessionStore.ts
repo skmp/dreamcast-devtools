@@ -4,7 +4,6 @@ import { DebuggerClient } from "../services/debuggerClient";
 import { ConnectionDiscovery, type AvailableConnection } from "../services/transport";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
-export type ExecutionState = "running" | "paused";
 
 interface SessionStore {
   client?: DebuggerClient;
@@ -12,12 +11,10 @@ interface SessionStore {
   endpoint?: string;
   connectionState: ConnectionState;
   connectionError?: string;
-  executionState: ExecutionState;
   connectionDiscovery?: ConnectionDiscovery;
   availableConnections: AvailableConnection[];
   selectedConnectionId?: string;
   showConnectionModal: boolean;
-  setExecutionState: (state: ExecutionState) => void;
   connect: (options?: { force?: boolean; connectionId?: string }) => Promise<void>;
   disconnect: () => void;
   startDiscovery: () => void;
@@ -29,12 +26,8 @@ interface SessionStore {
 export const useSessionStore = create<SessionStore>()((set, get) => ({
   mode: appConfig.mode,
   connectionState: "idle",
-  executionState: "running",
   availableConnections: [],
   showConnectionModal: false,
-  setExecutionState(state) {
-    set({ executionState: state });
-  },
   startDiscovery() {
     const current = get();
     if (current.connectionDiscovery) {
