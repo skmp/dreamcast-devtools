@@ -5,14 +5,18 @@ import {
   currentInstructionAddress,
   disassemblyRow,
   disassemblyRows,
+  gotoRoute,
   openWorkspace,
   panel,
   pauseFromToolbar,
   recordFlashes,
   registerRow,
+  statusBar,
   tooltipButton,
   treeItemRow,
 } from "./support/fixtures";
+
+import { serveScriptedDebugger } from "./support/scriptedDebugger";
 
 const hex8 = (address: number) => `0x${address.toString(16).toUpperCase().padStart(8, "0")}`;
 
@@ -103,8 +107,9 @@ for (const { name, workspace, id, disassembly, symbol, node, linkRegister, linkL
   });
 }
 
-/** "HH:MM:SS.mmm SUBSYSTEM message" */
-const LOG_LINE = /^\d{2}:\d{2}:\d{2}\.\d{3} (SH4|HOLLY|TA|CORE|AICA|DSP|ARM7|GDROM|MAPLE|SYSTEM|DEBUGGER) \S/;
+/** "HH:MM:SS.mmm SUBSYSTEM @cycles event message": when (wall clock), who, when (SH4 cycles), which event, what */
+const LOG_LINE =
+  /^\d{2}:\d{2}:\d{2}\.\d{3} (SH4|HOLLY|TA|CORE|AICA|DSP|ARM7|GDROM|MAPLE|SYSTEM|DEBUGGER) @\d+ dc\.[a-z0-9_.]+ \S/;
 
 test("Events: Log follows the target while it runs, newest first, and stands still while it is paused", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
@@ -127,10 +132,16 @@ test("Events: Log follows the target while it runs, newest first, and stands sti
     expect(text).toMatch(LOG_LINE);
   }
   // what the mock raises without a breakpoint: key on / key off and GD-ROM commands, the low-rate events
-  expect(paused.some((text) => /AICA key on: channel \d+$/.test(text))).toBe(true);
+  // each with the name of its event (what an event breakpoint takes) and the SH4 cycle it was raised in
+  expect(paused.some((text) => /AICA @\d+ dc\.aica\.channels\.key_on key on: channel \d+$/.test(text))).toBe(true);
   for (const text of paused) {
-    expect(text).toMatch(/(AICA key (on|off): channel \d+|GDROM packet command 0x30 \(CD_READ\), sector \d+|SH4 exception: TRAPA #0x20)$/);
+    expect(text).toMatch(
+      /(AICA @\d+ dc\.aica\.channels\.key_(on|off) key (on|off): channel \d+|GDROM @\d+ dc\.gdrom\.command packet command 0x30 \(CD_READ\), sector \d+|SH4 @\d+ dc\.sh4\.exception exception: TRAPA #0x20)$/,
+    );
   }
+  // the cycles do not go back: the list is newest first
+  const cycles = paused.map((text) => BigInt(/ @(\d+) /.exec(text)![1]));
+  expect(cycles).toEqual([...cycles].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0)));
   // newest first
   const pausedStamps = paused.map((text) => text.slice(0, 12));
   expect(pausedStamps).toEqual([...pausedStamps].sort().reverse());
@@ -166,7 +177,7 @@ test("a high-rate event is logged only while a breakpoint on it exists, and such
   // entries (a low-rate event of the same emulation step can be newer)
   const vblank = log.filter({ hasText: "vblank" });
   await expect(vblank).toHaveCount(1);
-  await expect(vblank).toHaveText(/^\d{2}:\d{2}:\d{2}\.\d{3} CORE vblank in, frame \d+$/);
+  await expect(vblank).toHaveText(/^\d{2}:\d{2}:\d{2}\.\d{3} CORE @\d+ dc\.holly\.core\.vblank vblank in, frame \d+$/);
   const newest = (await log.allInnerTexts()).slice(0, 3);
   expect(newest.some((text) => text.includes("vblank"))).toBe(true);
 });
@@ -200,4 +211,30 @@ test("the callstack says how it was found: frame by frame, and as a whole", asyn
   await page.getByRole("button", { name: "Disconnect", exact: true }).click();
   await expect(view).toContainText("No Data");
   await expect(frames).toHaveCount(0);
+});
+
+test("the event log shows what it does not know as it comes: a new subsystem, a new severity, no metadata", async ({ page }) => {
+  // a server inside the test, which logs what the mock would not
+  const server = await serveScriptedDebugger(page);
+  server.state.eventLog = [
+    { eventId: "1", timestamp: 1_700_000_000_000, subsystem: "sh4", severity: "info", message: "known", metadata: { event: "dc.sh4.interrupt", cycles: "448" } },
+    { eventId: "2", timestamp: 1_700_000_000_001, subsystem: "netplay", severity: "fatal", message: "from the future", metadata: { event: "dc.netplay.desync", cycles: "18446744073709551615", extra: 1 } },
+    // a v2 server sends no metadata
+    { eventId: "3", timestamp: 1_700_000_000_002, subsystem: "holly", severity: "warn", message: "bare" },
+  ];
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await addPanelFromSelector(page, 1, "Events: Log");
+  const entries = panel(page, "events").getByRole("listitem");
+
+  // newest first
+  await expect(entries).toHaveText([
+    /^\d{2}:\d{2}:\d{2}\.002 HOLLY bare$/,
+    // the cycle count is a 64-bit decimal string and is printed as it is
+    /^\d{2}:\d{2}:\d{2}\.001 NETPLAY @18446744073709551615 dc\.netplay\.desync from the future$/,
+    /^\d{2}:\d{2}:\d{2}\.000 SH4 @448 dc\.sh4\.interrupt known$/,
+  ]);
+  await expect(entries.nth(1).getByText("@18446744073709551615")).toHaveAttribute("title", "SH4 cycles when the event was raised");
+  await expect(entries.nth(1).getByText("dc.netplay.desync")).toHaveAttribute("title", "Event (the name an event breakpoint takes)");
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });

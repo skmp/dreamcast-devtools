@@ -31,6 +31,9 @@ export const EventLogPanel = () => {
               fractionalSecondDigits: 3
             });
             const tag = entry.subsystem.toUpperCase().padEnd(6, " ");
+            // a v3 server says which event this is and when, in SH4 cycles, it was raised
+            const event = typeof entry.metadata?.event === "string" ? entry.metadata.event : undefined;
+            const cycles = typeof entry.metadata?.cycles === "string" ? entry.metadata.cycles : undefined;
 
             return (
               <ListItem key={entry.eventId} sx={{ py: 0.25, px: 1 }}>
@@ -58,6 +61,20 @@ export const EventLogPanel = () => {
                   >
                     {tag.trim()}
                   </Box>{" "}
+                  {cycles !== undefined && (
+                    <>
+                      <Box component="span" title="SH4 cycles when the event was raised" sx={{ color: "text.secondary" }}>
+                        @{cycles}
+                      </Box>{" "}
+                    </>
+                  )}
+                  {event !== undefined && (
+                    <>
+                      <Box component="span" title="Event (the name an event breakpoint takes)" sx={{ color: "text.secondary" }}>
+                        {event}
+                      </Box>{" "}
+                    </>
+                  )}
                   {entry.message}
                 </Typography>
               </ListItem>
