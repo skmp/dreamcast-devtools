@@ -199,6 +199,47 @@ describe("ticks", () => {
     expect(store().toasts).toEqual([]);
   });
 
+  it("a subscriber that throws on a tick does not keep it from the subscribers after it, or its breakpoint from being announced", async () => {
+    const { transport } = await initialise(tickFrame({ state: "running", stopId: 1 }));
+
+    // subscribers are called in the order in which they subscribed; the first fails once for every stop
+    const failed = new Set<number>();
+    const unsubscribeFirst = useDebuggerDataStore.subscribe((state) => {
+      const stopId = state.executionState?.stopId;
+      if (stopId !== undefined && stopId > 1 && !failed.has(stopId)) {
+        failed.add(stopId);
+        throw new Error("Maximum update depth exceeded");
+      }
+    });
+    const heard: Array<number | undefined> = [];
+    const unsubscribeSecond = useDebuggerDataStore.subscribe((state) => heard.push(state.executionState?.stopId));
+
+    // a stop that nothing else follows: the subscriber after the one that threw is told of it all the same
+    const step = { state: "paused", stopId: 2, reason: "step" };
+    expect(() => transport.deliver(tickFrame(step))).not.toThrow();
+    expect(store().executionState).toEqual(step);
+    expect(heard).toEqual([2]);
+    expect(console.error).toHaveBeenCalledTimes(1);
+    expect(console.error).toHaveBeenCalledWith(
+      "A subscriber of the debugger data failed on a tick",
+      expect.objectContaining({ message: "Maximum update depth exceeded" }),
+    );
+
+    // a stop at a breakpoint: the tick is handled to its end
+    const hit = { state: "paused", stopId: 3, reason: "breakpoint", breakpointId: 4 };
+    const breakpoints = { "4": { id: 4, event: "dc.sh4.cpu.pc", address: 0x8c0000a6, kind: "code", enabled: true } };
+    transport.deliver(tickFrame(hit, { breakpoints }));
+    expect(store().toasts.map((toast) => toast.message)).toEqual(["Breakpoint hit: dc.sh4.cpu.pc == 0x8C0000A6"]);
+    expect(console.error).toHaveBeenCalledTimes(2);
+
+    // the tick after it is an ordinary one
+    transport.deliver(tickFrame({ state: "running", stopId: 3 }));
+    expect(store().executionState?.state).toBe("running");
+    expect(console.error).toHaveBeenCalledTimes(2);
+    unsubscribeFirst();
+    unsubscribeSecond();
+  });
+
   it("a tick that fails validation is dropped and counted, with the place that is wrong; the next good one is applied", async () => {
     const { transport } = await initialise();
     const bad = tickFrame({ state: "running", stopId: 1 });

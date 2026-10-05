@@ -100,9 +100,30 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
     setTimeout(() => get().dismissToast(id), TOAST_MS);
   };
 
+  /**
+   * Puts the state of a tick into the store. The store replaces its state and then calls its
+   * subscribers in turn. When one of them throws (React does when it is asked for a fifty-first
+   * render in a row), the ones after it have not heard of the tick and go on showing the one
+   * before, and for the tick of a stop there may be no next one to put that right. So the
+   * failure is logged instead of ending the tick halfway, and everyone is called once more.
+   */
+  const publish = (state: LiveState) => {
+    try {
+      set(state);
+    } catch (error) {
+      console.error("A subscriber of the debugger data failed on a tick", error);
+      try {
+        // the same values in a new state object: every subscriber is called again
+        set({});
+      } catch (again) {
+        console.error("A subscriber of the debugger data failed on a tick again", again);
+      }
+    }
+  };
+
   const handleTick = (tick: DebuggerTick) => {
     const outcome = applyTick(get(), tick);
-    set(outcome.state);
+    publish(outcome.state);
     if (outcome.hit) {
       const text = "event" in outcome.hit ? describeBreakpoint(get().shape, outcome.hit) : `#${outcome.hit.id}`;
       notify("warning", `Breakpoint hit: ${text}`);
