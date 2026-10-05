@@ -1,6 +1,17 @@
 import { useCallback, useMemo, useState } from "react";
 import { Panel } from "../layout/Panel";
-import { Autocomplete, Box, Button, IconButton, List, ListItem, Stack, TextField, Typography } from "@mui/material";
+import {
+  Autocomplete,
+  Box,
+  Button,
+  IconButton,
+  List,
+  ListItem,
+  Stack,
+  TextField,
+  Typography,
+  createFilterOptions,
+} from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import type { DeviceNodeDescriptor } from "../../lib/debuggerSchema";
@@ -209,6 +220,11 @@ const WatchItem = ({ expression, value, onRemove, onEdit, onModifyExpression }: 
   );
 };
 
+// The suggestion popup is not virtualised: with every register of a real machine as an
+// option it would mount thousands of rows. Show the best matches and let typing narrow them.
+const MAX_SUGGESTIONS = 50;
+const filterSuggestions = createFilterOptions<string>({ limit: MAX_SUGGESTIONS });
+
 // Helper to collect all register paths from device tree
 const collectRegisterPaths = (nodes: DeviceNodeDescriptor[]): string[] => {
   const paths: string[] = [];
@@ -281,6 +297,7 @@ export const WatchesPanel = () => {
             fullWidth
             freeSolo
             options={availablePaths}
+            filterOptions={filterSuggestions}
             // The typed text is the input value, not a selected option: bound to `value`,
             // MUI treats it as the selection and stops filtering the suggestions by it.
             value={null}

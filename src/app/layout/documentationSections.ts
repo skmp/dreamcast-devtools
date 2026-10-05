@@ -75,7 +75,7 @@ export const documentationSections: DocumentationSection[] = [
           "SH4 Debugger, ARM7 Debugger, Audio Debugger and Mixed Mode Debugger are dockable panel layouts.",
           "Each workspace stores its panel layout in the browser's localStorage. `Reset layout` in the top bar restores the default.",
           "The `+` button in a panel group's header adds another panel to that group.",
-          "Device Tree shows the tree returned by `debugger.describe` with the register values of the latest tick. Watches lists the watched expressions, and Events: Log shows the event log of the latest tick.",
+          "Device Tree shows the tree returned by `debugger.describe` with the register values of the latest tick. Its search box narrows the tree word by word (node, then register) and shows at most 200 matching rows. Watches lists the watched expressions, and Events: Log shows the event log of the latest tick.",
         ],
       },
       {

@@ -109,10 +109,9 @@ test("the search box filters the tree and expands the matches", async ({ page })
   await expect(treeItem(page, "dc.holly")).toHaveAttribute("aria-expanded", "true");
 });
 
-test.fixme("nodes the user expanded stay expanded after a search", async ({ page }) => {
-  // BROKEN: DeviceTreePanel derives the expanded set from the search text and remounts the
-  // tree (key={treeKey}, defaultExpandedItems) whenever it changes, so clearing a search
-  // resets the tree to "first two levels" and forgets what the user opened.
+test("nodes the user expanded stay expanded after a search", async ({ page }) => {
+  // regression: the expanded set was derived from the search text and the tree remounted
+  // whenever it changed, so clearing a search reset the tree to "first two levels"
   await openWorkspace(page, "sh4-debugger");
   await treeItemRow(page, "dc.sh4.cpu").click();
   await treeItemRow(page, "dc.holly").click();
