@@ -64,6 +64,27 @@ describe("DebuggerClient", () => {
     await described;
   });
 
+  it("a tick handler that throws does not keep the tick from the handlers after it", () => {
+    const { transport, client } = setup();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const ticks: number[] = [];
+    client.onNotification(() => {
+      throw new Error("Maximum update depth exceeded");
+    });
+    client.onNotification((notification) => ticks.push(notification.payload.tickId));
+    const frame = (tickId: number) => ({
+      jsonrpc: "2.0",
+      method: "event.tick",
+      params: { tickId, timestamp: 1, executionState: { state: "running", stopId: 0 }, registers: {}, breakpoints: {}, eventLog: [] },
+    });
+    expect(() => transport.deliver(frame(1))).not.toThrow();
+    transport.deliver(frame(2));
+    expect(ticks).toEqual([1, 2]);
+    expect(error).toHaveBeenCalledTimes(2);
+    expect(error).toHaveBeenCalledWith("A handler of event.tick failed", expect.objectContaining({ message: "Maximum update depth exceeded" }));
+    vi.restoreAllMocks();
+  });
+
   it("uses typed methods for every v3 request", async () => {
     const { transport, client } = setup();
     const calls = [

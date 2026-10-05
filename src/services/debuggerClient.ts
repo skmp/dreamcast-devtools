@@ -59,7 +59,14 @@ export class DebuggerClient {
     this.rpc.onNotification((notification) => {
       const mapped = mapNotification(notification);
       if (mapped) {
-        this.notificationHandlers.forEach((handler) => handler(mapped));
+        // as in JsonRpcClient: a handler that throws does not keep the tick from the others
+        this.notificationHandlers.forEach((handler) => {
+          try {
+            handler(mapped);
+          } catch (error) {
+            console.error(`A handler of ${notification.method} failed`, error);
+          }
+        });
       }
     });
   }

@@ -253,7 +253,15 @@ export class JsonRpcClient<S extends RpcSchema> {
         }
       }
 
-      this.notificationHandlers.forEach((handler) => handler(notification));
+      // Every handler gets the notification: one that throws does not keep it from the others,
+      // and does not end the handling of the frame.
+      this.notificationHandlers.forEach((handler) => {
+        try {
+          handler(notification);
+        } catch (error) {
+          console.error(`A handler of ${notification.method} failed`, error);
+        }
+      });
       return;
     }
 

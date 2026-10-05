@@ -142,6 +142,31 @@ describe("JsonRpcClient", () => {
     expect(console.error).toHaveBeenCalledTimes(1);
   });
 
+  it("a notification handler that throws does not keep the notification from the other handlers, or the next one from all", () => {
+    const { transport, client, reports } = setup();
+    const first: number[] = [];
+    const last: number[] = [];
+    client.onNotification((notification) => first.push((notification.params as { tickId: number }).tickId));
+    client.onNotification((notification) => {
+      if ((notification.params as { tickId: number }).tickId === 1) {
+        throw new Error("Maximum update depth exceeded");
+      }
+    });
+    client.onNotification((notification) => last.push((notification.params as { tickId: number }).tickId));
+
+    expect(() => transport.deliver({ jsonrpc: "2.0", method: "event.tick", params: tick({ tickId: 1 }) })).not.toThrow();
+    expect(first).toEqual([1]);
+    expect(last).toEqual([1]);
+    // it is said, with the error itself; the tick was a good one and is not reported as dropped
+    expect(console.error).toHaveBeenCalledTimes(1);
+    expect(console.error).toHaveBeenCalledWith("A handler of event.tick failed", expect.objectContaining({ message: "Maximum update depth exceeded" }));
+    expect(reports).toEqual([]);
+
+    transport.deliver({ jsonrpc: "2.0", method: "event.tick", params: tick({ tickId: 2 }) });
+    expect(first).toEqual([1, 2]);
+    expect(last).toEqual([1, 2]);
+  });
+
   it("delivers notifications of methods it has no schema for", () => {
     const { transport, client, reports } = setup();
     const methods: string[] = [];
