@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { Panel } from "../layout/Panel";
 import {
   Autocomplete,
@@ -245,14 +245,14 @@ const collectRegisterPaths = (nodes: DeviceNodeDescriptor[]): string[] => {
   return paths;
 };
 
-export const WatchesPanel = () => {
-  const initialized = useDebuggerDataStore((state) => state.initialized);
-  const watches = useDebuggerDataStore((state) => state.watches);
+/**
+ * The expression box and its button. A component of its own, and memoised: the panel renders
+ * again with every tick (the watch values), and a render of an open MUI Autocomplete drops
+ * the suggestion that the arrow keys highlighted. A running server sends five ticks a second.
+ */
+const AddWatchForm = memo(() => {
   const deviceTree = useDebuggerDataStore((state) => state.deviceTree);
   const addWatch = useDebuggerDataStore((state) => state.addWatch);
-  const removeWatch = useDebuggerDataStore((state) => state.removeWatch);
-  const editWatch = useDebuggerDataStore((state) => state.editWatch);
-  const modifyWatchExpression = useDebuggerDataStore((state) => state.modifyWatchExpression);
   const [newWatch, setNewWatch] = useState("");
 
   // Collect all available register paths from device tree
@@ -266,6 +266,50 @@ export const WatchesPanel = () => {
     await addWatch(trimmed);
     setNewWatch("");
   }, [newWatch, addWatch]);
+
+  return (
+    <Stack direction="row" spacing={1}>
+      <Autocomplete
+        size="small"
+        fullWidth
+        freeSolo
+        options={availablePaths}
+        filterOptions={filterSuggestions}
+        // The typed text is the input value, not a selected option: bound to `value`,
+        // MUI treats it as the selection and stops filtering the suggestions by it.
+        value={null}
+        inputValue={newWatch}
+        onInputChange={(_, newValue) => setNewWatch(newValue)}
+        renderInput={(params) => (
+          <TextField
+            {...params}
+            placeholder="Enter expression"
+            onKeyDown={(e) => {
+              // Enter on a highlighted suggestion completes the text (MUI does that)
+              const suggestionHighlighted = (e.target as HTMLElement).hasAttribute("aria-activedescendant");
+              if (e.key === "Enter" && !suggestionHighlighted) {
+                e.preventDefault();
+                void handleAdd();
+              }
+            }}
+            sx={{ "& .MuiOutlinedInput-root": { fontSize: "0.875rem", fontFamily: "monospace" } }}
+          />
+        )}
+      />
+      <Button size="small" variant="contained" onClick={handleAdd} sx={{ minWidth: 85 }}>
+        Add Watch
+      </Button>
+    </Stack>
+  );
+});
+AddWatchForm.displayName = "AddWatchForm";
+
+export const WatchesPanel = () => {
+  const initialized = useDebuggerDataStore((state) => state.initialized);
+  const watches = useDebuggerDataStore((state) => state.watches);
+  const removeWatch = useDebuggerDataStore((state) => state.removeWatch);
+  const editWatch = useDebuggerDataStore((state) => state.editWatch);
+  const modifyWatchExpression = useDebuggerDataStore((state) => state.modifyWatchExpression);
 
   const handleRemove = useCallback(
     async (watchId: number) => {
@@ -291,38 +335,7 @@ export const WatchesPanel = () => {
   return (
     <Panel>
       <Box sx={{ p: 1.5, borderBottom: "1px solid", borderColor: "divider" }}>
-        <Stack direction="row" spacing={1}>
-          <Autocomplete
-            size="small"
-            fullWidth
-            freeSolo
-            options={availablePaths}
-            filterOptions={filterSuggestions}
-            // The typed text is the input value, not a selected option: bound to `value`,
-            // MUI treats it as the selection and stops filtering the suggestions by it.
-            value={null}
-            inputValue={newWatch}
-            onInputChange={(_, newValue) => setNewWatch(newValue)}
-            renderInput={(params) => (
-              <TextField
-                {...params}
-                placeholder="Enter expression"
-                onKeyDown={(e) => {
-                  // Enter on a highlighted suggestion completes the text (MUI does that)
-                  const suggestionHighlighted = (e.target as HTMLElement).hasAttribute("aria-activedescendant");
-                  if (e.key === "Enter" && !suggestionHighlighted) {
-                    e.preventDefault();
-                    void handleAdd();
-                  }
-                }}
-                sx={{ "& .MuiOutlinedInput-root": { fontSize: "0.875rem", fontFamily: "monospace" } }}
-              />
-            )}
-          />
-          <Button size="small" variant="contained" onClick={handleAdd} sx={{ minWidth: 85 }}>
-            Add Watch
-          </Button>
-        </Stack>
+        <AddWatchForm />
       </Box>
       {!initialized ? (
         <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%" }}>
