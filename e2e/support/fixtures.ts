@@ -409,6 +409,70 @@ export const recordText = async (page: Page, selector: string): Promise<() => Pr
   return () => page.evaluate((name) => (window as unknown as Record<string, Array<{ at: number; text: string }>>)[name], key);
 };
 
+/** The page's debugger connection, put through the test (`holdResponses`). */
+export interface HeldResponses {
+  /** every request the page has sent, in order */
+  readonly sent: RpcFrame[];
+  /** Requests sent so far with this method. */
+  readonly requests: (method: string) => RpcFrame[];
+  /** how many answers are being held back now */
+  readonly held: () => number;
+  /** Lets the answers that are held back through. Later requests of the method are held again. */
+  readonly release: () => void;
+  /** Whether the answer to a request has been passed on to the page. */
+  readonly answered: (request: RpcFrame) => boolean;
+}
+
+/**
+ * Puts the page's WebSocket to /ws through the test, and holds back the server's answers to
+ * the requests of `method` until `release()`. Everything else passes as it comes. A server
+ * under load answers late (a busy emulator may take two seconds), and what the page does in
+ * the meantime is what such a test is about. Call it before the navigation.
+ */
+export const holdResponses = async (page: Page, method: string | RegExp): Promise<HeldResponses> => {
+  const sent: RpcFrame[] = [];
+  const awaited = new Set<number>();
+  const passedOn = new Set<number>();
+  const held: Array<() => void> = [];
+  const matches = (name: string | undefined) => name !== undefined && (typeof method === "string" ? name === method : method.test(name));
+  await page.routeWebSocket(/\/ws$/, (socket) => {
+    const server = socket.connectToServer();
+    socket.onMessage((message) => {
+      if (typeof message === "string") {
+        const frame = JSON.parse(message) as RpcFrame;
+        sent.push(frame);
+        if (frame.id !== undefined && matches(frame.method)) {
+          awaited.add(frame.id);
+        }
+      }
+      server.send(message);
+    });
+    server.onMessage((message) => {
+      if (typeof message === "string") {
+        const { id } = JSON.parse(message) as RpcFrame;
+        if (id !== undefined && awaited.delete(id)) {
+          held.push(() => {
+            passedOn.add(id);
+            socket.send(message);
+          });
+          return;
+        }
+        if (id !== undefined) {
+          passedOn.add(id);
+        }
+      }
+      socket.send(message);
+    });
+  });
+  return {
+    sent,
+    requests: (name) => sent.filter((frame) => frame.method === name),
+    held: () => held.length,
+    release: () => held.splice(0).forEach((send) => send()),
+    answered: (request) => request.id !== undefined && passedOn.has(request.id),
+  };
+};
+
 /**
  * Starts recording which disassembly rows flash (the "fadeOutTarget" animation of the
  * "target-address" class, which is removed again after two seconds, so it is recorded

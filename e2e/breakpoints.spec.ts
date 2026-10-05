@@ -11,8 +11,8 @@ import {
   tooltipButton,
   KNOWN,
 } from "./support/fixtures";
+import { requestAsAnotherClient } from "./support/mockServer";
 import type { Locator, Page } from "@playwright/test";
-import WebSocket from "ws";
 
 const entry = (view: Locator, text: string): Locator => view.getByRole("listitem").filter({ hasText: text });
 
@@ -356,21 +356,6 @@ test("the mute and solo buttons of a disassembly view work without a breakpoints
   await page.waitForTimeout(1000);
   await expect(tooltipButton(page, "Pause")).toBeEnabled();
 });
-
-/** One request to the server from a client of its own, as another debugger window would send it. */
-const requestAsAnotherClient = (wsURL: string, method: string, params: unknown): Promise<unknown> =>
-  new Promise((resolve, reject) => {
-    const socket = new WebSocket(wsURL);
-    socket.once("error", reject);
-    socket.once("open", () => socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })));
-    socket.on("message", (data) => {
-      const message = JSON.parse(data.toString()) as { id?: number; result?: unknown };
-      if (message.id === 1) {
-        socket.close();
-        resolve(message.result);
-      }
-    });
-  });
 
 test("mute and solo are kept by the server: a reload shows them again, and so does a change made elsewhere", async ({
   page,

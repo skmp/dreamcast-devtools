@@ -102,6 +102,21 @@ const addWatches = (wsURL: string, expressions: string[]): Promise<void> =>
     });
   });
 
+/** One request to the server from a client of its own, as another debugger window would send it. */
+export const requestAsAnotherClient = (wsURL: string, method: string, params: unknown): Promise<unknown> =>
+  new Promise((resolve, reject) => {
+    const socket = new WebSocket(wsURL);
+    socket.once("error", reject);
+    socket.once("open", () => socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })));
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as { id?: number; result?: unknown };
+      if (message.id === 1) {
+        socket.close();
+        resolve(message.result);
+      }
+    });
+  });
+
 /**
  * Starts the mock debugger server in production mode (it serves dist-native/ and
  * the WebSocket on one port). `port` restarts a server on a port a previous

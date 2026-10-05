@@ -5,14 +5,17 @@ import {
   currentInstructionAddress,
   disassemblyRow,
   disassemblyRows,
+  holdResponses,
   openWorkspace,
   panel,
   pauseFromToolbar,
   recordFlashes,
   tooltipButton,
   KNOWN,
+  type HeldResponses,
   type WorkspaceId,
 } from "./support/fixtures";
+import { requestAsAnotherClient } from "./support/mockServer";
 import type { Locator } from "@playwright/test";
 
 interface Target {
@@ -401,4 +404,107 @@ test("ticks do not make a disassembly view read again or move; a stop does both"
   await expect(view.locator(".current-instruction")).toHaveCount(1);
   await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
   await expect.poll(fetches).toBe(6);
+});
+
+test.describe("a breakpoint request that is answered late", () => {
+  // The server answers breakpoints.add, toggle and remove when it has done what they ask, and
+  // a busy emulator takes its time. The view reads its lines again when the answer is in:
+  // where it is then, which need not be where it was at the click.
+
+  /** The request for lines the view sent last has been answered, and the answer is on screen. */
+  const linesRead = async (view: Locator, connection: HeldResponses) => {
+    const request = connection.requests("state.getDisassembly").at(-1)!;
+    await expect.poll(() => connection.answered(request)).toBe(true);
+    await expect(view.getByText("Updating")).toBeHidden();
+  };
+
+  test("the target stops in the meantime: the view stays at the stop it followed", async ({ page, mock }) => {
+    const connection = await holdResponses(page, "breakpoints.add");
+    await openWorkspace(page, "sh4-debugger");
+    const view = panel(page, "sh4-disassembly");
+    const rows = disassemblyRows(view);
+    const fetches = () => connection.requests("state.getDisassembly");
+
+    // the user looks at code far from where the target runs, and sets a breakpoint there
+    const away = 0x8c010000;
+    await view.getByRole("textbox").fill(hex8(away));
+    await view.getByRole("textbox").press("Enter");
+    await expect(rows.first()).toHaveAttribute("data-address", String(away - 20));
+    const row = disassemblyRow(view, away + 8);
+    await row.hover();
+    await breakpointGutter(row).click();
+    await expect.poll(connection.held).toBe(1);
+
+    // while that request is out, the breakpoint of somebody else stops the target in its loop
+    const stop = 0x8c0000a4;
+    await requestAsAnotherClient(mock.wsURL, "breakpoints.add", { event: "dc.sh4.cpu.pc", address: stop, kind: "code" });
+    await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(stop));
+    await expect(rows.first()).toHaveAttribute("data-address", String(stop - 20));
+    await linesRead(view, connection);
+    const before = fetches().length;
+
+    // the answer arrives: the lines are read again where the view is now
+    connection.release();
+    await expect.poll(() => fetches().length).toBe(before + 1);
+    expect(fetches().at(-1)?.params).toEqual({ target: "sh4", address: stop - 20, count: 64 });
+    await linesRead(view, connection);
+    await expect(rows.first()).toHaveAttribute("data-address", String(stop - 20));
+    await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(stop));
+    await expect(view.getByRole("textbox")).toHaveValue(hex8(stop));
+
+    // the breakpoint the user asked for is there
+    await view.getByRole("textbox").fill(hex8(away + 8));
+    await view.getByRole("textbox").press("Enter");
+    await expect(breakpointGutter(disassemblyRow(view, away + 8))).toHaveAttribute("data-breakpoint", "enabled");
+  });
+
+  test.describe("with the view scrolled in the meantime", () => {
+    test.use({ mockOptions: { startPaused: true } });
+
+    test("adding, toggling and removing: the lines are read again where the view was scrolled to", async ({ page }) => {
+      const connection = await holdResponses(page, /^breakpoints\.(add|toggle|remove)$/);
+      await openWorkspace(page, "sh4-debugger");
+      const view = panel(page, "sh4-disassembly");
+      const rows = disassemblyRows(view);
+      const fetches = () => connection.requests("state.getDisassembly");
+      const opened = 0x8c0000a0 - 20;
+      const scrolled = opened + 4 * 6 * 2;
+      const row = disassemblyRow(view, 0x8c0000a8);
+      const gutter = breakpointGutter(row);
+
+      for (const edit of [
+        { method: "breakpoints.add", click: () => gutter.click(), marker: "enabled" },
+        { method: "breakpoints.toggle", click: () => gutter.click({ modifiers: ["Shift"] }), marker: "disabled" },
+        { method: "breakpoints.remove", click: () => gutter.click(), marker: "none" },
+      ]) {
+        await test.step(edit.method, async () => {
+          await expect(rows.first()).toHaveAttribute("data-address", String(opened));
+          await linesRead(view, connection);
+          await row.hover();
+          await edit.click();
+          await expect.poll(connection.held).toBe(1);
+          expect(connection.requests(edit.method)).toHaveLength(1);
+
+          // the user scrolls on: four notches of the wheel, 24 instructions
+          await page.mouse.wheel(0, 240);
+          await expect(rows.first()).toHaveAttribute("data-address", String(scrolled));
+          await linesRead(view, connection);
+          const box = await view.getByRole("textbox").inputValue();
+          const before = fetches().length;
+
+          connection.release();
+          await expect.poll(() => fetches().length).toBe(before + 1);
+          expect(fetches().at(-1)?.params).toEqual({ target: "sh4", address: scrolled, count: 64 });
+          await linesRead(view, connection);
+          // the listing is where the address box says it is
+          await expect(rows.first()).toHaveAttribute("data-address", String(scrolled));
+          await expect(view.getByRole("textbox")).toHaveValue(box);
+
+          await page.mouse.wheel(0, -240);
+          await expect(rows.first()).toHaveAttribute("data-address", String(opened));
+          await expect(gutter).toHaveAttribute("data-breakpoint", edit.marker);
+        });
+      }
+    });
+  });
 });

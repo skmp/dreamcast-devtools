@@ -262,6 +262,14 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   // Initialize address from default
   const [address, setAddress] = useState(defaultAddress);
   const [addressInput, setAddressInput] = useState(config.formatAddressInput(defaultAddress));
+  // Where the view is, or is going: a move sets it at once, and the state follows with the next
+  // render. What runs later than the render it was made in (the answer to a request, a timer)
+  // reads the place of the view from here, not from the `address` it was made with.
+  const targetRef = useRef(defaultAddress);
+  const moveTo = useCallback((next: number) => {
+    targetRef.current = next;
+    setAddress(next);
+  }, []);
 
   const requestIdRef = useRef(0);
   const wheelRemainder = useRef(0);
@@ -358,13 +366,13 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
       const contextOffset = config.instructionSize * 10;
       const targetAddress = Math.max(0, newPc - contextOffset);
       const normalizedTarget = normalizeAddress(targetAddress, config.maxAddress, config.instructionSize);
-      setAddress(normalizedTarget);
+      moveTo(normalizedTarget);
     }
 
     // Update previous execution state
     prevExecutionStateRef.current = executionState;
     markerRef.current = { currentPc, executionState };
-  }, [currentPc, executionState, config.instructionSize, config.maxAddress, followOnPause]);
+  }, [currentPc, executionState, config.instructionSize, config.maxAddress, followOnPause, moveTo]);
 
   const fetchDisassembly = useCallback(
     async (addr: number) => {
@@ -411,19 +419,16 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     if (!loading && pendingScrollSteps.current !== 0) {
       const steps = pendingScrollSteps.current;
       pendingScrollSteps.current = 0;
-      setAddress((prev: number) => normalizeAddress(prev + steps * config.instructionSize, config.maxAddress, config.instructionSize));
+      moveTo(normalizeAddress(targetRef.current + steps * config.instructionSize, config.maxAddress, config.instructionSize));
     }
-  }, [loading, config.instructionSize, config.maxAddress]);
+  }, [loading, config.instructionSize, config.maxAddress, moveTo]);
 
   const adjustAddress = useCallback(
     (steps: number) => {
       revealRef.current = undefined;
-      setAddress((prev: number) => {
-        const newAddr = normalizeAddress(prev + steps * config.instructionSize, config.maxAddress, config.instructionSize);
-        return newAddr;
-      });
+      moveTo(normalizeAddress(targetRef.current + steps * config.instructionSize, config.maxAddress, config.instructionSize));
     },
-    [config.instructionSize, config.maxAddress],
+    [config.instructionSize, config.maxAddress, moveTo],
   );
 
   const handleWheel = useCallback(
@@ -476,15 +481,17 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     const normalizedTarget = normalizeAddress(targetAddress, config.maxAddress, config.instructionSize);
 
     revealRef.current = undefined;
-    setAddress(normalizedTarget);
+    moveTo(normalizedTarget);
 
     // Flash the line once it is on screen (now, or after the fetch)
     applyHighlight(parsed);
-  }, [addressInput, config, applyHighlight]);
+  }, [addressInput, config, applyHighlight, moveTo]);
 
+  // Reads the lines again where the view is when this is called. The answer to a breakpoint
+  // request calls it some time after the click, and the view may have moved since.
   const handleRefresh = useCallback(() => {
-    void fetchDisassembly(normalizeAddress(address, config.maxAddress, config.instructionSize));
-  }, [fetchDisassembly, address, config.maxAddress, config.instructionSize]);
+    void fetchDisassembly(normalizeAddress(targetRef.current, config.maxAddress, config.instructionSize));
+  }, [fetchDisassembly, config.maxAddress, config.instructionSize]);
 
   /** Whether the line of an address is rendered and entirely inside what the panel shows. */
   const isLineOnScreen = useCallback((lineAddress: number) => {
@@ -505,14 +512,14 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         const start = normalizeAddress(Math.max(0, pc - config.instructionSize * 10), config.maxAddress, config.instructionSize);
         if (start !== address) {
           // the effect on `address` fetches
-          setAddress(start);
+          moveTo(start);
           return;
         }
       }
       // what the lines say can have changed with the stop (code that was just loaded or written)
       handleRefresh();
     },
-    [address, config.instructionSize, config.maxAddress, handleRefresh, isLineOnScreen],
+    [address, config.instructionSize, config.maxAddress, handleRefresh, isLineOnScreen, moveTo],
   );
 
   // The lines of a followed stop have been rendered. Ten instructions of context do not fit
@@ -534,8 +541,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     const fitting = lines.filter((line) => isLineOnScreen(line.address)).length;
     const context = reveal.adjusted ? 0 : Math.min(index, Math.max(0, Math.floor((fitting - 1) / 2)));
     revealRef.current = reveal.adjusted ? undefined : { pc: reveal.pc, adjusted: true };
-    setAddress(normalizeAddress(reveal.pc - context * config.instructionSize, config.maxAddress, config.instructionSize));
-  }, [lines, loading, isLineOnScreen, config.instructionSize, config.maxAddress]);
+    moveTo(normalizeAddress(reveal.pc - context * config.instructionSize, config.maxAddress, config.instructionSize));
+  }, [lines, loading, isLineOnScreen, config.instructionSize, config.maxAddress, moveTo]);
 
   // Expose methods via ref
   useImperativeHandle(ref, () => ({
@@ -545,7 +552,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
       const scrollAddr = Math.max(0, targetAddr - contextOffset);
       const normalizedAddr = normalizeAddress(scrollAddr, config.maxAddress, config.instructionSize);
       revealRef.current = undefined;
-      setAddress(normalizedAddr);
+      moveTo(normalizedAddr);
 
       if (highlight) {
         applyHighlight(targetAddr);
@@ -562,7 +569,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
       };
     },
     getTarget: () => target ?? "unknown",
-  }), [config.instructionSize, config.maxAddress, target, applyHighlight, followPc]);
+  }), [config.instructionSize, config.maxAddress, target, applyHighlight, followPc, moveTo]);
 
   const handleBreakpointClick = useCallback(
     async (lineAddress: number) => {
@@ -611,9 +618,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
       const contextOffset = config.instructionSize * 10;
       const targetAddress = Math.max(0, currentPc - contextOffset);
       revealRef.current = undefined;
-      setAddress(targetAddress);
+      moveTo(targetAddress);
     }
-  }, [currentPc, config.instructionSize]);
+  }, [currentPc, config.instructionSize, moveTo]);
 
   const handleStep = useCallback(async () => {
     if (executionState !== "paused") {
