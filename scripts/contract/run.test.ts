@@ -360,6 +360,12 @@ describe("the contract runner against the mock", () => {
     expect(summary.ok).toBe(true);
   });
 
+  it("S01, S03: a running tick that says registersStale is full without dc.sh4.cpu", async () => {
+    const summary = await run(undefined, ["S01", "S03"], { sliceContext: false });
+    expect(reportOf(summary)).toEqual(["S01 passed ", "S03 passed "]);
+    expect(summary.ok).toBe(true);
+  }, 30_000);
+
   it("S14: reconnects, i.e. the server has no client between the two connections", async () => {
     const mock = new ForgetfulMock();
     const { url } = await startServer(undefined, mock);

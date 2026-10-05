@@ -103,6 +103,15 @@ const isPaused = (tick: DebuggerTick) => tick.executionState.state === "paused";
 const isRunning = (tick: DebuggerTick) => tick.executionState.state === "running";
 const stopIdOf = (tick: DebuggerTick) => tick.executionState.stopId ?? fail("the tick has no stopId");
 
+/**
+ * The described paths a tick does not carry; none for a full tick. As in I5, a running tick
+ * that says `registersStale` is full without `dc.sh4.cpu`.
+ */
+const missingPaths = (session: ContractSession, tick: DebuggerTick): string[] =>
+  Array.from(session.index!.registers.keys()).filter(
+    (path) => !(path in tick.registers) && !(path === "dc.sh4.cpu" && isRunning(tick) && tick.executionState.registersStale === true),
+  );
+
 const ensurePaused = async (context: RunContext): Promise<TickRecord> => {
   const { session } = context;
   if (isPaused(session.latestTick().tick)) {
@@ -379,8 +388,7 @@ const s01: Scenario = {
     const response = session.frames.find((frame) => frame.seq >= mark && frame.kind === "response") ?? fail("the describe response was not recorded");
     const following = await session.waitForTick(() => true, 2000, "the tick that follows the debugger.describe response", response.seq);
     const first = following.tick;
-    const described = Array.from(session.index!.registers.keys());
-    const missing = described.filter((path) => !(path in first.registers));
+    const missing = missingPaths(session, first);
     if (first.executionState.reason !== "no-game") {
       check(missing.length === 0, `the tick after describe is full; it lacks ${missing.slice(0, 5).join(", ")}`);
     }
