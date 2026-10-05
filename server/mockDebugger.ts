@@ -847,14 +847,15 @@ export class MockDebugger {
     return this.clients.size;
   }
 
-  /** `debugger.describe` capabilities of this mock. */
+  /** `debugger.describe` capabilities of this mock, at the moment of the call. */
   get capabilities(): string[] {
     return [
       CAPABILITIES.EVENT_BREAKPOINTS,
       CAPABILITIES.CALLSTACK,
       CAPABILITIES.REGISTER_WRITE,
       CAPABILITIES.SGC_CAPTURE,
-      this.options.forceFallback ? CAPABILITIES.SH4_DEBUG_FALLBACK : CAPABILITIES.SH4_DEBUG_NATIVE,
+      // neither of the two before an SH4 backend is selected, i.e. while no game is loaded
+      ...(this.lifetime === "no-machine" ? [] : [this.options.forceFallback ? CAPABILITIES.SH4_DEBUG_FALLBACK : CAPABILITIES.SH4_DEBUG_NATIVE]),
     ];
   }
 
@@ -876,18 +877,24 @@ export class MockDebugger {
 
   /**
    * What the emulator's own window does to the machine: "stopped" is its pause or the guest's
-   * exit, "no-machine" is no game loaded, "running" resumes. Run control is refused while the
-   * machine is not running (-32001 / -32002).
+   * exit, "no-machine" is no game loaded, "running" resumes a stopped machine or starts a
+   * game. Run control is refused while the machine is not running (-32001 / -32002).
    */
   setLifetime(lifetime: MockLifetime, reason: "host-stopped" | "guest-exit" = "host-stopped"): void {
     if (lifetime === this.lifetime) {
       return;
     }
+    const gameStarts = lifetime === "running" && this.lifetime === "no-machine";
     this.lifetime = lifetime;
     this.pendingStepOut = undefined;
     this.stopBreakpointId = undefined;
     this.fallbackStep = false;
-    if (lifetime === "running") {
+    if (gameStarts && this.options.startPaused) {
+      // StartPaused parks once per start of a game
+      this.running = false;
+      this.stopId++;
+      this.reason = "start";
+    } else if (lifetime === "running") {
       // a debugger pause that was in force before the host stop is not re-applied
       this.running = true;
       this.reason = undefined;

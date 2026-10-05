@@ -612,6 +612,37 @@ describe("tick policy", () => {
     ]);
     session.ok("breakpoints.add", { event: "dc.sh4.interrupt" });
   });
+
+  it("with no game loaded no SH4 backend is selected: neither sh4-debug capability, until a game starts", () => {
+    const mock = createMock({ startPaused: true });
+    const session = connect(mock);
+    expect(session.describe().capabilities).toContain("sh4-debug-native");
+
+    mock.setLifetime("no-machine");
+    const without = session.describe().capabilities!;
+    expect(without.filter((capability) => capability.startsWith("sh4-debug-"))).toEqual([]);
+    expect(without).toContain("callstack");
+    expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: 2, reason: "no-game" });
+
+    // a game starts: StartPaused parks once per start, and the backend is selected
+    mock.setLifetime("running");
+    expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: 3, reason: "start" });
+    expect(session.describe().capabilities).toContain("sh4-debug-native");
+    session.ok("control.runUntil");
+    expect(session.lastTick().executionState).toEqual({ state: "running", stopId: 3 });
+
+    // without StartPaused the game runs
+    const running = createMock();
+    const other = connect(running);
+    running.setLifetime("no-machine");
+    running.setLifetime("running");
+    other.describe();
+    expect(other.lastTick().executionState).toEqual({ state: "running", stopId: 1 });
+
+    const fallback = createMock({ forceFallback: true });
+    fallback.setLifetime("no-machine");
+    expect(connect(fallback).describe().capabilities!.filter((capability) => capability.startsWith("sh4-debug-"))).toEqual([]);
+  });
 });
 
 describe("error table", () => {
