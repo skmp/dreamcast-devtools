@@ -6,6 +6,7 @@ import {
   openWorkspace,
   panel,
   registerRow,
+  saveScreenshot,
   statusBar,
   tooltipButton,
   treeItemRow,
@@ -76,6 +77,110 @@ test("Run to next breakpoint runs until a breakpoint stops the target", async ({
   await expect(page.getByRole("alert").filter({ hasText: "Breakpoint hit: dc.sh4.cpu.pc == 0x8C0000AA" })).toBeVisible();
   await expect(tooltipButton(page, "Run")).toBeEnabled();
   expect(await currentInstructionAddress(panel(page, "sh4-disassembly"))).toBe(0x8c0000aa);
+});
+
+test("next to the run controls: whether the target runs, why it is stopped and which stop it is", async ({ page }, testInfo) => {
+  await openWorkspace(page, "sh4-debugger");
+  const status = page.getByRole("status", { name: "Execution state" });
+  await expect(status).toHaveText("Running");
+
+  await tooltipButton(page, "Pause").click();
+  await expect(status).toHaveText("Paused · paused by the debugger · stop 1");
+
+  const view = panel(page, "sh4-disassembly");
+  await tooltipButton(view, "Step In").click();
+  await expect(status).toHaveText("Paused · step completed · stop 2");
+
+  // a breakpoint two instructions ahead: the stop names it, in the address format of its target
+  const start = await currentInstructionAddress(view);
+  const address = 0x8c0000a0 + ((start - 0x8c0000a0 + 4) % 16);
+  const row = view.locator(`[data-address="${address}"]`);
+  await row.hover();
+  await row.locator(".breakpoint-gutter").click();
+  await expect(row.locator(".breakpoint-gutter")).toHaveAttribute("data-breakpoint", "enabled");
+  // the tick that lists the new breakpoint is of the same stop: nothing about the stop changes
+  await expect(status).toHaveText("Paused · step completed · stop 2");
+  await tooltipButton(page, "Run").click();
+  await expect(status).toHaveText(`Paused · breakpoint dc.sh4.cpu.pc == 0x${address.toString(16).toUpperCase()} · stop 3`);
+  await saveScreenshot(page, testInfo, "toolbar-paused-at-breakpoint");
+
+  await tooltipButton(page, "Run to next breakpoint").click();
+  await expect(status).toHaveText(`Paused · breakpoint dc.sh4.cpu.pc == 0x${address.toString(16).toUpperCase()} · stop 4`);
+});
+
+test("a control request the server refuses says so; nothing is silently ignored", async ({ page }) => {
+  // the mock refuses a step whose precondition fails (-32005), in-band
+  await openWorkspace(page, "sh4-debugger");
+  await tooltipButton(page, "Pause").click();
+  const view = panel(page, "sh4-disassembly");
+  await expect(tooltipButton(view, "Step In")).toBeEnabled();
+  const status = page.getByRole("status", { name: "Execution state" });
+  await expect(status).toHaveText("Paused · paused by the debugger · stop 1");
+
+  // an odd program counter, written through the watch
+  const watches = panel(page, "watches");
+  await watches.getByText(/^0x8C0000A[0-9A-E]$/).dblclick();
+  await watches.getByRole("listitem").getByRole("textbox").fill("0x8C0000A1");
+  await watches.getByRole("listitem").getByRole("textbox").press("Enter");
+  await expect(watches).toContainText("dc.sh4.cpu.pc = 0x8C0000A1");
+
+  await tooltipButton(view, "Step In").click();
+  await expect(page.getByRole("alert").filter({ hasText: "Step: cannot step: pc is odd" })).toBeVisible();
+  await tooltipButton(view, "Step Over").click();
+  await expect(page.getByRole("alert").filter({ hasText: "Step over: cannot step: pc is odd" })).toBeVisible();
+  // no stop was made
+  await expect(status).toHaveText("Paused · paused by the debugger · stop 1");
+});
+
+test("the reason of a stop is an open string, and the notice of the server is shown with it", async ({ page }, testInfo) => {
+  // a server inside the test: it sends the ticks the test asks for
+  const server = await serveScriptedDebugger(page);
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  const status = page.getByRole("status", { name: "Execution state" });
+  const notice = page.getByRole("status", { name: "Notice from the server" });
+  await expect(status).toHaveText("Paused · paused by the debugger · stop 1");
+  await expect(notice).toHaveCount(0);
+
+  // every reason a v3 server sends has its words
+  for (const [reason, text] of [
+    ["start", "waiting at the start"],
+    ["event", "event breakpoint"],
+    ["reset", "reset"],
+    ["capture", "capture finished"],
+    ["host-stopped", "stopped in the emulator's window"],
+    ["guest-exit", "the program has exited"],
+    ["no-game", "no game loaded"],
+  ] as const) {
+    server.state.execution = { state: "paused", stopId: 2, reason };
+    server.tick();
+    await expect(status).toHaveText(`Paused · ${text} · stop 2`);
+  }
+  // one it does not know is shown as it came
+  server.state.execution = { state: "paused", stopId: 3, reason: "cosmic-ray" };
+  server.tick();
+  await expect(status).toHaveText("Paused · cosmic-ray · stop 3");
+  await expect(tooltipButton(page, "Run")).toBeEnabled();
+
+  // a notice: one line per statement
+  const lines = [
+    "SH4 runs on the interpreter while breakpoints are armed: FPU results can differ from a run without breakpoints",
+    "DSP runs per sample while a DSP breakpoint exists",
+  ];
+  server.state.execution = { state: "running", stopId: 3, notice: lines.join("\n") };
+  server.tick();
+  await expect(status).toHaveText("Running");
+  await expect(notice).toHaveText(lines.join(" · "));
+  // all of it can be read where there is no room for it
+  await expect(notice).toHaveAttribute("title", lines.join("\n"));
+  await expect(notice).toBeVisible();
+  await saveScreenshot(page, testInfo, "toolbar-notice");
+  // it is a statement, not an alarm
+  await expect(page.getByRole("alert")).toHaveCount(0);
+
+  server.state.execution = { state: "running", stopId: 3 };
+  server.tick();
+  await expect(notice).toHaveCount(0);
 });
 
 test("every control request is checked: an in-band error and a JSON-RPC error are both shown", async ({ page }) => {

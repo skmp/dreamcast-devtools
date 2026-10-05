@@ -53,6 +53,8 @@ import { DockingLayout, type PanelDefinition } from "./DockingLayout";
 import { clearDockingLayout } from "./dockingLayoutStorage";
 import type { DockviewApi } from "dockview";
 import { PANEL_IDS, type PanelId } from "../../lib/debuggerSchema";
+import { canResume } from "../../state/stopReasons";
+import { ExecutionStatus } from "./ExecutionStatus";
 
 // Panels that are large or bring a large dependency (Monaco, the DSP WebAssembly module,
 // the WebGL waveform renderer) are fetched when they are first shown. DockingLayout shows a
@@ -165,7 +167,8 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const endpoint = useSessionStore((state) => state.endpoint);
   const client = useSessionStore((state) => state.client);
   // the run state is what the last tick said; before the first one it is not known
-  const executionState = useDebuggerDataStore((state) => state.executionState?.state);
+  const execution = useDebuggerDataStore((state) => state.executionState);
+  const initialized = useDebuggerDataStore((state) => state.initialized);
   const showConnectionModal = useSessionStore((state) => state.showConnectionModal);
   const setShowConnectionModal = useSessionStore((state) => state.setShowConnectionModal);
   const initializeData = useDebuggerDataStore((state) => state.initialize);
@@ -398,6 +401,11 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const handleRun = useCallback(() => void control("run"), [control]);
   const handlePause = useCallback(() => void control("pause", "sh4"), [control]);
 
+  const connected = connectionState === "connected";
+  const runState = connected ? execution?.state : undefined;
+  // in the stops of the emulator's own window the server refuses run control
+  const resumable = runState === "paused" && canResume(execution?.reason);
+
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
       <AppBar position="static" elevation={1} color="default">
@@ -406,44 +414,38 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
           onResetLayout={handleResetLayout}
           currentPage={workspaceId}
           centerSection={
-            <Stack direction="row" spacing={1} alignItems="center">
-              <Tooltip title="Run">
-                <span>
-                  <IconButton
-                    size="small"
-                    color={connectionState === "connected" && executionState === "paused" ? "success" : "default"}
-                    disabled={connectionState !== "connected" || executionState !== "paused"}
-                    onClick={handleRun}
-                  >
-                    <PlayArrowIcon />
-                  </IconButton>
-                </span>
-              </Tooltip>
-              <Tooltip title="Pause">
-                <span>
-                  <IconButton
-                    size="small"
-                    color={connectionState === "connected" && executionState === "running" ? "warning" : "default"}
-                    disabled={connectionState !== "connected" || executionState !== "running"}
-                    onClick={handlePause}
-                  >
-                    <PauseIcon />
-                  </IconButton>
-                </span>
-              </Tooltip>
-              <Tooltip title="Run to next breakpoint">
-                <span>
-                  <IconButton
-                    size="small"
-                    color={connectionState === "connected" && executionState === "paused" ? "primary" : "default"}
-                    disabled={connectionState !== "connected" || executionState !== "paused"}
-                    onClick={handleRun}
-                  >
-                    <SkipNextIcon />
-                  </IconButton>
-                </span>
-              </Tooltip>
-            </Stack>
+            <Box sx={{ position: "relative" }}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Tooltip title="Run">
+                  <span>
+                    <IconButton size="small" color={resumable ? "success" : "default"} disabled={!resumable} onClick={handleRun}>
+                      <PlayArrowIcon />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+                <Tooltip title="Pause">
+                  <span>
+                    <IconButton
+                      size="small"
+                      color={runState === "running" ? "warning" : "default"}
+                      disabled={runState !== "running"}
+                      onClick={handlePause}
+                    >
+                      <PauseIcon />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+                <Tooltip title="Run to next breakpoint">
+                  <span>
+                    <IconButton size="small" color={resumable ? "primary" : "default"} disabled={!resumable} onClick={handleRun}>
+                      <SkipNextIcon />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              </Stack>
+              {/* next to the run controls: why the target is stopped, and what the server has to say */}
+              {connected && initialized && <ExecutionStatus />}
+            </Box>
           }
           rightSection={
             <Stack direction="row" spacing={1.5} alignItems="center">
