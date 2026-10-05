@@ -170,3 +170,34 @@ test("a high-rate event is logged only while a breakpoint on it exists, and such
   const newest = (await log.allInnerTexts()).slice(0, 3);
   expect(newest.some((text) => text.includes("vblank"))).toBe(true);
 });
+
+test("the callstack says how it was found: frame by frame, and as a whole", async ({ page }) => {
+  await openWorkspace(page, "sh4-debugger");
+  const view = panel(page, "sh4-callstack");
+  // nothing to explain while there are no frames
+  await expect(view.getByText("Empty callstack. The target is running.")).toBeVisible();
+  await expect(view.getByRole("note")).toHaveCount(0);
+
+  await pauseFromToolbar(page);
+  const frames = view.getByRole("listitem");
+  await expect(frames).toHaveCount(16);
+  // the unwinder guesses, and the panel says so
+  await expect(view.getByRole("note")).toHaveText(
+    "Heuristic unwind. #0 is the program counter and #1 the link register (PR), which is not always the caller; the frames after it are return addresses found on the stack and can be stale.",
+  );
+  // each frame is labelled with where it comes from, and the label explains itself
+  await expect(frames.nth(0).getByText(/^(pr|stack\+0x)/)).toHaveCount(0);
+  await expect(frames.nth(1).getByText("pr", { exact: true })).toHaveAttribute(
+    "title",
+    "The link register (PR). In a function that has made a call it points into that function, not to its caller.",
+  );
+  await expect(frames.nth(2).getByText("stack+0x0", { exact: true })).toHaveAttribute(
+    "title",
+    "A value on the stack that looks like a return address: the instruction before it is a call.",
+  );
+
+  // without a connection there are no frames, and nothing that looks like them
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await expect(view).toContainText("No Data");
+  await expect(frames).toHaveCount(0);
+});
