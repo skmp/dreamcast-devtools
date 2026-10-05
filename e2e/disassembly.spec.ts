@@ -170,7 +170,10 @@ for (const target of TARGETS) {
       test("Step Out resumes the target and stops it again after the return", async ({ page, rpc }) => {
         const view = panel(page, target.disassembly);
         await pauseFromToolbar(page);
+        const paused = await currentInstructionAddress(view);
         await tooltipButton(view, "Step In").click();
+        // the tick of that step has arrived when the highlight has moved
+        await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(nextInLoop(target, paused)));
         const before = rpc.received.filter((frame) => frame.method === "event.tick").length;
 
         await tooltipButton(view, "Step Out").click();
