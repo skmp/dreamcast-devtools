@@ -370,13 +370,19 @@ const s00: Scenario = {
     const notice = hit.tick.executionState.notice;
     if (engine === "native") {
       check(notice === undefined, `SH4_DEBUG_ENGINE is native, and the tick carries the notice "${notice}"`);
-      check(hasCapability(context, CAPABILITIES.SH4_DEBUG_NATIVE), 'SH4_DEBUG_ENGINE is native without the capability "sh4-debug-native"');
     } else if (engine === "interpreter-fallback") {
       check(notice !== undefined, "SH4_DEBUG_ENGINE is interpreter-fallback, and the tick of the breakpoint stop has no notice");
-      check(hasCapability(context, CAPABILITIES.SH4_DEBUG_FALLBACK), 'SH4_DEBUG_ENGINE is interpreter-fallback without the capability "sh4-debug-fallback"');
     } else {
       fail(`dc.timing.SH4_DEBUG_ENGINE is ${JSON.stringify(engine)}, expected "native" or "interpreter-fallback"`);
     }
+    // The capability says the same as the register, once an SH4 backend is selected. At the
+    // StartPaused stop, before the first Run(), it need not be: the SH4 has run by now, so
+    // debugger.describe is asked here, and that answer is what the later scenarios read.
+    await session.describe();
+    const [capability, other] =
+      engine === "native" ? [CAPABILITIES.SH4_DEBUG_NATIVE, CAPABILITIES.SH4_DEBUG_FALLBACK] : [CAPABILITIES.SH4_DEBUG_FALLBACK, CAPABILITIES.SH4_DEBUG_NATIVE];
+    check(hasCapability(context, capability), `SH4_DEBUG_ENGINE is ${engine}, and debugger.describe at this stop does not list the capability "${capability}"`);
+    check(!hasCapability(context, other), `SH4_DEBUG_ENGINE is ${engine}, and debugger.describe at this stop lists the capability "${other}"`);
     context.note(`SH4 debug engine: ${engine}`);
     await removeBreakpoint(context, breakpoint.id);
   },

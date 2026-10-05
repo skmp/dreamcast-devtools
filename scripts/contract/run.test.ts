@@ -1341,6 +1341,49 @@ describe("the emulator profile", () => {
     expect(noAnchor.finalState).toMatch(/paused/);
   });
 
+  it("S00: the sh4-debug capability is read at the anchor stop, where an SH4 backend is selected", async () => {
+    /**
+     * The mock at its StartPaused stop, 32 bytes before the entry point; `capabilities` rewrites
+     * what debugger.describe lists, and is told whether the SH4 has run yet.
+     */
+    const anchor = async (capabilities: (listed: string[], hasRun: boolean) => string[]) => {
+      const mock = new MockDebugger({ startPaused: true });
+      ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C00FFE0" });
+      const lines: string[] = [];
+      const { url } = await startServer(() => {
+        let hasRun = false;
+        return {
+          toClient: (frame) => {
+            if (isTick(frame)) {
+              hasRun ||= frame.params.executionState.state === "running";
+              return frame;
+            }
+            const result = frame.result as Json | undefined;
+            return result?.deviceTree ? { ...frame, result: { ...result, capabilities: capabilities(result.capabilities as string[], hasRun) } } : frame;
+          },
+        };
+      }, mock);
+      const summary = await runContract({ url, profile: "emulator", timeoutFactor: 1, only: new Set(["S00"]), say: (line) => lines.push(line) });
+      return { summary, lines };
+    };
+    const withoutEngine = (listed: string[]) => listed.filter((capability) => !capability.startsWith("sh4-debug-"));
+
+    // a server that selects its backend with the first Run(): neither capability at the StartPaused stop
+    const { summary: late, lines } = await anchor((listed, hasRun) => (hasRun ? listed : withoutEngine(listed)));
+    expect(lines.find((line) => line.startsWith("server: "))).toMatch(/capabilities: event-breakpoints, callstack, register-write, sgc-capture; targets: /);
+    expect(reportOf(late)).toEqual(["S00 passed SH4 debug engine: native"]);
+    expect(late.ok).toBe(true);
+    // (the summary names what the server said last)
+    expect(late.server.capabilities).toContain("sh4-debug-native");
+
+    // at the anchor stop the capability has to be there, and it has to be the one of the engine
+    const { summary: never } = await anchor(withoutEngine);
+    expect(reportOf(never)).toEqual(['S00 failed SH4_DEBUG_ENGINE is native, and debugger.describe at this stop does not list the capability "sh4-debug-native"']);
+    const { summary: both } = await anchor((listed) => [...listed, "sh4-debug-fallback"]);
+    expect(reportOf(both)).toEqual(['S00 failed SH4_DEBUG_ENGINE is native, and debugger.describe at this stop lists the capability "sh4-debug-fallback"']);
+    expect(both.cleanUpProblems).toEqual([]);
+  }, 30_000);
+
   it("S00: a runner that connected before the game had started asks debugger.describe again at the start stop", async () => {
     // the mock's SH4 walks straight on outside of its loop: from here it reaches the entry point 0x8C010000
     const mock = new MockDebugger({ startPaused: true });
