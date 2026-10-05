@@ -1,6 +1,7 @@
-import { lazy, useEffect, useCallback, useMemo, useState, useRef } from "react";
+import { useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { AppBar, Box, Button, Divider, IconButton, Stack, Switch, Typography, Alert } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
+import { lazyImport } from "../components/lazyImport";
 import PowerSettingsNewIcon from "@mui/icons-material/PowerSettingsNew";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudOffIcon from "@mui/icons-material/CloudOff";
@@ -55,13 +56,14 @@ import { PANEL_IDS, type PanelId } from "../../lib/debuggerSchema";
 
 // Panels that are large or bring a large dependency (Monaco, the DSP WebAssembly module,
 // the WebGL waveform renderer) are fetched when they are first shown. DockingLayout shows a
-// placeholder in the panel meanwhile.
-const AudioPanel = lazy(() => import("../panels/AudioPanel").then((module) => ({ default: module.AudioPanel })));
-const CoreInspectorPanel = lazy(() =>
+// placeholder in the panel meanwhile, and the error with a button that reloads the page when
+// the download fails.
+const AudioPanel = lazyImport(() => import("../panels/AudioPanel").then((module) => ({ default: module.AudioPanel })));
+const CoreInspectorPanel = lazyImport(() =>
   import("../panels/CoreInspectorPanel").then((module) => ({ default: module.CoreInspectorPanel })),
 );
-const Sh4SimPanel = lazy(() => import("../panels/Sh4SimPanel").then((module) => ({ default: module.Sh4SimPanel })));
-const DspPlaygroundPanel = lazy(() =>
+const Sh4SimPanel = lazyImport(() => import("../panels/Sh4SimPanel").then((module) => ({ default: module.Sh4SimPanel })));
+const DspPlaygroundPanel = lazyImport(() =>
   import("../panels/DspPlaygroundPanel").then((module) => ({ default: module.DspPlaygroundPanel })),
 );
 

@@ -1,20 +1,21 @@
-import { lazy } from "react";
 import { HomePage } from "./app/layout/HomePage";
 import { RouteBoundary } from "./app/layout/RouteBoundary";
+import { lazyImport } from "./app/components/lazyImport";
 import { HashRouter, Routes, Route, Navigate } from "react-router-dom";
 
 // Only the home page is part of the initial bundle. Every other route is fetched when it
-// is first visited (RouteBoundary shows a placeholder meanwhile).
-const AppLayout = lazy(() => import("./app/layout/AppLayout").then((module) => ({ default: module.AppLayout })));
-const DocsPage = lazy(() => import("./app/layout/DocsPage").then((module) => ({ default: module.DocsPage })));
-const Sh4SimPage = lazy(() => import("./app/layout/Sh4SimPage").then((module) => ({ default: module.Sh4SimPage })));
-const DspPlaygroundPage = lazy(() =>
+// is first visited (RouteBoundary shows a placeholder meanwhile, and the error with a
+// button that reloads the page when the download fails).
+const AppLayout = lazyImport(() => import("./app/layout/AppLayout").then((module) => ({ default: module.AppLayout })));
+const DocsPage = lazyImport(() => import("./app/layout/DocsPage").then((module) => ({ default: module.DocsPage })));
+const Sh4SimPage = lazyImport(() => import("./app/layout/Sh4SimPage").then((module) => ({ default: module.Sh4SimPage })));
+const DspPlaygroundPage = lazyImport(() =>
   import("./app/layout/DspPlaygroundPage").then((module) => ({ default: module.DspPlaygroundPage })),
 );
-const Clx2TaLogAnalyzerPage = lazy(() =>
+const Clx2TaLogAnalyzerPage = lazyImport(() =>
   import("./app/layout/Clx2TaLogAnalyzerPage").then((module) => ({ default: module.Clx2TaLogAnalyzerPage })),
 );
-const Clx2CoreLogAnalyzerPage = lazy(() =>
+const Clx2CoreLogAnalyzerPage = lazyImport(() =>
   import("./app/layout/Clx2CoreLogAnalyzerPage").then((module) => ({ default: module.Clx2CoreLogAnalyzerPage })),
 );
 

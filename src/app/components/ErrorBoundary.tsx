@@ -1,6 +1,8 @@
 import { Component, Fragment, type ErrorInfo, type ReactNode } from "react";
 import { Box, Button, Typography } from "@mui/material";
 import { CrashProbe } from "./CrashProbe";
+import { isFailedImport } from "./lazyImport";
+import { ReloadPageButton } from "./ReloadPageButton";
 
 interface ErrorBoundaryProps {
   /** "panel" fills a dock panel, "route" fills the page. */
@@ -25,6 +27,10 @@ interface ErrorBoundaryState {
  * Contains an exception thrown while rendering or in an effect of its children: the
  * children are replaced by the error (message, component stack) and a reload button,
  * and everything outside the boundary keeps running.
+ *
+ * The reload button mounts the children again. When they failed because their code could
+ * not be downloaded (see lazyImport), mounting them again cannot help, and the button
+ * reloads the page instead.
  */
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   state: ErrorBoundaryState = { error: null, componentStack: null, generation: 0 };
@@ -61,6 +67,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     }
 
     const isPanel = scope === "panel";
+    const failedImport = isFailedImport(error);
     return (
       <Box
         role="alert"
@@ -86,9 +93,19 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
         <Typography variant="body2" sx={{ fontFamily: "monospace", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
           {error.name}: {error.message}
         </Typography>
-        <Button variant="outlined" size="small" onClick={this.reload}>
-          {isPanel ? "Reload panel" : "Reload page"}
-        </Button>
+        {failedImport ? (
+          <>
+            <Typography variant="body2">
+              The code of this {isPanel ? "panel" : "page"} could not be downloaded. Reload the page when the server (the
+              emulator) is running again.
+            </Typography>
+            <ReloadPageButton variant="outlined" size="small" />
+          </>
+        ) : (
+          <Button variant="outlined" size="small" onClick={this.reload}>
+            {isPanel ? "Reload panel" : "Reload page"}
+          </Button>
+        )}
         <Box component="details" sx={{ width: "100%", typography: "body2" }}>
           <Box component="summary" sx={{ cursor: "pointer", color: "text.secondary" }}>
             Component stack
