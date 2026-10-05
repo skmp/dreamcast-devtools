@@ -168,22 +168,88 @@ test("the endpoint in the status bar opens the connection picker with the same-o
   await expect(statusBar(page)).toContainText("Connection: connected");
 });
 
-test.fixme("a manually entered WebSocket URL connects", async ({ page, mock }) => {
-  // BROKEN: ConnectionModal passes the typed URL as `connectionId`, and sessionStore.connect
-  // (src/state/sessionStore.ts) only accepts ids that are already in `availableConnections`,
-  // so any manual entry ends in "Selected connection not found". Not fixed here: the
-  // session store is out of scope.
-  const other = await startMockServer();
+test("a manually entered WebSocket URL connects", async ({ page, mock, rpc }) => {
+  const other = await startMockServer({ watches: ["dc.aica.arm7.pc"] });
   try {
     await openWorkspace(page, "sh4-debugger");
     await statusBar(page).getByText(/^Endpoint:/).click();
     const dialog = page.getByRole("dialog");
     await dialog.getByRole("radio", { name: "Enter connection string manually" }).check();
-    await dialog.getByPlaceholder(/Enter WebSocket URL/).fill(other.wsURL);
-    await dialog.getByRole("button", { name: "Connect", exact: true }).click();
+    const box = dialog.getByPlaceholder(/Enter WebSocket URL/);
+    const connect = dialog.getByRole("button", { name: "Connect", exact: true });
+
+    // only ws:// and wss:// URLs are endpoints
+    await expect(connect).toBeDisabled();
+    await box.fill("http://127.0.0.1:1/ws");
+    await expect(dialog.getByText("Not a ws:// or wss:// URL")).toBeVisible();
+    await expect(connect).toBeDisabled();
+
+    await box.fill(other.wsURL);
+    await connect.click();
+    await expect(dialog).toBeHidden();
     await expect(statusBar(page)).toContainText("Connection: connected");
     await expect(statusBar(page)).toContainText(`Endpoint: ${other.wsURL}`);
     expect(mock.port).not.toBe(other.port);
+    expect(rpc.sockets).toEqual([mock.wsURL, other.wsURL]);
+    // the session is the other server's: described again, with its watch
+    await expect(panel(page, "watches")).toContainText("dc.aica.arm7.pc = 0x002000");
+    await expect(panel(page, "watches")).not.toContainText("dc.sh4.cpu.pc =");
+    await expect(page.getByRole("alert")).toHaveCount(0);
+
+    // the last manual entry is preferred to the endpoint of the page from now on: after a reload too
+    await page.reload();
+    await expect(statusBar(page)).toContainText("Connection: connected");
+    await expect(statusBar(page)).toContainText(`Endpoint: ${other.wsURL}`);
+    await expect(panel(page, "watches")).toContainText("dc.aica.arm7.pc = 0x002000");
+    // the picker lists both, best first
+    await statusBar(page).getByText(/^Endpoint:/).click();
+    await expect(dialog.getByRole("radio", { name: /Last manual entry/ })).toBeChecked();
+    await expect(dialog.getByRole("radiogroup").getByRole("radio")).toHaveCount(2);
+
+    // picking the endpoint of the page puts the manual entry away
+    await dialog.getByRole("radio", { name: new RegExp(`nullDC @ 127\\.0\\.0\\.1:${mock.port}`) }).check();
+    await connect.click();
+    await expect(statusBar(page)).toContainText(`Endpoint: ${mock.wsURL}`);
+    await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
+    await page.reload();
+    await expect(statusBar(page)).toContainText("Connection: connected");
+    await expect(statusBar(page)).toContainText(`Endpoint: ${mock.wsURL}`);
+  } finally {
+    await other.stop();
+  }
+});
+
+test("?ws= in front of the # selects the endpoint, and survives what the panels do to the URL", async ({ page, mock, rpc }) => {
+  const other = await startMockServer({ watches: ["dc.aica.arm7.pc"] });
+  try {
+    // the page comes from one server, the debugger connection goes to the other
+    await page.goto(`/?ws=${encodeURIComponent(other.wsURL)}#/workspace/sh4-debugger`);
+    await expect(statusBar(page)).toContainText("Connection: connected");
+    await expect(statusBar(page)).toContainText(`Endpoint: ${other.wsURL}`);
+    expect(rpc.sockets).toEqual([other.wsURL]);
+    await expect(panel(page, "watches")).toContainText("dc.aica.arm7.pc = 0x002000");
+
+    // the memory panel rewrites the query of the hash route; ?ws= is not part of that
+    const memory = panel(page, "sh4-memory");
+    await memory.getByRole("textbox").fill("0x8C008120");
+    await memory.getByRole("textbox").press("Enter");
+    await expect(page).toHaveURL(/\?ws=.*#\/workspace\/sh4-debugger\?address=0x8C008120$/);
+    await page.reload();
+    await expect(statusBar(page)).toContainText(`Endpoint: ${other.wsURL}`);
+    await expect(statusBar(page)).toContainText("Connection: connected");
+
+    // the picker says where each endpoint comes from; ?ws= is first, the page's own /ws last
+    await statusBar(page).getByText(/^Endpoint:/).click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.getByRole("radio", { name: /From the address bar \(\?ws=\)/ })).toBeChecked();
+    await expect(dialog.getByRole("radio", { name: new RegExp(`nullDC @ 127\\.0\\.0\\.1:${mock.port}`) })).not.toBeChecked();
+    await expect(dialog.getByRole("radiogroup").getByRole("radio")).toHaveCount(2);
+
+    // something that is not a WebSocket URL is not an endpoint: the page's own is used
+    await page.goto(`/?ws=nonsense#/workspace/sh4-debugger`);
+    await page.reload();
+    await expect(statusBar(page)).toContainText(`Endpoint: ${mock.wsURL}`);
+    await expect(statusBar(page)).toContainText("Connection: connected");
   } finally {
     await other.stop();
   }
