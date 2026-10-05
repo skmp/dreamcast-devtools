@@ -5,13 +5,16 @@ import {
   breakpointGutter,
   disassemblyRow,
   disassemblyRows,
+  gotoRoute,
   openWorkspace,
   panel,
   pauseFromToolbar,
   saveScreenshot,
+  statusBar,
   tooltipButton,
   treeItemRow,
 } from "./support/fixtures";
+import { serveScriptedDebugger, type Json } from "./support/scriptedDebugger";
 import { MOCK_M1_SUPPORT } from "../server/mockDebugger";
 
 // What a server cannot do is said in `targets` and `capabilities` of debugger.describe, and
@@ -155,4 +158,40 @@ test.describe("a server without event breakpoints and without a callstack", () =
     await expect(panel(page, "sh4-callstack").getByRole("note")).toHaveText("This server has no callstack.");
     await expect(panel(page, "sh4-callstack").getByRole("listitem")).toHaveCount(0);
   });
+});
+
+test("a target whose memory the server cannot read: its memory panel says so, and asks the server for nothing", async ({ page }) => {
+  // The mock reads the memory of every target that has a memory panel, so this server is
+  // written by the test: the ARM7 is listed, and `memory` is false (then there is no default
+  // memory address either).
+  const server = await serveScriptedDebugger(page);
+  const arm7 = (server.shape.targets as Json[]).find((target) => target.id === "arm7")!;
+  arm7.memory = false;
+  delete arm7.defaultMemoryAddress;
+  await gotoRoute(page, "/workspace/arm7-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+
+  const memory = panel(page, "arm7-memory");
+  await expect(memory.getByRole("note")).toHaveText("This server cannot read the memory of the ARM7.");
+  await expect(memory.getByRole("textbox")).toHaveCount(0);
+  await expect(memory.getByRole("button")).toHaveCount(0);
+
+  // the rest of the target is as on any server: it is listed, stepped and has its breakpoints
+  const view = panel(page, "arm7-disassembly");
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x100));
+  await expect(tooltipButton(view, "Step In")).toBeEnabled();
+  await expect(panel(page, "arm7-breakpoints").getByPlaceholder("Address (e.g., 0x8C0000A0)")).toBeVisible();
+  await expect(page.getByRole("note")).toHaveCount(1);
+
+  // a stop makes the views read again; this panel has nothing to read
+  const listings = () => server.requestsOf("state.getDisassembly").length;
+  const before = listings();
+  server.state.execution = { state: "paused", stopId: 2, reason: "step" };
+  server.setRegister("dc.aica.arm7", "PC", "0x00000104");
+  server.tick();
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x104));
+  await expect.poll(listings).toBe(before + 1);
+  await expect(memory.getByRole("note")).toHaveText("This server cannot read the memory of the ARM7.");
+  expect(server.requestsOf("state.getMemorySlice")).toEqual([]);
 });
