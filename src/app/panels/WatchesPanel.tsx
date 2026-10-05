@@ -14,12 +14,18 @@ import {
 } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import type { DeviceNodeDescriptor } from "../../lib/debuggerSchema";
+import { useCapability } from "../../state/debuggerSelectors";
+import { CAPABILITIES, type DeviceNodeDescriptor } from "../../lib/debuggerSchema";
+
+const VALUE_TITLE = "Double-click to write the register";
+const READ_ONLY_TITLE = "Read-only: this server cannot write registers";
 
 // Component for individual watch item with inline editing
-const WatchItem = ({ expression, value, onRemove, onEdit, onModifyExpression }: {
+const WatchItem = ({ expression, value, writable, onRemove, onEdit, onModifyExpression }: {
   expression: string;
   value: unknown;
+  /** false: the server has no register writes, and the value cannot be edited */
+  writable: boolean;
   onRemove: () => void;
   onEdit: (newValue: string) => Promise<void>;
   onModifyExpression: (newExpression: string) => Promise<void>;
@@ -32,6 +38,9 @@ const WatchItem = ({ expression, value, onRemove, onEdit, onModifyExpression }: 
   const [hasExpressionError, setHasExpressionError] = useState(false);
 
   const handleDoubleClickValue = () => {
+    if (!writable) {
+      return;
+    }
     setEditValue(formatWatchValue(value));
     setIsEditingValue(true);
     setHasValueError(false);
@@ -210,7 +219,8 @@ const WatchItem = ({ expression, value, onRemove, onEdit, onModifyExpression }: 
           <Box
             component="span"
             onDoubleClick={handleDoubleClickValue}
-            sx={{ cursor: "text" }}
+            title={writable ? VALUE_TITLE : READ_ONLY_TITLE}
+            sx={{ cursor: writable ? "text" : "default" }}
           >
             {formatWatchValue(value)}
           </Box>
@@ -310,6 +320,8 @@ export const WatchesPanel = () => {
   const removeWatch = useDebuggerDataStore((state) => state.removeWatch);
   const editWatch = useDebuggerDataStore((state) => state.editWatch);
   const modifyWatchExpression = useDebuggerDataStore((state) => state.modifyWatchExpression);
+  // state.editWatch is a register write: a server without them (milestone M1) refuses it
+  const writable = useCapability(CAPABILITIES.REGISTER_WRITE);
 
   const handleRemove = useCallback(
     async (watchId: number) => {
@@ -354,6 +366,7 @@ export const WatchesPanel = () => {
               key={watch.id}
               expression={watch.expression}
               value={watch.value}
+              writable={writable}
               onRemove={() => void handleRemove(watch.id)}
               onEdit={(newValue) => handleEdit(watch.id, newValue)}
               onModifyExpression={(newExpression) => handleModifyExpression(watch.id, newExpression)}
