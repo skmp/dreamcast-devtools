@@ -30,7 +30,8 @@ const summarise = (counts: RenderCounts): TickCost => ({
 });
 
 test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => {
-  test.slow();
+  // mounting 2500 register rows (step 2) takes most of a minute on a busy machine
+  test.setTimeout(600_000);
   const synthetic = await serveSyntheticDebugger(page, { nodes: NODES, registersPerNode: REGISTERS });
   await installRenderCounter(page, '[data-panel-id="device-tree"]');
   await page.goto("/#/workspace/sh4-debugger");
@@ -41,9 +42,28 @@ test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => 
   await expect(treeItem(page, "dc")).toBeVisible();
   await expect(treeItem(page, synthetic.nodePath(NODES - 1))).toBeVisible();
 
+  /**
+   * Waits until the tree has stopped rendering by itself: mounting thousands of rows takes
+   * a while, and a tooltip under the mouse pointer opens and closes with a delay.
+   */
+  const settle = async () => {
+    await page.mouse.move(1, 1);
+    await expect
+      .poll(
+        async () => {
+          await resetRenderCounts(page);
+          await page.waitForTimeout(400);
+          const counts = await readRenderCounts(page);
+          return counts.rendered + counts.mounted;
+        },
+        { timeout: 60_000, message: "the device tree keeps rendering without input" },
+      )
+      .toBe(0);
+  };
+
   /** Sends one tick that changes the first register of `change` nodes and returns what the tree re-rendered for it. */
   const measureTick = async (change: number[], visible: boolean): Promise<TickCost> => {
-    await page.waitForTimeout(300);
+    await settle();
     await resetRenderCounts(page);
     synthetic.tick(change);
     if (visible) {
@@ -77,7 +97,7 @@ test("device tree render cost on 100 nodes x 25 registers", async ({ page }) => 
 
   // --- 3. a search that matches every node ---
   const search = tree.getByPlaceholder("Search components...");
-  await page.waitForTimeout(300);
+  await settle();
   await resetRenderCounts(page);
   await search.fill("n0");
   await expect(treeItem(page, synthetic.nodePath(0))).toBeVisible();
