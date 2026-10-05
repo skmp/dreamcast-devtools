@@ -86,7 +86,7 @@ export const documentationSections: DocumentationSection[] = [
         items: [
           "In a disassembly view, click the gutter to add or remove a breakpoint at that address.",
           "Ctrl, Cmd or Shift + click an existing breakpoint to enable or disable it. A filled red circle is enabled, an outlined one is disabled.",
-          "Events: Breakpoints takes event names such as `dc.aica.channel[0].step`; SH4: Breakpoints and ARM7: Breakpoints take hex addresses such as `0x8C0000A0`.",
+          "Events: Breakpoints takes the event names of the device tree, such as `dc.holly.core.vblank`; SH4: Breakpoints and ARM7: Breakpoints take hex addresses such as `0x8C0000A0`.",
           "Breakpoints live on the server. Every tick carries the full list, so all connected clients show the same set.",
         ],
       },
@@ -109,10 +109,10 @@ export const documentationSections: DocumentationSection[] = [
     title: "Protocol",
     level: 1,
     content: [
-      "JSON-RPC 2.0 over a single connection. There is no handshake and no subscribe/unsubscribe.",
-      "The first request is `debugger.describe`; it returns the emulator name, version and build plus the device tree. The About dialog shows these next to the DevTools version.",
-      "The server pushes `event.tick` notifications. Every tick is a complete snapshot: execution state, registers, breakpoints, event log, watches and callstacks.",
-      "Memory, disassembly and callstacks are fetched on demand with `state.getMemorySlice`, `state.getDisassembly` and `state.getCallstack`. The zod schemas in `src/lib/debuggerSchema.ts` are the reference for every method except `state.recordSgcFrames` and `state.getSgcFrameData`, which have no schema yet.",
+      "Protocol version 3: JSON-RPC 2.0 over a single connection, one message per frame. There is no subscribe/unsubscribe.",
+      "The first request is `debugger.describe`; it returns the emulator name, version and build, the protocol version, the capabilities and targets of the server, and the device tree. The About dialog shows name, version and build next to the DevTools version.",
+      "The server pushes `event.tick` notifications: after `debugger.describe`, after every change, and every 200 ms while the target runs. A tick carries the execution state (with a stop counter and the reason of a stop), breakpoints, event log, watches, callstacks and breakpoint categories completely, and registers per device-tree node: all nodes when paused, the program counters and the time in most running ticks.",
+      "Memory, disassembly and callstacks are fetched on demand with `state.getMemorySlice`, `state.getDisassembly` and `state.getCallstack`. The zod schemas in `src/lib/debuggerSchema.ts` are the reference for every method, error code and bound.",
     ],
   },
 ];

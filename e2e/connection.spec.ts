@@ -29,9 +29,17 @@ test("the first request is debugger.describe and the tick that follows populates
     method: "debugger.describe",
     params: { protocol: 3, client: expect.stringMatching(/^nullDC DevTools 3\.\d+\.\d+/) },
   });
-  expect(rpc.received[0]).toMatchObject({ id: 1 });
-  expect(rpc.received[0].method).toBeUndefined();
-  expect(rpc.received[1]).toMatchObject({ method: "event.tick" });
+  // A running server sends its periodic tick to every connection, so one can arrive before
+  // the response. The tick that follows the response is the one for this client, a full one.
+  const response = rpc.received.findIndex((frame) => frame.id === 1);
+  expect(response).toBeGreaterThanOrEqual(0);
+  expect(rpc.received.slice(0, response).map((frame) => frame.method)).toEqual(new Array(response).fill("event.tick"));
+  expect(rpc.received[response].method).toBeUndefined();
+  expect(rpc.received[response].result).toMatchObject({ protocol: 3, emulator: { name: "nullDC (mock)" }, ui: expect.stringMatching(/^3\./) });
+  expect(rpc.received[response + 1]).toMatchObject({ method: "event.tick" });
+  const firstTick = rpc.received[response + 1].params as { registers: Record<string, unknown>; executionState: unknown };
+  expect(Object.keys(firstTick.registers)).toEqual(expect.arrayContaining(["dc", "dc.sh4.cpu", "dc.sh4.bsc", "dc.holly.intc", "dc.timing"]));
+  expect(firstTick.executionState).toEqual({ state: "running", stopId: 0 });
 
   // describe -> device tree structure
   const tree = panel(page, "device-tree");
@@ -40,7 +48,9 @@ test("the first request is debugger.describe and the tick that follows populates
   await expect(tree.getByRole("treeitem", { name: "AICA Sound SoC" })).toBeVisible();
   // tick -> registers, watches, callstack; describe+tick -> disassembly and memory fetches
   await expect(tree.getByText("SYSCLK = 200MHz")).toBeVisible();
-  await expect(panel(page, "sh4-callstack")).toContainText("SH4_func_0");
+  await expect(tree.getByText("BUILD = nullDC 3.0.0 mock")).toBeVisible();
+  // a running target has no callstack
+  await expect(panel(page, "sh4-callstack")).toContainText("Empty callstack.");
   await expect(panel(page, "sh4-disassembly")).toContainText("0x8C010000");
   await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
   expect(rpc.sent.map((frame) => frame.method)).toEqual(
@@ -77,6 +87,9 @@ test("killing the server mid-session shows an error state; after a restart Conne
   await openWorkspace(page, "sh4-debugger");
   const tree = panel(page, "device-tree");
   await expect(tree.getByText("SYSCLK = 200MHz")).toBeVisible();
+  // paused, so that the panels have a callstack to keep
+  await tooltipButton(page, "Pause").click();
+  await expect(panel(page, "sh4-callstack")).toContainText("_main_loop+0x");
 
   // --- the emulator dies ---
   await mock.stop("SIGKILL");
@@ -91,7 +104,7 @@ test("killing the server mid-session shows an error state; after a restart Conne
   // TODAY: the data store is not reset, so every panel keeps showing the last
   // values as if they were live, and the per-panel buttons stay enabled.
   await expect(tree.getByText("SYSCLK = 200MHz")).toBeVisible();
-  await expect(panel(page, "sh4-callstack")).toContainText("SH4_func_0");
+  await expect(panel(page, "sh4-callstack")).toContainText("_main_loop+0x");
   await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
   await expect(tooltipButton(panel(page, "sh4-disassembly"), "Refresh")).toBeEnabled();
 

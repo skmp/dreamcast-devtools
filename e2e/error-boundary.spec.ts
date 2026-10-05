@@ -96,7 +96,8 @@ for (const phase of ["render", "effect"] as const) {
     const input = watches.getByPlaceholder("Enter expression");
     await input.fill("dc.aica.arm7.pc");
     await input.press("Enter");
-    await expect(watches.getByRole("listitem")).toHaveCount(4);
+    // the watch the server started with, PR from the device tree, and this one
+    await expect(watches.getByRole("listitem")).toHaveCount(3);
   });
 }
 

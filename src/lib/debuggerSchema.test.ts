@@ -124,6 +124,103 @@ describe("a v2 server (captured from the mock before protocol v3)", () => {
   });
 });
 
+describe("a v3 server (captured from the mock, server/mockDebugger.ts)", () => {
+  const capture = JSON.parse(readFileSync(new URL("./test-fixtures/protocol-v3-frames.json", import.meta.url), "utf8")) as {
+    requests: Array<{ id: number; method: MethodName }>;
+    frames: Frame[];
+  };
+  const methodOf = (id: number) => capture.requests.find((request) => request.id === id)!.method;
+  const responses = capture.frames.filter((frame) => frame.method === undefined);
+  const ticks = capture.frames.filter((frame) => frame.method === "event.tick").map((frame) => frame.params);
+
+  it("round-trips through the client schemas and through the strict copy: nothing is stripped, nothing is missing", () => {
+    for (const tick of ticks) {
+      expect(DebuggerRpcMethodSchemas["event.tick"].params.parse(tick)).toEqual(tick);
+      expect(StrictDebuggerRpcMethodSchemas["event.tick"].params.parse(tick)).toEqual(tick);
+    }
+    let results = 0;
+    for (const frame of responses) {
+      if (frame.result === undefined) {
+        continue;
+      }
+      const method = methodOf(frame.id!);
+      expect(DebuggerRpcMethodSchemas[method].result.parse(frame.result), method).toEqual(frame.result);
+      expect(StrictDebuggerRpcMethodSchemas[method].result.parse(frame.result), method).toEqual(frame.result);
+      results++;
+    }
+    expect(ticks).toHaveLength(6);
+    expect(results).toBeGreaterThanOrEqual(15);
+    expect(JSON.stringify(capture.frames)).not.toMatch(/:null[,}\]]/);
+  });
+
+  it("carries what protocol v3 added", () => {
+    const shape = DebuggerRpcMethodSchemas["debugger.describe"].result.parse(responses[0].result);
+    expect(shape.protocol).toBe(PROTOCOL_VERSION);
+    expect(shape.ui).toBe("none");
+    expect(shape.capabilities).toContain("event-breakpoints");
+    expect(shape.targets?.map((target) => [target.id, target.addressRadix, target.addressDigits, target.memory])).toEqual([
+      ["sh4", 16, 8, true],
+      ["arm7", 16, 8, true],
+      ["dsp", 10, 3, false],
+    ]);
+    expect(shape.targets?.[2].defaultMemoryAddress).toBeUndefined();
+
+    const parsed = ticks.map((tick) => DebuggerRpcMethodSchemas["event.tick"].params.parse(tick));
+    const states = parsed.map((tick) => tick.executionState);
+    expect(states.map((state) => `${state.state} ${state.reason ?? "-"}`)).toEqual([
+      "running -",
+      "running -",
+      "paused pause",
+      "paused step",
+      "paused breakpoint",
+      "paused capture",
+    ]);
+    expect(states.map((state) => state.stopId)).toEqual([0, 0, 1, 2, 3, 4]);
+    expect(states[4].breakpointId).toBe(1);
+    // the first tick is full, the periodic running tick carries the base paths only
+    expect(Object.keys(parsed[0].registers).length).toBeGreaterThan(20);
+    expect(Object.keys(parsed[1].registers).sort()).toEqual(["dc.aica.arm7", "dc.aica.dsp", "dc.sh4.cpu", "dc.timing"]);
+    expect(parsed[1].callstacks).toEqual({ sh4: [], arm7: [] });
+    expect(parsed[4].callstacks?.sh4.map((frame) => frame.location)).toEqual([undefined, "pr", "stack+0x0"]);
+    expect(parsed[4].categories).toEqual({
+      events: { muted: false, soloed: false },
+      sh4: { muted: false, soloed: false },
+      arm7: { muted: true, soloed: false },
+      dsp: { muted: false, soloed: false },
+    });
+    expect(parsed[4].watches).toEqual([
+      { id: 1, expression: "dc.sh4.cpu.pc", value: "0x8C0000A6" },
+      { id: 2, expression: "dc.sh4.scif.scfrdr2", value: "n/a" },
+    ]);
+    for (const entry of parsed[5].eventLog) {
+      expect(entry.metadata).toEqual({ event: expect.stringMatching(/^dc\./), cycles: expect.stringMatching(/^\d+$/) });
+    }
+  });
+
+  it("reports failures on the channel of the method, with code and message only", () => {
+    const byMethod = (method: string) => responses.filter((frame) => methodOf(frame.id!) === method);
+    expect(byMethod("breakpoints.remove")[0]).toEqual({
+      jsonrpc: "2.0",
+      id: expect.any(Number),
+      result: { error: { code: -32602, message: "invalid params: unknown breakpoint id 99" } },
+    });
+    expect(byMethod("control.reset")[0].result).toEqual({ error: { code: -32004, message: "not supported: control.reset" } });
+    expect(byMethod("state.getTable")[0].error).toEqual({ code: -32004, message: "not supported: state.getTable" });
+    expect(byMethod("state.getMemorySlice")[1].error).toEqual({ code: -32010, message: "address not readable" });
+    expect(byMethod("state.getSgcFrameData")[0].error).toEqual({ code: -32011, message: "no capture available" });
+    expect(byMethod("state.getSgcFrameData")[1].result).toEqual({
+      frameCount: 2,
+      channelsPerFrame: 64,
+      bytesPerChannel: 128,
+      totalBytes: 16384,
+      binaryId: 1,
+    });
+    // unreadable bytes are listed, and an unreadable word of the disassembly is marked
+    expect(byMethod("state.getMemorySlice")[0].result).toMatchObject({ baseAddress: 0x0021fff8, validity: "ok", unreadable: [[8, 8]] });
+    expect(byMethod("state.getDisassembly")[1].result).toMatchObject({ lines: [{ address: 0x0021fffe }, { address: 0x00220000, bytes: "??", disassembly: "<unreadable>" }] });
+  });
+});
+
 describe("the strict copy", () => {
   const tick = () => ({
     tickId: 12,

@@ -27,8 +27,8 @@ test("About in a workspace shows what the emulator reported in debugger.describe
   await page.getByRole("button", { name: "About", exact: true }).click();
 
   const dialog = page.getByRole("dialog");
-  await expect(dialog).toContainText(/Emulator\s*mockServer/);
-  await expect(dialog).toContainText(/Version\s*unspecified/);
+  await expect(dialog).toContainText(/Emulator\s*nullDC \(mock\)/);
+  await expect(dialog).toContainText(/Version\s*3\.0\.0/);
   await expect(dialog).toContainText(/Build\s*native/);
   await expect(dialog).toContainText("Connection state: connected");
   await expect(dialog).toContainText(/DevTools\s*3\.0\.0/);

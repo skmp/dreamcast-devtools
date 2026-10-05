@@ -14,14 +14,17 @@ import {
 test("the device tree shows the described nodes, expanded two levels deep", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
 
-  for (const path of ["dc", "dc.sh4", "dc.holly", "dc.aica"]) {
+  for (const path of ["dc", "dc.sh4", "dc.holly", "dc.aica", "dc.system"]) {
     await expect(treeItem(page, path)).toHaveAttribute("aria-expanded", "true");
   }
-  // registers of expanded nodes, with the values of the first tick
+  // registers of expanded nodes, with the values of the first tick: free text, not hex
   await expect(registerRow(page, "dc.reg.SYSCLK")).toHaveText(/SYSCLK = 200MHz/);
-  await expect(registerRow(page, "dc.reg.ASIC_REV")).toHaveText(/ASIC_REV = 0x0001/);
-  await expect(registerRow(page, "dc.holly.reg.HOLLY_ID")).toHaveText(/HOLLY_ID = 0x00050000/);
-  await expect(registerRow(page, "dc.aica.reg.AICA_CTRL")).toHaveText(/AICA_CTRL = 0x00000002/);
+  await expect(registerRow(page, "dc.reg.BUILD")).toHaveText(/BUILD = nullDC 3\.0\.0 mock/);
+  // the nodes of the second level have no registers of their own, so these are all rows there are
+  await expect(panel(page, "device-tree").locator("[data-register]")).toHaveCount(2);
+  for (const path of ["dc.sh4.cpu", "dc.sh4.pbus", "dc.holly.intc", "dc.aica.arm7", "dc.aica.dsp", "dc.timing", "dc.gdrom"]) {
+    await expect(treeItem(page, path)).toBeVisible();
+  }
   // third level is collapsed: its registers are not mounted
   await expect(treeItem(page, "dc.sh4.cpu")).toHaveAttribute("aria-expanded", "false");
   await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveCount(0);
@@ -33,18 +36,23 @@ test("expanding a node shows its registers and collapsing hides them", async ({ 
   await treeItemRow(page, "dc.sh4.cpu").click();
   await expect(treeItem(page, "dc.sh4.cpu")).toHaveAttribute("aria-expanded", "true");
   await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(/PC = 0x8C0000A[0-9A-E]/);
-  for (const register of ["PR", "VBR", "SR", "FPSCR"]) {
+  for (const register of ["PR", "VBR", "SR", "FPSCR", "R0", "R15", "R7_BANK", "FR15", "XF15"]) {
     await expect(registerRow(page, `dc.sh4.cpu.reg.${register}`)).toBeVisible();
   }
+  // 13 control registers, R0..R15, R0_BANK..R7_BANK, FR0..FR15, XF0..XF15
+  await expect(panel(page, "device-tree").locator('[data-register^="dc.sh4.cpu.reg."]')).toHaveCount(69);
 
   await treeItemRow(page, "dc.sh4.cpu").click();
   await expect(treeItem(page, "dc.sh4.cpu")).toHaveAttribute("aria-expanded", "false");
   await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveCount(0);
 
-  // nested nodes: PBUS -> BSC (a node with an action and no registers)
+  // nested nodes: PBUS -> BSC (a node with an action), PBUS -> SCIF with a register that cannot be read
   await treeItemRow(page, "dc.sh4.pbus").click();
   await expect(treeItem(page, "dc.sh4.bsc")).toBeVisible();
   await expect(treeItem(page, "dc.sh4.bsc").getByLabel("Open SH4: BSC Registers")).toBeVisible();
+  await treeItemRow(page, "dc.sh4.scif").click();
+  await expect(registerRow(page, "dc.sh4.scif.reg.SCFSR2")).toHaveText(/SCFSR2 = 0x0060/);
+  await expect(registerRow(page, "dc.sh4.scif.reg.SCFRDR2")).toHaveText(/SCFRDR2 = n\/a/);
 });
 
 test("register values follow the ticks", async ({ page }) => {
@@ -71,6 +79,27 @@ test("register values follow the ticks", async ({ page }) => {
   await expect(registerRow(page, "dc.sh4.cpu.reg.VBR")).toHaveText(/VBR = 0x8C000000/);
 });
 
+test("while the target runs, the registers of an expanded node follow the periodic ticks", async ({ page, rpc }) => {
+  // the server sends a tick every 200 ms while it runs; nothing has to be clicked for it
+  await openWorkspace(page, "sh4-debugger");
+  await treeItemRow(page, "dc.sh4.cpu").click();
+  await treeItemRow(page, "dc.timing").click();
+  const cycles = registerRow(page, "dc.timing.reg.SH4_CYCLES");
+  await expect(cycles).toHaveText(/SH4_CYCLES = 0x[0-9A-F]{16}$/);
+  const value = async () => BigInt((await cycles.innerText()).replace("SH4_CYCLES = ", ""));
+  const first = await value();
+  await expect.poll(value).toBeGreaterThan(first);
+  const second = await value();
+  await expect.poll(value).toBeGreaterThan(second);
+  // PR counts up as well, and the ticks came without a request that would have caused them
+  const pr = registerRow(page, "dc.sh4.cpu.reg.PR");
+  const before = await pr.innerText();
+  await expect(pr).not.toHaveText(before);
+  const ticks = rpc.received.filter((frame) => frame.method === "event.tick");
+  expect(ticks.length).toBeGreaterThan(3);
+  expect(rpc.sent.map((frame) => frame.method)).not.toContain("control.pause");
+});
+
 test("the + button of a register adds a watch and then reports it as watched", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
   await treeItemRow(page, "dc.sh4.cpu").click();
@@ -84,7 +113,7 @@ test("the + button of a register adds a watch and then reports it as watched", a
   // PR keeps counting up while the mock runs
   await expect(watches.getByText(/^dc\.sh4\.cpu\.pr = 0x8C00[0-9A-F]{4}$/)).toBeVisible();
   await expect(tooltipButton(row, "Already in watch")).toBeDisabled();
-  // dc.sh4.cpu.pc is one of the server's default watches
+  // dc.sh4.cpu.pc is the watch the suite's server starts with
   await expect(tooltipButton(registerRow(page, "dc.sh4.cpu.reg.PC"), "Already in watch")).toBeDisabled();
 });
 

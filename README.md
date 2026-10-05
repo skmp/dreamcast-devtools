@@ -129,6 +129,14 @@ Mock server, at run time:
 | `NODE_ENV` | `production` serves the static build from `dist-native/`. Anything else serves the sources through Vite middleware (which also opens Vite's hot-reload socket on port 24678). | unset |
 | `DEBUGGER_WS_PATH` | WebSocket path of the mock server. The UI always connects to `/ws`, so keep the default. | `/ws` |
 
+Mock server, on the command line (`npm run mock:serve -- --start-paused`):
+
+| Option | Description |
+| --- | --- |
+| `--start-paused` | Start in the `StartPaused` stop (`reason: "start"`) instead of running. |
+| `--force-fallback` | Behave like an SH4 backend without native breakpoints: `notice` in the ticks while SH4 breakpoints are active, `dc.timing.SH4_DEBUG_ENGINE` reads `interpreter-fallback`, capability `sh4-debug-fallback`. |
+| `--stale-registers` | Behave like a backend whose running ticks cannot carry `dc.sh4.cpu`: they omit it and say `registersStale`. |
+
 The version shown in the status bar and the About dialog is the `package.json` version, followed by
 `+<git describe --tags --always --dirty>` when the build runs inside a git checkout.
 
@@ -146,29 +154,45 @@ picker. The status bar of a workspace shows the connection state and the endpoin
 
 ## Protocol
 
-JSON-RPC 2.0 in text frames over that single connection. There is no handshake and no
-subscribe/unsubscribe.
+Protocol version 3: JSON-RPC 2.0, one message per text frame over that single connection. No
+batches, no subscribe/unsubscribe. The zod schemas in `src/lib/debuggerSchema.ts` are the
+reference for every parameter, result, error code and bound; what follows is the outline.
 
-- The client's first request is `debugger.describe` (params `{}`). The result contains
-  `emulator` (`name`, `version`, `build`) and `deviceTree`.
-- The server pushes one kind of notification, `event.tick`. Every tick is a complete snapshot:
-  `tickId`, `timestamp`, `executionState`, `registers`, `breakpoints`, `eventLog`, `watches`,
-  `callstacks`.
+- The client's first request is `debugger.describe` with `{ protocol: 3, client }`. The result
+  has `emulator` (`name`, `version`, `build`), `protocol`, `ui` (the version of the UI bundle the
+  server embeds, or `"none"`), `capabilities`, `targets` and `deviceTree`. A server says what it
+  implements through `capabilities` and `targets`, and answers everything else with the error
+  -32004 `not supported: ...`. A result without `protocol` is a v2 server; the UI then behaves as
+  it did for protocol v2.
+- The server pushes one kind of notification, `event.tick`: `tickId`, `timestamp`,
+  `executionState` (`state`, `stopId`, and for a stop its `reason` and `breakpointId`; `notice`,
+  `registersStale`), `registers`, `breakpoints`, `eventLog`, `watches`, `callstacks`,
+  `categories`. A tick follows the `debugger.describe` response, every successful request that
+  changes something and every change of the run state; while the target runs there is one every
+  200 ms. Everything in a tick is a complete snapshot except `registers`: a paused tick, the tick
+  after `debugger.describe` and every fifth periodic tick carry every node, the other running
+  ticks only `dc.sh4.cpu`, `dc.aica.arm7`, `dc.aica.dsp` and `dc.timing`. `stopId` counts stops;
+  a client acts on a stop (follow the PC, refetch, announce a breakpoint) when it changes.
 - Requests:
   - `state.getMemorySlice`, `state.getDisassembly`, `state.getCallstack`
-  - `state.watch`, `state.unwatch`, `state.editWatch`, `state.modifyWatchExpression`
-  - `control.pause`, `control.step`, `control.stepOver`, `control.stepOut`, `control.runUntil`
+  - `state.watch`, `state.unwatch`, `state.modifyWatchExpression`
+  - `control.pause`, `control.runUntil`, `control.step`, `control.stepOver`, `control.stepOut`
   - `breakpoints.add`, `breakpoints.remove`, `breakpoints.toggle`, `breakpoints.setCategoryStates`
-  - `state.recordSgcFrames`, `state.getSgcFrameData` (answered by a JSON result followed by one
-    binary frame with the recorded data)
+  - with a capability: `state.setRegister`, `state.editWatch` (`register-write`),
+    `state.writeMemory` (`memory-write`), `control.reset` (`reset`), `state.recordSgcFrames`,
+    `state.getSgcFrameData` (`sgc-capture`), `state.getMemoryBinary` (`memory-binary`),
+    `state.getTable` (`tables`), `state.captureHolly` (`holly-capture`)
+- Errors: the methods whose result is `{}` (`control.*`, `breakpoints.*`, the watch methods,
+  the writes, `state.recordSgcFrames`) report a failure in-band, as the result
+  `{ "error": { "code", "message" } }`. Every other method answers with a JSON-RPC error.
+- Binary frames (`state.getSgcFrameData`, `state.getMemoryBinary`, `state.captureHolly`): the
+  JSON result announces `totalBytes` and a `binaryId`, and one binary frame follows with a
+  16-byte little-endian header (`"NDB3"`, kind, `binaryId`, payload size) in front of the
+  payload (`src/lib/binaryFrame.ts`).
 
-The zod schemas in `src/lib/debuggerSchema.ts` are the reference for parameters and results, except
-for the two SGC methods, which have no schema yet (see `server/mockServer.ts` and
-`src/services/debuggerClient.ts`).
-
-The mock server (`server/mockServer.ts`) keeps one shared state for all clients. It sends a tick to
-every connected client after `debugger.describe`, after each request that changes state, and when a
-running target hits a breakpoint. It does not push ticks periodically.
+The mock (`server/mockDebugger.ts`, hosted with the page by `server/mockServer.ts`) implements
+the first milestone of this protocol around a fabricated machine, keeps one state for all
+clients, and also steps the ARM7 and the DSP, records SGC frames and writes registers.
 
 ## Breakpoints
 
@@ -180,7 +204,8 @@ Disassembly views:
 
 Breakpoint panels:
 
-- **Events: Breakpoints**: event breakpoints by name, for example `dc.aica.channel[0].step`.
+- **Events: Breakpoints**: event breakpoints by name, for example `dc.holly.core.vblank`. The
+  names are the `events` of the device tree; the server refuses an event it does not raise.
 - **SH4: Breakpoints**, **ARM7: Breakpoints**: code breakpoints by hex address, for example
   `0x8C0000A0`.
 

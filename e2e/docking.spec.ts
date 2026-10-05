@@ -6,6 +6,7 @@ import {
   gotoRoute,
   openWorkspace,
   panel,
+  pauseFromToolbar,
   statusBar,
   tooltipButton,
   treeItem,
@@ -15,7 +16,11 @@ import {
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
 
-/** Default dock contents of every workspace: panel id -> something the mock makes it show. */
+/**
+ * Default dock contents of every workspace: panel id -> something the mock makes it show.
+ * The mock starts running, and a running target has no callstack; CALLSTACKS is what those
+ * panels show once the target is paused.
+ */
 const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>> = {
   "sh4-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
@@ -23,7 +28,7 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
     "sh4-memory": /0x8C010000\s*45 BC 32 04/,
     "sh4-breakpoints": /No breakpoints defined\./,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
-    "sh4-callstack": /SH4_func_0/,
+    "sh4-callstack": /Empty callstack\./,
   },
   "arm7-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
@@ -31,7 +36,7 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
     "arm7-memory": /0x00200000\s*([0-9A-F]{2} ){15}/,
     "arm7-breakpoints": /No breakpoints defined\./,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
-    "arm7-callstack": /ARM7_func_0/,
+    "arm7-callstack": /Empty callstack\./,
   },
   "audio-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
@@ -45,9 +50,15 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
     "sh4-disassembly": /0x8C010000/,
     "arm7-disassembly": /0x00200000/,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
-    "sh4-callstack": /SH4_func_0/,
-    "arm7-callstack": /ARM7_func_0/,
+    "sh4-callstack": /Empty callstack\./,
+    "arm7-callstack": /Empty callstack\./,
   },
+};
+
+/** Frame 0 of a paused target: the program counter in the mock's loop, with its symbol. */
+const CALLSTACKS: Record<string, RegExp> = {
+  "sh4-callstack": /#0\s*0x8C0000A[02468ACE]\s*_main_loop\+0x[0-9A-E]\b/,
+  "arm7-callstack": /#0\s*0x002000[12][048C]\s*arm7_main_loop\+0x[0-9A-F]+\b/,
 };
 
 for (const workspace of WORKSPACES) {
@@ -66,6 +77,13 @@ for (const workspace of WORKSPACES) {
       elements.map((element) => element.getAttribute("data-panel-id")),
     );
     expect(mounted.sort()).toEqual(Object.keys(expected).sort());
+
+    // paused: the callstack panels of the workspace show the frames of the tick
+    await pauseFromToolbar(page);
+    for (const id of Object.keys(expected).filter((panelId) => panelId in CALLSTACKS)) {
+      await expect(panel(page, id), `panel ${id}`).toContainText(CALLSTACKS[id]);
+      await expect(panel(page, id).getByRole("listitem")).toHaveCount(16);
+    }
   });
 }
 
@@ -97,13 +115,14 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
   { title: "CLX2: TA", id: "holly-ta", content: /This view is under consideration\./ },
   { title: "CLX2: CORE", id: "holly-core", content: /Drop your refsw2 log here/ },
   { title: "SGC", id: "sgc", content: /Record some data to display here/ },
-  { title: "DSP: Disassembly", id: "dsp-disassembly", content: /000\s*TWT TWA YSEL/ },
+  // ... and the DSP is at any of its 128 steps: some lines of the mock's program, numbered in decimal
+  { title: "DSP: Disassembly", id: "dsp-disassembly", content: /\d{3}(TWT|YSEL|XSEL) [A-Z]+.*\d{3}(TWT|YSEL|XSEL) / },
   { title: "DSP: Breakpoints", id: "dsp-breakpoints", content: /No breakpoints defined\./ },
   { title: "DSP: Playground", id: "dsp-playground", content: /Start DSP/ },
   { title: "Device Tree", id: "device-tree", content: /SYSCLK = 200MHz/ },
   { title: "Watches", id: "watches", content: /dc\.sh4\.cpu\.pc = 0x8C0000A/ },
-  { title: "SH4: Callstack", id: "sh4-callstack", content: /SH4_func_0/ },
-  { title: "ARM7: Callstack", id: "arm7-callstack", content: /ARM7_func_0/ },
+  { title: "SH4: Callstack", id: "sh4-callstack", content: /Empty callstack\./ },
+  { title: "ARM7: Callstack", id: "arm7-callstack", content: /Empty callstack\./ },
 ];
 
 test("the panel selector offers every panel that is not in the dock, and each one mounts with content", async ({
@@ -229,13 +248,13 @@ test("the dock layout survives a reload and Reset layout restores the default", 
 
   // layouts are per workspace
   await gotoRoute(page, "/workspace/arm7-debugger");
-  await expect(panel(page, "arm7-callstack")).toContainText("ARM7_func_0");
+  await expect(panel(page, "arm7-callstack")).toContainText("Empty callstack.");
   await expect(panel(page, "holly-core")).toHaveCount(0);
 
   await gotoRoute(page, "/workspace/sh4-debugger");
   await expect(panel(page, "holly-core")).toBeVisible();
   await page.getByRole("button", { name: "Reset layout" }).click();
-  await expect(panel(page, "sh4-callstack")).toContainText("SH4_func_0");
+  await expect(panel(page, "sh4-callstack")).toContainText("Empty callstack.");
   await expect(panel(page, "holly-core")).toHaveCount(0);
   expect(await tabTitles(page)).toEqual(initial);
 });

@@ -9,19 +9,23 @@ import {
   panel,
   pauseFromToolbar,
   recordFlashes,
+  registerRow,
   tooltipButton,
+  treeItemRow,
 } from "./support/fixtures";
 
 const hex8 = (address: number) => `0x${address.toString(16).toUpperCase().padStart(8, "0")}`;
 
-for (const { name, workspace, id, disassembly, symbol, location, caller } of [
+for (const { name, workspace, id, disassembly, symbol, node, linkRegister, linkLocation, caller } of [
   {
     name: "SH4",
     workspace: "sh4-debugger",
     id: "sh4-callstack",
     disassembly: "sh4-disassembly",
-    symbol: "SH4_func_",
-    location: "sh4.c:",
+    symbol: "_main_loop+0x",
+    node: "dc.sh4.cpu",
+    linkRegister: "PR",
+    linkLocation: "pr",
     caller: 0x8c000000,
   },
   {
@@ -29,31 +33,49 @@ for (const { name, workspace, id, disassembly, symbol, location, caller } of [
     workspace: "arm7-debugger",
     id: "arm7-callstack",
     disassembly: "arm7-disassembly",
-    symbol: "ARM7_func_",
-    location: "arm7.c:",
+    symbol: "arm7_main_loop+0x",
+    node: "dc.aica.arm7",
+    linkRegister: "R14",
+    linkLocation: "lr",
     caller: 0x00200000,
   },
 ] as const) {
-  test(`${name}: Callstack lists the frames of the tick, the first one at the program counter`, async ({ page }) => {
+  test(`${name}: Callstack is empty while the target runs and lists the frames of the tick once it is paused`, async ({ page }) => {
     await openWorkspace(page, workspace);
-    await pauseFromToolbar(page);
     const view = panel(page, id);
+    // running ticks carry no frames
+    await expect(view.getByText("Empty callstack.")).toBeVisible();
+    await expect(view.getByRole("listitem")).toHaveCount(0);
+
+    await pauseFromToolbar(page);
     const frames = view.getByRole("listitem");
     await expect(frames).toHaveCount(16);
-    await expect(frames.nth(0)).toContainText("#0");
-    await expect(frames.nth(0)).toContainText(`${symbol}0`);
-    await expect(frames.nth(0)).toContainText(`${location}100`);
-    await expect(frames.nth(15)).toContainText("#15");
-    await expect(frames.nth(15)).toContainText(`${symbol}15`);
 
-    // frame 0 is where the disassembly view says the target stopped
+    // frame 0 is where the disassembly view says the target stopped, with its symbol and no location
     const pc = await currentInstructionAddress(panel(page, disassembly));
+    await expect(frames.nth(0)).toContainText("#0");
     await expect(frames.nth(0)).toContainText(hex8(pc));
-    await expect(frames.nth(1)).toContainText(hex8(caller));
+    await expect(frames.nth(0)).toContainText(symbol);
+    // frame 1 is the link register, labelled as such
+    await treeItemRow(page, node).click();
+    const link = (await registerRow(page, `${node}.reg.${linkRegister}`).innerText()).replace(`${linkRegister} = `, "").trim();
+    await expect(frames.nth(1)).toContainText("#1");
+    await expect(frames.nth(1)).toContainText(link);
+    await expect(frames.nth(1).getByText(linkLocation, { exact: true })).toBeVisible();
+    // the rest was found on the stack
+    await expect(frames.nth(2)).toContainText(hex8(caller + 4));
+    await expect(frames.nth(2).getByText("stack+0x0", { exact: true })).toBeVisible();
+    await expect(frames.nth(15)).toContainText("#15");
+    await expect(frames.nth(15).getByText("stack+0x34", { exact: true })).toBeVisible();
 
     // and it follows a step
     await tooltipButton(panel(page, disassembly), "Step In").click();
     await expect(frames.nth(0)).not.toContainText(hex8(pc));
+    await expect(frames).toHaveCount(16);
+
+    // running again: empty again
+    await tooltipButton(page, "Run").click();
+    await expect(view.getByText("Empty callstack.")).toBeVisible();
   });
 
   test(`${name}: clicking a frame address scrolls the disassembly view to it`, async ({ page }) => {
@@ -81,50 +103,70 @@ for (const { name, workspace, id, disassembly, symbol, location, caller } of [
   });
 }
 
-test("Events: Log shows the event log of the latest tick, newest first, and only changes with a tick", async ({ page }) => {
+/** "HH:MM:SS.mmm SUBSYSTEM message" */
+const LOG_LINE = /^\d{2}:\d{2}:\d{2}\.\d{3} (SH4|HOLLY|TA|CORE|AICA|DSP|ARM7|GDROM|MAPLE|SYSTEM|DEBUGGER) \S/;
+
+test("Events: Log follows the target while it runs, newest first, and stands still while it is paused", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
   await addPanelFromSelector(page, 1, "Events: Log");
   const view = panel(page, "events");
   const entries = view.getByRole("listitem");
 
-  // the mock keeps the last 60 events and sends all of them with every tick
-  await expect(entries.first()).toBeVisible();
-  const count = await entries.count();
-  expect(count).toBeGreaterThanOrEqual(6);
-  expect(count).toBeLessThanOrEqual(60);
-  // HH:MM:SS.mmm, subsystem badge, message
-  for (const text of await entries.allInnerTexts()) {
-    expect(text).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3} (SH4|HOLLY|TA|CORE|AICA|DSP) \S/);
-  }
+  // the server logs for as long as a client is connected, and sends its log with every tick:
+  // the list grows without anything being clicked
+  await expect.poll(() => entries.count()).toBeGreaterThanOrEqual(3);
   const stamps = async () => (await entries.allInnerTexts()).map((text) => text.slice(0, 12));
   const first = await stamps();
-  // newest first
-  expect(first).toEqual([...first].sort().reverse());
+  await expect.poll(() => entries.count()).toBeGreaterThan(first.length);
 
-  // the target is running and logging, but without a tick the panel is a snapshot
-  await page.waitForTimeout(700);
-  expect(await stamps()).toEqual(first);
-
-  // the next tick (here: caused by Pause) replaces the list with newer events
   await pauseFromToolbar(page);
-  await expect.poll(async () => (await stamps())[0] > first[0]).toBe(true);
-  const second = await stamps();
-  expect(second).toEqual([...second].sort().reverse());
-  expect(second.length).toBeLessThanOrEqual(60);
+  const paused = await entries.allInnerTexts();
+  expect(paused.length).toBeGreaterThan(first.length);
+  expect(paused.length).toBeLessThanOrEqual(200);
+  for (const text of paused) {
+    expect(text).toMatch(LOG_LINE);
+  }
+  // what the mock raises without a breakpoint: key on / key off and GD-ROM commands, the low-rate events
+  expect(paused.some((text) => /AICA key on: channel \d+$/.test(text))).toBe(true);
+  for (const text of paused) {
+    expect(text).toMatch(/(AICA key (on|off): channel \d+|GDROM packet command 0x30 \(CD_READ\), sector \d+|SH4 exception: TRAPA #0x20)$/);
+  }
+  // newest first
+  const pausedStamps = paused.map((text) => text.slice(0, 12));
+  expect(pausedStamps).toEqual([...pausedStamps].sort().reverse());
+  expect(pausedStamps.at(-1)).toBe(first.at(-1));
+
+  // a paused target raises nothing, and a paused server sends no periodic tick
+  await page.waitForTimeout(1200);
+  expect(await entries.allInnerTexts()).toEqual(paused);
 });
 
-test("a breakpoint hit is written to the event log", async ({ page }) => {
+test("a high-rate event is logged only while a breakpoint on it exists, and such a breakpoint stops the target", async ({
+  page,
+}) => {
   await openWorkspace(page, "sh4-debugger");
   await addPanelFromSelector(page, 1, "Events: Log");
+  await addPanelFromSelector(page, 3, "Events: Breakpoints");
+  const log = panel(page, "events").getByRole("listitem");
+  const breakpoints = panel(page, "events-breakpoints");
+  await expect.poll(() => log.count()).toBeGreaterThanOrEqual(2);
+  // vblank happens sixty times a second, and none of them is in the log
+  await expect(log.filter({ hasText: "vblank" })).toHaveCount(0);
+
   await pauseFromToolbar(page);
-  const breakpoints = panel(page, "sh4-breakpoints");
-  await breakpoints.getByPlaceholder("Address (e.g., 0x8C0000A0)").fill("0x8C0000A8");
-  await breakpoints.getByPlaceholder("Address (e.g., 0x8C0000A0)").press("Enter");
+  const input = breakpoints.getByPlaceholder("Event name (e.g., dc.aica.channel[0].step)");
+  await input.fill("dc.holly.core.vblank");
+  await input.press("Enter");
   await expect(breakpoints.getByRole("listitem")).toHaveCount(1);
 
   await tooltipButton(page, "Run").click();
-  await expect(page.getByRole("alert").filter({ hasText: "Breakpoint hit" })).toBeVisible();
-  // the mock logs one more frame event in the same emulation step, so the hit is the second newest
-  const entries = panel(page, "events").getByRole("listitem");
-  await expect(entries.nth(1)).toHaveText(/^\d{2}:\d{2}:\d{2}\.\d{3} SH4 SH4 breakpoint hit at 0x8C0000A8$/);
+  await expect(page.getByRole("alert").filter({ hasText: "Breakpoint hit: dc.holly.core.vblank" })).toBeVisible();
+  await expect(tooltipButton(page, "Run")).toBeEnabled();
+  // the one vblank that was raised while the breakpoint existed is in the log, among the newest
+  // entries (a low-rate event of the same emulation step can be newer)
+  const vblank = log.filter({ hasText: "vblank" });
+  await expect(vblank).toHaveCount(1);
+  await expect(vblank).toHaveText(/^\d{2}:\d{2}:\d{2}\.\d{3} CORE vblank in, frame \d+$/);
+  const newest = (await log.allInnerTexts()).slice(0, 3);
+  expect(newest.some((text) => text.includes("vblank"))).toBe(true);
 });

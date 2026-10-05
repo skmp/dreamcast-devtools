@@ -13,6 +13,7 @@ import {
   KNOWN,
   type WorkspaceId,
 } from "./support/fixtures";
+import type { Locator } from "@playwright/test";
 
 interface Target {
   name: string;
@@ -21,8 +22,9 @@ interface Target {
   breakpoints: string;
   /** breakpoint event of the target's program counter */
   event: string;
-  /** the mock steps through 8 instructions starting here */
+  /** the mock steps through `loopLength` instructions starting here */
   loopStart: number;
+  loopLength: number;
   instructionSize: number;
   /** how the address column prints an address */
   format: (address: number) => string;
@@ -46,6 +48,7 @@ const TARGETS: Target[] = [
     breakpoints: "sh4-breakpoints",
     event: "dc.sh4.cpu.pc",
     loopStart: 0x8c0000a0,
+    loopLength: 8,
     instructionSize: 2,
     format: hex8,
     input: hex8,
@@ -61,6 +64,7 @@ const TARGETS: Target[] = [
     breakpoints: "arm7-breakpoints",
     event: "dc.aica.arm7.pc",
     loopStart: 0x00200010,
+    loopLength: 8,
     instructionSize: 4,
     format: hex8,
     input: hex8,
@@ -75,7 +79,9 @@ const TARGETS: Target[] = [
     disassembly: "dsp-disassembly",
     breakpoints: "dsp-breakpoints",
     event: "dc.aica.dsp.step",
+    // the DSP executes its 128 steps once per sample
     loopStart: 0,
+    loopLength: 128,
     instructionSize: 1,
     format: step3,
     input: (address) => String(address),
@@ -86,7 +92,14 @@ const TARGETS: Target[] = [
 ];
 
 const nextInLoop = (target: Target, address: number) =>
-  target.loopStart + ((address - target.loopStart + target.instructionSize) % (8 * target.instructionSize));
+  target.loopStart + ((address - target.loopStart + target.instructionSize) % (target.loopLength * target.instructionSize));
+
+/** Shows `address` in the view (through the address box), wherever the view was. */
+const showAddress = async (view: Locator, target: Target, address: number) => {
+  await view.getByRole("textbox").fill(target.input(address));
+  await view.getByRole("textbox").press("Enter");
+  await expect(disassemblyRow(view, address)).toBeVisible();
+};
 
 for (const target of TARGETS) {
   test.describe(`${target.name} disassembly`, () => {
@@ -131,18 +144,48 @@ for (const target of TARGETS) {
 
       let address = await currentInstructionAddress(view);
       expect(address).toBeGreaterThanOrEqual(target.loopStart);
-      expect(address).toBeLessThan(target.loopStart + 8 * target.instructionSize);
+      expect(address).toBeLessThan(target.loopStart + target.loopLength * target.instructionSize);
       await expect(view.locator(".current-instruction").locator("span").first()).toHaveText(target.format(address));
 
       for (const label of target.stepButtons) {
         await expect(tooltipButton(view, label)).toBeEnabled();
         await tooltipButton(view, label).click();
-        address = nextInLoop(target, address);
+        // Step Over and Step In execute one instruction (the mock's loop has no calls). Step Out
+        // resumes until the return, which for the mock is the branch at the end of its loop.
+        const wrapped = label !== "Step Out" && nextInLoop(target, address) < address;
+        address = label === "Step Out" ? target.loopStart : nextInLoop(target, address);
+        if (wrapped && target.loopLength > 64) {
+          // TODAY a step does not scroll the view, and the first of the DSP's 128 steps is not
+          // among the 64 lines around the last one
+          await tooltipButton(view, "Go to current PC").click();
+        }
         await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(address));
+        await expect(tooltipButton(page, "Run")).toBeEnabled();
       }
       // exactly one row is highlighted
       await expect(view.locator(".current-instruction")).toHaveCount(1);
     });
+
+    if (target.stepButtons.includes("Step Out")) {
+      test("Step Out resumes the target and stops it again after the return", async ({ page, rpc }) => {
+        const view = panel(page, target.disassembly);
+        await pauseFromToolbar(page);
+        await tooltipButton(view, "Step In").click();
+        const before = rpc.received.filter((frame) => frame.method === "event.tick").length;
+
+        await tooltipButton(view, "Step Out").click();
+        await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(target.loopStart));
+        await expect(tooltipButton(page, "Run")).toBeEnabled();
+        // a running tick, then the paused tick of the new stop, which says that a step ended it
+        const states = rpc.received
+          .filter((frame) => frame.method === "event.tick")
+          .slice(before)
+          .map((frame) => (frame.params as { executionState: { state: string; reason?: string } }).executionState);
+        expect(states[0]).toMatchObject({ state: "running" });
+        expect(states.at(-1)).toMatchObject({ state: "paused", reason: "step" });
+        expect(rpc.requests("control.stepOut").at(-1)?.params).toEqual({ target: target.name.toLowerCase() });
+      });
+    }
 
     test("clicking the gutter adds a breakpoint that the breakpoints panel lists; clicking again removes it", async ({
       page,
@@ -153,6 +196,7 @@ for (const target of TARGETS) {
       await expect(breakpoints.getByText("No breakpoints defined.")).toBeVisible();
 
       const address = target.loopStart + 3 * target.instructionSize;
+      await showAddress(view, target, address);
       const row = disassemblyRow(view, address);
       const gutter = breakpointGutter(row);
       await expect(gutter).toHaveAttribute("data-breakpoint", "none");
@@ -188,6 +232,7 @@ for (const target of TARGETS) {
       const start = await currentInstructionAddress(view);
       const address = nextInLoop(target, nextInLoop(target, start));
 
+      await showAddress(view, target, address);
       const row = disassemblyRow(view, address);
       await row.hover();
       await breakpointGutter(row).click();
@@ -259,9 +304,12 @@ for (const target of TARGETS) {
 
       // Go to current PC brings the paused instruction back into view
       await pauseFromToolbar(page);
-      await box.fill(target.input(target.farAddress));
+      const paused = await currentInstructionAddress(view);
+      // somewhere the paused instruction is not among the 64 lines: the DSP can be at any of its 128 steps
+      const away = target.name === "DSP" ? (paused < 64 ? paused + 21 : 10) : target.farAddress;
+      await box.fill(target.input(away));
       await box.press("Enter");
-      await expect(rows.first()).toHaveAttribute("data-address", String(target.farAddress - 10 * size));
+      await expect(rows.first()).toHaveAttribute("data-address", String(away - 10 * size));
       await expect(view.locator(".current-instruction")).toHaveCount(0);
       await tooltipButton(view, "Go to current PC").click();
       await expect(view.locator(".current-instruction")).toHaveCount(1);

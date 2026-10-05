@@ -1,6 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
+import WebSocket from "ws";
 import { REPO_ROOT } from "./paths";
+
+/**
+ * The watch every server of the suite starts with. A debugger server has no watches of its
+ * own, and they belong to the server, not to a client: this one is added by a client that
+ * is gone before the page connects, so the page finds it in its first tick.
+ */
+export const SEEDED_WATCH = "dc.sh4.cpu.pc";
 
 export interface MockServer {
   readonly port: number;
@@ -59,15 +67,51 @@ const waitForHealth = async (baseURL: string, child: ChildProcess, output: () =>
   throw new Error(`mock server did not answer /health within 30 s:\n${output()}`);
 };
 
+/** Adds watches the way any client does: state.watch on a WebSocket of its own. */
+const addWatches = (wsURL: string, expressions: string[]): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const socket = new WebSocket(wsURL);
+    const timer = setTimeout(() => {
+      socket.terminate();
+      reject(new Error("the mock server did not answer state.watch within 10 s"));
+    }, 10_000);
+    socket.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    socket.once("open", () => {
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "state.watch", params: { expressions } }));
+    });
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as {
+        id?: number;
+        result?: { error?: { message: string } };
+        error?: { message: string };
+      };
+      if (message.id !== 1) {
+        return;
+      }
+      clearTimeout(timer);
+      socket.close();
+      const failure = message.error ?? message.result?.error;
+      if (failure) {
+        reject(new Error(`state.watch: ${failure.message}`));
+      } else {
+        resolve();
+      }
+    });
+  });
+
 /**
  * Starts the mock debugger server in production mode (it serves dist-native/ and
  * the WebSocket on one port). `port` restarts a server on a port a previous
- * instance used; without it a free port is picked.
+ * instance used; without it a free port is picked. Before the function returns the
+ * server is given the watches of `watches` (default: SEEDED_WATCH).
  *
  * The server runs as a single `node --import tsx` process so that it can be
  * stopped by pid without leaving a wrapper or a child behind.
  */
-export const startMockServer = async (options: { port?: number } = {}): Promise<MockServer> => {
+export const startMockServer = async (options: { port?: number; watches?: string[] } = {}): Promise<MockServer> => {
   const port = options.port ?? (await findFreePort());
   const baseURL = `http://127.0.0.1:${port}`;
   let log = "";
@@ -102,12 +146,17 @@ export const startMockServer = async (options: { port?: number } = {}): Promise<
     await waitForExit(child);
   };
 
+  const wsURL = `ws://127.0.0.1:${port}/ws`;
   try {
     await waitForHealth(baseURL, child, output);
+    const watches = options.watches ?? [SEEDED_WATCH];
+    if (watches.length > 0) {
+      await addWatches(wsURL, watches);
+    }
   } catch (error) {
     await stop();
     throw error;
   }
 
-  return { port, baseURL, wsURL: `ws://127.0.0.1:${port}/ws`, pid, output, stop };
+  return { port, baseURL, wsURL, pid, output, stop };
 };

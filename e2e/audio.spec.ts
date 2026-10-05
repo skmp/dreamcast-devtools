@@ -27,11 +27,15 @@ test("before the first recording the SGC panel asks for one", async ({ page, rpc
   await expect(view.getByRole("button", { name: "All (64)" })).toBeVisible();
   await expect(view.getByRole("button", { name: "Active (0)" })).toHaveAttribute("aria-pressed", "true");
   await expect(view.locator("canvas")).toHaveCount(0);
-  // the panel asked the server once and got the in-band "nothing recorded" error
+  // the panel asked the server once and got "no capture": a JSON-RPC error, followed by no binary frame
   expect(rpc.requests("state.getSgcFrameData")).toHaveLength(1);
+  const answer = rpc.received.find((frame) => frame.id === rpc.requests("state.getSgcFrameData")[0].id);
+  expect(answer?.error).toEqual({ code: -32011, message: "no capture available" });
+  expect(answer?.result).toBeUndefined();
+  expect(rpc.binaryFrames).toEqual([]);
 });
 
-test("Record captures 1024 frames, pauses the target and draws a waveform for every active channel", async ({
+test("Record captures 1024 frames while the target keeps running and draws a waveform for every active channel", async ({
   page,
   rpc,
 }) => {
@@ -41,10 +45,27 @@ test("Record captures 1024 frames, pauses the target and draws a waveform for ev
   expect(rpc.requests("state.recordSgcFrames")).toHaveLength(1);
   expect(rpc.requests("state.getSgcFrameData")).toHaveLength(2);
   const response = rpc.received.find((frame) => frame.id === rpc.requests("state.getSgcFrameData")[1].id);
-  expect(response?.result).toEqual({ frameCount: 1024, channelsPerFrame: 64, bytesPerChannel: 128, totalBytes: 8388608 });
+  expect(response?.result).toEqual({
+    frameCount: 1024,
+    channelsPerFrame: 64,
+    bytesPerChannel: 128,
+    totalBytes: 8388608,
+    binaryId: 1,
+  });
+  // the capture arrives in one binary frame: the 16-byte header of protocol v3 ("NDB3", kind 1,
+  // the binaryId and payload size of the response), then the frames
+  expect(rpc.binaryFrames).toHaveLength(1);
+  expect(rpc.binaryFrames[0].length).toBe(16 + 8388608);
+  expect(rpc.binaryFrames[0].subarray(0, 4).toString("latin1")).toBe("NDB3");
+  expect([4, 8, 12].map((offset) => rpc.binaryFrames[0].readUInt32LE(offset))).toEqual([1, 1, 8388608]);
 
-  // the mock pauses after a recording and the toolbar follows
-  await expect(tooltipButton(page, "Run")).toBeEnabled();
+  // a running target keeps running through a capture, and the toolbar says so
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
+  await expect(tooltipButton(page, "Run")).toBeDisabled();
+  const states = rpc.received
+    .filter((frame) => frame.method === "event.tick")
+    .map((frame) => (frame.params as { executionState: { state: string } }).executionState.state);
+  expect(new Set(states)).toEqual(new Set(["running"]));
 
   // one channel view per active channel, each with a header and a drawn canvas
   const canvases = view.locator("canvas");
@@ -70,6 +91,28 @@ test("Record captures 1024 frames, pauses the target and draws a waveform for ev
     // and the rest of the drawing is there too: envelopes and cursor
     expect(stats.nonBackground).toBeGreaterThan(stats.bars.blue + 300);
   }
+});
+
+test("a capture started while the target is paused runs it for the capture and pauses it again", async ({ page, rpc }) => {
+  const view = panel(page, "sgc");
+  await tooltipButton(page, "Pause").click();
+  await expect(tooltipButton(page, "Run")).toBeEnabled();
+  const ticksBefore = rpc.received.filter((frame) => frame.method === "event.tick").length;
+  const stop = (rpc.received.filter((frame) => frame.method === "event.tick").at(-1)?.params as {
+    executionState: { stopId: number };
+  }).executionState.stopId;
+
+  await record(view);
+  await expect(view.locator("canvas")).toHaveCount(8);
+  await expect(tooltipButton(page, "Run")).toBeEnabled();
+
+  // a running tick, then the paused tick of a new stop whose reason is the capture
+  const states = rpc.received
+    .filter((frame) => frame.method === "event.tick")
+    .slice(ticksBefore)
+    .map((frame) => (frame.params as { executionState: { state: string; reason?: string; stopId: number } }).executionState);
+  expect(states[0]).toEqual({ state: "running", stopId: stop });
+  expect(states.at(-1)).toEqual({ state: "paused", stopId: stop + 1, reason: "capture" });
 });
 
 test("All (64) also lists the silent channels, whose waveform is flat", async ({ page }) => {

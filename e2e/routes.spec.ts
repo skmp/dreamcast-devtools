@@ -112,7 +112,9 @@ test("the navigation dropdown switches between workspaces, tools and pages", asy
   await expect(panel(page, "arm7-disassembly")).toBeVisible();
   // the session survives the switch: no reconnect, the new workspace is populated
   await expect(statusBar(page)).toContainText("Connection: connected");
-  await expect(panel(page, "arm7-callstack")).toContainText("ARM7_func_0");
+  // (the target runs, and a running target has no callstack)
+  await expect(panel(page, "arm7-callstack")).toContainText("Empty callstack.");
+  await expect(panel(page, "arm7-disassembly")).toContainText("0x00200000");
 
   await page.getByPlaceholder("Navigate to...").click();
   await page.getByRole("option", { name: "Documentation" }).click();

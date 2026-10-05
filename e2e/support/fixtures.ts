@@ -54,12 +54,12 @@ export class Diagnostics {
  */
 export const KNOWN = {
   /**
-   * Before the first recording the mock answers state.getSgcFrameData with an in-band
-   * error; AudioPanel (src/app/panels/AudioPanel.tsx) reports that expected empty
+   * Before the first recording the server answers state.getSgcFrameData with the JSON-RPC
+   * error -32011; AudioPanel (src/app/panels/AudioPanel.tsx) reports that expected empty
    * state through console.error and then renders "Record some data to display here".
    */
   sgcNoData: [
-    /^console\.error: Failed to fetch SGC frame data: Error: No SGC frame data available/,
+    /^console\.error: Failed to fetch SGC frame data: JsonRpcException: no capture available/,
     "SGC panel logs the expected 'nothing recorded yet' answer of the server with console.error",
   ],
 } as const satisfies Record<string, readonly [RegExp, string]>;
@@ -103,6 +103,8 @@ export interface RpcLog {
   readonly sent: RpcFrame[];
   /** server -> client (responses and event.tick notifications) */
   readonly received: RpcFrame[];
+  /** binary frames, server -> client, with their protocol v3 header */
+  readonly binaryFrames: Buffer[];
   /** URLs of every WebSocket the page opened */
   readonly sockets: string[];
   /** Requests sent so far with this method. */
@@ -136,6 +138,7 @@ export const test = base.extend<Fixtures>({
     async ({ page }, use) => {
       const sent: RpcFrame[] = [];
       const received: RpcFrame[] = [];
+      const binaryFrames: Buffer[] = [];
       const sockets: string[] = [];
       page.on("websocket", (socket) => {
         sockets.push(socket.url());
@@ -144,9 +147,10 @@ export const test = base.extend<Fixtures>({
         });
         socket.on("framereceived", ({ payload }) => {
           if (typeof payload === "string") received.push(JSON.parse(payload) as RpcFrame);
+          else binaryFrames.push(payload);
         });
       });
-      await use({ sent, received, sockets, requests: (method) => sent.filter((frame) => frame.method === method) });
+      await use({ sent, received, binaryFrames, sockets, requests: (method) => sent.filter((frame) => frame.method === method) });
     },
     { auto: true },
   ],

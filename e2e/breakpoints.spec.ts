@@ -18,6 +18,14 @@ const entry = (view: Locator, text: string): Locator => view.getByRole("listitem
 const categoryHeader = (view: Locator, label: string): Locator =>
   view.locator("div").filter({ has: view.page().getByRole("heading", { name: label, exact: true }) }).last();
 
+/** Scrolls the DSP disassembly view to a step through its address box (decimal). */
+const showDspStep = async (page: Page, step: number) => {
+  const disassembly = panel(page, "dsp-disassembly");
+  await disassembly.getByRole("textbox").fill(String(step));
+  await disassembly.getByRole("textbox").press("Enter");
+  await expect(disassemblyRow(disassembly, step)).toBeVisible();
+};
+
 const openEventsBreakpoints = async (page: Page) => {
   // main dock, bottom-right group (the one that holds the target's own breakpoints panel)
   await addPanelFromSelector(page, 3, "Events: Breakpoints");
@@ -131,6 +139,8 @@ test("DSP: Breakpoints adds a step breakpoint, toggles and removes it", async ({
   await input.press("Enter");
   const item = entry(view, "dc.aica.dsp.step == 0x00000005");
   await expect(item).toBeVisible();
+  // the DSP was paused at any of its 128 steps: bring step 5 into the disassembly view
+  await showDspStep(page, 5);
   await expect(breakpointGutter(disassemblyRow(panel(page, "dsp-disassembly"), 5))).toHaveAttribute(
     "data-breakpoint",
     "enabled",
@@ -151,6 +161,9 @@ test("DSP: Breakpoints reads a plain number as a decimal step and 0x as hex", as
   const view = panel(page, "dsp-breakpoints");
   const input = view.getByPlaceholder("Step value (e.g., 0, 5, 0x10)");
   const disassembly = panel(page, "dsp-disassembly");
+  // steps 10 and 16 on screen, wherever the DSP was paused
+  await showDspStep(page, 10);
+  await expect(disassemblyRow(disassembly, 16)).toBeVisible();
 
   await input.fill("10");
   await input.press("Enter");
@@ -175,10 +188,10 @@ test("Events: Breakpoints suggests the events of the device tree and lists every
   const input = view.getByPlaceholder("Event name (e.g., dc.aica.channel[0].step)");
   await input.pressSequentially("dc.sh4.");
   await expect(page.getByRole("option", { name: "dc.sh4.interrupt", exact: true })).toBeVisible();
-  await page.getByRole("option", { name: "dc.sh4.tlb_miss", exact: true }).click();
+  await page.getByRole("option", { name: "dc.sh4.exception", exact: true }).click();
   await view.getByRole("button", { name: "Add", exact: true }).click();
 
-  const eventEntry = entry(view, "dc.sh4.tlb_miss");
+  const eventEntry = entry(view, "dc.sh4.exception");
   await expect(eventEntry).toBeVisible();
   await expect(eventEntry.getByText("event", { exact: true })).toBeVisible();
   await expect(view.getByRole("heading", { name: "Events", exact: true })).toBeVisible();
@@ -198,6 +211,49 @@ test("Events: Breakpoints suggests the events of the device tree and lists every
   await tooltipButton(eventEntry, "Remove breakpoint").click();
   await expect(eventEntry).toHaveCount(0);
   await expect(view.getByRole("heading", { name: "Events", exact: true })).toHaveCount(0);
+});
+
+test("an event breakpoint stops the target when its event is raised; the server refuses an event it does not raise", async ({
+  page,
+  rpc,
+}) => {
+  await openWorkspace(page, "sh4-debugger");
+  await pauseFromToolbar(page);
+  const view = await openEventsBreakpoints(page);
+  const input = view.getByPlaceholder("Event name (e.g., dc.aica.channel[0].step)");
+
+  // free text is accepted by the panel, and refused by the server: -32004, in-band
+  await input.fill("dc.sh4.tlb_miss");
+  await input.press("Enter");
+  await expect(page.getByRole("alert").filter({ hasText: "not supported: event dc.sh4.tlb_miss" })).toBeVisible();
+  await expect(view.getByText("No breakpoints defined.")).toBeVisible();
+  const refused = rpc.received.find((frame) => frame.id === rpc.requests("breakpoints.add").at(-1)?.id);
+  expect(refused?.result).toEqual({ error: { code: -32004, message: "not supported: event dc.sh4.tlb_miss" } });
+
+  // the mock keys a channel on about twice a second
+  await input.fill("dc.aica.channels.key_on");
+  await input.press("Enter");
+  await expect(entry(view, "dc.aica.channels.key_on")).toBeVisible();
+  expect(rpc.requests("breakpoints.add").at(-1)?.params).toEqual({ event: "dc.aica.channels.key_on", kind: "event", enabled: true });
+
+  await tooltipButton(page, "Run").click();
+  await expect(page.getByRole("alert").filter({ hasText: "Breakpoint hit: dc.aica.channels.key_on" })).toBeVisible();
+  await expect(tooltipButton(page, "Run")).toBeEnabled();
+  // the tick of the stop says why, and which breakpoint
+  const stop = rpc.received.filter((frame) => frame.method === "event.tick").at(-1)?.params as {
+    executionState: { state: string; reason: string; breakpointId: number; stopId: number };
+    breakpoints: Record<string, { event: string }>;
+  };
+  expect(stop.executionState).toMatchObject({ state: "paused", reason: "event" });
+  expect(stop.breakpoints[String(stop.executionState.breakpointId)].event).toBe("dc.aica.channels.key_on");
+
+  // disabled, it does not stop the target
+  await entry(view, "dc.aica.channels.key_on").getByRole("switch").click();
+  await expect(entry(view, "dc.aica.channels.key_on").getByRole("switch")).not.toBeChecked();
+  await tooltipButton(page, "Run").click();
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
+  await page.waitForTimeout(1500);
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
 });
 
 test("muting a category keeps its breakpoints from stopping the target; unmuting restores them", async ({ page, rpc }) => {
@@ -232,12 +288,12 @@ test("soloing a category disables the breakpoints of the others", async ({ page,
   await pauseFromToolbar(page);
   const view = await openEventsBreakpoints(page);
 
-  // one SH4 code breakpoint and one event breakpoint
+  // one SH4 code breakpoint and one event breakpoint, on an event the mock does not raise by itself
   const row = disassemblyRow(panel(page, "sh4-disassembly"), 0x8c0000a6);
   await row.hover();
   await breakpointGutter(row).click();
   const input = view.getByPlaceholder("Event name (e.g., dc.aica.channel[0].step)");
-  await input.fill("dc.sh4.interrupt");
+  await input.fill("dc.system.reset");
   await input.press("Enter");
   await expect(view.getByRole("listitem")).toHaveCount(2);
 
