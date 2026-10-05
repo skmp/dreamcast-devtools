@@ -27,7 +27,7 @@ Run `npm ci` once, then:
 | `npm run build:wasm` | Type-check and build the BroadcastChannel variant into `dist-wasm/`. |
 | `npm run build:dspsim` | Regenerate `src/wasm/aica-dsp/` from `crates/aica-dsp`. |
 | `npm run lint` | ESLint. |
-| `npm run typecheck` | `tsc -b`: the app, the Vite/Vitest configs, the mock server and the tests. |
+| `npm run typecheck` | `tsc -b`: the app, the Vite/Vitest configs, the mock server, the scripts and the tests. |
 | `npm test` | Vitest in watch mode. |
 | `npm run test:run` | Vitest, single run. |
 | `npm run test:ui` | Vitest with its browser UI. |
@@ -52,6 +52,11 @@ any path:
   `.css`, `.html`, `.png` and `.ttf` as usual.
 - A native build then opens its WebSocket at `/ws` on the same host and port (see
   [Connecting](#connecting)).
+- Every build ends by writing `bundle-info.json` into its output directory:
+  `{ "version", "protocol", "gitRev", "files": [{ "path", "bytes", "sha256" }] }`
+  (`scripts/bundle-info.ts`). The emulator's build reads it before it embeds `dist-native/`: a
+  bundle built for another protocol version is refused, `version` is what the emulator reports
+  as `ui` in `debugger.describe`, and every listed file is checked against its hash.
 
 `python3 -m http.server --directory dist-native` is enough to look at everything that does not
 need a debugger connection; `e2e/offline.spec.ts` checks exactly that setup, with every other

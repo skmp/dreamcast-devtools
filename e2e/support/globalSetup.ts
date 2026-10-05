@@ -5,7 +5,7 @@ import { DIST_DIR, REPO_ROOT } from "./paths";
 
 // Everything that ends up in the bundle. A change to any of these after the last
 // build means the suite would otherwise test a stale dist-native/.
-const BUILD_INPUTS = ["src", "public", "index.html", "vite.config.ts", "package.json"];
+const BUILD_INPUTS = ["src", "public", "index.html", "vite.config.ts", "scripts/bundle-info.ts", "package.json"];
 
 const newestMtime = (path: string): number => {
   const stat = statSync(path);
@@ -23,6 +23,9 @@ const buildReason = (): string | undefined => {
   const indexHtml = resolve(DIST_DIR, "index.html");
   if (!existsSync(indexHtml)) {
     return "dist-native/index.html is missing";
+  }
+  if (!existsSync(resolve(DIST_DIR, "bundle-info.json"))) {
+    return "dist-native/bundle-info.json is missing";
   }
   const builtAt = statSync(indexHtml).mtimeMs;
   for (const input of BUILD_INPUTS) {
