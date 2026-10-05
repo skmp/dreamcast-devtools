@@ -6,6 +6,7 @@ import {
   disassemblyRows,
   gotoRoute,
   panel,
+  recordAlerts,
   registerRow,
   saveScreenshot,
   statusBar,
@@ -41,6 +42,8 @@ const tickAndWait = async (page: Page, server: ScriptedDebugger, options?: Param
   server.tick(options ? { ...options, paths: options.paths ? [...options.paths, "dc"] : undefined } : undefined);
   await expect(registerRow(page, "dc.reg.SYSCLK")).toHaveText(`SYSCLK = ${value}`);
 };
+
+const hex8 = (address: number) => `0x${address.toString(16).toUpperCase().padStart(8, "0")}`;
 
 test("registers are merged per path: a path a tick does not carry keeps what it had", async ({ page }) => {
   const server = await open(page, "sh4-debugger");
@@ -97,6 +100,100 @@ test("nothing of a connection is left in the next one: registers and callstack s
   await expect(registerRow(page, "dc.sh4.tmu.reg.TCNT0")).toHaveText("TCNT0 = 0x22222222");
   await expect(panel(page, "sh4-callstack")).toContainText("Empty callstack.");
   await expect(panel(page, "sh4-callstack")).not.toContainText("_first_session");
+});
+
+test("a stop is acted on once: the views follow it, read again and announce its breakpoint; other ticks do none of that", async ({
+  page,
+}) => {
+  let alerts: () => Promise<string[]> = async () => [];
+  const server = await open(page, "sh4-debugger", async (scripted) => {
+    // the server is stopped at a breakpoint when the page connects
+    scripted.state.execution = { state: "paused", stopId: 4, reason: "breakpoint", breakpointId: 7 };
+    scripted.state.breakpoints = { "7": { id: 7, event: "dc.sh4.cpu.pc", address: 0x8c001000, kind: "code", enabled: true } };
+    alerts = await recordAlerts(page);
+  });
+  /** every announcement of a breakpoint the page has made so far (a notice leaves the screen after five seconds) */
+  const announced = async () => (await alerts()).filter((text) => text.startsWith("Breakpoint hit:"));
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const fetches = () => ({
+    disassembly: server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4").length,
+    memory: server.requestsOf("state.getMemorySlice").length,
+  });
+  const hits = (address: number) => page.getByRole("alert").filter({ hasText: `Breakpoint hit: dc.sh4.cpu.pc == ${hex8(address)}` });
+
+  // the first paused tick of a connection counts as a stop: the client learns why the target is stopped
+  await expect(hits(0x8c001000)).toBeVisible();
+  expect(await announced()).toEqual(["Breakpoint hit: dc.sh4.cpu.pc == 0x8C001000"]);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+  expect(fetches()).toEqual({ disassembly: 1, memory: 1 });
+
+  // paused ticks of the same stop: what follows a breakpoint or a watch being added, by anyone
+  await tickAndWait(page, server);
+  await tickAndWait(page, server);
+  expect(await announced()).toHaveLength(1);
+  expect(fetches()).toEqual({ disassembly: 1, memory: 1 });
+
+  // the user looks at something else; a tick of the same stop does not take the view back
+  await view.getByRole("textbox").fill("0x8C004000");
+  await view.getByRole("textbox").press("Enter");
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c004000 - 20));
+  expect(fetches()).toEqual({ disassembly: 2, memory: 1 });
+  await tickAndWait(page, server);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c004000 - 20));
+  expect(fetches()).toEqual({ disassembly: 2, memory: 1 });
+
+  // a new stop (a step): the view goes to the program counter, and both views read again
+  server.state.execution = { state: "paused", stopId: 5, reason: "step" };
+  server.setRegister("dc.sh4.cpu", "PC", "0x8C002000");
+  await tickAndWait(page, server);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c002000 - 20));
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c002000));
+  await expect.poll(fetches).toEqual({ disassembly: 3, memory: 2 });
+  // a step is not a breakpoint: nothing is announced
+  expect(await announced()).toHaveLength(1);
+
+  // the next stop is on a line that is on screen: the view stays where it is, and reads again
+  server.state.execution = { state: "paused", stopId: 6, reason: "breakpoint", breakpointId: 8 };
+  server.state.breakpoints = {
+    ...server.state.breakpoints,
+    "8": { id: 8, event: "dc.sh4.cpu.pc", address: 0x8c002002, kind: "code", enabled: true },
+  };
+  server.setRegister("dc.sh4.cpu", "PC", "0x8C002002");
+  await tickAndWait(page, server);
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c002002));
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c002000 - 20));
+  await expect.poll(fetches).toEqual({ disassembly: 4, memory: 3 });
+  await expect(hits(0x8c002002)).toBeVisible();
+  // the stop is repeated in every paused tick of it, and announced once
+  await tickAndWait(page, server);
+  await tickAndWait(page, server);
+  expect(await announced()).toEqual([
+    "Breakpoint hit: dc.sh4.cpu.pc == 0x8C001000",
+    "Breakpoint hit: dc.sh4.cpu.pc == 0x8C002002",
+  ]);
+  expect(fetches()).toEqual({ disassembly: 4, memory: 3 });
+
+  // running: five ticks, each with another program counter, and nothing is fetched or marked
+  server.state.execution = { state: "running", stopId: 6 };
+  for (let step = 1; step <= 5; step++) {
+    server.setRegister("dc.sh4.cpu", "PC", hex8(0x8c002002 + 2 * step));
+    await tickAndWait(page, server);
+  }
+  await expect(view.locator(".current-instruction")).toHaveCount(0);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c002000 - 20));
+  expect(fetches()).toEqual({ disassembly: 4, memory: 3 });
+
+  // stopped again, somewhere else
+  server.state.execution = { state: "paused", stopId: 7, reason: "pause" };
+  server.setRegister("dc.sh4.cpu", "PC", "0x8C008000");
+  await tickAndWait(page, server);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c008000 - 20));
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c008000));
+  await expect.poll(fetches).toEqual({ disassembly: 5, memory: 4 });
+  expect(await announced()).toHaveLength(2);
 });
 
 test("a breakpoint set or removed in a disassembly view makes it read again, where it is", async ({ page }) => {

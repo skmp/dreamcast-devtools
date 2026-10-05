@@ -34,7 +34,8 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
   "arm7-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
     "arm7-disassembly": /0x00200010/,
-    "arm7-memory": /0x00200000\s*([0-9A-F]{2} ){15}/,
+    // a memory view opens at the default address of its target, which the server says
+    "arm7-memory": /0x00000000\s*([0-9A-F]{2} ){15}/,
     "arm7-breakpoints": /No breakpoints defined\./,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
     "arm7-callstack": /Empty callstack\./,
@@ -112,7 +113,7 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
   { title: "SH4: TLB", id: "tlb-contents", content: /TLB Contents - Coming Soon/ },
   // opened after the first tick, a disassembly view starts ten instructions before the PC
   { title: "ARM7: Disassembly", id: "arm7-disassembly", content: /0x(001FFF|002000)[0-9A-F]{2}/ },
-  { title: "ARM7: Memory", id: "arm7-memory", content: /0x00200000/ },
+  { title: "ARM7: Memory", id: "arm7-memory", content: /0x00000000/ },
   { title: "ARM7: Breakpoints", id: "arm7-breakpoints", content: /No breakpoints defined\./ },
   { title: "CLX2: TA", id: "holly-ta", content: /This view is under consideration\./ },
   { title: "CLX2: CORE", id: "holly-core", content: /Drop your refsw2 log here/ },

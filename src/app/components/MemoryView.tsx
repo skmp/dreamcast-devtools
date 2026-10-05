@@ -20,8 +20,10 @@ export interface MemoryViewConfig {
   formatAddress: (value: number) => string;
   /** Parse an address string from user input */
   parseAddress: (input: string) => number | undefined;
-  /** Maximum address value */
+  /** The highest address a view can start at: `length` bytes from there end at the last address of the target */
   maxAddress: number;
+  /** The last address of the target (default: 0xFFFFFFFF) */
+  addressMax?: number;
   /** Number of bytes to fetch */
   length: number;
 }
@@ -44,6 +46,8 @@ export interface MemoryViewProps {
   initialized: boolean;
   /** Initial address from URL if any */
   initialUrlAddress?: { address: number; fromUrl: boolean };
+  /** The bytes are fetched again, without moving, whenever this changes (the target stopped). */
+  refreshSignal?: unknown;
 }
 
 const clampAddress = (value: number, max: number, alignment = 1) => {
@@ -64,7 +68,11 @@ export const MemoryView = ({
   defaultAddress,
   initialized,
   initialUrlAddress,
+  refreshSignal,
 }: MemoryViewProps) => {
+  const addressMax = config.addressMax ?? 0xffffffff;
+  /** the first address of the last row */
+  const lastRow = addressMax - (BYTES_PER_ROW - 1);
   const [slice, setSlice] = useState<MemorySlice | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
@@ -74,7 +82,7 @@ export const MemoryView = ({
   const initialAddress = initialUrlAddress
     ? Math.max(
         0,
-        clampAddress(initialUrlAddress.address, 0xffffffff - (BYTES_PER_ROW - 1), BYTES_PER_ROW) - BYTES_PER_ROW * 10,
+        clampAddress(initialUrlAddress.address, lastRow, BYTES_PER_ROW) - BYTES_PER_ROW * 10,
       )
     : defaultAddress;
   const [address, setAddress] = useState(initialAddress);
@@ -114,7 +122,7 @@ export const MemoryView = ({
       setError(undefined);
       try {
         // Calculate how many bytes can fit before hitting max address
-        const remainingAddressSpace = 0xffffffff - addr;
+        const remainingAddressSpace = addressMax - addr;
         const adjustedLength = Math.min(config.length, Math.max(1, remainingAddressSpace + 1));
 
         const result = await callbacks.onFetchMemory(addr, adjustedLength);
@@ -132,7 +140,7 @@ export const MemoryView = ({
         }
       }
     },
-    [callbacks, config.length],
+    [callbacks, config.length, addressMax],
   );
 
   // The box follows the view when the view moves (a submit, the wheel) and is rewritten for
@@ -141,15 +149,29 @@ export const MemoryView = ({
   useEffect(() => {
     const normalized = clampAddress(address, config.maxAddress, BYTES_PER_ROW);
     // Display the address 10 rows down (the intended target), not the fetch start
-    const displayAddress = Math.min(0xffffffff - (BYTES_PER_ROW - 1), normalized + BYTES_PER_ROW * 10);
+    const displayAddress = Math.min(lastRow, normalized + BYTES_PER_ROW * 10);
     setAddressInput(config.formatAddress(displayAddress));
-  }, [address, config]);
+  }, [address, config, lastRow]);
 
   useEffect(() => {
     if (initialized) {
       void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
     }
   }, [address, fetchSlice, config.maxAddress, initialized]);
+
+  // The target stopped somewhere new: what is on screen is read again, where it is. Ticks do
+  // not do that; a stop and the panel's own buttons do.
+  const seenRefreshSignal = useRef(refreshSignal);
+  useEffect(() => {
+    if (seenRefreshSignal.current === refreshSignal) {
+      return;
+    }
+    seenRefreshSignal.current = refreshSignal;
+    if (initialized) {
+      void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only a new signal fetches here; a new address or connection is the effect above
+  }, [refreshSignal]);
 
   // Trigger highlight effect when loaded from URL
   useEffect(() => {
@@ -161,13 +183,9 @@ export const MemoryView = ({
     urlHighlightTriggeredRef.current = true;
 
     // Align the address to row boundary for proper highlighting
-    pendingHighlightRef.current = clampAddress(
-      initialUrlAddress.address,
-      0xffffffff - (BYTES_PER_ROW - 1),
-      BYTES_PER_ROW,
-    );
+    pendingHighlightRef.current = clampAddress(initialUrlAddress.address, lastRow, BYTES_PER_ROW);
     applyPendingHighlight();
-  }, [initialUrlAddress, initialized, slice, applyPendingHighlight]);
+  }, [initialUrlAddress, initialized, slice, applyPendingHighlight, lastRow]);
 
   // Process pending scroll delta after loading completes
   useEffect(() => {
@@ -183,13 +201,22 @@ export const MemoryView = ({
       return [];
     }
     const bytes = slice.data;
+    // Bytes the debugger could not read are 0 in the data and listed as [offset, length]
+    // runs: they are shown as "??", not as the zero they are not.
+    const unreadable = new Uint8Array(bytes.length);
+    for (const [offset, length] of slice.unreadable ?? []) {
+      unreadable.fill(1, Math.max(0, offset), Math.min(bytes.length, offset + length));
+    }
     const result: MemoryRow[] = [];
     for (let offset = 0; offset < bytes.length; offset += BYTES_PER_ROW) {
       const chunk = bytes.slice(offset, offset + BYTES_PER_ROW);
       const rowAddress = slice.baseAddress + offset;
-      const hex = chunk.map(b => b.toString(16).toUpperCase().padStart(2, "0")).join(" ");
+      const hex = chunk.map((b, index) => (unreadable[offset + index] ? "??" : b.toString(16).toUpperCase().padStart(2, "0"))).join(" ");
       const ascii = chunk
-        .map((byte) => {
+        .map((byte, index) => {
+          if (unreadable[offset + index]) {
+            return "?";
+          }
           const char = String.fromCharCode(byte);
           return /[\x20-\x7E]/.test(char) ? char : ".";
         })
@@ -256,7 +283,7 @@ export const MemoryView = ({
       return;
     }
     // Align down to row boundary
-    const alignedAddress = clampAddress(parsed, 0xffffffff - (BYTES_PER_ROW - 1), BYTES_PER_ROW);
+    const alignedAddress = clampAddress(parsed, lastRow, BYTES_PER_ROW);
 
     // Update the input field to show the aligned address
     setAddressInput(config.formatAddress(alignedAddress));
@@ -275,11 +302,11 @@ export const MemoryView = ({
     if (clampedTarget === address) {
       applyPendingHighlight();
     }
-  }, [addressInput, config, callbacks, address, applyPendingHighlight]);
+  }, [addressInput, config, callbacks, address, applyPendingHighlight, lastRow]);
 
   const handleRefresh = useCallback(() => {
-    void fetchSlice(address);
-  }, [fetchSlice, address]);
+    void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
+  }, [fetchSlice, address, config.maxAddress]);
 
   return (
     <Box
