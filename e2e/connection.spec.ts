@@ -125,18 +125,20 @@ test("killing the server mid-session shows an error state; after a restart Conne
   }
 });
 
-test.fixme("a failed connection attempt shows a readable error", async ({ page, mock, diagnostics }) => {
-  // BROKEN: WebSocketTransport.connect (src/services/transport.ts) rejects with the DOM
-  // `Event`, and sessionStore.connect (src/state/sessionStore.ts) does String(error), so
-  // the alert reads "[object Event]". Not fixed here: transport/session are out of scope.
+test("a failed connection attempt shows a readable error", async ({ page, mock, diagnostics }) => {
+  // regression: WebSocketTransport.connect rejected with the DOM `Event` of the socket, which
+  // the session store turned into the text "[object Event]"
   diagnostics.allow(/^console\.error: (WebSocket connection to|Failed to connect)/, "the server is down on purpose");
   await openWorkspace(page, "sh4-debugger");
   await mock.stop("SIGKILL");
   await expect(statusBar(page)).toContainText("Connection: error");
   await connectButton(page).click();
-  const alert = page.getByRole("alert");
+  // the browser tells the page nothing about the failure, so the text names the endpoint and what it can be
+  const alert = page.getByRole("alert").filter({ hasText: "Could not connect" });
   await expect(alert).toBeVisible();
-  await expect(alert).not.toContainText("[object Event]");
+  await expect(alert).toContainText(`Could not connect to ${mock.wsURL}: the server is not running, is not reachable or refused the connection`);
+  await expect(page.getByRole("alert").filter({ hasText: "[object" })).toHaveCount(0);
+  await expect(statusBar(page)).toContainText("Connection: error");
 });
 
 test("the endpoint in the status bar opens the connection picker with the same-origin endpoint", async ({ page, mock }) => {
