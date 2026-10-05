@@ -1,5 +1,5 @@
-import { memo, useCallback, useMemo, useState } from "react";
-import type { KeyboardEvent, SyntheticEvent } from "react";
+import { memo, useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent, MutableRefObject, SyntheticEvent } from "react";
 import { SimpleTreeView } from "@mui/x-tree-view/SimpleTreeView";
 import { TreeItem } from "@mui/x-tree-view/TreeItem";
 import { useShallow } from "zustand/react/shallow";
@@ -312,6 +312,42 @@ const DeviceNodeItem = memo(({ node, depth, onOpenPanel }: DeviceNodeItemProps) 
 });
 DeviceNodeItem.displayName = "DeviceNodeItem";
 
+/**
+ * Rendered just before the tree, and goes with it. The tree goes when the connection does,
+ * and a node that had the keyboard focus takes the focus along: it would be on the page body
+ * when the tree is back a second later. This notes the node on the way out (it is unmounted
+ * before the tree is taken out of the document) and gives the focus back on the way in, if
+ * nothing else has taken it since.
+ */
+const TreeFocusKeeper = ({ treeId, lost }: { treeId: string; lost: MutableRefObject<string | undefined> }) => {
+  useLayoutEffect(() => {
+    const id = lost.current;
+    lost.current = undefined;
+    // The tree view renders the nodes below its top level a moment after itself: the node is
+    // looked for during the next frames, for as long as the focus is nowhere.
+    let frame = 0;
+    let framesLeft = 60;
+    const restore = () => {
+      if (id === undefined || document.activeElement !== document.body) {
+        return;
+      }
+      const item = document.getElementById(id);
+      if (item) {
+        item.focus();
+      } else if (framesLeft-- > 0) {
+        frame = requestAnimationFrame(restore);
+      }
+    };
+    restore();
+    return () => {
+      cancelAnimationFrame(frame);
+      const item = document.activeElement?.closest<HTMLElement>('[role="treeitem"]');
+      lost.current = item?.id.startsWith(`${treeId}-`) ? item.id : undefined;
+    };
+  }, [treeId, lost]);
+  return null;
+};
+
 interface DeviceTreePanelProps {
   onOpenPanel?: (panelId: PanelId) => void;
 }
@@ -320,6 +356,10 @@ export const DeviceTreePanel = ({ onOpenPanel }: DeviceTreePanelProps = {}) => {
   const initialized = useDebuggerDataStore((state) => state.initialized);
   const deviceTree = useDebuggerDataStore((state) => state.deviceTree);
   const [searchQuery, setSearchQuery] = useState("");
+  // The ids of the tree's nodes in the document start with this, and it is the panel's, not the
+  // tree's: the tree that comes with the next connection has the same ids.
+  const treeId = useId();
+  const lostFocus = useRef<string | undefined>(undefined);
 
   // What the user expanded and collapsed. Until they touch the tree it follows the default
   // of the current tree; a search does not change it.
@@ -351,59 +391,67 @@ export const DeviceTreePanel = ({ onOpenPanel }: DeviceTreePanelProps = {}) => {
     [searchQuery],
   );
 
+  const hasTree = initialized && deviceTree.length > 0;
+
   return (
     <Panel>
-      {!initialized ? (
-        <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%" }}>
-          <Typography variant="body2" color="text.secondary">
-            No Data
-          </Typography>
+      <Box sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+        {/* Always there, like the box of the Watches panel: what was typed, and the focus, are
+            still there when a lost connection is back. */}
+        <Box sx={{ px: 1.5, py: 1 }}>
+          <TextField
+            size="small"
+            fullWidth
+            placeholder="Search components..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            InputProps={{
+              startAdornment: <SearchIcon fontSize="small" sx={{ mr: 1, color: "text.secondary" }} />,
+            }}
+            sx={{ "& .MuiOutlinedInput-root": { fontSize: "0.875rem" } }}
+          />
+          {hasTree && search && search.totalRows > search.shownRows && (
+            <Typography variant="caption" color="warning.main" role="status" sx={{ display: "block", mt: 0.5 }}>
+              Showing the first {search.shownRows} of {search.totalRows} matching rows. Refine your search to see the
+              rest.
+            </Typography>
+          )}
+          {hasTree && search && search.totalRows === 0 && (
+            <Typography variant="caption" color="text.secondary" role="status" sx={{ display: "block", mt: 0.5 }}>
+              No component or register matches.
+            </Typography>
+          )}
         </Box>
-      ) : deviceTree.length === 0 ? (
-        <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
-          No device information available.
-        </Typography>
-      ) : (
-        <Box sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
-          <Box sx={{ px: 1.5, py: 1 }}>
-            <TextField
-              size="small"
-              fullWidth
-              placeholder="Search components..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              InputProps={{
-                startAdornment: <SearchIcon fontSize="small" sx={{ mr: 1, color: "text.secondary" }} />,
-              }}
-              sx={{ "& .MuiOutlinedInput-root": { fontSize: "0.875rem" } }}
-            />
-            {search && search.totalRows > search.shownRows && (
-              <Typography variant="caption" color="warning.main" role="status" sx={{ display: "block", mt: 0.5 }}>
-                Showing the first {search.shownRows} of {search.totalRows} matching rows. Refine your search to see the
-                rest.
-              </Typography>
-            )}
-            {search && search.totalRows === 0 && (
-              <Typography variant="caption" color="text.secondary" role="status" sx={{ display: "block", mt: 0.5 }}>
-                No component or register matches.
-              </Typography>
-            )}
+        <Divider />
+        {!initialized ? (
+          <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", flex: 1 }}>
+            <Typography variant="body2" color="text.secondary">
+              No Data
+            </Typography>
           </Box>
-          <Divider />
-          <SimpleTreeView
-            expandedItems={expandedItems}
-            onExpandedItemsChange={handleExpandedItemsChange}
-            slots={TREE_SLOTS}
-            itemChildrenIndentation={INDENT_PX}
-            multiSelect
-            sx={treeSx}
-          >
-            {nodes.map((node) => (
-              <DeviceNodeItem key={node.path} node={node} depth={0} onOpenPanel={onOpenPanel} />
-            ))}
-          </SimpleTreeView>
-        </Box>
-      )}
+        ) : deviceTree.length === 0 ? (
+          <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+            No device information available.
+          </Typography>
+        ) : (
+          <>
+            <TreeFocusKeeper treeId={treeId} lost={lostFocus} />
+            <SimpleTreeView
+              id={treeId}
+              expandedItems={expandedItems}
+              onExpandedItemsChange={handleExpandedItemsChange}
+              slots={TREE_SLOTS}
+              itemChildrenIndentation={INDENT_PX}
+              multiSelect
+              sx={treeSx}
+            >
+              {nodes.map((node) => (
+                <DeviceNodeItem key={node.path} node={node} depth={0} onOpenPanel={onOpenPanel} />
+              ))}
+            </SimpleTreeView>
+          </>
+        )}
+      </Box>
     </Panel>
   );
 };

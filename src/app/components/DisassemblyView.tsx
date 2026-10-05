@@ -1,6 +1,7 @@
 import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Box, Button, CircularProgress, IconButton, InputAdornment, Paper, Stack, TextField, Typography } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "./HideOnHoverTooltip";
+import { RunControlButton } from "./RunControlButton";
 import CircleIcon from "@mui/icons-material/Circle";
 import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
 import RadioButtonCheckedIcon from "@mui/icons-material/RadioButtonChecked";
@@ -786,9 +787,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
           {stepping ? (
             <Tooltip title={config.stepLabel}>
               <span>
-                <IconButton size="small" onClick={handleStep} disabled={stepDisabled || !initialized}>
+                <RunControlButton size="small" onClick={handleStep} disabled={stepDisabled || !initialized}>
                   <StepIcon fontSize="small" />
-                </IconButton>
+                </RunControlButton>
               </span>
             </Tooltip>
           ) : (
@@ -800,16 +801,16 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             <>
               <Tooltip title="Step In">
                 <span>
-                  <IconButton size="small" onClick={handleStepIn} disabled={stepDisabled || !initialized}>
+                  <RunControlButton size="small" onClick={handleStepIn} disabled={stepDisabled || !initialized}>
                     <ArrowDownwardRoundedIcon fontSize="small" />
-                  </IconButton>
+                  </RunControlButton>
                 </span>
               </Tooltip>
               <Tooltip title="Step Out">
                 <span>
-                  <IconButton size="small" onClick={handleStepOut} disabled={stepDisabled || !initialized}>
+                  <RunControlButton size="small" onClick={handleStepOut} disabled={stepDisabled || !initialized}>
                     <ArrowUpwardRoundedIcon fontSize="small" />
-                  </IconButton>
+                  </RunControlButton>
                 </span>
               </Tooltip>
             </>

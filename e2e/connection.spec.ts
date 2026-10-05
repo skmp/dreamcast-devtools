@@ -9,8 +9,9 @@ import {
   saveScreenshot,
   statusBar,
   tooltipButton,
+  treeItem,
 } from "./support/fixtures";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { startMockServer } from "./support/mockServer";
 import { serveScriptedDebugger } from "./support/scriptedDebugger";
 
@@ -239,6 +240,117 @@ test("a connection the server closes is taken up again, and the server is descri
   expect(back - lost).toBeGreaterThanOrEqual(900);
   await expect(panel(page, "device-tree").getByRole("treeitem").first()).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("the keyboard focus is where it was when a lost connection is back", async ({ page }) => {
+  // the scripted server is paused, so Run and the step buttons can be used
+  const server = await serveScriptedDebugger(page);
+  const treeTexts = await recordText(page, '[data-panel-id="device-tree"]');
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  const view = panel(page, "sh4-disassembly");
+  await expect(view.locator(".current-instruction")).toHaveCount(1);
+  const search = panel(page, "device-tree").getByPlaceholder("Search components...");
+
+  const places: Array<[string, Locator]> = [
+    ["the search box of the device tree", search],
+    ["a node of the device tree", treeItem(page, "dc.sh4")],
+    ["Step In", tooltipButton(view, "Step In")],
+    ["Run", tooltipButton(page, "Run")],
+  ];
+  let connections = 1;
+  for (const [name, place] of places) {
+    await test.step(name, async () => {
+      await place.focus();
+      await expect(place).toBeFocused();
+      if (place === search) {
+        await page.keyboard.type("tmu");
+      }
+
+      server.drop();
+      // one second later the page is back by itself
+      await expect.poll(() => server.connections()).toBe(++connections);
+      await server.described();
+      await expect(statusBar(page)).toContainText("Connection: connected");
+      await expect(view.locator(".current-instruction")).toHaveCount(1);
+      await expect(treeItem(page, "dc.sh4")).toBeVisible();
+
+      await expect(place).toBeFocused();
+      if (place === search) {
+        // what was typed is still there, and is still what the tree shows
+        await expect(search).toHaveValue("tmu");
+        await expect(treeItem(page, "dc.sh4.tmu")).toBeVisible();
+        await expect(treeItem(page, "dc.aica")).toHaveCount(0);
+        await search.fill("");
+      }
+    });
+  }
+  // every time the tree had gone in between, with the data of the lost connection
+  const without = (await treeTexts()).filter(({ text }) => text.includes("No Data"));
+  expect(without.length).toBeGreaterThanOrEqual(places.length);
+});
+
+test("a step button that cannot be used keeps the focus and does nothing: stepping with the keyboard goes on from where it is", async ({
+  page,
+}) => {
+  const server = await serveScriptedDebugger(page);
+  // like a real server: the target runs for a moment, and stops again one instruction on
+  let pc = 0x8c001000;
+  let stopId = 1;
+  server.answer("control.step", () => {
+    server.state.execution = { state: "running", stopId };
+    server.tick();
+    return {};
+  });
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  const view = panel(page, "sh4-disassembly");
+  const marked = view.locator(".current-instruction");
+  await expect(marked).toHaveAttribute("data-address", String(pc));
+  const stepIn = tooltipButton(view, "Step In");
+  const status = page.getByRole("status", { name: "Execution state" });
+
+  await stepIn.focus();
+  await page.keyboard.press("Enter");
+  await expect(status).toHaveText("Running");
+  expect(server.requestsOf("control.step")).toHaveLength(1);
+  // while the target runs the button cannot be used, says so, and still has the focus
+  await expect(stepIn).toBeDisabled();
+  await expect(stepIn).toHaveAttribute("aria-disabled", "true");
+  await expect(stepIn).toBeFocused();
+  // pressing it now asks the server for nothing
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Space");
+  await stepIn.click({ force: true });
+
+  // the step is done: the same key steps again, without a Tab back to the button
+  pc += 2;
+  server.state.execution = { state: "paused", stopId: ++stopId, reason: "step" };
+  server.setRegister("dc.sh4.cpu", "PC", `0x${pc.toString(16).toUpperCase()}`);
+  server.tick();
+  await expect(marked).toHaveAttribute("data-address", String(pc));
+  await expect(stepIn).toBeEnabled();
+  await expect(stepIn).not.toHaveAttribute("aria-disabled");
+  await expect(stepIn).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(status).toHaveText("Running");
+  expect(server.requestsOf("control.step")).toHaveLength(2);
+
+  // the same for the run controls of the toolbar: Run cannot be used while the target runs
+  const run = tooltipButton(page, "Run");
+  await expect(run).toBeDisabled();
+  await run.focus();
+  await page.keyboard.press("Enter");
+  await run.click({ force: true });
+  server.state.execution = { state: "paused", stopId: ++stopId, reason: "step" };
+  server.tick();
+  await expect(run).toBeEnabled();
+  await expect(run).toBeFocused();
+  expect(server.requestsOf("control.runUntil")).toEqual([]);
+  await page.keyboard.press("Enter");
+  await expect.poll(() => server.requestsOf("control.runUntil")).toHaveLength(1);
 });
 
 test("a failed connection attempt shows a readable error", async ({ page, mock, diagnostics }) => {

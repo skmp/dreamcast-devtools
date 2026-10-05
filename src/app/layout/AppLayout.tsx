@@ -2,6 +2,7 @@ import { useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { AppBar, Box, Button, Divider, IconButton, Link, Stack, Switch, Typography, Alert } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
 import { lazyImport } from "../components/lazyImport";
+import { RunControlButton } from "../components/RunControlButton";
 import PowerSettingsNewIcon from "@mui/icons-material/PowerSettingsNew";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudOffIcon from "@mui/icons-material/CloudOff";
@@ -425,28 +426,23 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
               <Stack direction="row" spacing={1} alignItems="center">
                 <Tooltip title="Run">
                   <span>
-                    <IconButton size="small" color={resumable ? "success" : "default"} disabled={!resumable} onClick={handleRun}>
+                    <RunControlButton size="small" color="success" disabled={!resumable} onClick={handleRun}>
                       <PlayArrowIcon />
-                    </IconButton>
+                    </RunControlButton>
                   </span>
                 </Tooltip>
                 <Tooltip title="Pause">
                   <span>
-                    <IconButton
-                      size="small"
-                      color={runState === "running" ? "warning" : "default"}
-                      disabled={runState !== "running"}
-                      onClick={handlePause}
-                    >
+                    <RunControlButton size="small" color="warning" disabled={runState !== "running"} onClick={handlePause}>
                       <PauseIcon />
-                    </IconButton>
+                    </RunControlButton>
                   </span>
                 </Tooltip>
                 <Tooltip title="Run to next breakpoint">
                   <span>
-                    <IconButton size="small" color={resumable ? "primary" : "default"} disabled={!resumable} onClick={handleRun}>
+                    <RunControlButton size="small" color="primary" disabled={!resumable} onClick={handleRun}>
                       <SkipNextIcon />
-                    </IconButton>
+                    </RunControlButton>
                   </span>
                 </Tooltip>
               </Stack>
