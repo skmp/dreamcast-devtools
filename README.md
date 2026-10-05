@@ -32,7 +32,8 @@ Run `npm ci` once, then:
 | `npm run test:run` | Vitest, single run. |
 | `npm run test:ui` | Vitest with its browser UI. |
 | `npm run test:e2e` | Playwright smoke suite in headless Chromium (see [End-to-end tests](#end-to-end-tests)). Not part of `check`. |
-| `npm run check` | `lint`, `typecheck`, `test:run`, `build:native`; stops at the first failure. CI runs this. |
+| `npm run contract` | The contract runner: holds a debugger server to the protocol (see [Contract runner](#contract-runner)). Without arguments it tests the mock, in-process. |
+| `npm run check` | `lint`, `typecheck`, `test:run`, `contract`, `build:native`; stops at the first failure. CI runs this. |
 
 ## Serving the build
 
@@ -193,6 +194,33 @@ reference for every parameter, result, error code and bound; what follows is the
 The mock (`server/mockDebugger.ts`, hosted with the page by `server/mockServer.ts`) implements
 the first milestone of this protocol around a fabricated machine, keeps one state for all
 clients, and also steps the ARM7 and the DSP, records SGC frames and writes registers.
+
+## Contract runner
+
+`npm run contract` holds a debugger server to the protocol. It connects with the UI's own
+`JsonRpcClient` and `WebSocketTransport`, validates every response and every tick with the
+strict copy of the schema (unknown keys fail, the v3 fields are required, `null` is an error),
+checks the tick invariants on every tick, and runs the scenarios S00 to S18
+(`scripts/contract/scenarios.ts`). It removes the breakpoints and watches it added, restores the
+breakpoint categories and the run state, and exits with 1 when a scenario failed or an invariant
+was violated.
+
+```
+npm run contract                                  # the mock, started in the same process
+npm run contract -- --url ws://127.0.0.1:55543/ws --elf 2ndmix.elf   # an emulator (profile emulator)
+npm run contract -- --url ws://127.0.0.1:5173/ws --profile mock      # a mock server that is already running
+npm run contract -- --only S05,S06 --verbose      # some scenarios, with every frame
+npm run contract -- --json                        # the summary as JSON on stdout
+npm run contract -- --list                        # the scenarios
+```
+
+Each scenario ends as `passed`, `FAILED`, `not applicable` (the server does not advertise the
+capability or target the scenario needs, or the scenario belongs to the other profile) or
+`partial` (the server advertises only some of the capabilities of the scenario, and those
+parts passed). Only `passed` is a pass. The emulator profile expects the emulator at its
+`StartPaused` stop, runs S00 and S15 as well, and multiplies every timeout by 5.
+`--idle-breakpoint <address|symbol>` is not a test run: it mutes the `sh4` category, adds one
+breakpoint, resumes and stays connected until the server closes the connection.
 
 ## Breakpoints
 

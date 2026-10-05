@@ -18,7 +18,8 @@
     "test:run": "vitest run",
     "test:ui": "vitest --ui",
     "test:e2e": "playwright test",
-    "check": "npm run lint && npm run typecheck && npm run test:run && npm run build:native"
+    "contract": "tsx --tsconfig tsconfig.scripts.json scripts/contract-test.ts",
+    "check": "npm run lint && npm run typecheck && npm run test:run && npm run contract && npm run build:native"
   },
   "engines": {
     "node": ">=22.13"
