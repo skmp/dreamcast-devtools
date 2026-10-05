@@ -1,5 +1,5 @@
 import { useEffect, useCallback, useMemo, useState, useRef } from "react";
-import { AppBar, Box, Button, Divider, IconButton, Stack, Switch, Typography, Alert } from "@mui/material";
+import { AppBar, Box, Button, Divider, IconButton, Link, Stack, Switch, Typography, Alert } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
 import { lazyImport } from "../components/lazyImport";
 import PowerSettingsNewIcon from "@mui/icons-material/PowerSettingsNew";
@@ -624,19 +624,20 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
       >
         <Typography variant="caption">Connection: {connectionState}</Typography>
         <Divider orientation="vertical" flexItem />
-        <Tooltip title="Click to change connection">
-          <Typography
+        {/* A button: the connection picker behind it is the only way to the box for another
+            endpoint, and has to open from the keyboard too. The tooltip describes it; its name
+            is what it shows. */}
+        <Tooltip title="Click to change connection" describeChild>
+          <Link
+            component="button"
+            type="button"
             variant="caption"
-            sx={{
-              cursor: "pointer",
-              "&:hover": {
-                textDecoration: "underline",
-              },
-            }}
+            color="inherit"
+            underline="hover"
             onClick={() => setShowConnectionModal(true)}
           >
             Endpoint: {endpoint ?? "-"}
-          </Typography>
+          </Link>
         </Tooltip>
         <Box sx={{ flexGrow: 1 }} />
         <Typography variant="caption">nullDC Debugger {DEBUGGER_VERSION}</Typography>

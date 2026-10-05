@@ -273,6 +273,28 @@ test("the endpoint in the status bar opens the connection picker with the same-o
   await expect(statusBar(page)).toContainText("Connection: connected");
 });
 
+test("the endpoint in the status bar is a button: the connection picker opens from the keyboard", async ({ page, mock }) => {
+  await openWorkspace(page, "sh4-debugger");
+  // its name is what it shows, and Tab stops at it
+  const endpoint = statusBar(page).getByRole("button", { name: `Endpoint: ${mock.wsURL}`, exact: true });
+  await expect(endpoint).toBeVisible();
+  expect(await endpoint.evaluate((element) => (element as HTMLElement).tabIndex)).toBe(0);
+  const dialog = page.getByRole("dialog");
+
+  for (const key of ["Enter", "Space"]) {
+    await endpoint.focus();
+    await page.keyboard.press(key);
+    await expect(dialog.getByRole("heading", { name: "Select Connection" })).toBeVisible();
+    // the way to the box for another endpoint, without a mouse
+    await dialog.getByRole("radio", { name: "Enter connection string manually" }).check();
+    await expect(dialog.getByPlaceholder(/Enter WebSocket URL/)).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(endpoint).toBeFocused();
+  }
+  await expect(statusBar(page)).toContainText("Connection: connected");
+});
+
 test("a manually entered WebSocket URL connects", async ({ page, mock, rpc }) => {
   const other = await startMockServer({ watches: ["dc.aica.arm7.pc"] });
   try {
