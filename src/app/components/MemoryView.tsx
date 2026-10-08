@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Box, Button, CircularProgress, IconButton, InputAdornment, Stack, TextField, Typography } from "@mui/material";
+import { Box, Button, CircularProgress, InputAdornment, Stack, TextField, Typography } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "./HideOnHoverTooltip";
+import { RunControlButton } from "./RunControlButton";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import type { MemorySlice } from "../../lib/debuggerSchema";
 
@@ -366,9 +367,9 @@ export const MemoryView = ({
             }}
           />
           <Tooltip title="Refresh">
-            <IconButton size="small" onClick={handleRefresh} disabled={loading}>
+            <RunControlButton size="small" onClick={handleRefresh} disabled={loading}>
               <RefreshIcon fontSize="small" />
-            </IconButton>
+            </RunControlButton>
           </Tooltip>
         </Stack>
       </Box>

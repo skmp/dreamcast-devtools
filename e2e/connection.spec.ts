@@ -13,7 +13,7 @@ import {
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
 import { startMockServer } from "./support/mockServer";
-import { serveScriptedDebugger } from "./support/scriptedDebugger";
+import { defaultAnswer, serveScriptedDebugger } from "./support/scriptedDebugger";
 
 const connectButton = (page: Page) => page.getByRole("button", { name: "Connect", exact: true });
 const disconnectButton = (page: Page) => page.getByRole("button", { name: "Disconnect", exact: true });
@@ -258,6 +258,11 @@ test("the keyboard focus is where it was when a lost connection is back", async 
     ["a node of the device tree", treeItem(page, "dc.sh4")],
     ["Step In", tooltipButton(view, "Step In")],
     ["Run", tooltipButton(page, "Run")],
+    // cannot be used while the connection is away: there is no program counter then
+    ["Go to current PC", tooltipButton(view, "Go to current PC")],
+    // cannot be used while the view reads, which it does when the connection is back
+    ["Refresh of the disassembly", tooltipButton(view, "Refresh")],
+    ["Refresh of the memory", tooltipButton(panel(page, "sh4-memory"), "Refresh")],
   ];
   let connections = 1;
   for (const [name, place] of places) {
@@ -351,6 +356,74 @@ test("a step button that cannot be used keeps the focus and does nothing: steppi
   expect(server.requestsOf("control.runUntil")).toEqual([]);
   await page.keyboard.press("Enter");
   await expect.poll(() => server.requestsOf("control.runUntil")).toHaveLength(1);
+});
+
+test("Refresh keeps the focus while its view reads: refreshing with the keyboard goes on from where it is", async ({ page }) => {
+  // a server that takes its time to read: its answers wait for `release`
+  const server = await serveScriptedDebugger(page);
+  let holding = false;
+  const held: Array<() => void> = [];
+  const release = () => {
+    holding = false;
+    held.splice(0).forEach((answer) => answer());
+  };
+  for (const method of ["state.getDisassembly", "state.getMemorySlice"] as const) {
+    server.answer(method, (params) =>
+      holding ? new Promise((resolve) => held.push(() => resolve(defaultAnswer(method, params)))) : defaultAnswer(method, params),
+    );
+  }
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  await expect(panel(page, "sh4-disassembly").locator(".current-instruction")).toHaveCount(1);
+  await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+
+  for (const [id, method] of [
+    ["sh4-disassembly", "state.getDisassembly"],
+    ["sh4-memory", "state.getMemorySlice"],
+  ] as const) {
+    await test.step(`Refresh of ${id}`, async () => {
+      const refresh = tooltipButton(panel(page, id), "Refresh");
+      const reads = () => server.requestsOf(method).length;
+      await expect(refresh).toBeEnabled();
+      const before = reads();
+
+      await refresh.focus();
+      holding = true;
+      await page.keyboard.press("Enter");
+      await expect.poll(reads).toBe(before + 1);
+      // while the view reads the button cannot be used, says so, and still has the focus
+      await expect(refresh).toBeDisabled();
+      await expect(refresh).toHaveAttribute("aria-disabled", "true");
+      await expect(refresh).toBeFocused();
+      // pressing it now asks the server for nothing
+      await page.keyboard.press("Enter");
+      await page.keyboard.press("Space");
+      await refresh.click({ force: true });
+      expect(reads()).toBe(before + 1);
+
+      // the answer is in: the same key reads again, without a Tab back to the button
+      release();
+      await expect(refresh).toBeEnabled();
+      await expect(refresh).not.toHaveAttribute("aria-disabled");
+      await expect(refresh).toBeFocused();
+      await page.keyboard.press("Enter");
+      await expect.poll(reads).toBe(before + 2);
+      await expect(refresh).toBeEnabled();
+      await expect(refresh).toBeFocused();
+
+      // a stop makes the view read by itself: that does not take the focus either
+      holding = true;
+      server.state.execution = { state: "paused", stopId: (server.state.execution.stopId as number) + 1, reason: "step" };
+      server.tick();
+      await expect.poll(reads).toBe(before + 3);
+      await expect(refresh).toBeDisabled();
+      await expect(refresh).toBeFocused();
+      release();
+      await expect(refresh).toBeEnabled();
+      await expect(refresh).toBeFocused();
+    });
+  }
 });
 
 test("a failed connection attempt shows a readable error", async ({ page, mock, diagnostics }) => {

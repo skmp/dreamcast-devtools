@@ -849,9 +849,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
           )}
           <Tooltip title="Go to current PC">
             <span>
-              <IconButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
+              <RunControlButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
                 <MyLocationIcon fontSize="small" />
-              </IconButton>
+              </RunControlButton>
             </span>
           </Tooltip>
           <TextField
@@ -878,9 +878,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             }}
           />
           <Tooltip title="Refresh">
-            <IconButton size="small" onClick={handleRefresh} disabled={loading}>
+            <RunControlButton size="small" onClick={handleRefresh} disabled={loading}>
               <RefreshIcon fontSize="small" />
-            </IconButton>
+            </RunControlButton>
           </Tooltip>
         </Stack>
       </Box>
