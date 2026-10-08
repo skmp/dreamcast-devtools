@@ -1472,17 +1472,44 @@ const s13: Scenario = {
     const sh4 = requireTarget(context, "sh4");
     const other = await context.openSession();
     try {
-      const mark = other.mark();
+      // Every successful mutating request is followed by a tick to every client. That is
+      // seen while the target is paused: while it runs, the periodic tick shows the same
+      // change to the second client 200 ms later, whether or not the request was broadcast.
+      await ensurePaused(context);
+      let since = other.mark();
       const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address: sh4.defaultDisassemblyAddress, enabled: false });
       await other.waitForTick(
         (tick) => String(breakpoint.id) in tick.breakpoints,
         1000,
         `a tick on the second connection that lists breakpoint ${breakpoint.id}`,
-        mark,
+        since,
       );
-      const removal = other.mark();
+      since = other.mark();
       await removeBreakpoint(context, breakpoint.id);
-      await other.waitForTick((tick) => !(String(breakpoint.id) in tick.breakpoints), 1000, "a tick on the second connection without the removed breakpoint", removal);
+      await other.waitForTick((tick) => !(String(breakpoint.id) in tick.breakpoints), 1000, "a tick on the second connection without the removed breakpoint", since);
+
+      // a watch
+      const register = unwatchedRegister(context, sh4.pcPath, ["SR", "GBR", "VBR"]);
+      const lists = (id: number) => (tick: DebuggerTick) => (tick.watches ?? []).some((watch) => watch.id === id);
+      since = other.mark();
+      const { id: watchId } = await addWatch(context, register.expression, register.expression);
+      await other.waitForTick(lists(watchId), 1000, `a tick on the second connection that lists watch ${watchId}`, since);
+      since = other.mark();
+      await unwatch(context, watchId);
+      await other.waitForTick((tick) => !lists(watchId)(tick), 1000, "a tick on the second connection without the removed watch", since);
+
+      // a category
+      const original = categoriesOf(session.latestTick().tick).events;
+      for (const state of [{ muted: !original.muted, soloed: original.soloed }, original]) {
+        since = other.mark();
+        await setCategories(context, { events: state });
+        await other.waitForTick(
+          (tick) => tick.categories?.events?.muted === state.muted,
+          1000,
+          `a tick on the second connection with the category events ${state.muted ? "muted" : "not muted"}`,
+          since,
+        );
+      }
     } finally {
       other.close();
       // what the invariants found on the second connection fails this scenario too

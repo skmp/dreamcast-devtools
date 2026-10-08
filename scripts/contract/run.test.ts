@@ -397,7 +397,7 @@ describe("the contract runner against the mock", () => {
     expect(summary.cleanUpProblems).toEqual([]);
     expect(summary.ok).toBe(true);
 
-    // S13 alone, i.e. on a running server: there the tick in front of the answer is a periodic one
+    // S13 alone, i.e. started on a running server: there the tick in front of the first answers is a periodic one
     const running = await run(staleTickBeforeEveryAnswer, ["S13"]);
     expect(reportOf(running)).toEqual(["S13 passed "]);
     expect(running.ok).toBe(true);
@@ -1026,6 +1026,48 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(summary, "S06")).toMatch(/^a paused tick at the breakpoint 0x8C0000[0-9A-F]{2}: not seen within 2000 ms; ticks since then: \d+ \(#\d+ running /);
     expect(summary.cleanUpProblems).toEqual([]);
     expect((await stateOf(url)).categories.sh4).toEqual({ muted: false, soloed: false });
+  }, 30_000);
+
+  it("S13: a change of the watches, or of the categories, whose tick goes to the client that asked for it only", async () => {
+    /** The mock, with the tick after the methods that match `quiet` sent to the requesting client only. */
+    const notBroadcasting = (quiet: RegExp): MockDebugger => {
+      const mock = new MockDebugger();
+      const inner = mock as unknown as {
+        dispatch(client: Json, id: number, method: string, params: Json): void;
+        tickAfter(context: { client: Json & { id: number }; afterResponse: Array<() => void> }): void;
+        broadcastTick(): void;
+        sendTick(client: Json, tick: Json): void;
+        buildTick(full: boolean): Json;
+        clients: Map<number, Json>;
+      };
+      let method = "";
+      const dispatch = inner.dispatch.bind(mock);
+      inner.dispatch = (client, id, name, params) => {
+        method = name;
+        dispatch(client, id, name, params);
+      };
+      inner.tickAfter = (context) => {
+        const own = quiet.test(method);
+        context.afterResponse.push(() => {
+          if (!own) {
+            inner.broadcastTick();
+          } else if (inner.clients.has(context.client.id)) {
+            inner.sendTick(context.client, inner.buildTick(false));
+          }
+        });
+      };
+      return mock;
+    };
+    const only = new Set(["S13"]);
+
+    const watches = await runContract({ url: (await startServer(undefined, notBroadcasting(/^state\.(watch|unwatch)$/))).url, profile: "mock", only });
+    expect(statusOf(watches, "S13")).toBe("failed");
+    expect(detailsOf(watches, "S13")).toBe("a tick on the second connection that lists watch 1: not seen within 1000 ms; ticks since then: 0");
+
+    const categories = await runContract({ url: (await startServer(undefined, notBroadcasting(/setCategoryStates/))).url, profile: "mock", only });
+    expect(statusOf(categories, "S13")).toBe("failed");
+    expect(detailsOf(categories, "S13")).toBe("a tick on the second connection with the category events muted: not seen within 1000 ms; ticks since then: 0");
+    expect(categories.cleanUpProblems).toEqual([]);
   }, 30_000);
 
   it("S05, S08: ids that are used again: a new breakpoint, or a new watch, under the lowest free id", async () => {
