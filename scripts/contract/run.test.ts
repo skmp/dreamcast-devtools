@@ -630,6 +630,64 @@ describe("the contract runner against a server that breaks the protocol", () => 
     ]);
   });
 
+  it("S01: targets that do not have the values of the table of 3.1, and a tree without nodes of milestone M1", async () => {
+    const describing = (rewrite: (result: Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) => Json): Faults => ({
+      toClient: (frame) => {
+        const result = frame.result as (Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) | undefined;
+        return result?.deviceTree ? { ...frame, result: rewrite(result) } : frame;
+      },
+    });
+    const constants = await run(
+      describing((result) => ({
+        ...result,
+        targets: result.targets.map((target) =>
+          target.id === "dsp"
+            ? { ...target, addressRadix: 16, addressDigits: 2, label: "" }
+            : target.id === "arm7"
+              ? { ...target, addressDigits: 6, defaultDisassemblyAddress: 0x00200000, defaultMemoryAddress: 0x00200000 }
+              : { ...target, addressMax: 0x1fffffff, breakpointEvent: "dc.sh4.pc" },
+        ),
+      })),
+      ["S01"],
+    );
+    expect(constants.scenarios[0].details).toEqual([
+      "target sh4: breakpointEvent is \"dc.sh4.pc\", the table of 3.1 says \"dc.sh4.cpu.pc\"",
+      "target sh4: addressMax is 0x1FFFFFFF, the table of 3.1 says 0xFFFFFFFF",
+      "target arm7: addressDigits is 6, the table of 3.1 says 8",
+      "target arm7: defaultDisassemblyAddress is 0x00200000, the table of 3.1 says 0",
+      "target arm7: defaultMemoryAddress is 0x00200000, the table of 3.1 says 0",
+      "target dsp: addressRadix is 16, the table of 3.1 says 10",
+      "target dsp: addressDigits is 2, the table of 3.1 says 3",
+    ]);
+
+    // without the timer unit and the interrupt controller of Holly, and with a core node that opens no panel
+    const prune = (nodes: Json[]): Json[] =>
+      nodes
+        .filter((node) => node.path !== "dc.sh4.tmu" && node.path !== "dc.holly.intc")
+        .map((node) => {
+          const { actions, children, ...rest } = node as Json & { actions?: string[]; children?: Json[] };
+          return { ...rest, ...(actions && node.path !== "dc.holly.core" ? { actions } : {}), ...(children ? { children: prune(children) } : {}) };
+        });
+    const pruned = describing((result) => ({ ...result, deviceTree: prune(result.deviceTree) }));
+    const nodes = await run(
+      {
+        ...pruned,
+        toClient: (frame) => {
+          if (!isTick(frame)) return pruned.toClient!(frame);
+          const { "dc.sh4.tmu": _tmu, "dc.holly.intc": _intc, ...registers } = frame.params.registers;
+          return { ...frame, params: { ...frame.params, registers } };
+        },
+      },
+      ["S01"],
+    );
+    expect(nodes.scenarios[0].details).toEqual([
+      "the device tree has no node dc.sh4.tmu, which the table of 2.8 lists for milestone M1",
+      "the device tree has no node dc.holly.intc, which the table of 2.8 lists for milestone M1",
+      'dc.holly.core: the action "holly-core" of the table of 2.8 is missing',
+    ]);
+    expect(nodes.invariantViolations).toEqual([]);
+  });
+
   it("S01: a server that answers debugger.describe with nothing the client can read, or sends no tick after it, fails S01; nothing else is run", async () => {
     const lines: string[] = [];
     const refused = await startServer({

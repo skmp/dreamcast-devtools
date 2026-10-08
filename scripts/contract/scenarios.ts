@@ -13,6 +13,7 @@ import type {
   TargetProcessor,
 } from "../../src/lib/debuggerSchema";
 import { MOCK_SH4_RING, mockNextAddress } from "../../server/mockDebugger";
+import { M1_DEVICE_TREE, TARGET_TABLE } from "./design";
 import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
 import { registerValuePattern } from "./invariants";
 import { ContractFailure, ContractSession, check, describeState, fail } from "./session";
@@ -527,6 +528,30 @@ const s01: Scenario = {
       expectThat(registers?.some((register) => register.name === target.pcRegister), `target ${target.id}: ${target.pcPath}.${target.pcRegister} is not in the device tree`);
     }
     expectThat(ids.includes("sh4"), "the SH4 target is listed");
+    // ... and has the values the table of 3.1 gives it
+    const written = (value: unknown) => (typeof value === "number" && value > 255 ? hex(value) : JSON.stringify(value));
+    for (const target of targets) {
+      for (const [key, fixed] of Object.entries(TARGET_TABLE[target.id] ?? {})) {
+        const sent = target[key as keyof DebuggerTarget];
+        expectThat(sent === fixed, `target ${target.id}: ${key} is ${written(sent)}, the table of 3.1 says ${written(fixed)}`);
+      }
+    }
+
+    // the nodes the device tree has from milestone M1 on, and the panels they open (2.8)
+    const nodes = new Map<string, DeviceNodeDescriptor>();
+    const collect = (list: DeviceNodeDescriptor[]) =>
+      list.forEach((node) => {
+        nodes.set(node.path, node);
+        collect(node.children ?? []);
+      });
+    collect(shape.deviceTree);
+    for (const row of M1_DEVICE_TREE) {
+      const node = nodes.get(row.path);
+      expectThat(node, `the device tree has no node ${row.path}, which the table of 2.8 lists for milestone M1`);
+      for (const action of node ? (row.actions ?? []) : []) {
+        expectThat(node?.actions?.includes(action), `${row.path}: the action "${action}" of the table of 2.8 is missing`);
+      }
+    }
 
     if (findings.length > 0) {
       fail(findings[0], findings.slice(1));
