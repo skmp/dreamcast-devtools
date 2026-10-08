@@ -226,6 +226,40 @@ test("bytes the debugger cannot read are shown as ??, not as the zeros they are 
   await expect(memoryRows(view).nth(0).locator("span").nth(1)).toHaveText(/^([0-9A-F]{2} ){15}[0-9A-F]{2}$/);
 });
 
+test("ARM7 memory ends where the address space of the ARM7 ends: its last row is 0x00FFFFF0", async ({ page, rpc }) => {
+  // `addressMax` of the target in debugger.describe is 0x00FFFFFF: the view asks for nothing above it
+  await openWorkspace(page, "arm7-debugger");
+  const view = panel(page, "arm7-memory");
+  const box = view.getByRole("textbox");
+  const slices = () => rpc.requests("state.getMemorySlice").map((frame) => frame.params as { target: string; address: number; length: number });
+  await expect(memoryRows(view)).toHaveCount(60);
+
+  await box.fill("0x00FFFFFF");
+  await box.press("Enter");
+  // sixty rows that end with the last one, and no ten rows of context that would push it out
+  await expect(memoryRows(view).first().locator("span").first()).toHaveText("0x00FFFC40");
+  await expect(memoryRows(view).last().locator("span").first()).toHaveText("0x00FFFFF0");
+  await expect(memoryRows(view)).toHaveCount(60);
+  expect(slices().at(-1)).toEqual({ target: "arm7", address: 0x00fffc40, length: 960 });
+  await expect(rowAt(view, 0x00fffff0)).toHaveClass(/target-address/);
+  const settled = slices().length;
+
+  // an address above the space, and the wheel: the view stays on the last sixty rows, and reads nothing
+  await box.fill("0x12345678");
+  await box.press("Enter");
+  await memoryRows(view).nth(5).hover();
+  await page.mouse.wheel(0, 600);
+  await page.waitForTimeout(300);
+  await expect(memoryRows(view).last().locator("span").first()).toHaveText("0x00FFFFF0");
+  expect(slices()).toHaveLength(settled);
+  for (const { address, length } of slices()) {
+    expect(address + length - 1, hex8(address)).toBeLessThanOrEqual(0x00ffffff);
+  }
+  // and scrolls back
+  await page.mouse.wheel(0, -60);
+  await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(0x00fffc40 - 96));
+});
+
 test("the memory is read again when the target stops, and not for any other tick", async ({ page, rpc }) => {
   await openWorkspace(page, "sh4-debugger");
   const view = panel(page, "sh4-memory");

@@ -16,6 +16,7 @@ import {
   type WorkspaceId,
 } from "./support/fixtures";
 import { requestAsAnotherClient } from "./support/mockServer";
+import { serveScriptedDebugger, V3_TARGETS } from "./support/scriptedDebugger";
 import type { Locator } from "@playwright/test";
 
 interface Target {
@@ -354,6 +355,168 @@ test("a word the debugger cannot read is listed as ?? <unreadable>, between the 
     await expect(cells.nth(1)).toHaveText("??");
     await expect(cells.nth(2)).toHaveText("<unreadable>");
   }
+});
+
+test.describe("where the address space of a target ends (addressMax of debugger.describe)", () => {
+  test("ARM7: the last line is 0x00FFFFFC; the address box and the wheel ask for nothing beyond it", async ({ page, rpc }) => {
+    await openWorkspace(page, "arm7-debugger");
+    const view = panel(page, "arm7-disassembly");
+    const rows = disassemblyRows(view);
+    const box = view.getByRole("textbox");
+    const LAST = 0x00fffffc;
+    const listings = () =>
+      rpc.requests("state.getDisassembly").map((frame) => frame.params as { target: string; address: number; count: number });
+
+    // the last instruction of the ARM7, with ten of context: eleven lines, and not 64
+    await box.fill(hex8(LAST));
+    await box.press("Enter");
+    await expect(rows.last()).toHaveAttribute("data-address", String(LAST));
+    await expect(rows).toHaveCount(11);
+    await expect(rows.first()).toHaveAttribute("data-address", String(LAST - 40));
+    expect(listings().at(-1)).toEqual({ target: "arm7", address: LAST - 40, count: 11 });
+    await expect(box).toHaveValue(hex8(LAST));
+
+    // an address above the space is brought back into it
+    await box.fill("0x01000000");
+    await box.press("Enter");
+    await expect(rows.first()).toHaveAttribute("data-address", String(0x01000000 - 40));
+    await expect(rows.last()).toHaveAttribute("data-address", String(LAST));
+    expect(listings().at(-1)).toEqual({ target: "arm7", address: 0x01000000 - 40, count: 10 });
+
+    // the wheel stops at the last instruction: forty notches down from there end on it
+    await rows.first().hover();
+    await page.mouse.wheel(0, 2400);
+    await expect(rows).toHaveCount(1);
+    await expect(rows.first()).toHaveAttribute("data-address", String(LAST));
+    expect(listings().at(-1)).toEqual({ target: "arm7", address: LAST, count: 1 });
+    const settled = listings().length;
+    await page.mouse.wheel(0, 600);
+    await page.waitForTimeout(300);
+    expect(listings()).toHaveLength(settled);
+    // nothing the view asked for goes past the end
+    for (const { address, count } of listings()) {
+      expect(address + (count - 1) * 4, `${hex8(address)} x ${count}`).toBeLessThanOrEqual(LAST);
+    }
+    // and it scrolls back out of it
+    await page.mouse.wheel(0, -60);
+    await expect(rows.first()).toHaveAttribute("data-address", String(LAST - 24));
+    await expect(rows).toHaveCount(7);
+  });
+
+  test("DSP: the last line is step 127, whatever step is asked for", async ({ page, rpc, diagnostics }) => {
+    diagnostics.allow(...KNOWN.sgcNoData);
+    await openWorkspace(page, "audio-debugger");
+    const view = panel(page, "dsp-disassembly");
+    const rows = disassemblyRows(view);
+    const box = view.getByRole("textbox");
+    await expect(rows.first()).toBeVisible();
+    const listings = () =>
+      rpc.requests("state.getDisassembly").map((frame) => frame.params as { target: string; address: number; count: number });
+
+    for (const { typed, first, count } of [
+      { typed: "128", first: 118, count: 10 },
+      { typed: "999", first: 127, count: 1 },
+      { typed: "0x7F", first: 117, count: 11 },
+    ]) {
+      await box.fill(typed);
+      await box.press("Enter");
+      await expect(rows.first(), typed).toHaveAttribute("data-address", String(first));
+      await expect(rows, typed).toHaveCount(count);
+      await expect(rows.last(), typed).toHaveAttribute("data-address", "127");
+      expect(listings().at(-1), typed).toEqual({ target: "dsp", address: first, count });
+      await expect(box, typed).toHaveValue("127");
+    }
+    for (const { address, count } of listings()) {
+      expect(address + count - 1, `${address} x ${count}`).toBeLessThanOrEqual(127);
+    }
+  });
+});
+
+test("a target is what debugger.describe says it is: where its views open and end, its instruction size, its digits, its breakpoint event", async ({
+  page,
+}) => {
+  // A server whose SH4 is none of what this UI has built in for a server that says nothing:
+  // 24-bit addresses printed with six digits, instructions of four bytes, other defaults, the
+  // program counter in another register and another event for its code breakpoints.
+  const server = await serveScriptedDebugger(page);
+  const targets = V3_TARGETS.map((target) => ({ ...target }));
+  Object.assign(targets[0], {
+    pcRegister: "PR",
+    breakpointEvent: "cpu.fetch",
+    instructionSize: 4,
+    addressMax: 0x00ffffff,
+    addressDigits: 6,
+    defaultDisassemblyAddress: 0x00001000,
+    defaultMemoryAddress: 0x00fffc00,
+  });
+  server.shape.targets = targets;
+  server.state.registers["dc.sh4.cpu"].find((register) => register.name === "PR")!.value = "n/a";
+  server.answer("state.getDisassembly", (params) => ({
+    lines: Array.from({ length: Number(params.count) }, (_, index) => ({
+      address: Number(params.address) + index * 4,
+      bytes: "00 00 A0 E1",
+      disassembly: "nop",
+    })),
+  }));
+  server.answer("breakpoints.add", (params) => {
+    server.state.breakpoints = { "1": { id: 1, event: params.event, address: params.address, kind: "code", enabled: true } };
+    setTimeout(() => server.tick(), 0);
+    return {};
+  });
+  await page.goto("/#/workspace/sh4-debugger");
+  await expect(panel(page, "sh4-disassembly").locator("[data-address]").first()).toBeVisible();
+  await server.described();
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const box = view.getByRole("textbox");
+  const listings = () => server.requestsOf("state.getDisassembly");
+
+  // the first tick does not say where the target is (PR is "n/a", and PC is not asked): the default address
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x1000));
+  await expect(rows.first().locator("span").first()).toHaveText("0x001000");
+  expect(listings()[0]).toEqual({ target: "sh4", address: 0x1000, count: 64 });
+  await expect(rows.nth(1)).toHaveAttribute("data-address", String(0x1004));
+  await expect(view.locator(".current-instruction")).toHaveCount(0);
+
+  // a stop: the program counter is the register the server named
+  server.setRegister("dc.sh4.cpu", "PR", "0x00001010");
+  server.state.execution = { state: "paused", stopId: 2, reason: "step" };
+  server.tick();
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x1010));
+
+  // a notch of the wheel is six instructions of four bytes
+  await rows.nth(3).hover();
+  await page.mouse.wheel(0, 60);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x1000 + 24));
+  await page.mouse.wheel(0, -60);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x1000));
+
+  // a breakpoint in the gutter is one of the event the server named, and is listed with six digits
+  const row = disassemblyRow(view, 0x1008);
+  await row.hover();
+  await breakpointGutter(row).click();
+  await expect(breakpointGutter(row)).toHaveAttribute("data-breakpoint", "enabled");
+  expect(server.requestsOf("breakpoints.add")).toEqual([{ event: "cpu.fetch", address: 0x1008, kind: "code", enabled: true }]);
+  await expect(panel(page, "sh4-breakpoints").getByRole("listitem")).toHaveText(/cpu\.fetch == 0x001008/);
+
+  // the listing ends at the last instruction of 24 bits
+  await box.fill("0xFFFFFC");
+  await box.press("Enter");
+  await expect(rows.last()).toHaveAttribute("data-address", String(0xfffffc));
+  await expect(rows).toHaveCount(11);
+  expect(listings().at(-1)).toEqual({ target: "sh4", address: 0xfffffc - 40, count: 11 });
+  await expect(box).toHaveValue("0xFFFFFC");
+
+  // the memory view opens where the server said, and ends with the address space
+  const memory = panel(page, "sh4-memory");
+  const slices = () => server.requestsOf("state.getMemorySlice");
+  expect(slices()[0]).toEqual({ target: "sh4", address: 0xfffc00, length: 960 });
+  await expect(memory.getByText("0xFFFC00", { exact: true })).toBeVisible();
+  await memory.getByRole("textbox").fill("0xFFFFFF");
+  await memory.getByRole("textbox").press("Enter");
+  await expect(memory.getByText("0xFFFFF0", { exact: true })).toBeVisible();
+  expect(slices().at(-1)).toEqual({ target: "sh4", address: 0xfffc40, length: 960 });
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("ticks do not make a disassembly view read again or move; a stop does both", async ({ page, rpc }) => {
