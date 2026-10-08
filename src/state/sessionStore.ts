@@ -10,7 +10,7 @@ import {
   type EndpointSource,
 } from "../services/transport";
 import { useDebuggerDataStore } from "./debuggerDataStore";
-import { SessionController, type ConnectionState, type RetryInfo, type SessionEndpoint } from "./sessionController";
+import { SessionController, announcedEndpoint, type ConnectionState, type RetryInfo, type SessionEndpoint } from "./sessionController";
 
 export type { ConnectionState };
 
@@ -112,18 +112,12 @@ export const useSessionStore = create<SessionStore>()((set, get) => {
     // every connection is described: after a reconnect the server can be another one
     onConnected: (client) => void useDebuggerDataStore.getState().initialize(client),
     onDisconnected: () => useDebuggerDataStore.getState().reset(),
-    // The emulator of a BroadcastChannel session is another tab. When it is reloaded it has a
-    // new id and the old one never answers again, so a reconnect waits for an announcement:
-    // of the same emulator, or of the only one there is.
+    // The emulator of a BroadcastChannel session is another tab, and a channel to nobody
+    // "opens" too: a reconnect on the clock would connect to an emulator that is gone. So in
+    // a wasm build a reconnect waits for an announcement (announcedEndpoint says of whom).
     announcedSince:
       appConfig.mode === "wasm"
-        ? (endpoint, since) => {
-            const announced = (get().connectionDiscovery?.getAvailableConnections() ?? []).filter(
-              (connection) => connection.lastSeen > since,
-            );
-            const target = announced.find((connection) => connection.id === endpoint.id) ?? (announced.length === 1 ? announced[0] : undefined);
-            return target ? { id: target.id, mode: "wasm" } : undefined;
-          }
+        ? (endpoint, since) => announcedEndpoint(get().connectionDiscovery?.getAvailableConnections() ?? [], endpoint, since)
         : undefined,
   });
 

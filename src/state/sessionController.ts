@@ -1,4 +1,4 @@
-import type { TransportState } from "../services/transport";
+import type { AvailableConnection, TransportState } from "../services/transport";
 
 // The life of a debugger session: connect, notice that the connection is gone, and connect
 // again. No store, no DOM and no real client in here, so the rules can be tested with a
@@ -32,6 +32,24 @@ export interface SessionEndpoint {
   id: string;
   mode: "native" | "wasm";
 }
+
+/**
+ * Where a session that lost its emulator goes once emulators have announced themselves: to
+ * the one it had, or to the only one there is. `connections` is what discovery has heard of,
+ * and only what was heard after `since` (ms) counts: an announcement from before the loss can
+ * be the last thing the emulator that is gone said. The emulator of a BroadcastChannel session
+ * is another tab, and when it is reloaded it has a new id and the old one never answers
+ * again. With several others to choose from there is no answer: the user picks.
+ */
+export const announcedEndpoint = (
+  connections: ReadonlyArray<Pick<AvailableConnection, "id" | "lastSeen">>,
+  endpoint: SessionEndpoint,
+  since: number,
+): SessionEndpoint | undefined => {
+  const announced = connections.filter((connection) => connection.lastSeen > since);
+  const target = announced.find((connection) => connection.id === endpoint.id) ?? (announced.length === 1 ? announced[0] : undefined);
+  return target ? { id: target.id, mode: "wasm" } : undefined;
+};
 
 export interface SessionClient {
   connect(): Promise<void>;

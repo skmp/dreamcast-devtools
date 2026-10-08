@@ -4,6 +4,7 @@ import {
   ANNOUNCEMENT_POLL_MS,
   RECONNECT_DELAYS_MS,
   SessionController,
+  announcedEndpoint,
   reconnectDelayMs,
   type SessionClient,
   type SessionEndpoint,
@@ -328,5 +329,39 @@ describe("a session that waits for an announcement (the BroadcastChannel transpo
     await vi.advanceTimersByTimeAsync(60_000);
     expect(asked).toBe(before);
     expect(clients).toHaveLength(1);
+  });
+});
+
+describe("the emulator a waiting session goes to", () => {
+  const WASM: SessionEndpoint = { id: "guid-1", mode: "wasm" };
+  const LOST_AT = 2_000_000;
+  /** what discovery has heard of: the id of each emulator, and how long after the loss it last announced itself */
+  const heard = (...emulators: Array<[id: string, afterLoss: number]>) =>
+    emulators.map(([id, afterLoss]) => ({ id, name: `emulator ${id}`, mode: "wasm" as const, lastSeen: LOST_AT + afterLoss }));
+
+  it("is the one it had, when that has announced itself after the loss", () => {
+    expect(announcedEndpoint(heard(["guid-1", 300]), WASM, LOST_AT)).toEqual({ id: "guid-1", mode: "wasm" });
+    // whoever else is there
+    expect(announcedEndpoint(heard(["guid-2", 100], ["guid-1", 300], ["guid-3", 200]), WASM, LOST_AT)).toEqual(WASM);
+  });
+
+  it("is the only other one that has: the tab of the emulator was reloaded, and has a new id", () => {
+    expect(announcedEndpoint(heard(["guid-2", 300]), WASM, LOST_AT)).toEqual({ id: "guid-2", mode: "wasm" });
+    // the one that is gone is still in the list of discovery for a few seconds, with what it said before
+    expect(announcedEndpoint(heard(["guid-1", -700], ["guid-2", 300]), WASM, LOST_AT)).toEqual({ id: "guid-2", mode: "wasm" });
+  });
+
+  it("is none while two others are there to choose from", () => {
+    expect(announcedEndpoint(heard(["guid-2", 300], ["guid-3", 400]), WASM, LOST_AT)).toBeUndefined();
+    expect(announcedEndpoint(heard(["guid-1", -700], ["guid-2", 300], ["guid-3", 400]), WASM, LOST_AT)).toBeUndefined();
+  });
+
+  it("is none while nothing was heard after the loss: what an emulator said before it says nothing about now", () => {
+    expect(announcedEndpoint([], WASM, LOST_AT)).toBeUndefined();
+    expect(announcedEndpoint(heard(["guid-1", -700]), WASM, LOST_AT)).toBeUndefined();
+    // at the moment of the loss is not after it
+    expect(announcedEndpoint(heard(["guid-1", 0]), WASM, LOST_AT)).toBeUndefined();
+    expect(announcedEndpoint(heard(["guid-1", -700], ["guid-2", -200]), WASM, LOST_AT)).toBeUndefined();
+    expect(announcedEndpoint(heard(["guid-1", 1]), WASM, LOST_AT)).toEqual(WASM);
   });
 });
