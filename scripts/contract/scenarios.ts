@@ -441,30 +441,50 @@ const s01: Scenario = {
     };
 
     // The result is valid: the session validates it with the strict schema and keeps every
-    // issue. (A describe without a result the client can read fails here: there is nothing to look at.)
-    const response = await session.requestDescribe();
-    const shape = session.shape;
-    const issues = session.describeProblems;
-    if (issues.length > 0) {
-      findings.push(
-        `the debugger.describe result does not follow the schema of protocol v3 (${issues.length} issue${issues.length === 1 ? "" : "s"}):`,
-        ...issues.map((issue) => `  ${issue}`),
-      );
-    }
-    expectThat(shape.protocol === 3, `protocol is ${shape.protocol}, expected 3`);
-    expectThat(Array.isArray(shape.targets), "targets is present");
-
-    // the first notification after the response is a full tick (response first, tick second)
-    try {
-      const following = await session.waitForTick(() => true, 2000, "the tick that follows the debugger.describe response", response.seq);
-      const first = following.tick;
-      const missing = missingPaths(session, first);
-      expectThat(first.executionState.reason === "no-game" || missing.length === 0, `the tick after describe is full; it lacks ${missing.slice(0, 5).join(", ")}`);
-    } catch (error) {
-      if (!(error instanceof ContractFailure)) {
-        throw error;
+    // issue; `protocol` is 3; and the first notification after the response is a full tick
+    // (response first, tick second).
+    let reported = "";
+    const describeWith = async (params?: { protocol?: number; client?: string }): Promise<void> => {
+      const asked = params ? `debugger.describe ${JSON.stringify(params)}: ` : "";
+      const response = await session.requestDescribe(params);
+      const issues = session.describeProblems;
+      // (what is wrong with every answer is said once)
+      if (issues.length > 0 && issues.join("\n") !== reported) {
+        reported = issues.join("\n");
+        findings.push(
+          `${asked}the debugger.describe result does not follow the schema of protocol v3 (${issues.length} issue${issues.length === 1 ? "" : "s"}):`,
+          ...issues.map((issue) => `  ${issue}`),
+        );
       }
-      findings.push(error.message);
+      expectThat(session.shape.protocol === 3, `${asked}protocol is ${session.shape.protocol}, expected 3`);
+      expectThat(Array.isArray(session.shape.targets), `${asked}targets is present`);
+      try {
+        const following = await session.waitForTick(() => true, 2000, `${asked}the tick that follows the debugger.describe response`, response.seq);
+        const first = following.tick;
+        const missing = missingPaths(session, first);
+        expectThat(first.executionState.reason === "no-game" || missing.length === 0, `${asked}the tick after describe is full; it lacks ${missing.slice(0, 5).join(", ")}`);
+      } catch (error) {
+        if (!(error instanceof ContractFailure)) {
+          throw error;
+        }
+        findings.push(error.message);
+      }
+    };
+    // (A describe without a result the client can read fails here: there is nothing to look at.)
+    await describeWith();
+    const shape = session.shape;
+
+    // The server answers whatever the client's protocol number is, and without one: an older
+    // client, or one that sends no params at all, gets the same result and the same tick.
+    for (const params of [{}, { protocol: 2, client: "contract runner, as a client of protocol 2" }]) {
+      try {
+        await describeWith(params);
+      } catch (error) {
+        if (!(error instanceof ContractFailure)) {
+          throw error;
+        }
+        findings.push(error.message);
+      }
     }
 
     // unique paths, unique register names per node, actions within PanelId, no empty arrays

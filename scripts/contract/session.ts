@@ -165,14 +165,16 @@ export class ContractSession {
   }
 
   /**
-   * Sends debugger.describe and returns the response frame. A result that fails the strict
+   * Sends debugger.describe (with the runner's own protocol number and name, unless `params`
+   * says otherwise) and returns the response frame. A result that fails the strict
    * schema is kept in `describeProblems` (and is an I1 violation, as for every response) and
    * the session goes on with what the client's schema reads from it; only a describe without
    * a result the client can use fails here.
    */
-  async requestDescribe(): Promise<RecordedFrame> {
+  async requestDescribe(
+    params: { protocol?: number; client?: string } = { protocol: PROTOCOL_VERSION, client: this.options.clientName },
+  ): Promise<RecordedFrame> {
     const mark = this.mark();
-    const params = { protocol: PROTOCOL_VERSION, client: this.options.clientName };
     this.describeProblems = [];
     try {
       this.shape = await this.rpc.call(RpcMethod.DEBUGGER_DESCRIBE, params);

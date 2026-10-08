@@ -618,6 +618,18 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(summary.cleanUpProblems).toEqual([]);
   }, 30_000);
 
+  it("S01: debugger.describe that is refused unless the client says protocol 3", async () => {
+    const summary = await run(
+      { answer: (request) => (request.method === "debugger.describe" && paramsOf(request).protocol !== 3 ? rpcError(request, -32602, "invalid params: protocol") : undefined) },
+      ["S01", "S02"],
+    );
+    expect(reportOf(summary)).toEqual([
+      'S01 failed debugger.describe {}: JSON-RPC error -32602 "invalid params: protocol" | ' +
+        'debugger.describe {"protocol":2,"client":"contract runner, as a client of protocol 2"}: JSON-RPC error -32602 "invalid params: protocol"',
+      "S02 passed ",
+    ]);
+  });
+
   it("S01: a server that answers debugger.describe with nothing the client can read, or sends no tick after it, fails S01; nothing else is run", async () => {
     const lines: string[] = [];
     const refused = await startServer({
