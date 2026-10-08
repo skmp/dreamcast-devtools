@@ -57,6 +57,7 @@ export const documentationSections: DocumentationSection[] = [
           "WASM builds use BroadcastChannel: the UI listens for emulator announcements and connects to the announced instance; with several it shows a connection picker.",
           "The status bar of a workspace shows the connection state and the endpoint. The endpoint is a button: click it, or press Enter on it, to pick another one, or to enter any `ws://` or `wss://` URL by hand; that URL is remembered and used first from then on.",
           "When the connection is lost the UI says so, shows no data as if it were live, and tries again after 1, 2, 5 and then every 10 seconds. `Stop` ends that; `Connect` and `Retry now` try at once. Every new connection is described again.",
+          "When the emulator could not describe itself (it was busy, or did not answer) the UI says so and asks again on the same connection after 1, 2, 5 and then every 10 seconds; `Retry now` asks at once.",
           "Next to the run controls the UI shows whether the target runs and why it is stopped. What a server cannot do (`targets` and `capabilities` of `debugger.describe`) is said in the panel concerned, in place of its controls.",
         ],
       },

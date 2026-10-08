@@ -78,7 +78,9 @@ not run it. After changing the crate, run it and commit the regenerated files.
 
 - `dist-native/` is built first when it is missing or older than the sources.
 - Every test starts its own mock server (production mode, free port) and kills it afterwards,
-  because the mock keeps one state for all clients.
+  because the mock keeps one state for all clients. A port that another worker took in the
+  meantime is noticed and the next one is tried (`e2e/support/mockServer.ts`;
+  `e2e/support.spec.ts` tests that, without a browser).
 - A test fails on any `console.error`, uncaught exception, failed request, HTTP status >= 400 or
   request to another origin, unless the test allows that message and says why
   (`diagnostics.allow` in `e2e/support/fixtures.ts`).
@@ -191,7 +193,8 @@ by the emulator's Host/Origin check is one of them.
   of the emulator's own window (`host-stopped`, `guest-exit`, `no-game`) Run and the step
   buttons are off, because the server refuses them there. A run control that is off (also
   while the target runs, and without a connection) keeps the keyboard focus, so that stepping
-  with the keyboard goes on from the same button. The answer of every `control.*` request is
+  with the keyboard goes on from the same button; so do `Refresh` of a view while the view
+  reads and `Go to current PC` without a connection. The answer of every `control.*` request is
   checked, and a refusal is shown; one that is repeated while its notice is on screen is
   counted in that notice (`×n`) instead of shown again.
 - **Stops.** A stop is a paused tick whose `stopId` the client has not acted on (for a v2
@@ -199,6 +202,8 @@ by the emulator's Host/Origin check is one of them.
   program counter if its line is not on screen, the disassembly and memory views read again,
   and a breakpoint that caused it is announced. No other tick does any of that. The views
   also read again after their own actions, and when a game is loaded where there was none.
+  A disassembly view that is a dock tab behind another has no lines on screen to look at: it
+  scrolls to the program counter of the last stop, if need be, when its tab is shown.
   When stops arrive faster than the page renders them (a script stepping through another
   client), their ticks are all applied, and the views move and read for the latest only.
 - **Registers.** `registers` of a tick is merged per path (`src/state/tickState.ts`); nothing
@@ -208,9 +213,14 @@ by the emulator's Host/Origin check is one of them.
   were built in before protocol v3 are used. A target the server does not list, stepping or
   memory it does not have, and a capability it lacks (`event-breakpoints`, `callstack`,
   `register-write`, `sgc-capture`) are said in the panel concerned, in place of its controls.
+  A memory view opens at `defaultMemoryAddress` of the first server that reads that memory,
+  also when servers before it only had such a notice to show.
 - **Problems.** A server of another protocol version, a `debugger.describe` that failed and
   every message that was dropped because it does not match the schema (with the path of what
-  is wrong) are shown in a bar under the toolbar.
+  is wrong) are shown in a bar under the toolbar. A `debugger.describe` that failed (the
+  emulator was busy, or did not answer) is sent again on the same connection 1, 2, 5 and then
+  every 10 seconds after each failure, and `Retry now` in its bar sends it at once; until it is
+  answered the panels show `No Data`.
 
 ## Protocol
 
