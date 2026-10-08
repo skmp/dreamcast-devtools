@@ -1309,6 +1309,13 @@ const s12: Scenario = {
     }
     if (!hasCapability(context, CAPABILITIES.REGISTER_WRITE)) {
       await session.expectError("state.setRegister", { path: sh4.pcPath, name: "R0", value: "0" }, -32004);
+      // state.editWatch is state.setRegister on the watched register, and -32004 until then. The
+      // request is a valid one: a watch that exists, and the value its register has.
+      const register = unwatchedRegister(context, sh4.pcPath, ["R0", "R1", "R2"]);
+      const { id, record } = await addWatch(context, register.expression, register.expression);
+      const value = record.tick.watches?.find((watch) => watch.id === id)?.value;
+      await session.expectError("state.editWatch", { watchId: id, value: typeof value === "string" && value.startsWith("0x") ? value : "0" }, -32004);
+      await unwatch(context, id);
     }
 
     // malformed JSON: -32700 with id null, and nothing else in the answer

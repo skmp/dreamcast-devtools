@@ -1416,6 +1416,18 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(wrongMessage, "S12")).toMatch(/the message of -32601 is .*got "Unhandled JSON-RPC method"/);
   });
 
+  it("S12: a server without register-write that answers {} to state.editWatch", async () => {
+    const summary = await run(
+      { answer: (request) => (request.method === "state.editWatch" ? { jsonrpc: "2.0", id: request.id, result: {} } : undefined) },
+      ["S12"],
+      { supports: MOCK_M1_SUPPORT },
+    );
+    expect(statusOf(summary, "S12")).toBe("failed");
+    expect(detailsOf(summary, "S12")).toMatch(/^state\.editWatch \{"watchId":1,"value":"0x00000000"\}: expected the error -32004, got the result \{\}$/);
+    // the watch of the probe is removed again
+    expect(summary.cleanUpProblems).toEqual([]);
+  });
+
   it("S12: a batch that is executed, and frames that are no request and get no answer", async () => {
     const batch = await run(
       { answer: (request) => (Array.isArray(request) ? ([{ jsonrpc: "2.0", id: 1, result: {} }] as unknown as Json) : undefined) },
