@@ -1031,6 +1031,28 @@ const s11: Scenario = {
     await session.expectError("state.getCallstack", { target: "sh4", maxFrames: 65 }, -32602);
     await session.expectError("state.getCallstack", { target: "sh4", maxFrames: 0 }, -32602);
 
+    // the ARM7, if the server lists it: frame 0 is its PC, frame 1 its link register
+    const arm7 = targetOf(session.shape, "arm7");
+    if (arm7) {
+      const arm7Frames = paused.tick.callstacks?.arm7 ?? [];
+      check(arm7Frames.length >= 2, `a paused tick carries the ARM7 callstack (frame 0 the PC, frame 1 the link register); this one has ${arm7Frames.length} frame(s)`);
+      check(arm7Frames[0].pc === pcOf(paused.tick, arm7), `arm7: frame 0 is at ${hex(arm7Frames[0].pc)}, the PC is ${hex(pcOf(paused.tick, arm7))}`);
+      check(
+        arm7Frames[1].pc === numberOf(paused.tick, arm7.pcPath, "R14"),
+        `arm7: frame 1 is at ${hex(arm7Frames[1].pc)}, R14 is ${registerOf(paused.tick, arm7.pcPath, "R14")}`,
+      );
+      check(arm7Frames[1].location === "lr", `arm7: frame 1 has location "${arm7Frames[1].location}", expected "lr"`);
+      arm7Frames.forEach((frame, position) => check(frame.index === position, `arm7: frame ${position} of the tick has index ${frame.index}`));
+      for (const frame of arm7Frames.slice(2)) {
+        check(/^stack\+0x[0-9A-Fa-f]+$/.test(frame.location ?? ""), `arm7: frame ${frame.index} has location "${frame.location}", expected "stack+0x.."`);
+      }
+      const fromArm7 = await session.call("state.getCallstack", { target: "arm7", maxFrames: 8 });
+      check(fromArm7.target === "arm7", `state.getCallstack {arm7} answers for target "${fromArm7.target}"`);
+      check(fromArm7.frames.length <= 8, `state.getCallstack {arm7, maxFrames: 8} returned ${fromArm7.frames.length} frames`);
+      fromArm7.frames.forEach((frame, position) => check(frame.index === position, `arm7: frame ${position} has index ${frame.index}`));
+      check(fromArm7.frames[0]?.pc === arm7Frames[0].pc, "arm7: frame 0 of state.getCallstack is the PC");
+    }
+
     // running ticks carry both arrays, empty
     const running = await ensureRunning(context);
     check(running.tick.callstacks?.sh4?.length === 0 && running.tick.callstacks?.arm7?.length === 0, "a running tick carries empty callstacks");

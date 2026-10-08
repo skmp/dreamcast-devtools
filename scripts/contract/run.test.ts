@@ -179,8 +179,9 @@ const ask = (mock: MockDebugger, method: string, params: Json): Json => {
 const isTick = (frame: Json): frame is Json & { params: Json & { executionState: Json; registers: Record<string, Json[]> } } =>
   frame.method === "event.tick";
 
-/** The answer of a server that refuses a request on the channel of the result. */
+/** The answers of a server that refuses a request: on the channel of the result, or as a JSON-RPC error. */
 const inBand = (request: Json, code: number, message: string): Json => ({ jsonrpc: "2.0", id: request.id, result: { error: { code, message } } });
+const rpcError = (request: Json, code: number, message: string): Json => ({ jsonrpc: "2.0", id: request.id, error: { code, message } });
 const paramsOf = (request: Json): Json => (request.params ?? {}) as Json;
 
 const statusOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.status;
@@ -796,6 +797,42 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(listedOnly, "S07")).toMatch(/^a paused tick at the breakpoint 0x8C0000[0-9A-F]{2}: not seen within 2000 ms/);
     expect(listedOnly.cleanUpProblems).toEqual([]);
   }, 30_000);
+
+  it("S11: a server without the ARM7 callstack: no frames in the tick, or state.getCallstack {arm7} refused", async () => {
+    const empty = await run(
+      { toClient: (frame) => (isTick(frame) ? { ...frame, params: { ...frame.params, callstacks: { ...(frame.params.callstacks as Json), arm7: [] } } } : frame) },
+      ["S11"],
+    );
+    expect(statusOf(empty, "S11")).toBe("failed");
+    expect(detailsOf(empty, "S11")).toBe("a paused tick carries the ARM7 callstack (frame 0 the PC, frame 1 the link register); this one has 0 frame(s)");
+
+    const refused = await run(
+      {
+        answer: (request) =>
+          request.method === "state.getCallstack" && paramsOf(request).target === "arm7" ? rpcError(request, -32004, "not supported: arm7 callstack") : undefined,
+      },
+      ["S11"],
+    );
+    expect(statusOf(refused, "S11")).toBe("failed");
+    expect(detailsOf(refused, "S11")).toBe('state.getCallstack {"target":"arm7","maxFrames":8}: JSON-RPC error -32004 "not supported: arm7 callstack"');
+
+    // the link register is R14, and the frame says where it came from
+    const wrongLink = await run(
+      {
+        toClient: (frame) => {
+          if (!isTick(frame)) return frame;
+          const arm7 = ((frame.params.callstacks as Json).arm7 as Json[]).map((entry) => (entry.index === 1 ? { ...entry, location: "pr" } : entry));
+          return { ...frame, params: { ...frame.params, callstacks: { ...(frame.params.callstacks as Json), arm7 } } };
+        },
+      },
+      ["S11"],
+    );
+    expect(detailsOf(wrongLink, "S11")).toBe('arm7: frame 1 has location "pr", expected "lr"');
+
+    // a server that does not list the ARM7 is not asked for its callstack
+    const withoutArm7 = await run(undefined, ["S11"], { supports: { targets: ["sh4", "dsp"] } });
+    expect(reportOf(withoutArm7)).toEqual(["S11 passed "]);
+  });
 
   it("S05, S08: ids that are used again: a new breakpoint, or a new watch, under the lowest free id", async () => {
     /** The server's ids, shown to the client as the lowest id that nothing listed has. */
