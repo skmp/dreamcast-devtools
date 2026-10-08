@@ -1,7 +1,7 @@
 import { request as httpRequest } from "node:http";
 import WebSocket from "ws";
 import { BINARY_FRAME_HEADER_BYTES, BinaryFrameKind, SGC_BYTES_PER_FRAME, parseBinaryFrame } from "../../src/lib/binaryFrame";
-import { CAPABILITIES, PROTOCOL_BOUNDS, PanelIdSchema, TABLE_IDS } from "../../src/lib/debuggerSchema";
+import { CAPABILITIES, DEBUGGER_ERROR_MESSAGES, PROTOCOL_BOUNDS, PanelIdSchema, TABLE_IDS } from "../../src/lib/debuggerSchema";
 import type {
   BreakpointCategoryState,
   BreakpointDescriptor,
@@ -1121,12 +1121,12 @@ const s11: Scenario = {
  * send): what the server answers to `text`. Ticks, which every connection receives, are
  * skipped.
  */
-const rawExchange = (url: string, text: string, timeoutMs: number): Promise<string> =>
+const rawExchange = (url: string, text: string, timeoutMs: number, what: string): Promise<string> =>
   new Promise((resolve, reject) => {
     const socket = new WebSocket(url);
     const timer = setTimeout(() => {
       socket.terminate();
-      reject(new ContractFailure(`no answer to a raw frame within ${timeoutMs} ms`));
+      reject(new ContractFailure(`no answer to ${what} within ${timeoutMs} ms`));
     }, timeoutMs);
     socket.once("error", (error) => {
       clearTimeout(timer);
@@ -1210,7 +1210,7 @@ const s12: Scenario = {
     }
 
     // malformed JSON: -32700 with id null, and nothing else in the answer
-    const answer = await rawExchange(context.url, "{nope", session.scale(2000));
+    const answer = await rawExchange(context.url, "{nope", session.scale(2000), "malformed JSON");
     let parsed: unknown;
     try {
       parsed = JSON.parse(answer);
@@ -1222,6 +1222,37 @@ const s12: Scenario = {
       JSON.stringify(sortKeys(parsed)) === JSON.stringify(sortKeys(expected)),
       `the answer to malformed JSON is ${answer.slice(0, 200)}, expected ${JSON.stringify(expected)}`,
     );
+
+    // What is JSON and not a request object of this protocol: -32600. There are no batches (a
+    // JSON array is not executed), requests are objects with jsonrpc "2.0", and their id is a
+    // number. What the id of such an answer is, the design does not say: it is not looked at.
+    const request = { jsonrpc: "2.0", id: 1, method: "debugger.describe", params: {} };
+    const { jsonrpc: _version, ...withoutVersion } = request;
+    const invalid: Array<[what: string, frame: unknown]> = [
+      ["a batch (a JSON array of requests)", [request]],
+      ["a frame that is JSON and not an object (42)", 42],
+      ["a request without the jsonrpc member", withoutVersion],
+      ["a request whose id is a string", { ...request, id: "1" }],
+    ];
+    for (const [what, frame] of invalid) {
+      const text = await rawExchange(context.url, JSON.stringify(frame), session.scale(2000), what);
+      let reply: unknown;
+      try {
+        reply = JSON.parse(text);
+      } catch {
+        fail(`the answer to ${what} is not JSON: ${text.slice(0, 120)}`);
+      }
+      const { jsonrpc, error, ...rest } = (typeof reply === "object" && reply !== null && !Array.isArray(reply) ? reply : {}) as Record<string, unknown>;
+      const { code, message, ...more } = (typeof error === "object" && error !== null ? error : {}) as Record<string, unknown>;
+      check(
+        jsonrpc === "2.0" && code === -32600 && typeof message === "string" && DEBUGGER_ERROR_MESSAGES[-32600].test(message),
+        `${what} is answered with ${text.slice(0, 200)}, expected the JSON-RPC error -32600 "invalid request"`,
+      );
+      check(
+        Object.keys(more).length === 0 && Object.keys(rest).every((key) => key === "id"),
+        `the answer to ${what} is ${text.slice(0, 200)}: a response has jsonrpc, id and error, and an error code and message only`,
+      );
+    }
     // "no data member anywhere" is checked on every response of the run by the session
   },
 };

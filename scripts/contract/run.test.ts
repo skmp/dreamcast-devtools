@@ -26,6 +26,8 @@ interface Faults {
   beforeRequest?: (request: Json) => Json[];
   /** answers a request in the server's place: the server does not see a request this returns a frame for */
   answer?: (request: Json) => Json | undefined;
+  /** a frame of the client for which this is true is lost: the server does not see it, and nothing answers it */
+  lose?: (request: unknown) => boolean;
   /** rewrites a binary frame of the server */
   toClientBinary?: (frame: Buffer) => Buffer;
   /** a frame of the server for which this is true is held back until the next binary frame has been sent */
@@ -78,6 +80,9 @@ const startServer = async (
       let answered: Json | undefined;
       try {
         const request = JSON.parse(text) as Json;
+        if (faults.lose?.(request)) {
+          return;
+        }
         faults.beforeRequest?.(request).forEach((frame) => client.send(JSON.stringify(frame)));
         answered = faults.answer?.(request);
         if (faults.toServer) {
@@ -1276,6 +1281,38 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(wrongMessage, "S12")).toBe("failed");
     expect(detailsOf(wrongMessage, "S12")).toMatch(/the message of -32601 is .*got "Unhandled JSON-RPC method"/);
   });
+
+  it("S12: a batch that is executed, and frames that are no request and get no answer", async () => {
+    const batch = await run(
+      { answer: (request) => (Array.isArray(request) ? ([{ jsonrpc: "2.0", id: 1, result: {} }] as unknown as Json) : undefined) },
+      ["S12"],
+    );
+    expect(statusOf(batch, "S12")).toBe("failed");
+    expect(detailsOf(batch, "S12")).toBe(
+      'a batch (a JSON array of requests) is answered with [{"jsonrpc":"2.0","id":1,"result":{}}], expected the JSON-RPC error -32600 "invalid request"',
+    );
+
+    // each of the frames that is no request of this protocol, lost without an answer
+    const isRequest = (frame: unknown): frame is Json => typeof frame === "object" && frame !== null && !Array.isArray(frame);
+    for (const [lost, what] of [
+      [(frame: unknown) => frame === 42, "a frame that is JSON and not an object \\(42\\)"],
+      [(frame: unknown) => isRequest(frame) && frame.jsonrpc === undefined, "a request without the jsonrpc member"],
+      [(frame: unknown) => isRequest(frame) && typeof frame.id === "string", "a request whose id is a string"],
+    ] as const) {
+      const summary = await run({ lose: lost }, ["S12"]);
+      expect(statusOf(summary, "S12")).toBe("failed");
+      expect(detailsOf(summary, "S12")).toMatch(new RegExp(`^no answer to ${what} within 2000 ms$`));
+    }
+
+    // a string id that is taken for an id: the request is executed
+    const lenient = await run(
+      { answer: (request) => (typeof request.id === "string" ? { jsonrpc: "2.0", id: request.id, result: {} } : undefined) },
+      ["S12"],
+    );
+    expect(detailsOf(lenient, "S12")).toBe(
+      'a request whose id is a string is answered with {"jsonrpc":"2.0","id":"1","result":{}}, expected the JSON-RPC error -32600 "invalid request"',
+    );
+  }, 30_000);
 
   it("reports a scenario whose capability the server does not advertise as not applicable, never as passed", async () => {
     const summary = await run(
