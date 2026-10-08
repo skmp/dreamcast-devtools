@@ -416,6 +416,20 @@ describe("the contract runner against the mock", () => {
     expect(reportOf(summary)).toEqual(["S14 passed "]);
     expect(mock.reconnects).toBe(1);
   });
+
+  it("S07: a program that does not come back to the breakpoint that was enabled again", async () => {
+    // outside of its loop the mock's SH4 walks straight on
+    const mock = new MockDebugger({ startPaused: true });
+    ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C00FFE0" });
+    const { url } = await startServer(undefined, mock);
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S07"]) });
+    expect(reportOf(summary)).toEqual([
+      expect.stringMatching(
+        /^S07 passed the program did not come back to 0x8C0[0-9A-F]{5} within 2000 ms of the breakpoint there being enabled again; a breakpoint on the next instruction that was disabled and enabled again was hit$/,
+      ),
+    ]);
+    expect(summary.ok).toBe(true);
+  }, 30_000);
 });
 
 describe("the contract runner against a server that breaks the protocol", () => {
@@ -751,6 +765,36 @@ describe("the contract runner against a server that breaks the protocol", () => 
     // (the first request of S06 is the one that names only "events")
     expect(detailsOf(echoOnly, "S06")).toMatch(/breakpoints\.setCategoryStates: the tick echoes events as \{"muted":false,"soloed":false\}, expected \{"muted":true,"soloed":false\}/);
     // (a request without effect is waited for, for a second)
+  }, 30_000);
+
+  it("S07: a breakpoint that is not enabled again by breakpoints.toggle, or is listed as enabled and never hit again", async () => {
+    // the server answers {} to {enabled: true} and leaves the breakpoint disabled
+    const ignored = await run({ toServer: (frame) => (frame.method === "breakpoints.toggle" ? { ...frame, params: { ...paramsOf(frame), enabled: false } } : frame) }, ["S07"]);
+    expect(statusOf(ignored, "S07")).toBe("failed");
+    expect(detailsOf(ignored, "S07")).toMatch(/^breakpoints\.toggle: breakpoint 1 is not listed as enabled \(1 tick within 1000 ms of the request/);
+
+    // the server lists it as enabled, and has not armed it
+    const listedOnly = await run(() => {
+      const revived = new Set<unknown>();
+      return {
+        toServer: (frame) => {
+          if (frame.method !== "breakpoints.toggle") return frame;
+          revived[paramsOf(frame).enabled ? "add" : "delete"](paramsOf(frame).id);
+          return { ...frame, params: { ...paramsOf(frame), enabled: false } };
+        },
+        toClient: (frame) => {
+          if (!isTick(frame)) return frame;
+          const breakpoints = Object.fromEntries(
+            Object.entries(frame.params.breakpoints as Record<string, Json>).map(([key, value]) => [key, revived.has(value.id) ? { ...value, enabled: true } : value]),
+          );
+          return { ...frame, params: { ...frame.params, breakpoints } };
+        },
+      };
+    }, ["S07"]);
+    expect(statusOf(listedOnly, "S07")).toBe("failed");
+    // the mock's loop comes back to the breakpoint within 130 ms; the runner then shows it once more, on the next instruction
+    expect(detailsOf(listedOnly, "S07")).toMatch(/^a paused tick at the breakpoint 0x8C0000[0-9A-F]{2}: not seen within 2000 ms/);
+    expect(listedOnly.cleanUpProblems).toEqual([]);
   }, 30_000);
 
   it("S05, S08: ids that are used again: a new breakpoint, or a new watch, under the lowest free id", async () => {

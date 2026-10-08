@@ -66,6 +66,8 @@ type Outcome = void | { notApplicable: string } | { parts: PartResult[] };
 type Scenario = { id: string; title: string; run: (context: RunContext) => Promise<Outcome> };
 
 const hex = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
+/** SH4 code addresses are compared under this mask: the same code is reachable at 0x0C.., 0x8C.. and 0xAC.. (design 2.3.3) */
+const SH4_CODE_ADDRESS_MASK = 0x1fffffff;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------------------
@@ -259,6 +261,41 @@ const removeBreakpoint = async (context: RunContext, id: number): Promise<void> 
   const mark = session.mark();
   await session.call("breakpoints.remove", { id });
   await tickShowing(session, mark, "breakpoints.remove", (tick) => (String(id) in tick.breakpoints ? `breakpoint ${id} is still listed` : undefined));
+};
+
+const toggleBreakpoint = async (context: RunContext, id: number, enabled: boolean): Promise<void> => {
+  const { session } = context;
+  const mark = session.mark();
+  await session.call("breakpoints.toggle", { id, enabled });
+  await tickShowing(session, mark, "breakpoints.toggle", (tick) =>
+    tick.breakpoints[String(id)]?.enabled === enabled ? undefined : `breakpoint ${id} is not listed as ${enabled ? "enabled" : "disabled"}`,
+  );
+};
+
+/** A paused tick that reports the stop of a code breakpoint: its id, the reason, and the PC in front of its instruction. */
+const checkBreakpointStop = (tick: DebuggerTick, target: DebuggerTarget, id: number, address: number): void => {
+  check(tick.executionState.breakpointId === id, `the stop reports breakpointId ${tick.executionState.breakpointId}, expected ${id}`);
+  check(tick.executionState.reason === "breakpoint", `the stop has reason "${tick.executionState.reason}", expected "breakpoint"`);
+  check(pcOf(tick, target) === address, `the stop is at ${hex(pcOf(tick, target))}, the breakpoint at ${hex(address)}`);
+};
+
+/**
+ * Resumes a target that is paused in front of a breakpoint on its next instruction: within
+ * 2 s a paused tick with a new stopId that reports that breakpoint, at its address.
+ */
+const resumeToBreakpoint = async (context: RunContext, target: DebuggerTarget, id: number, address: number): Promise<TickRecord> => {
+  const { session } = context;
+  const before = session.latestTick().tick;
+  const mark = session.mark();
+  await session.call("control.runUntil", {});
+  const hit = await session.waitForTick(
+    (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(before),
+    2000,
+    `a paused tick at the breakpoint ${hex(address)}`,
+    mark,
+  );
+  checkBreakpointStop(hit.tick, target, id, address);
+  return hit;
 };
 
 const categoriesOf = (tick: DebuggerTick): Record<string, BreakpointCategoryState> =>
@@ -656,25 +693,12 @@ const s05: Scenario = {
   id: "S05",
   title: "breakpoint hit",
   async run(context) {
-    const { session } = context;
     const sh4 = requireTarget(context, "sh4");
     const pc = await findBreakpointSite(context);
     const address = pc + sh4.instructionSize;
     // the request as the UI sends it: every member given
     const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address, kind: "code", enabled: true });
-    const before = session.latestTick().tick;
-
-    const mark = session.mark();
-    await session.call("control.runUntil", {});
-    const hit = await session.waitForTick(
-      (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(before),
-      2000,
-      `a paused tick at the breakpoint ${hex(address)}`,
-      mark,
-    );
-    check(hit.tick.executionState.breakpointId === breakpoint.id, `the stop reports breakpointId ${hit.tick.executionState.breakpointId}, expected ${breakpoint.id}`);
-    check(hit.tick.executionState.reason === "breakpoint", `the stop has reason "${hit.tick.executionState.reason}", expected "breakpoint"`);
-    check(pcOf(hit.tick, sh4) === address, `the stop is at ${hex(pcOf(hit.tick, sh4))}, the breakpoint at ${hex(address)}`);
+    const hit = await resumeToBreakpoint(context, sh4, breakpoint.id, address);
 
     // the next paused tick of the same stop repeats breakpointId and stopId
     const register = unwatchedRegister(context, sh4.pcPath, ["PR", "SR", "GBR"]);
@@ -744,16 +768,49 @@ const s07: Scenario = {
     const { session } = context;
     const sh4 = requireTarget(context, "sh4");
     const pc = await findBreakpointSite(context);
-    const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address: pc + sh4.instructionSize });
+    const address = pc + sh4.instructionSize;
+    // (without kind and enabled: a breakpoint with an address is a code breakpoint, and enabled)
+    const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address });
 
-    const mark = session.mark();
-    await session.call("breakpoints.toggle", { id: breakpoint.id, enabled: false });
-    await tickShowing(session, mark, "breakpoints.toggle", (tick) =>
-      tick.breakpoints[String(breakpoint.id)]?.enabled === false ? undefined : `breakpoint ${breakpoint.id} is not listed as disabled`,
-    );
+    await toggleBreakpoint(context, breakpoint.id, false);
     await expectToKeepRunning(context, "a disabled breakpoint on the next instruction");
 
-    await removeBreakpoint(context, breakpoint.id);
+    // Enabled again, it is listed as enabled, and it is hit when the program comes to it.
+    await toggleBreakpoint(context, breakpoint.id, true);
+    const armed = session.latestTick().tick;
+    const mark = session.mark();
+    await session.call("control.runUntil", {});
+    const back = await session
+      .waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(armed), 2000, `a paused tick at the breakpoint ${hex(address)}`, mark)
+      .catch(() => undefined);
+    if (back) {
+      const { breakpointId, reason } = back.tick.executionState;
+      check(breakpointId === breakpoint.id, `the stop after the breakpoint was enabled again reports breakpointId ${breakpointId}, expected ${breakpoint.id}`);
+      check(reason === "breakpoint", `the stop after the breakpoint was enabled again has reason "${reason}", expected "breakpoint"`);
+      // (the program can come back to that code through another mirror of it)
+      check(
+        ((pcOf(back.tick, sh4) ^ address) & SH4_CODE_ADDRESS_MASK) === 0,
+        `the stop after the breakpoint was enabled again is at ${hex(pcOf(back.tick, sh4))}, the breakpoint at ${hex(address)}`,
+      );
+      await removeBreakpoint(context, breakpoint.id);
+    } else {
+      // The program has run for 600 ms since it was in front of that address, and whether it
+      // comes back there is its business. The same is then shown where the arrival is certain,
+      // as in S05: with a breakpoint on the next instruction that is disabled and enabled again.
+      await ensurePaused(context);
+      await removeBreakpoint(context, breakpoint.id);
+      const site = (await findBreakpointSite(context)) + sh4.instructionSize;
+      const again = await addBreakpoint(context, { event: sh4.breakpointEvent, address: site });
+      await toggleBreakpoint(context, again.id, false);
+      await toggleBreakpoint(context, again.id, true);
+      await resumeToBreakpoint(context, sh4, again.id, site);
+      await removeBreakpoint(context, again.id);
+      context.note(
+        `the program did not come back to ${hex(address)} within ${session.scale(2000)} ms of the breakpoint there being enabled again; ` +
+          "a breakpoint on the next instruction that was disabled and enabled again was hit",
+      );
+    }
+
     // removing again and toggling an unknown id: in-band -32602
     await session.expectError("breakpoints.remove", { id: breakpoint.id }, -32602);
     await session.expectError("breakpoints.toggle", { id: breakpoint.id, enabled: true }, -32602);
