@@ -1234,6 +1234,70 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(strict, "S08")).toMatch(/^state\.unwatch \{"watchIds":\[1\]\}: in-band error -32602 "invalid params: unknown watch id 1"$/);
   });
 
+  it("S08 to S11: bounds that are smaller than the protocol's: the largest length, count, maxFrames and number of expressions are refused", async () => {
+    const summary = await run(
+      {
+        answer: (request) => {
+          const { length, count, maxFrames, expressions } = paramsOf(request) as { length?: number; count?: number; maxFrames?: number; expressions?: string[] };
+          if (
+            (request.method === "state.getMemorySlice" && length! > 4096 && length! <= 65536) ||
+            (request.method === "state.getDisassembly" && count! > 256 && count! <= 1024) ||
+            (request.method === "state.getCallstack" && maxFrames! > 32 && maxFrames! <= 64)
+          ) {
+            return rpcError(request, -32602, "invalid params: too large");
+          }
+          return request.method === "state.watch" && expressions!.length > 16 && expressions!.length <= 64 ? inBand(request, -32602, "invalid params: too many") : undefined;
+        },
+      },
+      ["S08", "S09", "S10", "S11"],
+    );
+    expect(reportOf(summary)).toEqual([
+      expect.stringMatching(/^S08 failed state\.watch \{"expressions":\[("dc[a-z0-9_.]+",?){64}\]\}: in-band error -32602 "invalid params: too many"$/),
+      expect.stringMatching(/^S09 failed state\.getMemorySlice \{"target":"sh4","address":\d+,"length":65536\}: JSON-RPC error -32602 "invalid params: too large"$/),
+      expect.stringMatching(/^S10 failed state\.getDisassembly \{"target":"sh4","address":\d+,"count":1024\}: JSON-RPC error -32602 "invalid params: too large"$/),
+      'S11 failed state.getCallstack {"target":"sh4","maxFrames":64}: JSON-RPC error -32602 "invalid params: too large"',
+    ]);
+    expect(summary.cleanUpProblems).toEqual([]);
+  }, 30_000);
+
+  it("S10, S11: a server that uses the context of state.getDisassembly, or needs the parameters that have a default", async () => {
+    const context = await run(
+      {
+        toServer: (frame) => {
+          const params = paramsOf(frame) as { target?: string; address: number; context?: number };
+          const size = params.target === "arm7" ? 4 : params.target === "dsp" ? 1 : 2;
+          return frame.method === "state.getDisassembly" && params.context ? { ...frame, params: { ...params, address: Math.max(0, params.address - params.context * size) } } : frame;
+        },
+      },
+      ["S10"],
+    );
+    expect(detailsOf(context, "S10")).toMatch(/^sh4: with context 8 the 16 lines start at 0x8C000[0-9A-F]{3}, without it the 16 lines start at 0x8C0000[0-9A-F]{2}; context is ignored$/);
+
+    const defaults = await run(
+      {
+        answer: (request) =>
+          (request.method === "state.getDisassembly" && paramsOf(request).target === undefined) || (request.method === "state.getCallstack" && paramsOf(request).maxFrames === undefined)
+            ? rpcError(request, -32602, "invalid params: missing")
+            : undefined,
+      },
+      ["S10", "S11"],
+    );
+    expect(reportOf(defaults)).toEqual([
+      expect.stringMatching(/^S10 failed state\.getDisassembly \{"address":\d+,"count":16\}: JSON-RPC error -32602 "invalid params: missing"$/),
+      'S11 failed state.getCallstack {"target":"sh4"}: JSON-RPC error -32602 "invalid params: missing"',
+    ]);
+
+    // a default of eight frames where the protocol says 32 (the mock's stacks have sixteen)
+    const shallow = await run(
+      {
+        toServer: (frame) =>
+          frame.method === "state.getCallstack" && paramsOf(frame).maxFrames === undefined ? { ...frame, params: { ...paramsOf(frame), maxFrames: 8 } } : frame,
+      },
+      ["S11"],
+    );
+    expect(detailsOf(shallow, "S11")).toBe("state.getCallstack without maxFrames returned 8 frames, with maxFrames 32 16; maxFrames defaults to 32");
+  }, 30_000);
+
   it("S09: a target that says memory: true and refuses state.getMemorySlice", async () => {
     const summary = await run(
       {

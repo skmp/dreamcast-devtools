@@ -334,6 +334,15 @@ const unwatchedRegister = (context: RunContext, path: string, preferred: string[
   return fail(`every register of ${path} is watched already`);
 };
 
+/** `<path>.<name in lower case>` for every register of the device tree that no watch names. */
+const unwatchedExpressions = (context: RunContext): string[] => {
+  const { session } = context;
+  const watched = new Set((session.latestTick().tick.watches ?? []).map((watch) => watch.expression));
+  return Array.from(session.index?.registers ?? [])
+    .flatMap(([path, registers]) => registers.map((register) => `${path}.${register.name.toLowerCase()}`))
+    .filter((expression) => !watched.has(expression));
+};
+
 const addWatch = async (context: RunContext, expression: string, expected: string): Promise<{ id: number; record: TickRecord }> => {
   const { session } = context;
   const listed = new Set((session.latestTick().tick.watches ?? []).map((watch) => watch.id));
@@ -994,6 +1003,25 @@ const s08: Scenario = {
     await session.expectError("state.watch", { expressions: many }, -32602);
     const long = `${sh4.pcPath}.${"r".repeat(PROTOCOL_BOUNDS.watchExpressionLength + 1 - sh4.pcPath.length - 1)}`;
     await session.expectError("state.watch", { expressions: [long] }, -32602);
+    // ... and 64 expressions in a call are accepted, and so are 64 ids in a call that removes them
+    const stored = session.latestTick().tick.watches ?? [];
+    const free = unwatchedExpressions(context);
+    const perCall = PROTOCOL_BOUNDS.watchExpressionsPerCall;
+    if (free.length >= perCall && stored.length + perCall <= PROTOCOL_BOUNDS.watches) {
+      const kept = new Set(stored.map((watch) => watch.id));
+      const adding = session.mark();
+      await session.call("state.watch", { expressions: free.slice(0, perCall) });
+      const filled = await tickShowing(session, adding, `state.watch of ${perCall} expressions`, (tick) =>
+        (tick.watches ?? []).length === stored.length + perCall ? undefined : `the tick lists ${(tick.watches ?? []).length} watches, expected ${stored.length + perCall}`,
+      );
+      const removing = session.mark();
+      await session.call("state.unwatch", { watchIds: filled.tick.watches!.map((watch) => watch.id).filter((watchId) => !kept.has(watchId)) });
+      await tickShowing(session, removing, `state.unwatch of ${perCall} ids`, (tick) =>
+        (tick.watches ?? []).length === stored.length ? undefined : `the tick lists ${(tick.watches ?? []).length} watches, expected ${stored.length}`,
+      );
+    } else {
+      context.note(`${perCall} expressions in one state.watch were not tried: ${stored.length} watches exist, and ${free.length} registers are not watched`);
+    }
 
     // none of the refused requests added anything (a tick follows the describe)
     const final = ((await session.describe()).tick.watches ?? []).map((watch) => `${watch.id}:${watch.expression}`);
@@ -1049,9 +1077,12 @@ const s09: Scenario = {
         }
       }
     }
-    // bounds
+    // bounds: 1 to 65536 bytes
     await session.expectError("state.getMemorySlice", { target: "sh4", address: pc, length: 0 }, -32602);
     await session.expectError("state.getMemorySlice", { target: "sh4", address: pc, length: 65537 }, -32602);
+    const longest = PROTOCOL_BOUNDS.memorySliceLength.max;
+    const most = await session.call("state.getMemorySlice", { target: "sh4", address: Math.min(pc, PROTOCOL_BOUNDS.addressMax - longest + 1), length: longest });
+    check(most.data.length === longest, `a read of ${longest} bytes, the longest there is, returns ${most.data.length} bytes`);
   },
 };
 
@@ -1078,6 +1109,12 @@ const s10: Scenario = {
         }
         check((line.bytes === "??") === (line.disassembly === "<unreadable>"), `${target.id}: an unreadable word is bytes "??" and text "<unreadable>"`);
       });
+      // `context` is ignored: the lines are those of the request without it
+      const withContext = (await session.call("state.getDisassembly", { target: target.id, address: start, count: 16, context: 8 })).lines;
+      check(
+        JSON.stringify(withContext) === JSON.stringify(lines),
+        `${target.id}: with context 8 the ${withContext.length} lines start at ${hex(withContext[0]?.address ?? 0)}, without it the 16 lines start at ${hex(start)}; context is ignored`,
+      );
       // fewer lines only at the end of the address space
       const last = target.addressMax - (target.addressMax % target.instructionSize);
       const tail = await disassemble(context, target.id, last - target.instructionSize, 16);
@@ -1097,8 +1134,18 @@ const s10: Scenario = {
       );
     });
 
+    // bounds: 1 to 1024 lines
     await session.expectError("state.getDisassembly", { target: "sh4", address: 0x8c010000, count: 0 }, -32602);
     await session.expectError("state.getDisassembly", { target: "sh4", address: 0x8c010000, count: 1025 }, -32602);
+    const sh4 = requireTarget(context, "sh4");
+    const most = PROTOCOL_BOUNDS.disassemblyCount.max;
+    const pc = pcOf(paused.tick, sh4);
+    const from = pc + (most - 1) * sh4.instructionSize <= sh4.addressMax ? pc : sh4.defaultDisassemblyAddress;
+    const longest = await disassemble(context, "sh4", from, most);
+    check(longest.length === most, `sh4: ${longest.length} lines for count ${most}, the largest there is, at ${hex(from)}`);
+    // target defaults to sh4
+    const byDefault = (await session.call("state.getDisassembly", { address: from, count: 16 })).lines;
+    check(JSON.stringify(byDefault) === JSON.stringify(longest.slice(0, 16)), "without a target the disassembly is that of the SH4");
   },
 };
 
@@ -1129,8 +1176,18 @@ const s11: Scenario = {
     check(requested.frames.length <= 8, `state.getCallstack {maxFrames: 8} returned ${requested.frames.length} frames`);
     requested.frames.forEach((frame, position) => check(frame.index === position, `frame ${position} has index ${frame.index}`));
     check(requested.frames[0]?.pc === frames[0].pc, "frame 0 of state.getCallstack is the PC");
+    // bounds: 1 to 64 frames, 32 when the request does not say
     await session.expectError("state.getCallstack", { target: "sh4", maxFrames: 65 }, -32602);
     await session.expectError("state.getCallstack", { target: "sh4", maxFrames: 0 }, -32602);
+    const deepest = await session.call("state.getCallstack", { target: "sh4", maxFrames: PROTOCOL_BOUNDS.callstackMaxFrames.max });
+    check(deepest.frames.length <= PROTOCOL_BOUNDS.callstackMaxFrames.max, `state.getCallstack {maxFrames: 64} returned ${deepest.frames.length} frames`);
+    deepest.frames.forEach((frame, position) => check(frame.index === position, `frame ${position} has index ${frame.index}`));
+    const byDefault = await session.call("state.getCallstack", { target: "sh4" });
+    const named = await session.call("state.getCallstack", { target: "sh4", maxFrames: PROTOCOL_BOUNDS.callstackMaxFrames.default });
+    check(
+      JSON.stringify(byDefault.frames) === JSON.stringify(named.frames),
+      `state.getCallstack without maxFrames returned ${byDefault.frames.length} frames, with maxFrames 32 ${named.frames.length}; maxFrames defaults to 32`,
+    );
 
     // the ARM7, if the server lists it: frame 0 is its PC, frame 1 its link register
     const arm7 = targetOf(session.shape, "arm7");
