@@ -415,6 +415,26 @@ describe("the contract runner against the mock", () => {
     expect(summary.ok).toBe(true);
   }, 30_000);
 
+  it("S06: needs no tick after a breakpoints.setCategoryStates that changed nothing", async () => {
+    // a server that sends no tick then, found with sh4 muted: muting sh4 is the request that changes nothing
+    const mock = new MockDebugger();
+    const tables = mock as unknown as {
+      setCategoryStates(params: { categories: Record<string, Json> }, context: Json): unknown;
+      categories: Map<string, Json>;
+    };
+    const set = tables.setCategoryStates.bind(mock);
+    tables.setCategoryStates = (params, context) => {
+      const same = Array.from(tables.categories).every(([key, state]) => !params.categories[key] || JSON.stringify(params.categories[key]) === JSON.stringify(state));
+      return same ? {} : set(params, context);
+    };
+    ask(mock, "breakpoints.setCategoryStates", { categories: { sh4: { muted: true, soloed: false } } });
+    const { url } = await startServer(undefined, mock);
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S06"]) });
+    expect(reportOf(summary)).toEqual(["S06 passed "]);
+    expect(summary.ok).toBe(true);
+    expect((await stateOf(url)).categories.sh4).toEqual({ muted: true, soloed: false });
+  }, 30_000);
+
   it("S14: reconnects, i.e. the server has no client between the two connections", async () => {
     const mock = new ForgetfulMock();
     const { url } = await startServer(undefined, mock);

@@ -352,9 +352,7 @@ const categoriesOf = (tick: DebuggerTick): Record<string, BreakpointCategoryStat
 
 const setCategories = async (context: RunContext, categories: Record<string, BreakpointCategoryState>): Promise<TickRecord> => {
   const { session } = context;
-  const mark = session.mark();
-  await session.call("breakpoints.setCategoryStates", { categories });
-  return tickShowing(session, mark, "breakpoints.setCategoryStates", (tick) => {
+  const problem = (tick: DebuggerTick): string | undefined => {
     for (const [key, state] of Object.entries(categories)) {
       const echoed = tick.categories?.[key];
       if (echoed?.muted !== state.muted || echoed?.soloed !== state.soloed) {
@@ -362,7 +360,12 @@ const setCategories = async (context: RunContext, categories: Record<string, Bre
       }
     }
     return undefined;
-  });
+  };
+  // (whether a tick follows a request that changes nothing is the server's choice)
+  const changes = problem(session.latestTick().tick) !== undefined;
+  const mark = session.mark();
+  await session.call("breakpoints.setCategoryStates", { categories });
+  return changes ? tickShowing(session, mark, "breakpoints.setCategoryStates", problem) : session.latestTick();
 };
 
 /** A register of `path` that no watch names yet, preferring the given names; as the expression `<path>.<name lower case>`. */
