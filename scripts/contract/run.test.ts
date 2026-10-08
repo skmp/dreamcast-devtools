@@ -1329,6 +1329,79 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(shallow, "S11")).toBe("state.getCallstack without maxFrames returned 8 frames, with maxFrames 32 16; maxFrames defaults to 32");
   }, 30_000);
 
+  it("S07, S08: a server that stores more breakpoints or watches than the protocol allows, or fewer", async () => {
+    // the 1025th breakpoint and the 257th watch are stored
+    const mock = new MockDebugger();
+    const tables = mock as unknown as {
+      watch(params: { expressions: string[] }, context: Json): unknown;
+      addBreakpoint(params: Json, context: Json): unknown;
+      watches: Map<number, Json>;
+      breakpoints: Map<number, Json>;
+      nextWatchId: number;
+      nextBreakpointId: number;
+      resolveExpression(expression: string): Json;
+      tickAfter(context: Json): void;
+    };
+    const watch = tables.watch.bind(mock);
+    tables.watch = (params, context) => {
+      if (tables.watches.size + params.expressions.length <= 256) {
+        return watch(params, context);
+      }
+      for (const expression of params.expressions) {
+        const id = tables.nextWatchId++;
+        tables.watches.set(id, { id, ...tables.resolveExpression(expression) });
+      }
+      tables.tickAfter(context);
+      return {};
+    };
+    const add = tables.addBreakpoint.bind(mock);
+    tables.addBreakpoint = (params, context) => {
+      if (tables.breakpoints.size < 1024) {
+        return add(params, context);
+      }
+      const id = tables.nextBreakpointId++;
+      tables.breakpoints.set(id, { id, event: params.event, kind: "event", enabled: false });
+      tables.tickAfter(context);
+      return {};
+    };
+    const { url } = await startServer(undefined, mock);
+    const unbounded = await runContract({ url, profile: "mock", only: new Set(["S07", "S08"]) });
+    expect(reportOf(unbounded)).toEqual([
+      'S07 failed breakpoints.add {"event":"dc.system.reset","kind":"event","enabled":false}: expected the error -32602, got the result {}',
+      expect.stringMatching(/^S08 failed state\.watch \{"expressions":\["dc[a-z0-9_.]+"\]\}: expected the error -32602, got the result \{\}$/),
+    ]);
+    // what the two scenarios stored is removed again: 1025 breakpoints, 257 watches
+    expect(unbounded.cleanUpProblems).toEqual([]);
+    const left = await stateOf(url);
+    expect([Object.keys(left.breakpoints).length, left.watches.length]).toEqual([0, 0]);
+
+    // 512 breakpoints and 128 watches at most
+    const smaller = await run(() => {
+      let stored = { breakpoints: 0, watches: 0 };
+      return {
+        toClient: (frame) => {
+          if (isTick(frame)) {
+            stored = { breakpoints: Object.keys(frame.params.breakpoints as Json).length, watches: (frame.params.watches as Json[]).length };
+          }
+          return frame;
+        },
+        answer: (request) => {
+          if (request.method === "breakpoints.add" && stored.breakpoints >= 512) {
+            return inBand(request, -32602, "invalid params: at most 512 breakpoints");
+          }
+          return request.method === "state.watch" && stored.watches + (paramsOf(request).expressions as string[]).length > 128
+            ? inBand(request, -32602, "invalid params: at most 128 watches")
+            : undefined;
+        },
+      };
+    }, ["S07", "S08"]);
+    expect(reportOf(smaller)).toEqual([
+      'S07 failed breakpoints.add {"event":"dc.system.reset","kind":"event","enabled":false}: in-band error -32602 "invalid params: at most 512 breakpoints"',
+      expect.stringMatching(/^S08 failed state\.watch \{"expressions":\[("dc[a-z0-9_.]+",?){64}\]\}: in-band error -32602 "invalid params: at most 128 watches"$/),
+    ]);
+    expect(smaller.cleanUpProblems).toEqual([]);
+  }, 120_000);
+
   it("S09: a target that says memory: true and refuses state.getMemorySlice", async () => {
     const summary = await run(
       {

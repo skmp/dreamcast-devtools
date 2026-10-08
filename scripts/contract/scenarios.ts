@@ -266,6 +266,52 @@ const removeBreakpoint = async (context: RunContext, id: number): Promise<void> 
   await tickShowing(session, mark, "breakpoints.remove", (tick) => (String(id) in tick.breakpoints ? `breakpoint ${id} is still listed` : undefined));
 };
 
+/**
+ * Adds disabled breakpoints on `event` until the server has as many as the protocol allows,
+ * requires the next one to be refused, and removes what it added.
+ */
+const fillBreakpointTable = async (context: RunContext, event: string): Promise<void> => {
+  const { session } = context;
+  const most = PROTOCOL_BOUNDS.breakpoints;
+  const countOf = (tick: DebuggerTick) => Object.keys(tick.breakpoints).length;
+  const tickWith = (since: number, what: string, expected: number) =>
+    tickShowing(session, since, what, (tick) => (countOf(tick) === expected ? undefined : `the tick lists ${countOf(tick)} breakpoints, expected ${expected}`));
+  const found = new Set(Object.keys(session.latestTick().tick.breakpoints));
+  const used = new Set(context.seen.breakpoints);
+  const room = most - found.size;
+  if (room <= 0) {
+    context.note(`the limit of ${most} breakpoints was not tried: the server has ${found.size}`);
+    return;
+  }
+  const request = { event, kind: "event", enabled: false } as const;
+  let mark = session.mark();
+  for (let added = 0; added < room; added++) {
+    mark = session.mark();
+    await session.call("breakpoints.add", request);
+    // every request is followed by a tick that lists every breakpoint: only the latest are kept
+    if (added % 64 === 63) {
+      session.forget(mark);
+    }
+  }
+  const full = await tickWith(mark, `breakpoints.add, ${room} times`, most);
+  const ours = Object.values(full.tick.breakpoints).filter((breakpoint) => !found.has(String(breakpoint.id)));
+  const again = ours.find((breakpoint) => used.has(breakpoint.id));
+  check(!again, `breakpoints.add: a new breakpoint has id ${again?.id}, which an earlier breakpoint of this run had; ids are never reused`);
+
+  await session.expectError("breakpoints.add", request, -32602);
+  const after = (await session.describe()).tick;
+  check(countOf(after) === most, `the server has ${countOf(after)} breakpoints after it refused one more than ${most}`);
+
+  for (const [position, breakpoint] of ours.entries()) {
+    mark = session.mark();
+    await session.call("breakpoints.remove", { id: breakpoint.id });
+    if (position % 64 === 63) {
+      session.forget(mark);
+    }
+  }
+  await tickWith(mark, `breakpoints.remove, ${ours.length} times`, found.size);
+};
+
 const toggleBreakpoint = async (context: RunContext, id: number, enabled: boolean): Promise<void> => {
   const { session } = context;
   const mark = session.mark();
@@ -948,6 +994,10 @@ const s07: Scenario = {
     for (const added of [vblank, ...disabled]) {
       await removeBreakpoint(context, added.id);
     }
+
+    // At most 1024 breakpoints. Those that fill the table are event breakpoints, disabled:
+    // nothing is armed by them, and nothing is compiled again.
+    await fillBreakpointTable(context, events.includes("dc.system.reset") ? "dc.system.reset" : events[0]);
   },
 };
 
@@ -1009,22 +1059,42 @@ const s08: Scenario = {
     await session.expectError("state.watch", { expressions: many }, -32602);
     const long = `${sh4.pcPath}.${"r".repeat(PROTOCOL_BOUNDS.watchExpressionLength + 1 - sh4.pcPath.length - 1)}`;
     await session.expectError("state.watch", { expressions: [long] }, -32602);
-    // ... and 64 expressions in a call are accepted, and so are 64 ids in a call that removes them
+    // ... and 64 expressions in a call are accepted, and so are 64 ids in a call that removes
+    // them. There are at most 256 watches: the calls go on until that many are stored (if the
+    // device tree has that many registers), and one more is refused.
     const stored = session.latestTick().tick.watches ?? [];
     const free = unwatchedExpressions(context);
     const perCall = PROTOCOL_BOUNDS.watchExpressionsPerCall;
-    if (free.length >= perCall && stored.length + perCall <= PROTOCOL_BOUNDS.watches) {
+    const most = PROTOCOL_BOUNDS.watches;
+    const countOf = (tick: DebuggerTick) => (tick.watches ?? []).length;
+    const tickWith = (since: number, what: string, expected: number) =>
+      tickShowing(session, since, what, (tick) => (countOf(tick) === expected ? undefined : `the tick lists ${countOf(tick)} watches, expected ${expected}`));
+    if (free.length >= perCall && stored.length + perCall <= most) {
       const kept = new Set(stored.map((watch) => watch.id));
-      const adding = session.mark();
-      await session.call("state.watch", { expressions: free.slice(0, perCall) });
-      const filled = await tickShowing(session, adding, `state.watch of ${perCall} expressions`, (tick) =>
-        (tick.watches ?? []).length === stored.length + perCall ? undefined : `the tick lists ${(tick.watches ?? []).length} watches, expected ${stored.length + perCall}`,
-      );
-      const removing = session.mark();
-      await session.call("state.unwatch", { watchIds: filled.tick.watches!.map((watch) => watch.id).filter((watchId) => !kept.has(watchId)) });
-      await tickShowing(session, removing, `state.unwatch of ${perCall} ids`, (tick) =>
-        (tick.watches ?? []).length === stored.length ? undefined : `the tick lists ${(tick.watches ?? []).length} watches, expected ${stored.length}`,
-      );
+      const reachable = free.length > most - stored.length;
+      let sent = 0;
+      let latest: TickRecord;
+      do {
+        const expressions = free.slice(sent, sent + Math.min(perCall, most - stored.length - sent));
+        const adding = session.mark();
+        await session.call("state.watch", { expressions });
+        sent += expressions.length;
+        latest = await tickWith(adding, `state.watch of ${expressions.length} expressions`, stored.length + sent);
+      } while (reachable && stored.length + sent < most);
+      if (reachable) {
+        await session.expectError("state.watch", { expressions: [free[sent]] }, -32602);
+        latest = await session.describe();
+        check(countOf(latest.tick) === most, `the server has ${countOf(latest.tick)} watches after it refused one more than ${most}`);
+      } else {
+        context.note(`the limit of ${most} watches was not reached: ${stored.length} watches exist, and the device tree has ${free.length} more registers`);
+      }
+      const ours = latest.tick.watches!.map((watch) => watch.id).filter((watchId) => !kept.has(watchId));
+      let removing = session.mark();
+      for (let position = 0; position < ours.length; position += perCall) {
+        removing = session.mark();
+        await session.call("state.unwatch", { watchIds: ours.slice(position, position + perCall) });
+      }
+      await tickWith(removing, `state.unwatch of ${ours.length} ids`, stored.length);
     } else {
       context.note(`${perCall} expressions in one state.watch were not tried: ${stored.length} watches exist, and ${free.length} registers are not watched`);
     }

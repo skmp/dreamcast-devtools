@@ -123,18 +123,18 @@ export class ContractSession {
       this.options.trace?.(`<- binary frame, ${data.byteLength} bytes`);
       this.wake();
     });
+    // The tap applies the strict schema to every tick (I1), and nothing else reads ticks: the
+    // client gets the schemas of the responses only, so that a tick is validated once.
+    const { [RpcMethod.EVENT_TICK]: _tick, ...responseSchemas } = StrictDebuggerRpcMethodSchemas;
     this.rpc = new JsonRpcClient<DebuggerRpcSchema>(this.transport, {
       requestTimeoutMs: 10_000 * options.timeoutFactor,
-      validationSchemas: StrictDebuggerRpcMethodSchemas,
+      validationSchemas: responseSchemas,
       validateResponses: true,
       // the runner sends invalid requests on purpose
       validateParams: false,
     });
     this.rpc.onInvalidMessage((report) => {
-      // ticks are reported by the tap, with the same strict schema
-      if (report.kind !== "notification") {
-        this.violations.push(`I1: ${report.message}`);
-      }
+      this.violations.push(`I1: ${report.message}`);
     });
     this.transport.onStateChange((state) => {
       if (state === "closed") {
@@ -229,6 +229,18 @@ export class ContractSession {
   /** The position in the frame sequence; frames with `seq >= mark()` arrive after this call. */
   mark(): number {
     return this.seq;
+  }
+
+  /**
+   * Drops what was recorded before `mark`, except the latest tick: for a scenario that causes
+   * thousands of large ticks and needs none of them afterwards. Marks stay valid.
+   */
+  forget(mark: number): void {
+    const latest = this.ticks.at(-1);
+    const kept = this.ticks.filter((record) => record.seq >= mark || record === latest);
+    this.ticks.splice(0, this.ticks.length, ...kept);
+    const frames = this.frames.filter((frame) => frame.seq >= mark || frame.seq === latest?.seq);
+    this.frames.splice(0, this.frames.length, ...frames);
   }
 
   /** The first response at or after `mark`: that of a request sent right after `mark()`, the runner sends one at a time. */
