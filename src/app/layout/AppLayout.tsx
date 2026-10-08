@@ -183,6 +183,8 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const toasts = useDebuggerDataStore((state) => state.toasts);
   const dismissToast = useDebuggerDataStore((state) => state.dismissToast);
   const initError = useDebuggerDataStore((state) => state.initError);
+  const describeRetry = useDebuggerDataStore((state) => state.describeRetry);
+  const retryDescribe = useDebuggerDataStore((state) => state.retryDescribe);
   const invalidMessages = useDebuggerDataStore((state) => state.invalidMessages);
   const dismissInvalidMessages = useDebuggerDataStore((state) => state.dismissInvalidMessages);
   const epoch = useDebuggerDataStore((state) => state.epoch);
@@ -518,8 +520,22 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
         )
       )}
       {initError && (
-        <Alert severity="error" sx={{ borderRadius: 0 }}>
-          {initError}
+        // the connection is there and the server could not be described: it is asked again
+        <Alert
+          severity="error"
+          sx={{ borderRadius: 0 }}
+          action={
+            describeRetry && (
+              <Button color="inherit" size="small" onClick={retryDescribe}>
+                Retry now
+              </Button>
+            )
+          }
+        >
+          {initError}.{" "}
+          {describeRetry
+            ? `Asking again in ${describeRetry.delayMs / 1000} s (attempt ${describeRetry.attempt}).`
+            : "Asking again."}
         </Alert>
       )}
       {connected && initialized && serverProtocol !== PROTOCOL_VERSION && protocolNoticeDismissed !== epoch && (

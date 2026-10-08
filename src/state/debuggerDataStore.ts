@@ -11,6 +11,7 @@ import type {
 import type { DebuggerClient } from "../services/debuggerClient";
 import type { InvalidMessageReport } from "../services/jsonRpcClient";
 import { toggleMuted, toggleSoloed } from "./breakpointCategoryState";
+import { reconnectDelayMs } from "./sessionController";
 import { describeBreakpoint } from "./targets";
 import { applyTick, emptyLiveState } from "./tickState";
 import type { CategoryStates, LiveState } from "./tickState";
@@ -53,10 +54,17 @@ interface DebuggerDataState extends LiveState {
   availableEvents: string[];
   /** why debugger.describe of the current connection failed */
   initError?: string;
+  /**
+   * After a debugger.describe that failed: which attempt comes next (1 is the first one after
+   * the failure) and how long after the failure it is made. Undefined while it is being made.
+   */
+  describeRetry?: { attempt: number; delayMs: number };
   invalidMessages?: InvalidMessages;
   toasts: Toast[];
   // Methods
   initialize: (client: DebuggerClient) => Promise<void>;
+  /** Sends the debugger.describe that is waiting for its time (`describeRetry`) now. */
+  retryDescribe: () => void;
   reset: () => void;
   addWatch: (expression: string) => Promise<void>;
   removeWatch: (watchId: number) => Promise<void>;
@@ -93,6 +101,8 @@ const messageOf = (error: unknown, fallback: string): string => (error instanceo
 /** Identifies the connection that `initialize` was last called for; what an older one still delivers is ignored. */
 let generation = 0;
 let unsubscribe: (() => void) | undefined;
+/** the debugger.describe that is sent again when its time has come, after one that failed */
+let pendingDescribe: { timer: ReturnType<typeof setTimeout>; send: () => void } | undefined;
 let nextToastId = 1;
 /** what takes each notice away again, by its id */
 const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
@@ -167,6 +177,99 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
     }
   };
 
+  const cancelPendingDescribe = () => {
+    if (pendingDescribe) {
+      clearTimeout(pendingDescribe.timer);
+      pendingDescribe = undefined;
+    }
+  };
+
+  /**
+   * Has the server of a connection describe itself: the store is emptied, the handlers are
+   * registered and debugger.describe is sent. `failures` is how often that failed on this
+   * connection before.
+   *
+   * A failure is said (`initError`), and need not last: every method can be answered with
+   * "emulator busy" (-32000) when the emulator thread did not get to it within two seconds,
+   * and with nothing at all for ten. The connection is there, so nothing reconnects and
+   * nothing else would ask again: the session would stay connected and empty until somebody
+   * disconnected by hand. So the server is asked again, 1, 2, 5 and then every 10 seconds
+   * after each failure (the delays of a reconnect), for as long as the connection lasts.
+   */
+  const describeServer = async (client: DebuggerClient, failures: number): Promise<void> => {
+    const mine = ++generation;
+    cancelPendingDescribe();
+    unsubscribe?.();
+    // nothing of an earlier connection is live any more: its registers and its callstack go too
+    set({
+      client,
+      initialized: false,
+      shape: undefined,
+      deviceTree: [],
+      availableEvents: [],
+      describeRetry: undefined,
+      // while it is asked again, why the attempt before failed stays on screen
+      ...(failures === 0 ? { initError: undefined, invalidMessages: undefined } : {}),
+      ...emptyLiveState(),
+    });
+
+    // Before debugger.describe is sent: the server answers and then sends a full tick, and
+    // both can be delivered before the code after `await` runs.
+    const unsubscribeTicks = client.onNotification((notification) => {
+      if (generation === mine && notification.topic === "tick") {
+        handleTick(notification.payload);
+      }
+    });
+    // A message that fails validation never reaches the handlers above. Without this a
+    // dropped tick is only visible as a UI that stopped updating.
+    const unsubscribeInvalid = client.onInvalidMessage((report) => {
+      if (generation === mine) {
+        set((state) => ({ invalidMessages: { count: (state.invalidMessages?.count ?? 0) + 1, last: report } }));
+      }
+    });
+    unsubscribe = () => {
+      unsubscribeTicks();
+      unsubscribeInvalid();
+    };
+
+    try {
+      const shape = await client.describe();
+      if (generation !== mine) {
+        return;
+      }
+      set((state) => ({
+        shape,
+        deviceTree: shape.deviceTree,
+        availableEvents: collectEventsFromTree(shape.deviceTree),
+        initialized: true,
+        epoch: state.epoch + 1,
+        initError: undefined,
+      }));
+    } catch (error) {
+      if (generation !== mine) {
+        return;
+      }
+      console.error("Failed to initialize debugger data", error);
+      // ticks of a server that is not described are not applied: nothing says what they are of
+      unsubscribe?.();
+      unsubscribe = undefined;
+      const attempt = failures + 1;
+      const delayMs = reconnectDelayMs(attempt);
+      set({
+        initialized: false,
+        client: undefined,
+        initError: `debugger.describe failed: ${messageOf(error, String(error))}`,
+        describeRetry: { attempt, delayMs },
+        ...emptyLiveState(),
+      });
+      const send = () => {
+        pendingDescribe = undefined;
+        void describeServer(client, attempt);
+      };
+      pendingDescribe = { timer: setTimeout(send, delayMs), send };
+    }
+  };
+
   return {
     initialized: false,
     epoch: 0,
@@ -175,70 +278,19 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
     toasts: [],
     ...emptyLiveState(),
 
-    async initialize(client) {
-      const mine = ++generation;
-      unsubscribe?.();
-      // nothing of an earlier connection is live any more: its registers and its callstack go too
-      set({
-        client,
-        initialized: false,
-        shape: undefined,
-        deviceTree: [],
-        availableEvents: [],
-        initError: undefined,
-        invalidMessages: undefined,
-        ...emptyLiveState(),
-      });
+    initialize: (client) => describeServer(client, 0),
 
-      // Before debugger.describe is sent: the server answers and then sends a full tick, and
-      // both can be delivered before the code after `await` runs.
-      const unsubscribeTicks = client.onNotification((notification) => {
-        if (generation === mine && notification.topic === "tick") {
-          handleTick(notification.payload);
-        }
-      });
-      // A message that fails validation never reaches the handlers above. Without this a
-      // dropped tick is only visible as a UI that stopped updating.
-      const unsubscribeInvalid = client.onInvalidMessage((report) => {
-        if (generation === mine) {
-          set((state) => ({ invalidMessages: { count: (state.invalidMessages?.count ?? 0) + 1, last: report } }));
-        }
-      });
-      unsubscribe = () => {
-        unsubscribeTicks();
-        unsubscribeInvalid();
-      };
-
-      try {
-        const shape = await client.describe();
-        if (generation !== mine) {
-          return;
-        }
-        set((state) => ({
-          shape,
-          deviceTree: shape.deviceTree,
-          availableEvents: collectEventsFromTree(shape.deviceTree),
-          initialized: true,
-          epoch: state.epoch + 1,
-        }));
-      } catch (error) {
-        if (generation !== mine) {
-          return;
-        }
-        console.error("Failed to initialize debugger data", error);
-        unsubscribe?.();
-        unsubscribe = undefined;
-        set({
-          initialized: false,
-          client: undefined,
-          initError: `debugger.describe failed: ${messageOf(error, String(error))}`,
-          ...emptyLiveState(),
-        });
+    retryDescribe() {
+      const pending = pendingDescribe;
+      if (pending) {
+        clearTimeout(pending.timer);
+        pending.send();
       }
     },
 
     reset() {
       generation++;
+      cancelPendingDescribe();
       unsubscribe?.();
       unsubscribe = undefined;
       // Without a connection nothing on screen is live: the panels say "No Data" instead of
@@ -250,6 +302,7 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
         deviceTree: [],
         availableEvents: [],
         initError: undefined,
+        describeRetry: undefined,
         invalidMessages: undefined,
         ...emptyLiveState(),
       });

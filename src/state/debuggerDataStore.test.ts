@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DebuggerClient } from "../services/debuggerClient";
 import { FakeTransport } from "../services/test-support/fakeTransport";
 import { useDebuggerDataStore } from "./debuggerDataStore";
+import { RECONNECT_DELAYS_MS } from "./sessionController";
 
 // The store against a transport the test plays the server on: what it sends and when, and
 // what a tick, an answer and a broken message do to it.
@@ -166,6 +167,132 @@ describe("initialize", () => {
     await again;
     expect(store().initError).toMatch(/^debugger\.describe failed: Response validation failed for debugger\.describe: emulator\.version: /);
     expect(store().invalidMessages).toMatchObject({ count: 1, last: { kind: "response", method: "debugger.describe" } });
+  });
+
+  describe("after a debugger.describe that failed", () => {
+    const describes = (transport: FakeTransport) => transport.sent.filter((request) => request.method === "debugger.describe").length;
+    const BUSY = "debugger.describe failed: emulator busy";
+
+    /** A connection whose first debugger.describe the server refused with "emulator busy". */
+    const refused = async () => {
+      const { transport, client } = connect();
+      const done = store().initialize(client);
+      transport.respondError(-32000, "emulator busy");
+      await done;
+      return { transport, client };
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    it("the server is asked again on the same connection after 1, 2, 5 and then every 10 seconds, until it answers", async () => {
+      expect(RECONNECT_DELAYS_MS).toEqual([1000, 2000, 5000, 10_000]);
+      const epoch = store().epoch;
+      const { transport, client } = await refused();
+      expect(store()).toMatchObject({ initialized: false, initError: BUSY, describeRetry: { attempt: 1, delayMs: 1000 } });
+      expect(store().client).toBeUndefined();
+      expect(describes(transport)).toBe(1);
+
+      // a tick of a server that is not described is not applied
+      transport.deliver(tickFrame({ state: "paused", stopId: 1, reason: "pause" }));
+      expect(store().ticks).toBe(0);
+
+      const delays = [1000, 2000, 5000, 10_000, 10_000];
+      for (const [index, delayMs] of delays.entries()) {
+        await vi.advanceTimersByTimeAsync(delayMs - 1);
+        expect(describes(transport), `before the ${delayMs} ms are over`).toBe(index + 1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(describes(transport), `after ${delayMs} ms`).toBe(index + 2);
+        expect(transport.sent.at(-1)).toMatchObject({ method: "debugger.describe", params: { protocol: 3, client: "unit test" } });
+        // while it is asked, why the attempt before failed stays, and no next attempt is announced
+        expect(store().initError).toBe(BUSY);
+        expect(store().describeRetry).toBeUndefined();
+        expect(store().initialized).toBe(false);
+
+        if (index < delays.length - 1) {
+          transport.respondError(-32000, "emulator busy");
+          await vi.advanceTimersByTimeAsync(0);
+          expect(store().describeRetry).toEqual({ attempt: index + 2, delayMs: delays[index + 1] });
+          expect(store().client).toBeUndefined();
+        }
+      }
+
+      // the sixth debugger.describe is answered: the server is described, and its tick is applied
+      transport.respond(describeResult());
+      transport.deliver(tickFrame({ state: "paused", stopId: 3, reason: "pause" }, { registers: { "dc.sh4.cpu": pc("0x8C0000A0") } }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store()).toMatchObject({ initialized: true, epoch: epoch + 1, ticks: 1, executionState: { state: "paused", stopId: 3 } });
+      expect(store().client).toBe(client);
+      expect(store().initError).toBeUndefined();
+      expect(store().describeRetry).toBeUndefined();
+      expect(store().deviceTree).toHaveLength(1);
+      // and that is the end of the asking
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(describes(transport)).toBe(6);
+    });
+
+    it("retryDescribe() asks now instead of when the wait is over, and does nothing without a wait", async () => {
+      const { transport } = await refused();
+      store().retryDescribe();
+      expect(describes(transport)).toBe(2);
+      expect(store().describeRetry).toBeUndefined();
+      // nothing is waiting any more: a second call sends nothing, and neither does the second the wait had left
+      store().retryDescribe();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(describes(transport)).toBe(2);
+
+      // the count of the attempts goes on from where it was
+      transport.respondError(-32000, "emulator busy");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store().describeRetry).toEqual({ attempt: 2, delayMs: 2000 });
+      store().retryDescribe();
+      expect(describes(transport)).toBe(3);
+      transport.respond(describeResult());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store().initialized).toBe(true);
+      store().retryDescribe();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(describes(transport)).toBe(3);
+    });
+
+    it("the wait ends with the connection: reset() and the next connection send nothing for it", async () => {
+      const lost = await refused();
+      store().reset();
+      expect(store().initError).toBeUndefined();
+      expect(store().describeRetry).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(describes(lost.transport)).toBe(1);
+      store().retryDescribe();
+      expect(describes(lost.transport)).toBe(1);
+
+      // the session reconnected while the server of the connection before was waited for
+      const first = await refused();
+      const second = connect();
+      const done = store().initialize(second.client);
+      expect(store().initError).toBeUndefined();
+      expect(store().describeRetry).toBeUndefined();
+      second.transport.respond(describeResult());
+      await done;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(describes(first.transport)).toBe(1);
+      expect(describes(second.transport)).toBe(1);
+      expect(store().client).toBe(second.client);
+      expect(store().initialized).toBe(true);
+    });
+
+    it("a connection that closes while the server is asked again is not asked a third time", async () => {
+      const { transport } = await refused();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(describes(transport)).toBe(2);
+      // the session controller hears of the loss and resets the store; the open request is rejected
+      transport.close();
+      store().reset();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(describes(transport)).toBe(2);
+      expect(store().initError).toBeUndefined();
+      expect(store().describeRetry).toBeUndefined();
+    });
   });
 
   it("reset() forgets the connection: no client, no data, and nothing of it is applied afterwards", async () => {

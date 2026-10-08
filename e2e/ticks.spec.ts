@@ -9,6 +9,7 @@ import {
   gotoRoute,
   panel,
   recordAlerts,
+  recordText,
   registerRow,
   saveScreenshot,
   statusBar,
@@ -539,4 +540,79 @@ test("a debugger.describe the client cannot use, or that the server refuses, is 
   await page.getByRole("button", { name: "Connect", exact: true }).click();
   await expect(page.getByRole("alert").filter({ hasText: "debugger.describe failed: internal error" })).toBeVisible();
   await expect(panel(page, "device-tree")).toContainText("No Data");
+});
+
+test("a debugger.describe that failed is asked again: the session comes back when the server can answer", async ({ page, diagnostics }) => {
+  diagnostics.allow(/^console\.error: Failed to initialize debugger data/, "the store logs the failed initialisation");
+  const server = await serveScriptedDebugger(page);
+  // The emulator thread did not get to the request within two seconds: every method can be
+  // answered with -32000 then (design 3.3), and a moment later the server is fine again.
+  let busy = true;
+  server.answer("debugger.describe", () => {
+    if (busy) {
+      return jsonRpcError(-32000, "emulator busy");
+    }
+    // the response first, then a full tick to this client
+    queueMicrotask(() => server.tick());
+    return server.shape;
+  });
+  // what the notice says changes within a second: it is recorded, not looked for
+  const said = await recordText(page, '[role="alert"]');
+  const announced = async () =>
+    (await said()).flatMap(({ at, text }) => {
+      const attempt = /^debugger\.describe failed: emulator busy\. Asking again in (\d+) s \(attempt (\d+)\)\./.exec(text);
+      return attempt ? [{ at, wait: Number(attempt[1]), attempt: Number(attempt[2]) }] : [];
+    });
+  const execution = page.getByRole("status", { name: "Execution state" });
+  const failed = page.getByRole("alert").filter({ hasText: "debugger.describe failed: emulator busy" });
+  const describes = () => server.requestsOf("debugger.describe").length;
+
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  // the third debugger.describe is refused like the two before it; the fourth is five seconds away
+  await expect(failed).toContainText("Asking again in 5 s (attempt 3).");
+  expect(describes()).toBe(3);
+  const attempts = await announced();
+  expect(attempts.map(({ wait, attempt }) => ({ wait, attempt }))).toEqual([
+    { wait: 1, attempt: 1 },
+    { wait: 2, attempt: 2 },
+    { wait: 5, attempt: 3 },
+  ]);
+  expect(attempts[1].at - attempts[0].at).toBeGreaterThanOrEqual(900);
+  expect(attempts[2].at - attempts[1].at).toBeGreaterThanOrEqual(1900);
+  // all of it on the one connection, which is there: nothing reconnects
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  expect(server.connections()).toBe(1);
+  for (const id of ["device-tree", "sh4-disassembly", "sh4-memory", "watches"]) {
+    await expect(panel(page, id), id).toContainText("No Data");
+  }
+  await expect(execution).toHaveCount(0);
+
+  // "Retry now" does not wait for the five seconds, and the server can answer by now
+  busy = false;
+  await failed.getByRole("button", { name: "Retry now" }).click();
+  await expect(execution).toContainText("Paused", { timeout: 3000 });
+  expect(describes()).toBe(4);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(panel(page, "sh4-disassembly").locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+  // a session like any other: the next tick is applied
+  await tickAndWait(page, server);
+
+  // The same on the next connection, and nobody clicks: a second after the refusal the page
+  // asks again by itself.
+  busy = true;
+  server.drop();
+  await expect.poll(() => server.connections()).toBe(2);
+  await expect(failed).toBeVisible();
+  await expect(panel(page, "device-tree")).toContainText("No Data");
+  busy = false;
+  await expect(execution).toContainText("Paused");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  expect(server.connections()).toBe(2);
+  await tickAndWait(page, server);
+  // nothing is asked again once the server is described
+  const settled = describes();
+  await page.waitForTimeout(2500);
+  expect(describes()).toBe(settled);
 });
