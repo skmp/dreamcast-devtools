@@ -1037,7 +1037,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       ["S07"],
     );
     expect(statusOf(refused, "S07")).toBe("failed");
-    expect(detailsOf(refused, "S07")).toBe('breakpoints.add {"event":"dc.system.reset","enabled":false}: in-band error -32004 "not supported: event dc.no.such.event"');
+    expect(detailsOf(refused, "S07")).toBe('breakpoints.add {"event":"dc.system.reset","kind":"event","enabled":false}: in-band error -32004 "not supported: event dc.no.such.event"');
 
     const notAdvertised = await run(
       {
@@ -1050,6 +1050,41 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
     expect(statusOf(notAdvertised, "S07")).toBe("failed");
     expect(detailsOf(notAdvertised, "S07")).toBe('the capability "event-breakpoints" is part of milestone M1');
+  }, 30_000);
+
+  it("S07: event breakpoints that are listed and never stop the target, and a tree without the vertical blank event", async () => {
+    const mock = new MockDebugger();
+    // the event is logged, and no breakpoint on it is ever reported as hit
+    const machine = mock as unknown as { emitEvent(name: string, message: string): number | undefined };
+    const emit = machine.emitEvent.bind(mock);
+    machine.emitEvent = (name, message) => {
+      emit(name, message);
+      return undefined;
+    };
+    const { url } = await startServer(undefined, mock);
+    const neverHit = await runContract({ url, profile: "mock", only: new Set(["S07"]) });
+    expect(statusOf(neverHit, "S07")).toBe("failed");
+    expect(detailsOf(neverHit, "S07")).toMatch(/^a paused tick at the event breakpoint on dc\.holly\.core\.vblank: not seen within 2000 ms; ticks since then: \d+ \(#\d+ running /);
+    expect(neverHit.cleanUpProblems).toEqual([]);
+    expect((await stateOf(url)).breakpoints).toEqual({});
+
+    const withoutEvent = (nodes: Json[]): Json[] =>
+      nodes.map((node) => {
+        const { events, children, ...rest } = node as Json & { events?: string[]; children?: Json[] };
+        const kept = events?.filter((event) => event !== "dc.holly.core.vblank");
+        return { ...rest, ...(kept?.length ? { events: kept } : {}), ...(children ? { children: withoutEvent(children) } : {}) };
+      });
+    const notListed = await run(
+      {
+        toClient: (frame) => {
+          const result = frame.result as Json | undefined;
+          return result?.deviceTree ? { ...frame, result: { ...result, deviceTree: withoutEvent(result.deviceTree as Json[]) } } : frame;
+        },
+      },
+      ["S07"],
+    );
+    expect(statusOf(notListed, "S07")).toBe("failed");
+    expect(detailsOf(notListed, "S07")).toBe("the device tree lists the event dc.holly.core.vblank, which every running program raises");
   }, 30_000);
 
   it("S08: a watch bound that is not enforced, and state.unwatch that refuses an id it does not know", async () => {

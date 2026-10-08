@@ -68,6 +68,8 @@ type Scenario = { id: string; title: string; run: (context: RunContext) => Promi
 const hex = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
 /** SH4 code addresses are compared under this mask: the same code is reachable at 0x0C.., 0x8C.. and 0xAC.. (design 2.3.3) */
 const SH4_CODE_ADDRESS_MASK = 0x1fffffff;
+/** The event of the vertical blank: raised by every program that runs, about sixty times a second (design 2.6). */
+const VBLANK_EVENT = "dc.holly.core.vblank";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------------------
@@ -815,10 +817,9 @@ const s07: Scenario = {
     await session.expectError("breakpoints.remove", { id: breakpoint.id }, -32602);
     await session.expectError("breakpoints.toggle", { id: breakpoint.id, enabled: true }, -32602);
 
-    // Event breakpoints: every event the device tree lists is in the server's table. Each is
-    // added disabled (an enabled one would stop the target when its event comes), listed and
-    // removed. The request is the one the UI sends, with the kind; the first one is sent
-    // without it, and without an address the kind is "event".
+    // Event breakpoints. Every event the device tree lists is in the server's table: a
+    // breakpoint on each, added disabled (an enabled one stops the target when its event
+    // comes) with the request the UI sends, i.e. with the kind.
     check(hasCapability(context, CAPABILITIES.EVENT_BREAKPOINTS), 'the capability "event-breakpoints" is part of milestone M1');
     const events: string[] = [];
     const visit = (nodes: DeviceNodeDescriptor[]) =>
@@ -828,8 +829,32 @@ const s07: Scenario = {
       });
     visit(session.shape.deviceTree);
     check(events.length > 0, "the device tree lists no events");
-    for (const [position, event] of events.entries()) {
-      const added = await addBreakpoint(context, position === 0 ? { event, enabled: false } : { event, kind: "event", enabled: false });
+    check(events.includes(VBLANK_EVENT), `the device tree lists the event ${VBLANK_EVENT}, which every running program raises`);
+    await ensurePaused(context);
+    const disabled: BreakpointDescriptor[] = [];
+    for (const event of events.filter((name) => name !== VBLANK_EVENT)) {
+      disabled.push(await addBreakpoint(context, { event, kind: "event", enabled: false }));
+    }
+    // The one on the vertical blank is sent without kind and enabled: without an address the
+    // kind is "event", and it is enabled. (Nothing raises an event while the target is paused.)
+    const vblank = await addBreakpoint(context, { event: VBLANK_EVENT });
+    await toggleBreakpoint(context, vblank.id, false);
+    // while they are disabled none of them stops the target ...
+    await expectToKeepRunning(context, "a disabled event breakpoint on every event of the device tree");
+    // ... and the enabled one stops it when its event is raised
+    await toggleBreakpoint(context, vblank.id, true);
+    const waiting = session.latestTick().tick;
+    const resumed = session.mark();
+    await session.call("control.runUntil", {});
+    const stop = await session.waitForTick(
+      (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(waiting),
+      2000,
+      `a paused tick at the event breakpoint on ${VBLANK_EVENT}`,
+      resumed,
+    );
+    check(stop.tick.executionState.reason === "event", `the stop of the event breakpoint has reason "${stop.tick.executionState.reason}", expected "event"`);
+    check(stop.tick.executionState.breakpointId === vblank.id, `the stop reports breakpointId ${stop.tick.executionState.breakpointId}, expected ${vblank.id}`);
+    for (const added of [vblank, ...disabled]) {
       await removeBreakpoint(context, added.id);
     }
   },
