@@ -513,51 +513,52 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   }, [fetchDisassembly, config.maxAddress, config.instructionSize]);
 
   /**
-   * Whether the lines have a place on the page. They have none while the panel is a dock tab
-   * behind another: the dock takes such a panel out of the document, and every rectangle in
-   * it then measures as nothing, at 0.
+   * Whether the lines are rendered and have no place on the page. That is the case while the
+   * panel is a dock tab behind another: the dock takes such a panel out of the document, and
+   * every rectangle in it then measures as nothing, at 0. (A view that shows an error, or
+   * "No Data", in place of its lines is not that: it has no lines, and is there to be seen.)
    */
-  const hasLayout = useCallback(() => {
+  const isOffPage = useCallback(() => {
     const node = containerRef.current;
-    return node !== null && node.isConnected && node.getBoundingClientRect().height > 0;
+    return node !== null && !(node.isConnected && node.getBoundingClientRect().height > 0);
   }, []);
 
-  // Counts the times the lines got a place (back): what could not be seen until then is
+  // Counts the times the lines got their place back: what could not be seen until then is
   // looked at again (the effect on `revealRef`).
   const [shown, setShown] = useState(0);
   useEffect(() => {
     if (!container || typeof ResizeObserver === "undefined") {
       return;
     }
-    let laidOut = hasLayout();
+    let offPage = isOffPage();
     const observer = new ResizeObserver(() => {
-      const now = hasLayout();
-      if (now && !laidOut) {
+      const now = isOffPage();
+      if (offPage && !now) {
         setShown((count) => count + 1);
       }
-      laidOut = now;
+      offPage = now;
     });
     observer.observe(container);
     return () => observer.disconnect();
-  }, [container, hasLayout]);
+  }, [container, isOffPage]);
 
   /**
    * Whether the line of an address is rendered and entirely inside what the panel shows.
-   * No line is while the panel has no place on the page (two rectangles of nothing would
+   * No line is while the lines have no place on the page (two rectangles of nothing would
    * compare as "inside").
    */
   const isLineOnScreen = useCallback(
     (lineAddress: number) => {
       const element = lineRefsMap.current.get(lineAddress);
       const node = containerRef.current;
-      if (!element || !node || !hasLayout()) {
+      if (!element || !node || isOffPage()) {
         return false;
       }
       const line = element.getBoundingClientRect();
       const visible = node.getBoundingClientRect();
       return line.top >= visible.top && line.bottom <= visible.bottom;
     },
-    [hasLayout],
+    [isOffPage],
   );
 
   /**
@@ -585,7 +586,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         // the line is not going to be on screen if it is not among the lines asked for, and
         // if it is, that is seen when they are in. The same goes for a view that is a dock
         // tab behind another: it is seen when the tab is shown.
-        const seen = isUpToDate() && hasLayout();
+        const seen = isUpToDate() && !isOffPage();
         const away = seen ? !isLineOnScreen(pc) : pc < at || pc >= at + size * LINES_PER_FETCH;
         if (away) {
           revealRef.current = { pc, stage: "moved" };
@@ -602,7 +603,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
       // what the lines say can have changed with the stop (code that was just loaded or written)
       handleRefresh();
     },
-    [config.instructionSize, config.maxAddress, handleRefresh, hasLayout, isLineOnScreen, isUpToDate, moveTo],
+    [config.instructionSize, config.maxAddress, handleRefresh, isOffPage, isLineOnScreen, isUpToDate, moveTo],
   );
 
   // The lines of a followed stop have been rendered. A view that stayed where it was goes to
@@ -610,11 +611,11 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   // do not fit above it in a panel that is short, or whose lines wrap: then as many as fit
   // are shown above it, and none if even that leaves it outside.
   //
-  // All of that is measured, so it waits while the view has no place on the page, and is done
-  // when it has one again (`shown`).
+  // All of that is measured, so it waits while the lines have no place on the page, and is
+  // done when they have one again (`shown`).
   useEffect(() => {
     const reveal = revealRef.current;
-    if (!reveal || loading || !isUpToDate() || !hasLayout()) {
+    if (!reveal || loading || !isUpToDate() || isOffPage()) {
       return;
     }
     if (isLineOnScreen(reveal.pc)) {
@@ -639,7 +640,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     const context = adjusted ? 0 : Math.min(index, Math.max(0, Math.floor((fitting - 1) / 2)));
     revealRef.current = adjusted ? undefined : { pc: reveal.pc, stage: "adjusted" };
     moveTo(normalizeAddress(reveal.pc - context * size, config.maxAddress, size));
-  }, [lines, loading, shown, hasLayout, isLineOnScreen, isUpToDate, config.instructionSize, config.maxAddress, moveTo]);
+  }, [lines, loading, shown, isOffPage, isLineOnScreen, isUpToDate, config.instructionSize, config.maxAddress, moveTo]);
 
   // Expose methods via ref
   useImperativeHandle(ref, () => ({

@@ -340,6 +340,41 @@ test("a stop while the disassembly view is a tab behind another: its program cou
   expect(server.requestsOf("state.getDisassembly").at(-1)).toEqual({ target: "sh4", address: far - 20, count: 64 });
 });
 
+test("a stop while the view has an error to show in place of its lines: it goes to the program counter, with one request", async ({
+  page,
+}) => {
+  const server = await open(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  const listings = () => server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4");
+
+  // the emulator is busy when the view reads for a stop: the view shows that instead of lines
+  let busy = true;
+  server.answer("state.getDisassembly", (params) =>
+    busy ? jsonRpcError(-32000, "emulator busy") : defaultAnswer("state.getDisassembly", params),
+  );
+  server.state.execution = { state: "paused", stopId: 2, reason: "step" };
+  await tickAndWait(page, server);
+  await expect(view).toContainText("emulator busy");
+  await expect(rows).toHaveCount(0);
+
+  // The next stop is forty instructions on: among the 64 lines the view had, none of which is
+  // on screen. That is not a view behind a tab, which has to wait to see: it is there to be
+  // seen and has no lines, so it goes to the program counter at once.
+  busy = false;
+  const before = listings().length;
+  const pc = 0x8c001000 + 2 * 40;
+  server.state.execution = { state: "paused", stopId: 3, reason: "step" };
+  server.setRegister("dc.sh4.cpu", "PC", hex8(pc));
+  await tickAndWait(page, server);
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(pc));
+  await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(pc - 20));
+  await page.waitForTimeout(300);
+  expect(listings().slice(before)).toEqual([{ target: "sh4", address: pc - 20, count: 64 }]);
+});
+
 test("stops that arrive faster than the page renders them: everything ends at the last, and the views read for the latest only", async ({
   page,
 }) => {
