@@ -1,7 +1,9 @@
 import {
   test,
   expect,
+  addPanelFromSelector,
   breakpointGutter,
+  dockTab,
   disassemblyRow,
   disassemblyRows,
   gotoRoute,
@@ -279,6 +281,62 @@ test("two stops close together: the second is followed from where the view is go
   await expect(marked).toHaveAttribute("data-address", String(below));
   await expect(marked).toBeInViewport({ ratio: 1 });
   await expect(rows.first()).toHaveAttribute("data-address", String(below - 20));
+});
+
+test("a stop while the disassembly view is a tab behind another: its program counter is on screen when the tab is shown", async ({
+  page,
+}) => {
+  const server = await open(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const marked = view.locator(".current-instruction");
+  await expect(marked).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  // the panel shows fewer than fifty lines: the fiftieth after the program counter is below it
+  await expect(disassemblyRow(view, 0x8c001000 + 2 * 50)).not.toBeInViewport();
+
+  let stopId = 1;
+  /** Another panel comes to the front of the group, and the target stops at `pc` behind it. */
+  const stopBehindTheTab = async (pc: number) => {
+    await dockTab(page, "Events: Log").click();
+    await expect(panel(page, "events")).toBeVisible();
+    // the dock takes a panel that is not in front out of the document: nothing in it has a place
+    await expect(view).toHaveCount(0);
+    server.state.execution = { state: "paused", stopId: ++stopId, reason: "step" };
+    server.setRegister("dc.sh4.cpu", "PC", hex8(pc));
+    await tickAndWait(page, server);
+    await expect(page.getByRole("status", { name: "Execution state" })).toContainText(`stop ${stopId}`);
+    // what the view does for a stop it does from a timer: give it the time
+    await page.waitForTimeout(300);
+    await dockTab(page, "SH4: Disassembly").click();
+    await expect(view).toBeVisible();
+  };
+  await addPanelFromSelector(page, 1, "Events: Log");
+
+  // 1. Fifty instructions on: among the 64 lines the view has, and below what it showed.
+  //    (A panel that is not in the document measures as nothing, and a line of nothing
+  //    "is inside" its container of nothing: the view took the line for one on screen.)
+  const below = 0x8c001000 + 2 * 50;
+  await stopBehindTheTab(below);
+  await expect(marked).toHaveAttribute("data-address", String(below));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(below - 20));
+  await expect(view.getByRole("textbox")).toHaveValue(hex8(below));
+
+  // 2. A stop on a line the view shows: as in a view that is in front, it stays where it is.
+  await stopBehindTheTab(below + 4);
+  await expect(marked).toHaveAttribute("data-address", String(below + 4));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await page.waitForTimeout(300);
+  await expect(rows.first()).toHaveAttribute("data-address", String(below - 20));
+
+  // 3. A stop outside the lines the view has: it goes there without having been seen.
+  const far = 0x8c004000;
+  await stopBehindTheTab(far);
+  await expect(marked).toHaveAttribute("data-address", String(far));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(far - 20));
+  expect(server.requestsOf("state.getDisassembly").at(-1)).toEqual({ target: "sh4", address: far - 20, count: 64 });
 });
 
 test("stops that arrive faster than the page renders them: everything ends at the last, and the views read for the latest only", async ({
