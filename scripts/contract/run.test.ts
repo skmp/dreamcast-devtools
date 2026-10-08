@@ -788,6 +788,37 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(others, "S02")).toMatch(/^control\.pause \{"target":"arm7"\}: in-band error -32004/);
   });
 
+  it("S05: a second breakpoint on the same address that is not added, or that is the one a stop reports", async () => {
+    // the server answers {} to a request for a breakpoint it has, and adds nothing
+    const mock = new MockDebugger();
+    const tables = mock as unknown as { addBreakpoint(params: Json, context: Json): unknown; breakpoints: Map<number, Json>; tickAfter(context: Json): void };
+    const add = tables.addBreakpoint.bind(mock);
+    tables.addBreakpoint = (params, context) => {
+      if (Array.from(tables.breakpoints.values()).some((breakpoint) => breakpoint.event === params.event && breakpoint.address === params.address)) {
+        tables.tickAfter(context);
+        return {};
+      }
+      return add(params, context);
+    };
+    const { url } = await startServer(undefined, mock);
+    const deduplicated = await runContract({ url, profile: "mock", only: new Set(["S05"]) });
+    expect(statusOf(deduplicated, "S05")).toBe("failed");
+    expect(detailsOf(deduplicated, "S05")).toMatch(/^breakpoints\.add: no tick lists a new breakpoint \(1 tick within 1000 ms of the request/);
+    expect(deduplicated.cleanUpProblems).toEqual([]);
+
+    // when several match, the lowest id is reported
+    const highest = await run(
+      {
+        toClient: (frame) =>
+          isTick(frame) && frame.params.executionState.breakpointId === 1 && "2" in (frame.params.breakpoints as Json)
+            ? { ...frame, params: { ...frame.params, executionState: { ...frame.params.executionState, breakpointId: 2 } } }
+            : frame,
+      },
+      ["S05"],
+    );
+    expect(detailsOf(highest, "S05")).toBe("the stop reports breakpointId 2, expected 1");
+  });
+
   it("S05, S07: breakpoints.add that is refused when it names the kind, as the UI's request does", async () => {
     const summary = await run(
       {
@@ -1549,15 +1580,17 @@ describe("what a failing run leaves behind", () => {
     expect(detailsOf(summary, "S05")).toMatch(/^breakpoints\.remove: breakpoint 1 is still listed \(1 tick within 1000 ms of the request/);
     expect(detailsOf(summary, "S05")).toMatch(/clean-up: breakpoint 1 \(dc\.sh4\.cpu\.pc at 0x8C0000A[0-9A-E]\) is left behind/);
 
-    // the run found the server running; it is resumed, and stops at the breakpoint that is still there
+    // the run found the server running; it is resumed, and stops at the breakpoints that are still there
+    // (S05 adds its breakpoint twice, and the stop reports the lower id)
     expect(summary.cleanUpProblems).toEqual([
       expect.stringMatching(/^breakpoint 1 \(dc\.sh4\.cpu\.pc at 0x8C0000A[0-9A-E]\) is left behind$/),
+      expect.stringMatching(/^breakpoint 2 \(dc\.sh4\.cpu\.pc at 0x8C0000A[0-9A-E]\) is left behind$/),
       "the target is paused, it was running",
     ]);
     expect(summary.finalState).toMatch(/paused stop \d+ breakpoint bp 1$/);
     expect(summary.ok).toBe(false);
     const after = await stateOf(direct);
-    expect(Object.keys(after.breakpoints)).toEqual(["1"]);
+    expect(Object.keys(after.breakpoints)).toEqual(["1", "2"]);
     expect(after.executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
   }, 30_000);
 

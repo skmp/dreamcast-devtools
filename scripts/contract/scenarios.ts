@@ -784,19 +784,25 @@ const s05: Scenario = {
     const pc = await findBreakpointSite(context);
     const address = pc + sh4.instructionSize;
     // the request as the UI sends it: every member given
-    const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address, kind: "code", enabled: true });
-    const hit = await resumeToBreakpoint(context, sh4, breakpoint.id, address);
+    const request = { event: sh4.breakpointEvent, address, kind: "code", enabled: true } as const;
+    const breakpoint = await addBreakpoint(context, request);
+    // Every breakpoints.add creates a breakpoint: the same request again gives a second one
+    // with an id of its own, and when both match, the stop reports the lower id.
+    const twin = await addBreakpoint(context, request);
+    const lowest = Math.min(breakpoint.id, twin.id);
+    const hit = await resumeToBreakpoint(context, sh4, lowest, address);
 
     // the next paused tick of the same stop repeats breakpointId and stopId
     const register = unwatchedRegister(context, sh4.pcPath, ["PR", "SR", "GBR"]);
     const { id: watchId, record } = await addWatch(context, register.expression, register.expression);
     check(isPaused(record.tick), "adding a watch does not resume the target");
     check(stopIdOf(record.tick) === stopIdOf(hit.tick), `a later tick of the same stop has stopId ${stopIdOf(record.tick)}, the stop was ${stopIdOf(hit.tick)}`);
-    check(record.tick.executionState.breakpointId === breakpoint.id, "a later paused tick of the same stop repeats breakpointId");
+    check(record.tick.executionState.breakpointId === lowest, "a later paused tick of the same stop repeats breakpointId");
     check(record.tick.executionState.reason === "breakpoint", "a later paused tick of the same stop repeats the reason");
 
     await unwatch(context, watchId);
     await removeBreakpoint(context, breakpoint.id);
+    await removeBreakpoint(context, twin.id);
   },
 };
 
