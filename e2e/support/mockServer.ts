@@ -23,7 +23,10 @@ export interface MockServer {
   readonly stop: (signal?: NodeJS.Signals) => Promise<void>;
 }
 
-/** Asks the kernel for a free TCP port on the loopback interface. */
+/**
+ * Asks the kernel for a free TCP port on the loopback interface. The port is free when this
+ * returns and nothing keeps it so: whoever is given it has to find out whether it got it.
+ */
 export const findFreePort = (): Promise<number> =>
   new Promise((resolve, reject) => {
     const probe = createServer();
@@ -47,6 +50,44 @@ const waitForExit = (child: ChildProcess): Promise<void> =>
     }
     child.once("exit", () => resolve());
   });
+
+/** The mock could not have its port: another process was listening on it. */
+export class PortInUseError extends Error {
+  readonly port: number;
+
+  constructor(port: number, output: string) {
+    super(`the mock server could not listen on port ${port}: it is in use (EADDRINUSE)\n${output}`);
+    this.name = "PortInUseError";
+    this.port = port;
+  }
+}
+
+/**
+ * Waits until the server process says that it is listening (the line server/mockServer.ts
+ * prints from its listen callback). That /health answers does not say so: when the port
+ * belongs to the server of another test, that one answers, while this process is on its way
+ * out with EADDRINUSE.
+ */
+const waitUntilListening = async (port: number, child: ChildProcess, output: () => string) => {
+  const listening = `Mock debugger server running at http://localhost:${port}\n`;
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (output().includes(listening)) {
+      return;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      // "close" comes when what the process wrote has been read: its last words are in `output`
+      await closed;
+      if (output().includes("EADDRINUSE")) {
+        throw new PortInUseError(port, output());
+      }
+      throw new Error(`mock server exited during start-up:\n${output()}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`mock server did not start listening within 30 s:\n${output()}`);
+};
 
 const waitForHealth = async (baseURL: string, child: ChildProcess, output: () => string) => {
   const deadline = Date.now() + 30_000;
@@ -117,17 +158,48 @@ export const requestAsAnotherClient = (wsURL: string, method: string, params: un
     });
   });
 
+export interface MockServerOptions {
+  /** restarts a server on the port a previous instance used; without it a free port is picked */
+  port?: number;
+  /** the watches the server is given before the function returns (default: SEEDED_WATCH) */
+  watches?: string[];
+  /** replaces findFreePort (the test of what happens when a port is taken in the meantime) */
+  findPort?: () => Promise<number>;
+}
+
+/** How many ports are tried when the one that was picked is taken before the mock has it. */
+const PORT_ATTEMPTS = 5;
+
 /**
  * Starts the mock debugger server in production mode (it serves dist-native/ and
- * the WebSocket on one port). `port` restarts a server on a port a previous
- * instance used; without it a free port is picked. Before the function returns the
- * server is given the watches of `watches` (default: SEEDED_WATCH).
+ * the WebSocket on one port).
+ *
+ * A free port is found by binding it and letting it go, and the mock binds it some hundred
+ * milliseconds later (node and tsx start up). In between it is free, and the kernel can give
+ * it to the probe of another worker: the mock that comes second dies with EADDRINUSE. That
+ * is noticed (waitUntilListening), and the next port is tried. A port the caller asked for
+ * is not replaced by another: then the start fails with PortInUseError.
  *
  * The server runs as a single `node --import tsx` process so that it can be
  * stopped by pid without leaving a wrapper or a child behind.
  */
-export const startMockServer = async (options: { port?: number; watches?: string[] } = {}): Promise<MockServer> => {
-  const port = options.port ?? (await findFreePort());
+export const startMockServer = async (options: MockServerOptions = {}): Promise<MockServer> => {
+  if (options.port !== undefined) {
+    return startMockServerOn(options.port, options.watches);
+  }
+  const findPort = options.findPort ?? findFreePort;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await startMockServerOn(await findPort(), options.watches);
+    } catch (error) {
+      if (!(error instanceof PortInUseError) || attempt >= PORT_ATTEMPTS) {
+        throw error;
+      }
+    }
+  }
+};
+
+const startMockServerOn = async (port: number, seeded: string[] | undefined): Promise<MockServer> => {
   const baseURL = `http://127.0.0.1:${port}`;
   let log = "";
 
@@ -163,8 +235,9 @@ export const startMockServer = async (options: { port?: number; watches?: string
 
   const wsURL = `ws://127.0.0.1:${port}/ws`;
   try {
+    await waitUntilListening(port, child, output);
     await waitForHealth(baseURL, child, output);
-    const watches = options.watches ?? [SEEDED_WATCH];
+    const watches = seeded ?? [SEEDED_WATCH];
     if (watches.length > 0) {
       await addWatches(wsURL, watches);
     }

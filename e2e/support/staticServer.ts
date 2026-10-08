@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findFreePort } from "./mockServer";
 import { DIST_DIR } from "./paths";
 
 export interface StaticServer {
@@ -20,11 +19,12 @@ export interface StaticServer {
 export const startStaticServer = async (mount = "ui"): Promise<StaticServer> => {
   const root = mkdtempSync(join(tmpdir(), "nulldc-devtools-static-"));
   symlinkSync(DIST_DIR, join(root, mount), "dir");
-  const port = await findFreePort();
-  const origin = `http://127.0.0.1:${port}`;
+  let origin = "";
   let log = "";
 
-  const child = spawn("python3", ["-m", "http.server", String(port), "--bind", "127.0.0.1", "--directory", root], {
+  // Port 0: the server binds a free port itself and says which (unbuffered, -u). A port
+  // that is looked for first and given to it afterwards can be taken in between.
+  const child = spawn("python3", ["-u", "-m", "http.server", "0", "--bind", "127.0.0.1", "--directory", root], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout?.on("data", (chunk: Buffer) => (log += chunk.toString()));
@@ -47,12 +47,16 @@ export const startStaticServer = async (mount = "ui"): Promise<StaticServer> => 
       if (child.exitCode !== null) {
         throw new Error(`python3 -m http.server exited:\n${log}`);
       }
-      try {
-        if ((await fetch(`${origin}/${mount}/index.html`)).ok) {
-          return;
+      const port = /Serving HTTP on 127\.0\.0\.1 port (\d+)/.exec(log)?.[1];
+      if (port !== undefined) {
+        origin = `http://127.0.0.1:${port}`;
+        try {
+          if ((await fetch(`${origin}/${mount}/index.html`)).ok) {
+            return;
+          }
+        } catch {
+          // not accepting yet
         }
-      } catch {
-        // not listening yet
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
