@@ -1015,6 +1015,19 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(stale, "S03")).toMatch(/invariant: 2\.2\.8: watch 2 \(dc\.sh4\.cpu\.pc\) reads "0x8C0000A0" in a tick that says registersStale, expected "n\/a"/);
   }, 30_000);
 
+  it("S06: a soloed category whose own breakpoints are not active either", async () => {
+    const mock = new MockDebugger();
+    const machine = mock as unknown as { isActive(breakpoint: Json): boolean; categories: Map<string, { soloed: boolean }> };
+    const isActive = machine.isActive.bind(mock);
+    machine.isActive = (breakpoint) => !Array.from(machine.categories.values()).some((category) => category.soloed) && isActive(breakpoint);
+    const { url } = await startServer(undefined, mock);
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S06"]) });
+    expect(statusOf(summary, "S06")).toBe("failed");
+    expect(detailsOf(summary, "S06")).toMatch(/^a paused tick at the breakpoint 0x8C0000[0-9A-F]{2}: not seen within 2000 ms; ticks since then: \d+ \(#\d+ running /);
+    expect(summary.cleanUpProblems).toEqual([]);
+    expect((await stateOf(url)).categories.sh4).toEqual({ muted: false, soloed: false });
+  }, 30_000);
+
   it("S05, S08: ids that are used again: a new breakpoint, or a new watch, under the lowest free id", async () => {
     /** The server's ids, shown to the client as the lowest id that nothing listed has. */
     const lowestFree = () => {

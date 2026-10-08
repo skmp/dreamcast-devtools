@@ -894,6 +894,14 @@ const s06: Scenario = {
         await setCategories(context, original);
         await removeBreakpoint(context, breakpoint.id);
       }
+
+      // a soloed category keeps its own breakpoints active: with sh4 soloed the breakpoint is hit
+      const address = (await findBreakpointSite(context)) + sh4.instructionSize;
+      const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address });
+      await setCategories(context, { ...original, sh4: { muted: false, soloed: true } });
+      await resumeToBreakpoint(context, sh4, breakpoint.id, address);
+      await setCategories(context, original);
+      await removeBreakpoint(context, breakpoint.id);
     } finally {
       await session.call("breakpoints.setCategoryStates", { categories: original }).catch(() => undefined);
     }
