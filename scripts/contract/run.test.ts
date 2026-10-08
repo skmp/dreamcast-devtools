@@ -690,6 +690,29 @@ describe("the contract runner against a server that breaks the protocol", () => 
     ]);
   });
 
+  it("S01: a server that answers a client of another protocol version in another shape; the run goes on with the answer to its own request", async () => {
+    // without targets for a client that does not say protocol 3
+    const summary = await run(() => {
+      const older = new Set<unknown>();
+      return {
+        toServer: (frame) => {
+          if (frame.method === "debugger.describe" && paramsOf(frame).protocol !== 3) older.add(frame.id);
+          return frame;
+        },
+        toClient: (frame) => {
+          if (!older.delete(frame.id)) return frame;
+          const { targets: _targets, ...result } = frame.result as Json;
+          return { ...frame, result };
+        },
+      };
+    }, ["S01", "S02", "S10"]);
+    expect(reportOf(summary)).toEqual([
+      expect.stringMatching(/^S01 failed debugger\.describe \{\}: the debugger\.describe result does not follow the schema of protocol v3 \(1 issue\): \| {3}targets: Invalid input: expected array, received undefined \| debugger\.describe \{\}: targets is present \| /),
+      "S02 passed ",
+      "S10 passed ",
+    ]);
+  });
+
   it("S01: targets that do not have the values of the table of 3.1, and a tree without nodes of milestone M1", async () => {
     const describing = (rewrite: (result: Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) => Json): Faults => ({
       toClient: (frame) => {

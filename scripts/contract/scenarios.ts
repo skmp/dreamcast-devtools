@@ -15,7 +15,7 @@ import type {
 import { MOCK_SH4_RING, mockNextAddress } from "../../server/mockDebugger";
 import { M1_DEVICE_TREE, TARGET_TABLE } from "./design";
 import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
-import { registerValuePattern } from "./invariants";
+import { indexDescribe, registerValuePattern } from "./invariants";
 import { ContractFailure, ContractSession, check, describeState, fail } from "./session";
 import type { BinaryRecord, TickRecord } from "./session";
 import type { ElfSymbols } from "./elfSymbols";
@@ -558,6 +558,9 @@ const s01: Scenario = {
         findings.push(error.message);
       }
     }
+    // (what the rest of the run reads is the answer to the runner's own request)
+    session.shape = shape;
+    session.index = indexDescribe(shape);
 
     // unique paths, unique register names per node, actions within PanelId, no empty arrays
     const paths = new Set<string>();
