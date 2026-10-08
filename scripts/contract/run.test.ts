@@ -549,6 +549,45 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(violations).toMatch(/I5: stopId 0 follows stopId 1/);
   });
 
+  it("registersStale in a paused tick, a timestamp in seconds, and an event log that is newest first or numbers its entries anew in every tick", async () => {
+    const tickFault = (rewrite: (params: Json & { executionState: Json; eventLog: Json[]; timestamp: number }) => Json): Faults => ({
+      toClient: (frame) => (isTick(frame) ? { ...frame, params: rewrite(frame.params as never) } : frame),
+    });
+
+    const stale = await run(
+      tickFault((params) => (params.executionState.state === "paused" ? { ...params, executionState: { ...params.executionState, registersStale: true } } : params)),
+      ["S01", "S02"],
+    );
+    expect(reportOf(stale)).toEqual([
+      "S01 passed ",
+      expect.stringMatching(/^S02 failed invariant: I5: registersStale in a paused tick; a paused tick is full, and the SH4 context is complete at a stop \(tick \d+\)/),
+    ]);
+
+    const seconds = await run(
+      tickFault((params) => ({ ...params, timestamp: Math.floor(params.timestamp / 1000) })),
+      ["S01"],
+    );
+    expect(reportOf(seconds)).toEqual([expect.stringMatching(/^S01 failed invariant: 2\.9: timestamp \d{10} is not the wall clock in ms; the clock of this machine reads \d{13} \(tick \d+\)/)]);
+
+    // (S03 runs for two seconds, in which the mock logs a key-on and a key-off twice a second)
+    const newestFirst = await run(
+      tickFault((params) => ({ ...params, eventLog: params.eventLog.slice().reverse() })),
+      ["S03"],
+    );
+    expect(statusOf(newestFirst, "S03")).toBe("failed");
+    expect(detailsOf(newestFirst, "S03")).toMatch(/^invariant: I3: the event log is oldest first and its eventIds ascend; eventId \d+ follows eventId \d+ \(tick \d+\)$/m);
+
+    // the position in the log for an id, in a log that keeps its three newest entries
+    const perTick = await run(
+      tickFault((params) => ({ ...params, eventLog: params.eventLog.slice(-3).map((entry, position) => ({ ...entry, eventId: String(position) })) })),
+      ["S03"],
+    );
+    expect(statusOf(perTick, "S03")).toBe("failed");
+    expect(detailsOf(perTick, "S03")).toMatch(/^invariant: I3: eventId 0 named another entry in an earlier tick: it is \[\d+,"aica","info","key o(n|ff): channel \d+","dc\.aica\.channels\.key_o(n|ff)","\d+"\] now and was \[/m);
+    // (nothing else is wrong with these ticks)
+    expect(perTick.invariantViolations.every((violation) => /^I3: eventId \d named another entry/.test(violation))).toBe(true);
+  }, 30_000);
+
   it("S01: the tick after the describe response is not full", async () => {
     let afterDescribe = false;
     const summary = await run(

@@ -3,7 +3,11 @@ import type { DebuggerShape, DebuggerTick, DeviceNodeDescriptor } from "../../sr
 
 /**
  * The invariants of the contract (design 5.5, I1 to I5), applied to every tick of every
- * connection of a run. Pure functions: the session feeds them what arrived.
+ * connection of a run, and with them what sections 2.6, 2.8, 2.9 and 3.2 say of every tick:
+ * the timestamp is the wall clock in ms; eventIds ascend in the log and name the same entry
+ * in every tick; a watch reads what its register reads; registersStale is a matter of running
+ * ticks; a running tick has no callstack; a breakpointId comes with its reason. Pure
+ * functions: the session feeds them what arrived.
  */
 
 /** The three paths every running tick carries: the PC of every target. */
@@ -70,15 +74,21 @@ export const registerValuePattern = (width: number): RegExp => new RegExp(`^(0x[
 export interface TickTracking {
   lastTickId?: number;
   lastStopId?: number;
+  /** eventId -> the entry it named when a tick of this connection first carried it */
+  events?: Map<string, string>;
 }
+
+/** `timestamp` is wall-clock ms: it is this far from the runner's clock at most (two machines, two clocks). */
+const CLOCK_TOLERANCE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Checks one tick as it arrived (`raw` is the parsed `params` of the notification, before
  * any schema touched it). Returns the violations, each starting with the invariant it
  * breaks; an empty list means the tick is fine. `index` is undefined until the describe
- * result is known, and I4 / I5 are skipped then.
+ * result is known, and I4 / I5 are skipped then. `now` is the runner's clock when the tick
+ * arrived.
  */
-export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracking: TickTracking): string[] => {
+export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracking: TickTracking, now: number = Date.now()): string[] => {
   const violations: string[] = [];
 
   // I1: the strict copy of the schema, and no null
@@ -106,6 +116,11 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
   }
   tracking.lastTickId = tick.tickId;
 
+  // 2.9: timestamp is wall-clock ms
+  if (Math.abs(tick.timestamp - now) > CLOCK_TOLERANCE_MS) {
+    violations.push(`2.9: timestamp ${tick.timestamp} is not the wall clock in ms; the clock of this machine reads ${now}`);
+  }
+
   // I3: breakpoint keys, event ids, size of the event log
   for (const [key, breakpoint] of Object.entries(tick.breakpoints)) {
     if (key !== String(breakpoint.id)) {
@@ -119,6 +134,26 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
     }
     eventIds.add(entry.eventId);
   }
+  // 2.6: an eventId is a sequence number of the process. The log is oldest first, so the ids
+  // ascend in it; and an id names one entry, the same one in every tick that carries it.
+  const known = (tracking.events ??= new Map<string, string>());
+  let descending = false;
+  let renamed = false;
+  tick.eventLog.forEach((entry, position) => {
+    const before = position > 0 ? tick.eventLog[position - 1].eventId : undefined;
+    if (before !== undefined && BigInt(entry.eventId) < BigInt(before) && !descending) {
+      descending = true;
+      violations.push(`I3: the event log is oldest first and its eventIds ascend; eventId ${entry.eventId} follows eventId ${before}`);
+    }
+    const said = JSON.stringify([entry.timestamp, entry.subsystem, entry.severity, entry.message, entry.metadata?.event, entry.metadata?.cycles]);
+    const first = known.get(entry.eventId);
+    if (first === undefined) {
+      known.set(entry.eventId, said);
+    } else if (first !== said && !renamed) {
+      renamed = true;
+      violations.push(`I3: eventId ${entry.eventId} named another entry in an earlier tick: it is ${said} now and was ${first}`);
+    }
+  });
   if (tick.eventLog.length > PROTOCOL_BOUNDS.eventLogEntries) {
     violations.push(`I3: the event log has ${tick.eventLog.length} entries`);
   }
@@ -174,6 +209,12 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
         violations.push("I5: registersStale is set although the tick carries dc.sh4.cpu");
       }
     }
+  }
+
+  // I5 / 2.2.8: registersStale says that a running tick omits dc.sh4.cpu. A paused tick is
+  // full, and at a stop the SH4 context is complete.
+  if (state.state === "paused" && state.registersStale === true) {
+    violations.push("I5: registersStale in a paused tick; a paused tick is full, and the SH4 context is complete at a stop");
   }
 
   // I5: stopId never decreases
