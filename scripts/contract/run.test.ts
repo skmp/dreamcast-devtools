@@ -7,6 +7,7 @@ import type { MockClient, MockConnection, MockDebuggerOptions } from "../../serv
 import { listenMockDebugger } from "../../server/mockWebSocket";
 import { isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
 import { runContract } from "./run";
+import { SCENARIOS, scenariosOfMilestone } from "./scenarios";
 import type { ContractSummary } from "./run";
 import { ContractFailure } from "./session";
 
@@ -1699,6 +1700,48 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(summary.scenarios.map((scenario) => scenario.status)).toEqual(["not-applicable", "not-applicable", "not-applicable"]);
     expect(summary).toMatchObject({ passed: 0, failed: 0, partial: 0, notApplicable: 3 });
     expect(detailsOf(summary, "S17")).toBe('no capability "sgc-capture"; targets: dsp.stepping is false');
+    // nothing failed, and nothing was asked to pass
+    expect(summary).toMatchObject({ ok: true, required: [], requiredNotPassed: [] });
+  });
+
+  it("fails the gate of a milestone when a scenario of it is not applicable or partial: a capability that is not advertised", async () => {
+    // an M1 server at the gate of M2 and M3
+    const lines: string[] = [];
+    const { url } = await startServer(undefined, { supports: MOCK_M1_SUPPORT });
+    const m1 = await runContract({ url, profile: "mock", only: new Set(["S16", "S17", "S18"]), require: new Set(["S17", "S16"]), say: (line) => lines.push(line) });
+    expect(m1).toMatchObject({ passed: 0, failed: 0, partial: 0, notApplicable: 3, ok: false });
+    expect(m1.required).toEqual(["S16", "S17"]);
+    expect(m1.requiredNotPassed).toEqual([
+      { id: "S16", status: "not-applicable" },
+      { id: "S17", status: "not-applicable" },
+    ]);
+    expect(lines.slice(-4)).toEqual([
+      "required: S16 is not applicable; it has to pass",
+      "required: S17 is not applicable; it has to pass",
+      expect.stringMatching(/^0 passed, 0 failed, 0 partial, 3 not applicable; /),
+      "contract: FAILED",
+    ]);
+
+    // the mock, which has two of the four parts of S16, and all of S17
+    const mock = await runContract({ url: (await startServer()).url, profile: "mock", only: new Set(["S16", "S17"]), require: new Set(["S16", "S17"]) });
+    expect(mock.requiredNotPassed).toEqual([{ id: "S16", status: "partial" }]);
+    expect(mock.ok).toBe(false);
+    const m3only = await runContract({ url: (await startServer()).url, profile: "mock", only: new Set(["S16", "S17"]), require: new Set(["S17"]) });
+    expect(m3only).toMatchObject({ ok: true, required: ["S17"], requiredNotPassed: [] });
+
+    // a required scenario that was not run has not passed
+    const notRun = await runContract({ url: (await startServer()).url, profile: "mock", only: new Set(["S01"]), require: new Set(["S01", "S02"]) });
+    expect(notRun.requiredNotPassed).toEqual([{ id: "S02", status: "not-run" }]);
+    expect(notRun.ok).toBe(false);
+  });
+
+  it("names the scenarios of the gate of each milestone", () => {
+    const upTo = (last: number) => Array.from({ length: last }, (_, index) => `S${String(index + 1).padStart(2, "0")}`);
+    expect(scenariosOfMilestone("M1", "mock")).toEqual(upTo(14));
+    expect(scenariosOfMilestone("M1", "emulator")).toEqual(["S00", ...upTo(15)]);
+    expect(scenariosOfMilestone("M2", "emulator")).toEqual(["S00", ...upTo(16)]);
+    expect(scenariosOfMilestone("M3", "mock")).toEqual([...upTo(14), "S16", "S17"]);
+    expect(scenariosOfMilestone("M4", "emulator")).toEqual(SCENARIOS.map((scenario) => scenario.id));
   });
 
   it("S17: a binary frame whose header does not belong to the result", async () => {

@@ -15,6 +15,13 @@ export interface ContractOptions {
   elf?: ElfSymbols;
   /** run only these scenarios */
   only?: Set<string>;
+  /**
+   * Scenarios that have to pass: one of them that ends as not applicable or partial (the
+   * server does not advertise what it needs), or that was not run, fails the run. Without it a
+   * scenario the server does not claim to support is skipped, and a run of nothing but such
+   * scenarios is OK: right for looking at a server, wrong for the gate of a milestone.
+   */
+  require?: Set<string>;
   /** multiplies every timeout; default 1 for the mock profile, 5 for the emulator profile */
   timeoutFactor?: number;
   verbose?: boolean;
@@ -24,8 +31,11 @@ export interface ContractOptions {
 
 /** The machine-readable result of a run (`--json`). */
 export interface ContractSummary {
-  /** no scenario failed, no invariant was violated, everything was cleaned up */
+  /** no scenario failed, every required scenario passed, no invariant was violated, everything was cleaned up */
   ok: boolean;
+  /** the scenarios that had to pass (`require`), and those of them that did not, with how they ended */
+  required: string[];
+  requiredNotPassed: Array<{ id: string; status: ScenarioResult["status"] | "not-run" }>;
   url: string;
   profile: Profile;
   timeoutFactor: number;
@@ -233,9 +243,15 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
     const violations = Array.from(new Set(sessions.flatMap((entry) => entry.violations)));
     const ticksChecked = sessions.reduce((sum, entry) => sum + entry.ticksChecked, 0);
     const count = (status: ScenarioResult["status"]) => results.filter((result) => result.status === status).length;
-    const ok = count("failed") === 0 && violations.length === 0 && problems.length === 0;
+    const required = SCENARIOS.map((scenario) => scenario.id).filter((id) => options.require?.has(id));
+    const requiredNotPassed = required
+      .map((id) => ({ id, status: results.find((result) => result.id === id)?.status ?? ("not-run" as const) }))
+      .filter((entry) => entry.status !== "passed");
+    const ok = count("failed") === 0 && requiredNotPassed.length === 0 && violations.length === 0 && problems.length === 0;
     const summary: ContractSummary = {
       ok,
+      required,
+      requiredNotPassed,
       url,
       profile: options.profile,
       timeoutFactor,
@@ -265,6 +281,9 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
     const reported = new Set(results.flatMap((result) => result.details));
     for (const violation of violations.filter((entry) => !reported.has(`invariant: ${entry}`)).slice(0, 20)) {
       say(`invariant: ${violation}`);
+    }
+    for (const { id, status } of requiredNotPassed.filter((entry) => entry.status !== "failed")) {
+      say(`required: ${id} is ${status === "not-run" ? "not run" : STATUS_TEXT[status]}; it has to pass`);
     }
     say(
       `${count("passed")} passed, ${count("failed")} failed, ${count("partial")} partial, ${count("not-applicable")} not applicable; ` +

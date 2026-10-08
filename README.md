@@ -283,6 +283,7 @@ schema is S01 failed, with every issue, and the run goes on with what the client
 npm run contract                                  # the mock, started in the same process
 npm run contract -- --url ws://127.0.0.1:55543/ws --elf 2ndmix.elf   # an emulator (profile emulator)
 npm run contract -- --url ws://127.0.0.1:5173/ws --profile mock      # a mock server that is already running
+npm run contract -- --url ws://127.0.0.1:55543/ws --elf 2ndmix.elf --milestone M2   # the gate of milestone M2
 npm run contract -- --only S05,S06 --verbose      # some scenarios, with every frame
 npm run contract -- --json                        # the summary as JSON on stdout
 npm run contract -- --list                        # the scenarios
@@ -291,7 +292,12 @@ npm run contract -- --list                        # the scenarios
 Each scenario ends as `passed`, `FAILED`, `not applicable` (the server does not advertise the
 capability or target the scenario needs, or the scenario belongs to the other profile) or
 `partial` (the server advertises only some of the capabilities of the scenario, and those
-parts passed). Only `passed` is a pass. The emulator profile expects the emulator at its
+parts passed). Only `passed` is a pass, and neither of the other two is a failure: a run of
+nothing but scenarios the server does not claim to support ends with `contract: OK`. The gate of
+a milestone therefore says which scenarios have to pass: `--milestone M1` (S00 to S15; S00 and
+S15 in the emulator profile only), `M2` (and S16), `M3` (and S17), `M4` (and S18), or
+`--require S16,S17` for a list of one's own. A required scenario that ends as `not applicable`
+or `partial` fails the run with exit code 1. The emulator profile expects the emulator at its
 `StartPaused` stop, runs S00 and S15 as well, and multiplies every timeout by 5.
 `--idle-breakpoint <address|symbol>` is not a test run: it mutes the `sh4` category, adds one
 breakpoint, resumes and stays connected until the server closes the connection.

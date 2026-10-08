@@ -2,15 +2,16 @@ import { writeFileSync } from "node:fs";
 import { readElfSymbols } from "./contract/elfSymbols";
 import type { ElfSymbols } from "./contract/elfSymbols";
 import { runContract, runIdleBreakpoint } from "./contract/run";
-import { SCENARIOS } from "./contract/scenarios";
-import type { Profile } from "./contract/scenarios";
+import { MILESTONES, SCENARIOS, scenariosOfMilestone } from "./contract/scenarios";
+import type { Milestone, Profile } from "./contract/scenarios";
 import { ContractFailure } from "./contract/session";
 
 /**
  * The contract runner: holds a debugger server to protocol v3.
  *
  *   npm run contract -- [--url ws://host:port/ws] [--profile mock|emulator] [--elf <path>]
- *                       [--only S05,S06] [--json] [--json-file <path>] [--verbose]
+ *                       [--milestone M1|M2|M3|M4] [--require S16,S17] [--only S05,S06]
+ *                       [--json] [--json-file <path>] [--verbose]
  *   npm run contract -- --url ws://host:port/ws --idle-breakpoint <address|symbol> [--elf <path>]
  *
  * Without --url it starts the mock debugger in this process (no page, no Vite) and runs
@@ -19,7 +20,10 @@ import { ContractFailure } from "./contract/session";
  * schema, checks the invariants I1 to I5 on every tick, and runs the scenarios S00 to S18
  * (scripts/contract/). It leaves the server with the breakpoints, watches, categories and run
  * state it found, and exits with 1 when a scenario failed, an invariant was violated or the
- * server could not be put back. 2 means that there was no run: a wrong option, or a server
+ * server could not be put back. A scenario the server does not advertise the capabilities of
+ * is "not applicable" (or "partial"), which is neither a pass nor a failure: the gate of a
+ * milestone names the scenarios that have to pass with --milestone (or --require), and then
+ * such a scenario is exit code 1 as well. 2 means that there was no run: a wrong option, or a server
  * that could not be connected to. What a connected server answers is always a result, with
  * the summary: a debugger.describe that cannot be used is S01 failed.
  */
@@ -31,6 +35,11 @@ const USAGE = `usage: npm run contract -- [options]
                               emulator: waits for the StartPaused stop, runs S00 and S15,
                               multiplies every timeout by 5
   --elf <path>                the test program, for its entry point and symbols
+  --milestone M1|M2|M3|M4     the gate of a milestone: its scenarios and those of the milestones
+                              before it have to pass (M1: S00 to S15, M2: and S16, M3: and S17,
+                              M4: and S18; S00 and S15 only in the emulator profile). One that
+                              is "not applicable" or "partial" fails the run
+  --require <ids>             the same for the scenarios named, e.g. --require S16,S17
   --only <ids>                run only these scenarios, e.g. --only S05,S06
   --timeout-factor <n>        multiply every timeout by n instead of the profile's factor
   --json                      print the summary as JSON on stdout (the scenario lines go to stderr)
@@ -49,6 +58,8 @@ interface Options {
   profile: Profile;
   elf?: string;
   only?: Set<string>;
+  require?: Set<string>;
+  milestone?: Milestone;
   timeoutFactor?: number;
   json: boolean;
   jsonFile?: string;
@@ -86,8 +97,19 @@ const parseArguments = (argv: string[]): Options => {
         options.elf = value(index++, flag);
         break;
       case "--only":
-        options.only = new Set(value(index++, flag).split(",").map((id) => id.trim().toUpperCase()).filter(Boolean));
+        options.only = idsOf(value(index++, flag));
         break;
+      case "--require":
+        options.require = idsOf(value(index++, flag));
+        break;
+      case "--milestone": {
+        const milestone = value(index++, flag).toUpperCase();
+        if (!(MILESTONES as readonly string[]).includes(milestone)) {
+          throw new Error(`--milestone is one of ${MILESTONES.join(", ")}, not "${milestone}"`);
+        }
+        options.milestone = milestone as Milestone;
+        break;
+      }
       case "--timeout-factor": {
         const factor = Number(value(index++, flag));
         if (!(factor > 0)) {
@@ -126,15 +148,44 @@ const parseArguments = (argv: string[]): Options => {
   if (options.url && !/^wss?:\/\//.test(options.url)) {
     throw new Error(`--url is a ws:// or wss:// URL, not "${options.url}"`);
   }
-  if (options.only) {
-    const known = new Set(SCENARIOS.map((scenario) => scenario.id));
-    for (const id of options.only) {
+  const known = new Set(SCENARIOS.map((scenario) => scenario.id));
+  for (const [flag, ids] of [
+    ["--only", options.only],
+    ["--require", options.require],
+  ] as const) {
+    for (const id of ids ?? []) {
       if (!known.has(id)) {
-        throw new Error(`--only: there is no scenario ${id}`);
+        throw new Error(`${flag}: there is no scenario ${id}`);
       }
     }
   }
+  // a scenario that --only leaves out cannot pass
+  for (const id of options.require ?? []) {
+    if (options.only && !options.only.has(id)) {
+      throw new Error(`--require ${id}: --only leaves that scenario out`);
+    }
+  }
   return options;
+};
+
+const idsOf = (list: string): Set<string> =>
+  new Set(
+    list
+      .split(",")
+      .map((id) => id.trim().toUpperCase())
+      .filter(Boolean),
+  );
+
+/**
+ * The scenarios that have to pass: those of --require, and those of the gate of --milestone
+ * (of them, the ones that --only selects: a gate can be run in pieces).
+ */
+const requiredOf = (options: Options): Set<string> | undefined => {
+  if (!options.require && !options.milestone) {
+    return undefined;
+  }
+  const gate = options.milestone ? scenariosOfMilestone(options.milestone, options.profile) : [];
+  return new Set([...(options.require ?? []), ...gate.filter((id) => !options.only || options.only.has(id))]);
 };
 
 const main = async (): Promise<number> => {
@@ -159,6 +210,7 @@ const main = async (): Promise<number> => {
     profile: options.profile,
     elf,
     only: options.only,
+    require: requiredOf(options),
     timeoutFactor: options.timeoutFactor,
     verbose: options.verbose,
     say,

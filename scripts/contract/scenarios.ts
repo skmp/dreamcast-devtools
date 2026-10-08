@@ -63,8 +63,20 @@ export interface RunContext {
   note: (text: string) => void;
 }
 
+/** The milestones of the design: each adds scenarios to the gate of the one before it. */
+export const MILESTONES = ["M1", "M2", "M3", "M4"] as const;
+export type Milestone = (typeof MILESTONES)[number];
+
 type Outcome = void | { notApplicable: string } | { parts: PartResult[] };
-type Scenario = { id: string; title: string; run: (context: RunContext) => Promise<Outcome> };
+type Scenario = {
+  id: string;
+  title: string;
+  /** the first milestone whose server has to pass it; M1 when absent */
+  milestone?: Milestone;
+  /** it applies to the emulator profile only */
+  emulatorOnly?: boolean;
+  run: (context: RunContext) => Promise<Outcome>;
+};
 
 const hex = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
 /** SH4 code addresses are compared under this mask: the same code is reachable at 0x0C.., 0x8C.. and 0xAC.. (design 2.3.3) */
@@ -439,6 +451,7 @@ const expectToKeepRunning = async (context: RunContext, why: string): Promise<vo
 const s00: Scenario = {
   id: "S00",
   title: "anchor",
+  emulatorOnly: true,
   async run(context) {
     if (context.profile !== "emulator") {
       return { notApplicable: "emulator profile only: the mock has no program to anchor in" };
@@ -1610,6 +1623,7 @@ const upgradeStatus = (url: string, origin: string | undefined): Promise<number>
 const s15: Scenario = {
   id: "S15",
   title: "HTTP, Host and Origin",
+  emulatorOnly: true,
   async run(context) {
     if (context.profile !== "emulator") {
       return { notApplicable: "emulator profile only: the mock's host is Express, not the emulator's HTTP server" };
@@ -1696,6 +1710,7 @@ const stepAndBreakpoint = async (context: RunContext, targetId: "arm7" | "dsp"):
 const s16: Scenario = {
   id: "S16",
   title: "M2: ARM7, writes, reset",
+  milestone: "M2",
   run: (context) =>
     runParts([
       {
@@ -1802,6 +1817,7 @@ const s16: Scenario = {
 const s17: Scenario = {
   id: "S17",
   title: "M3: SGC capture, DSP",
+  milestone: "M3",
   run: (context) =>
     runParts([
       {
@@ -1888,6 +1904,7 @@ const s17: Scenario = {
 const s18: Scenario = {
   id: "S18",
   title: "M4: tables, Holly capture",
+  milestone: "M4",
   run: (context) =>
     runParts([
       {
@@ -1933,6 +1950,15 @@ const s18: Scenario = {
 };
 
 export const SCENARIOS: Scenario[] = [s00, s01, s02, s03, s04, s05, s06, s07, s08, s09, s10, s11, s12, s13, s14, s15, s16, s17, s18];
+
+/**
+ * The scenarios a server of `milestone` has to pass, i.e. the gate of that milestone: those
+ * of the milestone and of the ones before it, without those of the other profile.
+ */
+export const scenariosOfMilestone = (milestone: Milestone, profile: Profile): string[] =>
+  SCENARIOS.filter(
+    (scenario) => MILESTONES.indexOf(scenario.milestone ?? "M1") <= MILESTONES.indexOf(milestone) && (profile === "emulator" || !scenario.emulatorOnly),
+  ).map((scenario) => scenario.id);
 
 /**
  * Runs one scenario. It fails when an assertion fails, when the scenario throws, or when
