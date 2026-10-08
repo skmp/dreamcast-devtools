@@ -403,6 +403,7 @@ test("mute and solo are kept by the server: a reload shows them again, and so do
 
 test("the list of a target has that target's code breakpoints, each in the address format of its target", async ({
   page,
+  mock,
   diagnostics,
 }) => {
   diagnostics.allow(...KNOWN.sgcNoData);
@@ -441,4 +442,25 @@ test("the list of a target has that target's code breakpoints, each in the addre
   await dockTab(page, "DSP: Breakpoints").click();
   await expect(dsp.getByRole("listitem")).toHaveCount(1);
   await expect(entry(dsp, "dc.aica.dsp.step == 127")).toBeVisible();
+
+  // Nor are the code breakpoints of the other targets. Somebody else sets one on the SH4 and
+  // one on the ARM7; the panel of all breakpoints has them when their tick is in.
+  await requestAsAnotherClient(mock.wsURL, "breakpoints.add", { event: "dc.sh4.cpu.pc", address: 0x8c0000a4, kind: "code" });
+  await requestAsAnotherClient(mock.wsURL, "breakpoints.add", { event: "dc.aica.arm7.pc", address: 0x00200014, kind: "code" });
+  await dockTab(page, "Events: Breakpoints").click();
+  await expect(events.getByRole("listitem")).toHaveCount(5);
+  await expect(entry(events, "dc.sh4.cpu.pc == 0x8C0000A4")).toBeVisible();
+  await expect(entry(events, "dc.aica.arm7.pc == 0x00200014")).toBeVisible();
+  await dockTab(page, "DSP: Breakpoints").click();
+  await expect(dsp.getByRole("listitem")).toHaveCount(1);
+  await expect(entry(dsp, "dc.aica.dsp.step == 127")).toBeVisible();
+  // and the panel of the SH4 lists the one of the SH4: not the DSP step, not the ARM7's
+  await addPanelFromSelector(page, 3, "SH4: Breakpoints");
+  const sh4 = panel(page, "sh4-breakpoints");
+  await expect(sh4.getByRole("listitem")).toHaveCount(1);
+  await expect(entry(sh4, "dc.sh4.cpu.pc == 0x8C0000A4")).toBeVisible();
+  await addPanelFromSelector(page, 3, "ARM7: Breakpoints");
+  const arm7 = panel(page, "arm7-breakpoints");
+  await expect(arm7.getByRole("listitem")).toHaveCount(1);
+  await expect(entry(arm7, "dc.aica.arm7.pc == 0x00200014")).toBeVisible();
 });
