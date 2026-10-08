@@ -24,6 +24,8 @@ interface Faults {
   toServer?: (frame: Json) => Json;
   /** frames the client receives after it has sent a request and before the server sees that request */
   beforeRequest?: (request: Json) => Json[];
+  /** answers a request in the server's place: the server does not see a request this returns a frame for */
+  answer?: (request: Json) => Json | undefined;
   /** rewrites a binary frame of the server */
   toClientBinary?: (frame: Buffer) => Buffer;
   /** a frame of the server for which this is true is held back until the next binary frame has been sent */
@@ -73,14 +75,20 @@ const startServer = async (
     const held: Json[] = [];
     client.on("message", (data) => {
       let text = data.toString();
+      let answered: Json | undefined;
       try {
         const request = JSON.parse(text) as Json;
         faults.beforeRequest?.(request).forEach((frame) => client.send(JSON.stringify(frame)));
+        answered = faults.answer?.(request);
         if (faults.toServer) {
           text = JSON.stringify(faults.toServer(request));
         }
       } catch {
         // not JSON: the runner's malformed frame goes through as it is
+      }
+      if (answered) {
+        client.send(JSON.stringify(answered));
+        return;
       }
       if (upstream.readyState === WebSocket.OPEN) {
         upstream.send(text);
@@ -170,6 +178,10 @@ const ask = (mock: MockDebugger, method: string, params: Json): Json => {
 
 const isTick = (frame: Json): frame is Json & { params: Json & { executionState: Json; registers: Record<string, Json[]> } } =>
   frame.method === "event.tick";
+
+/** The answer of a server that refuses a request on the channel of the result. */
+const inBand = (request: Json, code: number, message: string): Json => ({ jsonrpc: "2.0", id: request.id, result: { error: { code, message } } });
+const paramsOf = (request: Json): Json => (request.params ?? {}) as Json;
 
 const statusOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.status;
 const detailsOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.details.join("\n") ?? "";
@@ -666,6 +678,43 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
     expect(statusOf(frozen, "S02")).toBe("failed");
     expect(detailsOf(frozen, "S02")).toMatch(/stopId 5 is not new/);
+  });
+
+  it("S02: control.pause that is refused when it names a target, as the UI's request does", async () => {
+    const refusing = (targets: string[]): Faults => ({
+      answer: (request) =>
+        request.method === "control.pause" && targets.includes(paramsOf(request).target as string)
+          ? inBand(request, -32004, "not supported: pause of one target")
+          : undefined,
+    });
+    const any = await run(refusing(["sh4", "arm7", "dsp"]), ["S02"]);
+    expect(statusOf(any, "S02")).toBe("failed");
+    expect(detailsOf(any, "S02")).toMatch(/^control\.pause \{"target":"sh4"\}: in-band error -32004/);
+    expect(any.cleanUpProblems).toEqual([]);
+
+    // the target is ignored: a pause is not a request to one target
+    const others = await run(refusing(["arm7", "dsp"]), ["S02"]);
+    expect(statusOf(others, "S02")).toBe("failed");
+    expect(detailsOf(others, "S02")).toMatch(/^control\.pause \{"target":"arm7"\}: in-band error -32004/);
+  });
+
+  it("S05, S07: breakpoints.add that is refused when it names the kind, as the UI's request does", async () => {
+    const summary = await run(
+      {
+        answer: (request) => {
+          const { kind, address } = paramsOf(request);
+          return request.method === "breakpoints.add" && ((kind === "code" && typeof address === "number") || kind === "event")
+            ? inBand(request, -32602, "invalid params: kind")
+            : undefined;
+        },
+      },
+      ["S05", "S07"],
+    );
+    expect(statusOf(summary, "S05")).toBe("failed");
+    expect(detailsOf(summary, "S05")).toMatch(/^breakpoints\.add \{"event":"dc\.sh4\.cpu\.pc","address":\d+,"kind":"code","enabled":true\}: in-band error -32602/);
+    expect(statusOf(summary, "S07")).toBe("failed");
+    expect(detailsOf(summary, "S07")).toMatch(/^breakpoints\.add \{"event":"[a-z0-9_.]+","kind":"event","enabled":false\}: in-band error -32602/);
+    expect(summary.cleanUpProblems).toEqual([]);
   });
 
   it("S06 / S07: a muted or a disabled breakpoint that stops the target", async () => {

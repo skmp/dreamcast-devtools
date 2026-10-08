@@ -482,15 +482,18 @@ const s02: Scenario = {
     const { session } = context;
     const running = await ensureRunning(context);
     const mark = session.mark();
-    await session.call("control.pause", {});
-    const paused = await session.waitForTick(isPaused, 2000, "a paused tick after control.pause", mark);
+    // The request as the UI sends it: with a target. There is one run state, so the target is
+    // ignored. (Without a target the request is sent by every scenario that needs a paused server.)
+    await session.call("control.pause", { target: "sh4" });
+    const paused = await session.waitForTick(isPaused, 2000, 'a paused tick after control.pause {target: "sh4"}', mark);
     check(paused.tick.executionState.reason === "pause", `the stop has reason "${paused.tick.executionState.reason}", expected "pause"`);
     check(stopIdOf(paused.tick) > stopIdOf(running.tick), `stopId ${stopIdOf(paused.tick)} is not new (it was ${stopIdOf(running.tick)} while running)`);
     check(paused.tick.executionState.breakpointId === undefined, "a pause carries no breakpointId");
 
-    // a second pause returns {} and changes nothing
+    // a second pause returns {} and changes nothing, whatever target it names
+    const other = (session.shape.targets ?? []).map((target) => target.id).find((id) => id !== "sh4");
     const second = session.mark();
-    await session.call("control.pause", {});
+    await session.call("control.pause", other ? { target: other } : {});
     const later = await session.collectTicks(300);
     for (const record of [...session.ticksSince(second), ...later]) {
       check(
@@ -657,7 +660,8 @@ const s05: Scenario = {
     const sh4 = requireTarget(context, "sh4");
     const pc = await findBreakpointSite(context);
     const address = pc + sh4.instructionSize;
-    const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address });
+    // the request as the UI sends it: every member given
+    const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address, kind: "code", enabled: true });
     const before = session.latestTick().tick;
 
     const mark = session.mark();
@@ -755,7 +759,9 @@ const s07: Scenario = {
     await session.expectError("breakpoints.toggle", { id: breakpoint.id, enabled: true }, -32602);
 
     // Event breakpoints: every event the device tree lists is in the server's table. Each is
-    // added disabled (an enabled one would stop the target when its event comes), listed and removed.
+    // added disabled (an enabled one would stop the target when its event comes), listed and
+    // removed. The request is the one the UI sends, with the kind; the first one is sent
+    // without it, and without an address the kind is "event".
     check(hasCapability(context, CAPABILITIES.EVENT_BREAKPOINTS), 'the capability "event-breakpoints" is part of milestone M1');
     const events: string[] = [];
     const visit = (nodes: DeviceNodeDescriptor[]) =>
@@ -765,8 +771,8 @@ const s07: Scenario = {
       });
     visit(session.shape.deviceTree);
     check(events.length > 0, "the device tree lists no events");
-    for (const event of events) {
-      const added = await addBreakpoint(context, { event, enabled: false });
+    for (const [position, event] of events.entries()) {
+      const added = await addBreakpoint(context, position === 0 ? { event, enabled: false } : { event, kind: "event", enabled: false });
       await removeBreakpoint(context, added.id);
     }
   },
