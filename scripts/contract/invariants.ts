@@ -8,6 +8,8 @@ import type { DebuggerShape, DebuggerTick, DeviceNodeDescriptor } from "../../sr
 
 /** The three paths every running tick carries: the PC of every target. */
 export const HARD_WIRED_PATHS = ["dc.sh4.cpu", "dc.aica.arm7", "dc.aica.dsp"] as const;
+/** The path a running tick omits, with `registersStale: true`, on a backend without a context at the slice hook. */
+const SH4_CONTEXT_PATH = "dc.sh4.cpu";
 
 export interface DescribeIndex {
   /** node path -> its register names (in describe order) and widths; only nodes with registers */
@@ -163,12 +165,12 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
         if (path in tick.registers) {
           continue;
         }
-        if (path === "dc.sh4.cpu" && state.registersStale === true) {
+        if (path === SH4_CONTEXT_PATH && state.registersStale === true) {
           continue;
         }
-        violations.push(`I5: a running tick carries ${path}${path === "dc.sh4.cpu" ? " (or says registersStale)" : ""}`);
+        violations.push(`I5: a running tick carries ${path}${path === SH4_CONTEXT_PATH ? " (or says registersStale)" : ""}`);
       }
-      if (state.registersStale === true && "dc.sh4.cpu" in tick.registers) {
+      if (state.registersStale === true && SH4_CONTEXT_PATH in tick.registers) {
         violations.push("I5: registersStale is set although the tick carries dc.sh4.cpu");
       }
     }
@@ -203,6 +205,24 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
   const watchIds = (tick.watches ?? []).map((watch) => watch.id);
   if (watchIds.some((id, position) => position > 0 && id <= watchIds[position - 1])) {
     violations.push(`2.8: watches are not in id order: ${watchIds.join(", ")}`);
+  }
+  // 2.8: watches are evaluated in every tick. A watch on <path>.<name> reads what that register
+  // reads in the same tick, when the tick carries the path; while the SH4 context is stale
+  // (2.2.8) a watch on it reads "n/a".
+  for (const watch of tick.watches ?? []) {
+    const dot = watch.expression.lastIndexOf(".");
+    const path = watch.expression.slice(0, dot);
+    const name = watch.expression.slice(dot + 1);
+    if (state.registersStale === true && path === SH4_CONTEXT_PATH) {
+      if (watch.value !== "n/a") {
+        violations.push(`2.2.8: watch ${watch.id} (${watch.expression}) reads ${JSON.stringify(watch.value)} in a tick that says registersStale, expected "n/a"`);
+      }
+      continue;
+    }
+    const register = dot > 0 ? tick.registers[path]?.find((candidate) => candidate.name.toLowerCase() === name) : undefined;
+    if (register && watch.value !== register.value) {
+      violations.push(`2.8: watch ${watch.id} (${watch.expression}) reads ${JSON.stringify(watch.value)}, the register in the same tick reads "${register.value}"`);
+    }
   }
 
   return violations;

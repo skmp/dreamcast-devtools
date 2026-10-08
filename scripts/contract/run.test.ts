@@ -834,6 +834,42 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(reportOf(withoutArm7)).toEqual(["S11 passed "]);
   });
 
+  it("a watch that is not evaluated in every tick: the value of the last stop while running, or a value while the SH4 context is stale", async () => {
+    const frozen = await run(() => {
+      const atStop = new Map<unknown, unknown>();
+      return {
+        toClient: (frame) => {
+          if (!isTick(frame)) return frame;
+          const watches = frame.params.watches as Json[];
+          if (frame.params.executionState.state === "paused") {
+            watches.forEach((watch) => atStop.set(watch.id, watch.value));
+            return frame;
+          }
+          return { ...frame, params: { ...frame.params, watches: watches.map((watch) => ({ ...watch, value: atStop.get(watch.id) ?? watch.value })) } };
+        },
+      };
+    }, ["S03"]);
+    expect(statusOf(frozen, "S03")).toBe("failed");
+    expect(detailsOf(frozen, "S03")).toMatch(/^the watch on dc\.timing\.sh4_cycles reads "0x[0-9A-F]{16}" in every running tick; watches are evaluated in every tick$/m);
+    expect(frozen.invariantViolations.join("\n")).toMatch(/2\.8: watch 1 \(dc\.timing\.sh4_cycles\) reads "0x[0-9A-F]{16}", the register in the same tick reads "0x[0-9A-F]{16}" \(tick \d+\)/);
+    expect(frozen.invariantViolations.join("\n")).toMatch(/2\.8: watch 2 \(dc\.sh4\.cpu\.pc\) reads "0x8C0000[0-9A-F]{2}", the register in the same tick reads/);
+    expect(frozen.cleanUpProblems).toEqual([]);
+
+    // a backend without a context at the slice hook: its ticks say registersStale, and a watch on the SH4 reads "n/a"
+    const stale = await run(
+      {
+        toClient: (frame) =>
+          isTick(frame)
+            ? { ...frame, params: { ...frame.params, watches: (frame.params.watches as Json[]).map((watch) => (watch.value === "n/a" ? { ...watch, value: "0x8C0000A0" } : watch)) } }
+            : frame,
+      },
+      ["S03"],
+      { sliceContext: false },
+    );
+    expect(statusOf(stale, "S03")).toBe("failed");
+    expect(detailsOf(stale, "S03")).toMatch(/invariant: 2\.2\.8: watch 2 \(dc\.sh4\.cpu\.pc\) reads "0x8C0000A0" in a tick that says registersStale, expected "n\/a"/);
+  }, 30_000);
+
   it("S05, S08: ids that are used again: a new breakpoint, or a new watch, under the lowest free id", async () => {
     /** The server's ids, shown to the client as the lowest id that nothing listed has. */
     const lowestFree = () => {

@@ -549,6 +549,19 @@ const s03: Scenario = {
   async run(context) {
     const { session } = context;
     const paused = await ensurePaused(context);
+    const sh4 = requireTarget(context, "sh4");
+    // Two watches for the time the target runs: watches are evaluated in every tick, whatever
+    // paths it carries. The invariants compare every watch of every tick with its register;
+    // one of these is on the scheduler time, which moves, and one on the SH4, whose context
+    // some backends do not have while running (the watch then reads "n/a").
+    const keepWatch = async (expression: string): Promise<{ id: number; added: boolean }> => {
+      const stored = (session.latestTick().tick.watches ?? []).find((watch) => watch.expression === expression);
+      return stored ? { id: stored.id, added: false } : { id: (await addWatch(context, expression, expression)).id, added: true };
+    };
+    const hasCycles = session.index?.registers.get("dc.timing")?.some((register) => register.name === "SH4_CYCLES") ?? false;
+    const cyclesWatch = hasCycles ? await keepWatch("dc.timing.sh4_cycles") : undefined;
+    const pcWatch = await keepWatch(`${sh4.pcPath}.${sh4.pcRegister.toLowerCase()}`);
+
     const mark = session.mark();
     await session.call("control.runUntil", {});
     const running = await session.waitForTick(isRunning, 1000, "a running tick after control.runUntil", mark);
@@ -557,8 +570,20 @@ const s03: Scenario = {
     const runningTicks = more.filter((record) => isRunning(record.tick));
     check(runningTicks.length >= 2, `${runningTicks.length} running tick(s) in 1.5 s after the first one; the running tick is periodic`);
 
+    const kept = [cyclesWatch, pcWatch].filter((watch) => watch !== undefined);
+    for (const watch of kept) {
+      const missing = [running, ...runningTicks].find((record) => !(record.tick.watches ?? []).some((entry) => entry.id === watch.id));
+      check(!missing, `watch ${watch.id} is not listed in the running tick ${missing?.tick.tickId}; watches are evaluated in every tick`);
+    }
+    if (cyclesWatch) {
+      const readings = [running, ...runningTicks].map((record) => record.tick.watches!.find((entry) => entry.id === cyclesWatch.id)!.value);
+      check(
+        new Set(readings).size > 1,
+        `the watch on dc.timing.sh4_cycles reads ${JSON.stringify(readings[0])} in every running tick; watches are evaluated in every tick`,
+      );
+    }
+
     // the machine advances between them
-    const sh4 = requireTarget(context, "sh4");
     const useCycles = cyclesOf(running.tick) !== undefined;
     if (!useCycles) {
       check(context.profile === "mock", "dc.timing.SH4_CYCLES is in every running tick");
@@ -584,6 +609,12 @@ const s03: Scenario = {
     // a second resume returns {} and changes nothing
     await session.call("control.runUntil", {});
     check(isRunning(session.latestTick().tick), "a second control.runUntil changes nothing");
+
+    for (const watch of kept) {
+      if (watch.added) {
+        await unwatch(context, watch.id);
+      }
+    }
   },
 };
 
