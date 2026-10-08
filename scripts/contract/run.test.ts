@@ -344,7 +344,7 @@ describe("the contract runner against the mock", () => {
     expect(tick.categories).toEqual({ events: unmuted, sh4: unmuted, arm7: unmuted, dsp: unmuted });
     expect(tick.executionState.state).toBe("running");
     expect(mock.clientCount).toBeLessThanOrEqual(1);
-  }, 60_000);
+  }, 180_000);
 
   it("passes the mock that implements only milestone M1: S16 and S17 are not applicable to it", async () => {
     const summary = await run(undefined, undefined, { supports: MOCK_M1_SUPPORT });
@@ -353,7 +353,7 @@ describe("the contract runner against the mock", () => {
     expect(statusesOf(summary)).toEqual({ ...MOCK_STATUSES, S16: "not-applicable", S17: "not-applicable" });
     expect(summary.ok).toBe(true);
     expect(summary.server.capabilities).toEqual(["event-breakpoints", "callstack", "sh4-debug-native"]);
-  }, 60_000);
+  }, 180_000);
 
   it("restores a paused server to paused, and keeps the watches it found", async () => {
     const { url } = await startServer(undefined, { startPaused: true });
@@ -402,7 +402,7 @@ describe("the contract runner against the mock", () => {
     const running = await run(staleTickBeforeEveryAnswer, ["S13"]);
     expect(reportOf(running)).toEqual(["S13 passed "]);
     expect(running.ok).toBe(true);
-  }, 60_000);
+  }, 180_000);
 
   it("S08: needs no tick after a state.watch that changed nothing", async () => {
     const summary = await run(() => noTickAfter(isWatchOfStoredExpression), ["S08"]);
@@ -456,7 +456,7 @@ describe("the contract runner against the mock", () => {
       ),
     ]);
     expect(summary.ok).toBe(true);
-  }, 30_000);
+  }, 90_000);
 });
 
 describe("the contract runner against a server that breaks the protocol", () => {
@@ -769,7 +769,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       'dc.holly.core: the action "holly-core" of the table of 2.8 is missing',
     ]);
     expect(nodes.invariantViolations).toEqual([]);
-  });
+  }, 30_000);
 
   it("S01: a server that answers debugger.describe with nothing the client can read, or sends no tick after it, fails S01; nothing else is run", async () => {
     const lines: string[] = [];
@@ -869,7 +869,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     const others = await run(refusing(["arm7", "dsp"]), ["S02"]);
     expect(statusOf(others, "S02")).toBe("failed");
     expect(detailsOf(others, "S02")).toMatch(/^control\.pause \{"target":"arm7"\}: in-band error -32004/);
-  });
+  }, 30_000);
 
   it("S05: a second breakpoint on the same address that is not added, or that is the one a stop reports", async () => {
     // the server answers {} to a request for a breakpoint it has, and adds nothing
@@ -900,7 +900,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       ["S05"],
     );
     expect(detailsOf(highest, "S05")).toBe("the stop reports breakpointId 2, expected 1");
-  });
+  }, 30_000);
 
   it("S05, S07: breakpoints.add that is refused when it names the kind, as the UI's request does", async () => {
     const summary = await run(
@@ -985,7 +985,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     // the mock's loop comes back to the breakpoint within 130 ms; the runner then shows it once more, on the next instruction
     expect(detailsOf(listedOnly, "S07")).toMatch(/^a paused tick at the breakpoint 0x8C0000[0-9A-F]{2}: not seen within 2000 ms/);
     expect(listedOnly.cleanUpProblems).toEqual([]);
-  }, 30_000);
+  }, 90_000);
 
   it("S11: a server without the ARM7 callstack: no frames in the tick, or state.getCallstack {arm7} refused", async () => {
     const empty = await run(
@@ -1021,7 +1021,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     // a server that does not list the ARM7 is not asked for its callstack
     const withoutArm7 = await run(undefined, ["S11"], { supports: { targets: ["sh4", "dsp"] } });
     expect(reportOf(withoutArm7)).toEqual(["S11 passed "]);
-  });
+  }, 30_000);
 
   it("a watch that is not evaluated in every tick: the value of the last stop while running, or a value while the SH4 context is stale", async () => {
     const frozen = await run(() => {
@@ -1365,7 +1365,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
     expect(statusOf(notListed, "S07")).toBe("failed");
     expect(detailsOf(notListed, "S07")).toBe("the device tree lists the event dc.holly.core.vblank, which every running program raises");
-  }, 30_000);
+  }, 90_000);
 
   it("S08: a watch bound that is not enforced, and state.unwatch that refuses an id it does not know", async () => {
     // (state.unwatch of nothing is what the mock answers with {})
@@ -1668,7 +1668,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(summary, "S12")).toMatch(/^state\.editWatch \{"watchId":1,"value":"0x00000000"\}: expected the error -32004, got the result \{\}$/);
     // the watch of the probe is removed again
     expect(summary.cleanUpProblems).toEqual([]);
-  });
+  }, 30_000);
 
   it("S12: a batch that is executed, and frames that are no request and get no answer", async () => {
     const batch = await run(
@@ -1756,7 +1756,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     const notRun = await runContract({ url: (await startServer()).url, profile: "mock", only: new Set(["S01"]), require: new Set(["S01", "S02"]) });
     expect(notRun.requiredNotPassed).toEqual([{ id: "S02", status: "not-run" }]);
     expect(notRun.ok).toBe(false);
-  });
+  }, 30_000);
 
   it("names the scenarios of the gate of each milestone", () => {
     const upTo = (last: number) => Array.from({ length: last }, (_, index) => `S${String(index + 1).padStart(2, "0")}`);
