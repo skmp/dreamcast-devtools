@@ -14,7 +14,7 @@ import {
   tooltipButton,
   treeItemRow,
 } from "./support/fixtures";
-import { serveScriptedDebugger, type Json } from "./support/scriptedDebugger";
+import { serveScriptedDebugger, V3_TARGETS, type Json, type ScriptedDebugger } from "./support/scriptedDebugger";
 import { MOCK_M1_SUPPORT } from "../server/mockDebugger";
 
 // What a server cannot do is said in `targets` and `capabilities` of debugger.describe, and
@@ -194,4 +194,61 @@ test("a target whose memory the server cannot read: its memory panel says so, an
   await expect.poll(listings).toBe(before + 1);
   await expect(memory.getByRole("note")).toHaveText("This server cannot read the memory of the ARM7.");
   expect(server.requestsOf("state.getMemorySlice")).toEqual([]);
+});
+
+test("a memory panel that had a notice to show opens where the next server says, not at an address of its own", async ({ page }) => {
+  // The emulator is restarted as another one, three times. The page reconnects by itself, and
+  // each server says in `targets` whether the memory of the ARM7 can be read, and from where.
+  const server = await serveScriptedDebugger(page);
+  const memory = panel(page, "arm7-memory");
+  const firstRow = memory.locator("span").filter({ hasText: /^0x[0-9A-F]{8}$/ }).first();
+  const slices = () => server.requestsOf("state.getMemorySlice").filter((params) => params.target === "arm7");
+  /** The ARM7 as the next server describes it; undefined: that server has no ARM7. */
+  const describeArm7 = (scripted: ScriptedDebugger, arm7: { memory: boolean; defaultMemoryAddress?: number } | undefined) => {
+    scripted.shape.targets = V3_TARGETS.flatMap((target): Json[] => {
+      if (target.id !== "arm7") {
+        return [{ ...target }];
+      }
+      if (!arm7) {
+        return [];
+      }
+      const { defaultMemoryAddress: _builtIn, ...rest } = target;
+      return [{ ...rest, ...arm7 }];
+    });
+  };
+  let connections = 1;
+  const restartAs = async (arm7: Parameters<typeof describeArm7>[1]) => {
+    describeArm7(server, arm7);
+    server.drop();
+    // one second later the page is back by itself
+    await expect.poll(() => server.connections()).toBe(++connections);
+    await server.described();
+    await expect(statusBar(page)).toContainText("Connection: connected");
+  };
+
+  // 1. a server without the ARM7
+  describeArm7(server, undefined);
+  await gotoRoute(page, "/workspace/arm7-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  await expect(memory.getByRole("note")).toHaveText("This server does not support the ARM7 target.");
+
+  // 2. one that has it: the view opens at the address this server names
+  await restartAs({ memory: true, defaultMemoryAddress: 0x1000 });
+  await expect(firstRow).toHaveText("0x00001000");
+  expect(slices()).toEqual([{ target: "arm7", address: 0x1000, length: 960 }]);
+  await expect(memory.getByRole("textbox")).toHaveValue("0x000010A0");
+
+  // 3. one that cannot read its memory
+  await restartAs({ memory: false });
+  await expect(memory.getByRole("note")).toHaveText("This server cannot read the memory of the ARM7.");
+  await expect(memory.getByRole("textbox")).toHaveCount(0);
+
+  // 4. one that can, from another address: neither the built-in one nor that of the server before the notice
+  await restartAs({ memory: true, defaultMemoryAddress: 0x2000 });
+  await expect(firstRow).toHaveText("0x00002000");
+  expect(slices().at(-1)).toEqual({ target: "arm7", address: 0x2000, length: 960 });
+  expect(slices()).toHaveLength(2);
+  await expect(memory.getByRole("textbox")).toHaveValue("0x000020A0");
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });

@@ -26,12 +26,22 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
   const epoch = useDebuggerDataStore((state) => state.epoch);
   const refresh = useDebuggerDataStore((state) => state.refresh);
 
-  // The view is mounted once the server has been described, because where it opens is the
-  // server's to say. After that it stays, and keeps its place when the connection is lost.
-  // (Once its first tick is in, so that a stop the server is already in is not a new one.)
+  // The view is mounted once a server that reads this memory has been described, because
+  // where it opens is that server's to say. After that it stays, and keeps its place when the
+  // connection is lost. (Once its first tick is in, so that a stop the server is already in
+  // is not a new one.)
+  //
+  // A server that has a notice to show instead (no such target, or no memory) has said
+  // nothing about where a view opens. While its connection is away the target is described
+  // by the built-in values again, and a view mounted then would open at the built-in address
+  // and stay there. So the notice takes the view away, and the next view waits for a server
+  // as the first one did.
   const hasTick = useDebuggerDataStore((state) => state.ticks > 0);
+  const readable = info.supported && info.memory && info.defaultMemoryAddress !== undefined;
   const [described, setDescribed] = useState(false);
-  if (initialized && hasTick && !described) {
+  if (initialized && !readable && described) {
+    setDescribed(false);
+  } else if (initialized && hasTick && readable && !described) {
     setDescribed(true);
   }
 
@@ -86,7 +96,7 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
     return undefined;
   }, [searchParams, info]);
 
-  if (initialized && (!info.supported || !info.memory || info.defaultMemoryAddress === undefined)) {
+  if (initialized && !readable) {
     return (
       <Panel>
         <PanelNotice>
