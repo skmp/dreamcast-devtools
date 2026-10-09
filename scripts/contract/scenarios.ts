@@ -19,6 +19,7 @@ import {
   ANCHOR_REGISTERS,
   ARM7_ENABLED_REGISTER,
   BASE_PATHS,
+  DSP_REGISTER_WIDTHS,
   M1_DEVICE_TREE,
   MILESTONES,
   SH4_CPU_REGISTERS,
@@ -722,6 +723,12 @@ const s01: Scenario = {
       const enabled = nodes.get(path)?.registers?.find((register) => register.name === name);
       expectThat(enabled, `${path} has no register ${name}, the anchor register of 2.8 that says whether the ARM7 is clocked; a server that lists the target arm7 has it`);
       expectThat(!enabled || enabled.width === width, `${path}.${name} has width ${enabled?.width}, 2.8 says ${width}`);
+    }
+    // ... the widths of the DSP's registers, of each one the server lists (the anchor, STEP, is
+    // the only one that has to be there) ...
+    for (const register of nodes.get("dc.aica.dsp")?.registers ?? []) {
+      const width = DSP_REGISTER_WIDTHS.get(register.name);
+      expectThat(width === undefined || register.width === width, `dc.aica.dsp.${register.name} has width ${register.width}, 2.8 says ${width}`);
     }
     // ... the register list of dc.sh4.cpu: the names of 2.8 in their order, all of width 32 ...
     const cpu = nodes.get("dc.sh4.cpu")?.registers;

@@ -1114,6 +1114,45 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(reportOf(last)).toEqual(["S01 passed ", "S11 passed "]);
   }, 30_000);
 
+  it("S01: the registers of dc.aica.dsp have the widths of 2.8, each one the server lists; only STEP has to be there", async () => {
+    /** The DSP's register list rewritten in the tree and in every tick, so that the ticks agree with the tree. */
+    const dsp = (rewrite: (registers: Json[]) => Json[]): Faults =>
+      describing(
+        (result) => ({ ...result, deviceTree: mapNodes(result.deviceTree, (node) => (node.path === "dc.aica.dsp" ? { ...node, registers: rewrite(node.registers as Json[]) } : node)) }),
+        (registers) => (registers["dc.aica.dsp"] ? { ...registers, "dc.aica.dsp": rewrite(registers["dc.aica.dsp"]) } : registers),
+      );
+    /** A register under another width, its value written to that width. */
+    const wide = (register: Json, width: number): Json => ({
+      ...register,
+      width,
+      value: `0x${Number.parseInt(String(register.value), 16).toString(16).toUpperCase().padStart(Math.ceil(width / 4), "0")}`,
+    });
+    const widths = (to: Record<string, number>) => dsp((registers) => registers.map((register) => (String(register.name) in to ? wide(register, to[String(register.name)]) : register)));
+
+    // the step as a register of 16 bits: the tree and the ticks agree with each other, and not with the design
+    const step = await run(widths({ STEP: 16 }), ["S01"]);
+    expect(step.scenarios[0].details).toEqual(["dc.aica.dsp.STEP has width 16, 2.8 says 8"]);
+    expect(step.invariantViolations).toEqual([]);
+    // the counter as the 32-bit value an emulator keeps it in, and a ring length of 16 bits
+    const others = await run(widths({ MDEC_CT: 32, RBL: 16 }), ["S01"]);
+    expect(others.scenarios[0].details).toEqual(["dc.aica.dsp.MDEC_CT has width 32, 2.8 says 16", "dc.aica.dsp.RBL has width 16, 2.8 says 8"]);
+    const pointer = await run(widths({ RBP: 13 }), ["S01"]);
+    expect(pointer.scenarios[0].details).toEqual(["dc.aica.dsp.RBP has width 13, 2.8 says 16"]);
+
+    // The list is the server's: the anchor alone, or with registers of its own next to those of
+    // 2.8, whose widths are then the server's too.
+    const anchorOnly = await run(
+      dsp((registers) => registers.filter((register) => register.name === "STEP")),
+      ["S01", "S10"],
+    );
+    expect(reportOf(anchorOnly)).toEqual(["S01 passed ", "S10 passed "]);
+    const more = await run(
+      dsp((registers) => [...registers, { name: "ACC", value: "0x0000000", width: 26 }, { name: "MDEC_CT_RELOAD", value: "0x00002000", width: 32 }]),
+      ["S01"],
+    );
+    expect(reportOf(more)).toEqual(["S01 passed "]);
+  }, 30_000);
+
   it("S01: a server that answers debugger.describe with nothing the client can read, or sends no tick after it, fails S01; nothing else is run", async () => {
     const lines: string[] = [];
     const refused = await startServer({

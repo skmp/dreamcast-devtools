@@ -126,6 +126,17 @@ export const ANCHOR_REGISTERS: ReadonlyArray<{ path: string; name: string }> = [
  */
 export const ARM7_ENABLED_REGISTER = { path: "dc.aica.arm7", name: "ENABLED", width: 1 } as const;
 
+/**
+ * The widths of the registers of `dc.aica.dsp` (2.8), for every server that lists them: those
+ * of the hardware. Only `STEP`, the anchor, has to be there.
+ */
+export const DSP_REGISTER_WIDTHS: ReadonlyMap<string, number> = new Map([
+  ["STEP", 8],
+  ["MDEC_CT", 16],
+  ["RBP", 16],
+  ["RBL", 8],
+]);
+
 const numbered = (prefix: string, count: number, suffix = ""): string[] => Array.from({ length: count }, (_, index) => `${prefix}${index}${suffix}`);
 
 /** The register list of `dc.sh4.cpu` (2.8): these names, in this order, all of width 32. */
