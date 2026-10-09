@@ -3479,19 +3479,22 @@ describe("the emulator profile", () => {
       acceptSh4Interrupt(): unknown;
       enterStop(reason: string): void;
       running: boolean;
+      values: Map<string, Map<string, unknown>>;
     };
     /**
-     * The mock at its StartPaused stop. `ends(n)` says how its n-th control.step or
-     * control.stepOver of the SH4 ends: "vector", the interrupt is accepted and nothing is
-     * executed (the time stands); "twice", two instructions are executed; undefined, as ever.
+     * The mock at its StartPaused stop. `ends(n, pc)` says how its n-th control.step or
+     * control.stepOver of the SH4, from `pc`, ends: "vector", the interrupt is accepted and
+     * nothing is executed (the time stands); "twice", two instructions are executed; undefined,
+     * as ever. With `vbr` the program has its vector base there.
      */
-    const stepping = (ends: (n: number) => "vector" | "twice" | undefined): MockDebugger => {
+    const stepping = (ends: (n: number, pc: number) => "vector" | "twice" | undefined, vbr?: number): MockDebugger => {
       const mock = new MockDebugger({ startPaused: true });
+      if (vbr !== undefined) ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "VBR", value: String(vbr) });
       const machine = mock as unknown as Machine;
       const step = machine.step.bind(mock);
       let steps = 0;
       machine.step = (kind, params, context) => {
-        const how = machine.running || params.target !== "sh4" || kind === "stepOut" ? undefined : ends(++steps);
+        const how = machine.running || params.target !== "sh4" || kind === "stepOut" ? undefined : ends(++steps, machine.values.get("dc.sh4.cpu")!.get("PC") as number);
         if (how === "vector") {
           context.afterResponse.push(() => {
             machine.acceptSh4Interrupt();
@@ -3532,6 +3535,33 @@ describe("the emulator profile", () => {
     const [twice] = await s04(stepping((n) => (n === 1 ? "vector" : "twice")));
     expect(twice).toMatch(
       /^S04 failed ".+" at 0x8C00060[0-9A-F] is not control flow, and the step ended at 0x8C[0-9A-F]{6}, not at 0x8C00060[0-9A-F]: a step before it ended at an exception vector, which one step may, and the step from the next plain line has to show the instruction$/,
+    );
+
+    // ... also when the two steps at a vector are not in a row. A program whose interrupt entry
+    // is a branch: the runner steps over it to the next plain line, and the step it makes from
+    // there ends at the entry once more.
+    const linesAt = (address: number) =>
+      (ask(new MockDebugger(), "state.getDisassembly", { target: "sh4", address: address - 2, count: 2 }).result as { lines: Array<{ disassembly: string }> }).lines;
+    const isPlain = (address: number) => {
+      const [previous, line] = linesAt(address);
+      return !isSh4ControlFlow(line.disassembly) && !isSh4DelayedBranch(previous.disassembly);
+    };
+    const entry = Array.from({ length: 24 }, (_, index) => 0x8c00ffc0 + index * 2).find((address) => isSh4ControlFlow(linesAt(address)[1].disassembly))!;
+    let again = false;
+    const [apart] = await s04(
+      stepping((n, pc) => {
+        // the first step of the run, and the first one after it that starts from a plain line
+        const atVector = n === 1 || (!again && isPlain(pc));
+        again ||= n > 1 && atVector;
+        return atVector ? "vector" : undefined;
+      }, entry - 0x600),
+    );
+    expect(again).toBe(true);
+    expect(apart).toMatch(
+      new RegExp(
+        `^S04 failed ".+" at 0x8C0[0-9A-F]{5} is not control flow, and the step ended at 0x${entry.toString(16).toUpperCase()}, not at 0x8C0[0-9A-F]{5}: ` +
+          "a step before it ended at an exception vector, which one step may, and the step from the next plain line has to show the instruction$",
+      ),
     );
   }, 60_000);
 
