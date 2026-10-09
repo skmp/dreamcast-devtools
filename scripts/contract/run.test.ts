@@ -863,6 +863,61 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(frozen, "S02")).toMatch(/stopId 5 is not new/);
   });
 
+  it("S05, I7: a breakpointId that outlives its breakpoint, a stop that goes over to the other breakpoint on the address, a stop that loses its reason", async () => {
+    /** A server that goes on reporting something for a stop whose breakpoint the client removed. One per connection. */
+    const afterRemoval = (rewrite: (executionState: Json, removed: number, tick: Json) => Json): FaultSource => () => {
+      // stopId -> the breakpoint that stop reported
+      const reported = new Map<unknown, number>();
+      return {
+        toClient: (frame) => {
+          if (!isTick(frame)) return frame;
+          const state = frame.params.executionState;
+          if (typeof state.breakpointId === "number") {
+            reported.set(state.stopId, state.breakpointId);
+            return frame;
+          }
+          const removed = reported.get(state.stopId);
+          return state.state === "paused" && removed !== undefined
+            ? { ...frame, params: { ...frame.params, executionState: rewrite(state, removed, frame.params) } }
+            : frame;
+        },
+      };
+    };
+
+    // the id is repeated in the ticks of the stop although the breakpoint is gone
+    const stale = await run(
+      afterRemoval((state, removed) => ({ ...state, breakpointId: removed })),
+      ["S05"],
+    );
+    expect(statusOf(stale, "S05")).toBe("failed");
+    expect(detailsOf(stale, "S05")).toMatch(
+      /^after breakpoints\.remove \{1\} a paused tick of the same stop carries breakpointId 1; the ticks of a stop stop carrying the id of a breakpoint that was removed$/m,
+    );
+    // (in a later tick of the stop, not in its first one)
+    expect(stale.invariantViolations.join("\n")).toMatch(/I7: breakpointId 1 is not a key of breakpoints in the same tick \(stop \d+\)/);
+    expect(stale.cleanUpProblems).toEqual([]);
+
+    // the stop reports the twin on the same address instead: an id that is listed, and not the stop's
+    const twin = await run(
+      afterRemoval((state, _removed, tick) => {
+        const left = Object.keys(tick.breakpoints as Json).map(Number);
+        return left.length > 0 ? { ...state, breakpointId: left[0] } : state;
+      }),
+      ["S05"],
+    );
+    expect(statusOf(twin, "S05")).toBe("failed");
+    expect(detailsOf(twin, "S05")).toMatch(/^after breakpoints\.remove \{1\} a paused tick of the same stop carries breakpointId 2; /);
+    expect(twin.invariantViolations).toEqual([]);
+
+    // the reason leaves with the id
+    const noReason = await run(
+      afterRemoval((state) => ({ ...state, reason: "pause" })),
+      ["S05"],
+    );
+    expect(statusOf(noReason, "S05")).toBe("failed");
+    expect(detailsOf(noReason, "S05")).toBe('after breakpoints.remove {1} the paused tick of the same stop has reason "pause"; the reason stays "breakpoint"');
+  }, 30_000);
+
   it("S02: control.pause that is refused when it names a target, as the UI's request does", async () => {
     const refusing = (targets: string[]): Faults => ({
       answer: (request) =>

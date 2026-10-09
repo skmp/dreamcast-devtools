@@ -6,8 +6,8 @@ import type { DebuggerShape, DebuggerTick, DeviceNodeDescriptor } from "../../sr
  * connection of a run, and with them what sections 2.6, 2.8, 2.9 and 3.2 say of every tick:
  * the timestamp is the wall clock in ms; eventIds ascend in the log and name the same entry
  * in every tick; a watch reads what its register reads; registersStale is a matter of running
- * ticks; a running tick has no callstack; a breakpointId comes with its reason. Pure
- * functions: the session feeds them what arrived.
+ * ticks; a running tick has no callstack; a breakpointId comes with its reason and names a
+ * breakpoint the tick lists. Pure functions: the session feeds them what arrived.
  */
 
 /** The three paths every running tick carries: the PC of every target. */
@@ -222,25 +222,23 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
   if (tracking.lastStopId !== undefined && stopId < tracking.lastStopId) {
     violations.push(`I5: stopId ${stopId} follows stopId ${tracking.lastStopId}`);
   }
-  // (the first tick of a connection can belong to a stop that is older than the connection)
-  const newStop = tracking.lastStopId !== undefined && stopId > tracking.lastStopId;
   tracking.lastStopId = stopId;
 
   // 2.9 / 2.10: running ticks carry empty callstacks
   if (state.state === "running" && ((tick.callstacks?.sh4?.length ?? 0) > 0 || (tick.callstacks?.arm7?.length ?? 0) > 0)) {
     violations.push("2.9: a running tick carries callstack frames");
   }
-  // 3.2: a breakpointId comes with a breakpoint reason, and the tick that reports the hit lists
-  // the breakpoint (later ticks of the same stop repeat the id, also after it has been removed)
+  // I7: a breakpointId comes with the reason of a breakpoint stop, and it is a key of
+  // `breakpoints` in the same tick: in every tick that carries one, not only in the first tick
+  // of a stop. When the breakpoint of a stop is removed, the later ticks of that stop keep the
+  // reason and stop carrying the id (2.3.1), so the two reasons can come without one.
   if (state.breakpointId !== undefined) {
-    if (newStop && !(String(state.breakpointId) in tick.breakpoints)) {
-      violations.push(`3.2: the first tick of stop ${stopId} reports breakpointId ${state.breakpointId}, which is not in its breakpoints`);
+    if (!(String(state.breakpointId) in tick.breakpoints)) {
+      violations.push(`I7: breakpointId ${state.breakpointId} is not a key of breakpoints in the same tick (stop ${stopId}); a tick stops carrying the id of a breakpoint that was removed`);
     }
     if (state.reason !== "breakpoint" && state.reason !== "event") {
-      violations.push(`3.2: breakpointId with reason "${state.reason}"`);
+      violations.push(`I7: breakpointId with reason "${state.reason}"`);
     }
-  } else if (state.reason === "breakpoint" || state.reason === "event") {
-    violations.push(`3.2: reason "${state.reason}" without a breakpointId`);
   }
   // 2.8: watches in id order
   const watchIds = (tick.watches ?? []).map((watch) => watch.id);

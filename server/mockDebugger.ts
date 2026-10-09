@@ -1739,7 +1739,12 @@ export class MockDebugger {
   }
 
   private removeBreakpoint(params: Record<string, unknown>, context: RequestContext): Record<string, never> {
-    this.breakpoints.delete(this.breakpointById(params.id as number).id);
+    const { id } = this.breakpointById(params.id as number);
+    this.breakpoints.delete(id);
+    if (this.stopBreakpointId === id) {
+      // the stop in force was this breakpoint's: its later ticks keep the reason and stop carrying the id
+      this.stopBreakpointId = undefined;
+    }
     this.afterBreakpointChange(context);
     return {};
   }

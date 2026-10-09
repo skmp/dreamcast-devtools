@@ -845,6 +845,7 @@ const s05: Scenario = {
   id: "S05",
   title: "breakpoint hit",
   async run(context) {
+    const { session } = context;
     const sh4 = requireTarget(context, "sh4");
     const pc = await findBreakpointSite(context);
     const address = pc + sh4.instructionSize;
@@ -866,8 +867,27 @@ const s05: Scenario = {
     check(record.tick.executionState.reason === "breakpoint", "a later paused tick of the same stop repeats the reason");
 
     await unwatch(context, watchId);
-    await removeBreakpoint(context, breakpoint.id);
-    await removeBreakpoint(context, twin.id);
+
+    // The breakpoint the stop reports is removed during the stop: the paused ticks of that stop
+    // keep the stopId and the reason, and stop carrying its id (a breakpointId is always a key
+    // of `breakpoints` in the same tick). The twin on the same address is still listed, and is
+    // not what the stop reports now.
+    const removing = session.mark();
+    await session.call("breakpoints.remove", { id: lowest });
+    const after = await tickShowing(session, removing, "breakpoints.remove", (tick) => (String(lowest) in tick.breakpoints ? `breakpoint ${lowest} is still listed` : undefined));
+    check(
+      isPaused(after.tick) && stopIdOf(after.tick) === stopIdOf(hit.tick),
+      `removing the breakpoint of a stop does not end the stop: the tick after breakpoints.remove {${lowest}} is ${describeState(after.tick)}, the stop was ${stopIdOf(hit.tick)}`,
+    );
+    check(
+      after.tick.executionState.breakpointId === undefined,
+      `after breakpoints.remove {${lowest}} a paused tick of the same stop carries breakpointId ${after.tick.executionState.breakpointId}; the ticks of a stop stop carrying the id of a breakpoint that was removed`,
+    );
+    check(
+      after.tick.executionState.reason === "breakpoint",
+      `after breakpoints.remove {${lowest}} the paused tick of the same stop has reason "${after.tick.executionState.reason}"; the reason stays "breakpoint"`,
+    );
+    await removeBreakpoint(context, lowest === breakpoint.id ? twin.id : breakpoint.id);
   },
 };
 

@@ -292,6 +292,17 @@ describe("tick policy", () => {
     expect(session.lastTick().executionState.state).toBe("running");
     await vi.advanceTimersByTimeAsync(16);
     expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 2, reason: "breakpoint", breakpointId: 1 });
+
+    // removing another breakpoint changes nothing about the stop ...
+    session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address, enabled: false });
+    session.ok("breakpoints.remove", { id: 2 });
+    expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 2, reason: "breakpoint", breakpointId: 1 });
+    // ... and when its own breakpoint is removed, the ticks of the stop keep the reason and stop carrying the id
+    session.ok("breakpoints.remove", { id: 1 });
+    expect(session.lastTick().breakpoints).toEqual({});
+    expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 2, reason: "breakpoint" });
+    session.ok("state.unwatch", { watchIds: [1] });
+    expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 2, reason: "breakpoint" });
   });
 
   it("compares SH4 code addresses masked, reports the lowest id when several match, and never reuses an id", async () => {
