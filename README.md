@@ -262,28 +262,35 @@ reference for every parameter, result, error code and bound; what follows is the
 
 The mock (`server/mockDebugger.ts`, hosted with the page by `server/mockServer.ts`) implements
 the first milestone of this protocol around a fabricated machine, keeps one state for all
-clients, and also steps the ARM7 and the DSP, records SGC frames and writes registers.
+clients, and also steps the ARM7 and the DSP, records SGC frames and writes registers. Its SH4
+walks a loop of eight instructions at `0x8C0000A0` and, like a program with interrupts enabled,
+takes an interrupt at every vertical blank: the PC leaves the loop for the handler at
+`VBR + 0x600` (`0x8C000600`: two instructions, `rte` and its delay slot) and comes back, so
+between two frames it is in the loop, and a breakpoint in the handler stops it there.
 
 ## Contract runner
 
-`npm run contract` holds a debugger server to the protocol. It connects with the UI's own
-`JsonRpcClient` and `WebSocketTransport`, validates every response and every tick with the
-strict copy of the schema (unknown keys fail, the v3 fields are required, `null` is an error),
-checks the tick invariants on every tick, and runs the scenarios S00 to S18
-(`scripts/contract/scenarios.ts`). It leaves the server with the breakpoints, watches, breakpoint
-categories and run state it found: after a failed scenario and at the end of the run it removes
-every breakpoint and watch that was not there when it connected (so nobody else should add any
-while it runs), and it reports what it could not put back. It exits with 1 when a scenario
-failed, an invariant was violated or the server was left changed, and with 2 when there was no
-run: a wrong option, or a server it could not connect to. Whatever a connected server answers is
-a result, with the summary of `--json`: a `debugger.describe` result that does not follow the
-schema is S01 failed, with every issue, and the run goes on with what the client reads from it.
+`npm run contract` holds a debugger server to the protocol. Two servers implement it, the mock
+of this repository and the emulator's own, and the runner is what both are measured with. It
+connects with the UI's own `JsonRpcClient` and `WebSocketTransport`, validates every response
+and every tick with the strict copy of the schema (unknown keys fail, the v3 fields are
+required, `null` is an error), checks the tick invariants I1 to I8 on every tick of every
+connection, and runs the scenarios S00 to S21 (`scripts/contract/scenarios.ts`; `--list` names
+them). An error is its code and a message that is not empty: the wording of a message is the
+server's, and nothing is matched against it.
+
+It leaves the server with the breakpoints, watches, breakpoint categories and run state it
+found: after a failed scenario and at the end of the run it removes every breakpoint and watch
+that was not there when it connected (so nobody else should add any while it runs), and it
+reports what it could not put back. Whatever a connected server answers is a result, with the
+summary of `--json`: a `debugger.describe` result that does not follow the schema is S01 failed,
+with every issue, and the run goes on with what the client reads from it.
 
 ```
-npm run contract                                  # the mock, started in the same process
-npm run contract -- --url ws://127.0.0.1:55543/ws --elf 2ndmix.elf   # an emulator (profile emulator)
+npm run contract                                  # look at the mock, started in the same process
+npm run contract -- --milestone M1                # the gate of milestone M1 on the mock (part of `npm run check`)
+npm run contract -- --url ws://127.0.0.1:<port>/ws --profile emulator --elf <path> --milestone M1   # the gate of M1 on an emulator
 npm run contract -- --url ws://127.0.0.1:5173/ws --profile mock      # a mock server that is already running
-npm run contract -- --url ws://127.0.0.1:55543/ws --elf 2ndmix.elf --milestone M2   # the gate of milestone M2
 npm run contract -- --only S05,S06 --verbose      # some scenarios, with every frame
 npm run contract -- --json                        # the summary as JSON on stdout
 npm run contract -- --list                        # the scenarios
@@ -291,14 +298,49 @@ npm run contract -- --list                        # the scenarios
 
 Each scenario ends as `passed`, `FAILED`, `not applicable` (the server does not advertise the
 capability or target the scenario needs, or the scenario belongs to the other profile) or
-`partial` (the server advertises only some of the capabilities of the scenario, and those
-parts passed). Only `passed` is a pass, and neither of the other two is a failure: a run of
-nothing but scenarios the server does not claim to support ends with `contract: OK`. The gate of
-a milestone therefore says which scenarios have to pass: `--milestone M1` (S00 to S15; S00 and
-S15 in the emulator profile only), `M2` (and S16), `M3` (and S17), `M4` (and S18), or
-`--require S16,S17` for a list of one's own. A required scenario that ends as `not applicable`
-or `partial` fails the run with exit code 1. The emulator profile expects the emulator at its
-`StartPaused` stop, runs S00 and S15 as well, and multiplies every timeout by 5.
+`partial` (some of its parts passed and the rest could not be shown: a capability that is not
+advertised, a program that takes no interrupt). Only `passed` is a pass. S07 and S20 show that
+a breakpoint that is enabled again, or added while the target runs, is hit where every program
+with interrupts enabled comes at each vertical blank: at the interrupt entry `VBR + 0x600`, with
+`VBR` read at a stop the target has run up to. The mock passes them the way a program does,
+through its interrupt handler.
+
+**What a gate is.** A gate is a run that names a milestone.
+
+- `--milestone Mx` selects the scenarios of that milestone, i.e. those whose milestone is Mx or
+  earlier, without those of the other profile, and requires each of them to pass: `partial` and
+  `not applicable` fail a gate, and so does a scenario that was not run. M1 is S00 to S15, S19
+  and S20 (S00 and S15 in the emulator profile only); M2 adds S16, M3 adds S17 (and S21, below),
+  M4 adds S18. Under a gate S01 also wants `sh4`, `arm7` and `dsp` listed and the capabilities
+  of the milestone advertised.
+- Without `--milestone` the runner looks at a server: a scenario the server does not claim to
+  support is not applicable, and that is no failure. But a run in which no scenario passed has
+  verified nothing, and fails.
+- `--only <ids>` narrows the selection, also inside a gate, and never turns an empty result into
+  a success: a selection that leaves nothing to pass is a failed run. `--require <ids>` names
+  further scenarios that are run and have to pass.
+- Exit codes: 0, every selected scenario that had to pass passed, no invariant was violated and
+  the server was put back; 1, anything else that is a result; 2, there was no run (a wrong
+  option, or a server that could not be connected to).
+
+The gate of a milestone for the emulator is
+
+```
+npm run contract -- --url ws://127.0.0.1:<port>/ws --profile emulator --elf <path> --milestone M1
+```
+
+and likewise for M2, M3 and M4, against one emulator per run that was started headless with its
+test program and is at its `StartPaused` stop: `Debugger:Enabled=yes`, `Debugger:Port=0`,
+`Debugger:Required=yes`, `Debugger:StartPaused=yes`, with the port taken from the
+`Debugger: http://127.0.0.1:<port>/` line the emulator prints. The emulator profile waits for
+that stop, runs S00 (the anchor at the entry point of `--elf`) and S15 as well, and multiplies
+every timeout by 5. The gate of M3 is two runs: that one with the test program of M1, which
+selects everything of M3 but S21, and a second one against an emulator started with the DSP
+test program, `--elf <dsptest.elf> --milestone M3 --dsp-program`, which selects S00 and S21
+alone. The mock's gate is `npm run contract -- --milestone M1` (in-process, profile mock), which
+`npm run check` runs; the mock is "M1 plus", so without `--milestone` its S16 is partial and its
+S17 passes.
+
 `--idle-breakpoint <address|symbol>` is not a test run: it mutes the `sh4` category, adds one
 breakpoint, resumes and stays connected until the server closes the connection.
 
