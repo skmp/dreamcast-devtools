@@ -199,6 +199,24 @@ describe("tick policy", () => {
     expect(session.frames.length).toBe(before + 1); // the response, no tick
   });
 
+  it("takes a pause for every target id, listed or not, and refuses any other string with -32602", () => {
+    // there is one run state: the target of a pause is ignored when it is a target id
+    for (const options of [undefined, { supports: { targets: ["sh4" as const] } }, { supports: MOCK_M1_SUPPORT }]) {
+      const session = connect(createMock(options));
+      session.describe();
+      expect(session.call("control.pause", { target: "dsp" }).result).toEqual({});
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: 1, reason: "pause" });
+      const ticks = session.ticks().length;
+      for (const target of ["sh4", "arm7", "dsp"]) {
+        expect(session.call("control.pause", { target }).result).toEqual({});
+      }
+      expect(session.ticks()).toHaveLength(ticks);
+      session.fail("control.pause", { target: "gpu" }, -32602);
+      session.fail("control.pause", { target: 4 }, -32602);
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: 1, reason: "pause" });
+    }
+  });
+
   it("resumes: {} and a running tick without reason; a second resume changes nothing", async () => {
     const mock = createMock();
     const session = connect(mock);
