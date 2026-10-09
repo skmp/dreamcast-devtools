@@ -5,10 +5,10 @@ import { DebuggerErrorCode, type MemorySlice } from "../../lib/debuggerSchema";
 import { JsonRpcException } from "../../lib/jsonRpc";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import { useTarget } from "../../state/debuggerSelectors";
+import { useNoDataText, useTarget } from "../../state/debuggerSelectors";
 import { formatAddress, parseAddress } from "../../state/targets";
 import { MemoryView, type MemoryViewConfig, type MemoryViewCallbacks } from "../components/MemoryView";
-import { PanelNotice, PanelPlaceholder } from "../components/PanelNotice";
+import { NoData, PanelNotice } from "../components/PanelNotice";
 
 const BYTES_PER_ROW = 16;
 const VISIBLE_ROWS = 60;
@@ -32,14 +32,14 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
   // is not a new one.)
   //
   // A server that has a notice to show instead (no such target, or no memory) has said
-  // nothing about where a view opens. While its connection is away the target is described
-  // by the built-in values again, and a view mounted then would open at the built-in address
-  // and stay there. So the notice takes the view away, and the next view waits for a server
-  // as the first one did.
+  // nothing about where a view opens. The notice takes the view away and stays while the
+  // connection of that server is away; the next view waits for a server that reads this
+  // memory, as the first one did.
   const hasTick = useDebuggerDataStore((state) => state.ticks > 0);
   const readable = info.supported && info.memory && info.defaultMemoryAddress !== undefined;
+  const noDataText = useNoDataText();
   const [described, setDescribed] = useState(false);
-  if (initialized && !readable && described) {
+  if (!readable && described) {
     setDescribed(false);
   } else if (initialized && hasTick && readable && !described) {
     setDescribed(true);
@@ -96,7 +96,8 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
     return undefined;
   }, [searchParams, info]);
 
-  if (initialized && !readable) {
+  // said for as long as that server is the one of this page, connected or not
+  if (!readable) {
     return (
       <Panel>
         <PanelNotice>
@@ -110,7 +111,7 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
   if (!described) {
     return (
       <Panel>
-        <PanelPlaceholder>No Data</PanelPlaceholder>
+        <NoData />
       </Panel>
     );
   }
@@ -125,6 +126,7 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
         initialUrlAddress={initialUrlAddress}
         // a stop the client has not acted on yet, or a game that was just loaded: the bytes on screen are read again
         refreshSignal={`${epoch}:${refresh}`}
+        noDataText={noDataText}
       />
     </Panel>
   );

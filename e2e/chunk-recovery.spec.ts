@@ -216,7 +216,7 @@ test("a panel first opened while the server is down is loaded by Reload page onc
   await expect(reloadPage(alert)).toBeEnabled();
   expect(await isSameDocument(page)).toBe(true);
   // the other panels are as they were: without a connection, they have no data
-  await expect(panel(page, "watches")).toContainText("No Data");
+  await expect(panel(page, "watches")).toContainText("Not connected");
   await expect(panel(page, "watches").getByRole("button", { name: "Add Watch" })).toBeVisible();
   await expect(failure(page)).toHaveCount(1);
   await saveScreenshot(page, testInfo, "chunk-recovery-server-down-panel");

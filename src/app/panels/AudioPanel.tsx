@@ -8,7 +8,7 @@ import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { SgcFrameData } from "../../lib/sgcChannelData";
 import { CAPABILITIES, type RpcError } from "../../lib/debuggerSchema";
-import { useCapability } from "../../state/debuggerSelectors";
+import { useCapability, useNoDataText } from "../../state/debuggerSelectors";
 import { PanelNotice } from "../components/PanelNotice";
 
 export const AudioPanel = () => {
@@ -31,6 +31,7 @@ export const AudioPanel = () => {
   const showError = useDebuggerDataStore((state) => state.showError);
   // a server without the SGC capture (before milestone M3) is not asked for one
   const canCapture = useCapability(CAPABILITIES.SGC_CAPTURE);
+  const noDataText = useNoDataText();
   const channelListRef = useRef<HTMLDivElement>(null);
   const dragStartXRef = useRef<number>(0);
   const dragStartScrollRef = useRef<number>(0);
@@ -254,7 +255,8 @@ export const AudioPanel = () => {
     });
   }, [hoverPosition, playbackPosition]);
 
-  if (initialized && !canCapture) {
+  // said for as long as that server is the one of this page, connected or not
+  if (!canCapture) {
     return (
       <Panel>
         <PanelNotice>This server cannot capture SGC frames.</PanelNotice>
@@ -356,6 +358,20 @@ export const AudioPanel = () => {
             >
               <div>WebGL Initialization Failed</div>
               <div style={{ fontSize: '0.9rem', color: 'text.secondary' }}>{webglError}</div>
+            </Box>
+          ) : !initialized ? (
+            // a capture is the server's: without a connection there is none to show
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                height: '100%',
+                color: 'text.secondary',
+                fontSize: '1.2rem',
+              }}
+            >
+              {noDataText}
             </Box>
           ) : noDataAvailable ? (
             <Box

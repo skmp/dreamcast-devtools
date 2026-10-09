@@ -133,6 +133,8 @@ export interface DisassemblyViewProps {
   refetchAfterBreakpointEdit?: boolean;
   /** false: the step buttons are disabled although the target is paused (default: true). */
   canStep?: boolean;
+  /** What is said in place of the lines while the view is not `initialized` (default: "No Data"). */
+  noDataText?: string;
 }
 
 export interface DisassemblyViewRef {
@@ -266,6 +268,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   followOnPause = true,
   refetchAfterBreakpointEdit = false,
   canStep = true,
+  noDataText = "No Data",
 }, ref) => {
   const [lines, setLines] = useState<DisassemblyLine[]>([]);
   // how many lines of the answer on screen repeated an address, and were left out
@@ -959,7 +962,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         {!initialized ? (
           <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
             <Typography variant="body2" color="text.secondary">
-              No Data
+              {noDataText}
             </Typography>
           </Stack>
         ) : error ? (

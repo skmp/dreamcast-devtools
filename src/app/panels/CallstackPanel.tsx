@@ -6,7 +6,7 @@ import { CAPABILITIES, type CallstackFrame } from "../../lib/debuggerSchema";
 import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
 import { useCapability, useRunState, useTarget } from "../../state/debuggerSelectors";
 import { formatAddress, type TargetInfo } from "../../state/targets";
-import { PanelNotice } from "../components/PanelNotice";
+import { NoData, PanelNotice } from "../components/PanelNotice";
 
 interface CallstackPanelProps {
   target: "sh4" | "arm7";
@@ -100,16 +100,13 @@ const CallstackPanel = ({ target, showTitle = false }: CallstackPanelProps) => {
 
   return (
     <Panel title={showTitle ? title : undefined}>
-      {!initialized ? (
-        <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
-          <Typography variant="body2" color="text.secondary">
-            No Data
-          </Typography>
-        </Stack>
-      ) : !info.supported || !supported ? (
+      {!info.supported || !supported ? (
+        // what the server cannot do is said for as long as it is the server of this page, connected or not
         <PanelNotice>
           {info.supported ? "This server has no callstack." : `This server does not support the ${info.label} target.`}
         </PanelNotice>
+      ) : !initialized ? (
+        <NoData />
       ) : frames.length === 0 ? (
         <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
           Empty callstack.{running ? " The target is running." : ""}

@@ -14,6 +14,7 @@ import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import SearchIcon from "@mui/icons-material/Search";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { PANEL_REGISTRY, type PanelRegistryEntry } from "../layout/panelRegistry";
+import { NoData } from "../components/PanelNotice";
 import { targetInfo } from "../../state/targets";
 import { NO_GAME } from "../../state/tickState";
 import {
@@ -424,10 +425,9 @@ export const DeviceTreePanel = ({ onOpenPanel }: DeviceTreePanelProps = {}) => {
         </Box>
         <Divider />
         {!initialized ? (
-          <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", flex: 1 }}>
-            <Typography variant="body2" color="text.secondary">
-              No Data
-            </Typography>
+          // the tree is the server's: without a connection there is none, and the box above stays
+          <Box sx={{ flex: 1 }}>
+            <NoData />
           </Box>
         ) : deviceTree.length === 0 ? (
           <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>

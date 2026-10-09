@@ -209,7 +209,7 @@ test("the callstack says how it was found: frame by frame, and as a whole", asyn
 
   // without a connection there are no frames, and nothing that looks like them
   await page.getByRole("button", { name: "Disconnect", exact: true }).click();
-  await expect(view).toContainText("No Data");
+  await expect(view).toContainText("Not connected");
   await expect(frames).toHaveCount(0);
 });
 

@@ -73,7 +73,8 @@ beforeEach(() => {
 
 afterEach(() => {
   store().reset();
-  useDebuggerDataStore.setState({ toasts: [] });
+  // what a server said about itself outlives its connection: not into the next test
+  useDebuggerDataStore.setState({ toasts: [], shape: undefined });
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -293,6 +294,35 @@ describe("initialize", () => {
       expect(store().initError).toBeUndefined();
       expect(store().describeRetry).toBeUndefined();
     });
+  });
+
+  it("what the server said about itself outlives its connection, until the next server has described itself", async () => {
+    // It is not data: the panels draw their frame from it, and keep that frame without a connection.
+    await initialise(undefined, describeResult({ capabilities: ["callstack"] }));
+    const first = store().shape;
+    expect(first?.capabilities).toEqual(["callstack"]);
+    store().reset();
+    expect(store().initialized).toBe(false);
+    expect(store().deviceTree).toEqual([]);
+    expect(store().shape).toBe(first);
+
+    // the next connection: still the last server's while this one has not answered
+    const { transport, client } = connect();
+    const done = store().initialize(client);
+    expect(store().shape).toBe(first);
+    expect(store().initialized).toBe(false);
+    transport.respond(describeResult({ capabilities: [] }));
+    transport.deliver(tickFrame({ state: "running", stopId: 1 }));
+    await done;
+    expect(store().shape?.capabilities).toEqual([]);
+
+    // a server that cannot be described changes nothing about the frame either
+    const third = connect();
+    const failed = store().initialize(third.client);
+    third.transport.respondError(-32000, "emulator busy");
+    await failed;
+    expect(store().initialized).toBe(false);
+    expect(store().shape?.capabilities).toEqual([]);
   });
 
   it("reset() forgets the connection: no client, no data, and nothing of it is applied afterwards", async () => {

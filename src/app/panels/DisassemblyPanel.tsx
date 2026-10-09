@@ -4,10 +4,10 @@ import SubdirectoryArrowRightIcon from "@mui/icons-material/SubdirectoryArrowRig
 import type { TargetProcessor } from "../../lib/debuggerSchema";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import { useProgramCounter, useRunState, useTarget } from "../../state/debuggerSelectors";
+import { useNoDataText, useProgramCounter, useRunState, useTarget } from "../../state/debuggerSelectors";
 import { formatAddress, formatAddressInput, parseAddress, programCounter, withContextAbove } from "../../state/targets";
 import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks, type DisassemblyViewRef } from "../components/DisassemblyView";
-import { PanelNotice, PanelPlaceholder } from "../components/PanelNotice";
+import { NoData, PanelNotice } from "../components/PanelNotice";
 import { canResume } from "../../state/stopReasons";
 import { Panel } from "../layout/Panel";
 import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
@@ -36,6 +36,7 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
   const control = useDebuggerDataStore((state) => state.control);
   const runState = useRunState();
   const currentPc = useProgramCounter(info);
+  const noDataText = useNoDataText();
   const viewRef = useRef<DisassemblyViewRef>(null);
   const panelIdRef = useRef(generateUUID());
 
@@ -190,17 +191,20 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
     };
   }, [target]);
 
-  if (initialized && !info.supported) {
+  // said for as long as that server is the one of this page, connected or not
+  if (!info.supported) {
     return (
       <Panel>
         <PanelNotice>This server does not support the {info.label} target.</PanelNotice>
       </Panel>
     );
   }
+  // A view has no place before a server has said where its target is. Once it has one it
+  // stays, with its toolbar and where it was, through every loss of the connection.
   if (firstAddress === undefined) {
     return (
       <Panel>
-        <PanelPlaceholder>No Data</PanelPlaceholder>
+        <NoData />
       </Panel>
     );
   }
@@ -221,6 +225,7 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
       followOnPause={false}
       refetchAfterBreakpointEdit
       canStep={steppable}
+      noDataText={noDataText}
     />
   );
 };

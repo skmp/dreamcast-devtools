@@ -111,6 +111,59 @@ test.describe("a server of milestone M1", () => {
   });
 });
 
+test.describe("a server of milestone M1, when its connection is lost", () => {
+  test.use({ mockOptions: { supports: MOCK_M1_SUPPORT } });
+
+  test("the panels keep their frame: what the server cannot do stays said, the boxes stay as they were, and only the data goes", async ({
+    page,
+    mock,
+    diagnostics,
+  }, testInfo) => {
+    diagnostics.allow(/^console\.error: WebSocket connection to/, "the server is down on purpose");
+    await openWorkspace(page, "arm7-debugger");
+    const view = panel(page, "arm7-disassembly");
+    const memory = panel(page, "arm7-memory");
+    const breakpoints = panel(page, "arm7-breakpoints");
+    await expect(disassemblyRows(view)).toHaveCount(64);
+    // the user has been somewhere: a search in the tree, the memory view at an address of their own
+    const search = panel(page, "device-tree").getByPlaceholder("Search components...");
+    await search.fill("arm7");
+    await memory.getByRole("textbox").fill("0x00200100");
+    await memory.getByRole("textbox").press("Enter");
+    await expect(memory).toContainText(/0x00200100\s*([0-9A-F]{2} ){15}/);
+    const listedFrom = await view.getByRole("textbox").inputValue();
+    expect(listedFrom).toMatch(/^0x002000[0-9A-F]{2}$/);
+
+    // --- the emulator goes ---
+    await mock.stop();
+    await expect(statusBar(page)).toContainText("Connection: reconnecting");
+    // where the data was, each panel says that there is no connection
+    for (const id of ["device-tree", "arm7-disassembly", "arm7-memory", "arm7-breakpoints", "watches", "arm7-callstack"]) {
+      await expect(panel(page, id), id).toContainText("Not connected");
+    }
+    await expect(disassemblyRows(view)).toHaveCount(0);
+    await expect(memory).not.toContainText("0x00200100 ");
+
+    // The frame of each is the one this server gave it. Its ARM7 is not stepped: the notice is
+    // where the step buttons would be, and no step button comes back because nobody is there to refuse it.
+    await expect(view.getByRole("note")).toHaveText("This server cannot step the ARM7 or set code breakpoints on it.");
+    for (const label of ["Step Over", "Step In", "Step Out", "Mute category", "Solo category"]) {
+      await expect(view.getByLabel(label, { exact: true }), label).toHaveCount(0);
+    }
+    await expect(breakpoints.getByRole("note")).toHaveText("This server cannot set code breakpoints on the ARM7.");
+    await expect(breakpoints.getByRole("textbox")).toHaveCount(0);
+    // the toolbars and the boxes are there, and say what they said
+    await expect(search).toHaveValue("arm7");
+    await expect(view.getByRole("textbox")).toHaveValue(listedFrom);
+    await expect(memory.getByRole("textbox")).toHaveValue("0x00200100");
+    for (const button of [tooltipButton(view, "Go to current PC"), tooltipButton(view, "Refresh"), tooltipButton(memory, "Refresh")]) {
+      await expect(button).toBeVisible();
+    }
+    await expect(panel(page, "watches").getByPlaceholder("Enter expression")).toBeVisible();
+    await saveScreenshot(page, testInfo, "m1-server-arm7-debugger-not-connected");
+  });
+});
+
 test.describe("a server without the ARM7", () => {
   test.use({ mockOptions: { supports: { targets: ["sh4", "dsp"] } } });
 

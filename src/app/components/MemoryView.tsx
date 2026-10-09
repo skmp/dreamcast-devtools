@@ -49,6 +49,8 @@ export interface MemoryViewProps {
   initialUrlAddress?: { address: number; fromUrl: boolean };
   /** The bytes are fetched again, without moving, whenever this changes (the target stopped). */
   refreshSignal?: unknown;
+  /** What is said in place of the bytes while the view is not `initialized` (default: "No Data"). */
+  noDataText?: string;
 }
 
 const clampAddress = (value: number, max: number, alignment = 1) => {
@@ -70,6 +72,7 @@ export const MemoryView = ({
   initialized,
   initialUrlAddress,
   refreshSignal,
+  noDataText = "No Data",
 }: MemoryViewProps) => {
   const addressMax = config.addressMax ?? 0xffffffff;
   /** the first address of the last row */
@@ -377,7 +380,7 @@ export const MemoryView = ({
         {!initialized ? (
           <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
             <Typography variant="body2" color="text.secondary">
-              No Data
+              {noDataText}
             </Typography>
           </Stack>
         ) : error ? (

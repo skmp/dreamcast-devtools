@@ -15,6 +15,8 @@ import {
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { useCapability } from "../../state/debuggerSelectors";
+import { NoData } from "../components/PanelNotice";
+import { UNUSABLE_SX } from "../components/unusable";
 import { CAPABILITIES, type DeviceNodeDescriptor } from "../../lib/debuggerSchema";
 
 const VALUE_TITLE = "Double-click to write the register";
@@ -263,6 +265,7 @@ const collectRegisterPaths = (nodes: DeviceNodeDescriptor[]): string[] => {
 const AddWatchForm = memo(() => {
   const deviceTree = useDebuggerDataStore((state) => state.deviceTree);
   const addWatch = useDebuggerDataStore((state) => state.addWatch);
+  const initialized = useDebuggerDataStore((state) => state.initialized);
   const [newWatch, setNewWatch] = useState("");
 
   // Collect all available register paths from device tree
@@ -270,12 +273,14 @@ const AddWatchForm = memo(() => {
 
   const handleAdd = useCallback(async () => {
     const trimmed = newWatch.trim();
-    if (!trimmed) {
+    // Without a server nothing can be watched. The box stays, with what is in it: it is there
+    // to be sent when the connection is back.
+    if (!trimmed || !initialized) {
       return;
     }
     await addWatch(trimmed);
     setNewWatch("");
-  }, [newWatch, addWatch]);
+  }, [newWatch, addWatch, initialized]);
 
   return (
     <Stack direction="row" spacing={1}>
@@ -306,7 +311,14 @@ const AddWatchForm = memo(() => {
           />
         )}
       />
-      <Button size="small" variant="contained" onClick={handleAdd} sx={{ minWidth: 85 }}>
+      {/* not `disabled` while it cannot be used: that would take the keyboard focus away from it */}
+      <Button
+        size="small"
+        variant="contained"
+        onClick={handleAdd}
+        aria-disabled={!initialized || undefined}
+        sx={[{ minWidth: 85 }, !initialized && UNUSABLE_SX]}
+      >
         Add Watch
       </Button>
     </Stack>
@@ -350,11 +362,7 @@ export const WatchesPanel = () => {
         <AddWatchForm />
       </Box>
       {!initialized ? (
-        <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%" }}>
-          <Typography variant="body2" color="text.secondary">
-            No Data
-          </Typography>
-        </Box>
+        <NoData />
       ) : watches.length === 0 ? (
         <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
           No watches subscribed.

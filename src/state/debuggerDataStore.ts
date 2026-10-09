@@ -49,6 +49,12 @@ interface DebuggerDataState extends LiveState {
   /** counts the connections that were initialised; what belongs to one connection is keyed on it */
   epoch: number;
   client?: DebuggerClient;
+  /**
+   * What the server that described itself last said: of the current connection once
+   * `initialized`, and of the one before while there is none or the next server has not
+   * answered yet. It is not data: the panels draw their frame from it (which controls a target
+   * has, how its addresses are written), and keep that frame while the connection is away.
+   */
   shape?: DebuggerShape;
   deviceTree: DeviceNodeDescriptor[];
   availableEvents: string[];
@@ -200,11 +206,11 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
     const mine = ++generation;
     cancelPendingDescribe();
     unsubscribe?.();
-    // nothing of an earlier connection is live any more: its registers and its callstack go too
+    // Nothing of an earlier connection is live any more: its registers and its callstack go too.
+    // What its server said about itself stays until this one has answered (`shape`).
     set({
       client,
       initialized: false,
-      shape: undefined,
       deviceTree: [],
       availableEvents: [],
       describeRetry: undefined,
@@ -293,12 +299,14 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
       cancelPendingDescribe();
       unsubscribe?.();
       unsubscribe = undefined;
-      // Without a connection nothing on screen is live: the panels say "No Data" instead of
-      // showing the last values as if they were.
+      // Without a connection nothing on screen is live: the panels say "Not connected" in
+      // place of their data instead of showing the last values as if they were. Only the data
+      // goes. What the server said about itself (`shape`) stays, so the panels keep their
+      // frame — the boxes, the toolbars, the notice of a target the server cannot step — and
+      // with it the keyboard focus, until the next server has described itself.
       set({
         client: undefined,
         initialized: false,
-        shape: undefined,
         deviceTree: [],
         availableEvents: [],
         initError: undefined,

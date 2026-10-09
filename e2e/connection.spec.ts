@@ -106,6 +106,11 @@ test("killing the server mid-session: nothing stays on screen as if it were live
   await tooltipButton(page, "Pause").click();
   await expect(panel(page, "sh4-callstack")).toContainText("_main_loop+0x");
   expect(rpc.requests("debugger.describe")).toHaveLength(1);
+  // something typed and not sent yet, in the boxes of two panels
+  const watchBox = panel(page, "watches").getByPlaceholder("Enter expression");
+  const breakpointBox = panel(page, "sh4-breakpoints").getByPlaceholder("Address (e.g., 0x8C0000A0)");
+  await watchBox.fill("dc.sh4.cpu.pr");
+  await breakpointBox.fill("0x8C0000A8");
 
   // --- the emulator dies ---
   diagnostics.allow(
@@ -124,14 +129,31 @@ test("killing the server mid-session: nothing stays on screen as if it were live
   // run control is disabled
   await expect(tooltipButton(page, "Pause")).toBeDisabled();
   await expect(tooltipButton(page, "Run")).toBeDisabled();
-  // the data of the lost connection is gone, the callstack with it: the panels say so
-  for (const id of ["device-tree", "sh4-callstack", "watches", "sh4-disassembly", "sh4-memory"]) {
-    await expect(panel(page, id), id).toContainText("No Data");
+  // the data of the lost connection is gone, the callstack with it: where it was, each panel says that there is no connection
+  for (const id of ["device-tree", "sh4-callstack", "watches", "sh4-disassembly", "sh4-memory", "sh4-breakpoints"]) {
+    await expect(panel(page, id), id).toContainText("Not connected");
+    await expect(panel(page, id), id).not.toContainText("No Data");
   }
   await expect(tree.getByText("SYSCLK = 200MHz")).toHaveCount(0);
   await expect(panel(page, "sh4-callstack").getByRole("listitem")).toHaveCount(0);
   await expect(panel(page, "watches")).not.toContainText("dc.sh4.cpu.pc =");
+  await expect(panel(page, "sh4-breakpoints")).not.toContainText("No breakpoints defined.");
   await expect(tooltipButton(panel(page, "sh4-disassembly"), "Step In")).toBeDisabled();
+  // Only the data: the boxes are there, with what was typed. Nothing can be added now, and
+  // trying leaves the text where it is.
+  await expect(watchBox).toHaveValue("dc.sh4.cpu.pr");
+  await expect(breakpointBox).toHaveValue("0x8C0000A8");
+  await watchBox.press("Enter");
+  await breakpointBox.press("Enter");
+  for (const button of [
+    panel(page, "watches").getByRole("button", { name: "Add Watch" }),
+    panel(page, "sh4-breakpoints").getByRole("button", { name: "Add", exact: true }),
+  ]) {
+    await expect(button).toHaveAttribute("aria-disabled", "true");
+    await button.click({ force: true });
+  }
+  await expect(watchBox).toHaveValue("dc.sh4.cpu.pr");
+  await expect(breakpointBox).toHaveValue("0x8C0000A8");
   await saveScreenshot(page, testInfo, "session-reconnecting");
 
   // with the server still down the attempts fail, and say so in words
@@ -158,6 +180,15 @@ test("killing the server mid-session: nothing stays on screen as if it were live
     // the views kept their place and show the new server's bytes
     await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
     await expect(panel(page, "sh4-disassembly").locator(".current-instruction")).toHaveCount(1);
+    // what was typed while the server was away is sent now
+    await expect(watchBox).toHaveValue("dc.sh4.cpu.pr");
+    await watchBox.press("Enter");
+    await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pr = 0x8C000");
+    await expect(watchBox).toHaveValue("");
+    await expect(breakpointBox).toHaveValue("0x8C0000A8");
+    await panel(page, "sh4-breakpoints").getByRole("button", { name: "Add", exact: true }).click();
+    await expect(panel(page, "sh4-breakpoints").getByRole("listitem")).toHaveText(/dc\.sh4\.cpu\.pc == 0x8C0000A8/);
+    await expect(breakpointBox).toHaveValue("");
   } finally {
     await restarted.stop();
   }
@@ -230,11 +261,11 @@ test("a connection the server closes is taken up again, and the server is descri
   await server.described();
   await expect(statusBar(page)).toContainText("Connection: connected");
   expect(server.requestsOf("debugger.describe")).toHaveLength(2);
-  // in between it said that it was reconnecting, and showed no data
+  // in between it said that it was reconnecting, and that there was no connection where the data had been
   // (textContent runs the cells of the status bar together: "Connection: connectedEndpoint: ws://...")
   const sequence = (await states()).map(({ text }) => /Connection: ([a-z]+)/.exec(text)?.[1]).filter(Boolean);
   expect(sequence.slice(-3)).toEqual(["connected", "reconnecting", "connected"]);
-  expect((await tree()).some(({ text }) => text.includes("No Data"))).toBe(true);
+  expect((await tree()).some(({ text }) => text.includes("Not connected"))).toBe(true);
   const lost = (await states()).find(({ text }) => text.includes("Connection: reconnecting"))!.at;
   const back = (await states()).findLast(({ text }) => text.includes("Connection: connected"))!.at;
   expect(back - lost).toBeGreaterThanOrEqual(900);
@@ -263,6 +294,12 @@ test("the keyboard focus is where it was when a lost connection is back", async 
     // cannot be used while the view reads, which it does when the connection is back
     ["Refresh of the disassembly", tooltipButton(view, "Refresh")],
     ["Refresh of the memory", tooltipButton(panel(page, "sh4-memory"), "Refresh")],
+    // the boxes of the panels, and the buttons next to them
+    ["the address box of the disassembly", view.getByRole("textbox")],
+    ["the address box of the memory", panel(page, "sh4-memory").getByRole("textbox")],
+    ["the expression box of the watches", panel(page, "watches").getByPlaceholder("Enter expression")],
+    ["Add Watch", panel(page, "watches").getByRole("button", { name: "Add Watch" })],
+    ["the address box of the breakpoints", panel(page, "sh4-breakpoints").getByPlaceholder("Address (e.g., 0x8C0000A0)")],
   ];
   let connections = 1;
   for (const [name, place] of places) {
@@ -292,7 +329,7 @@ test("the keyboard focus is where it was when a lost connection is back", async 
     });
   }
   // every time the tree had gone in between, with the data of the lost connection
-  const without = (await treeTexts()).filter(({ text }) => text.includes("No Data"));
+  const without = (await treeTexts()).filter(({ text }) => text.includes("Not connected"));
   expect(without.length).toBeGreaterThanOrEqual(places.length);
 });
 

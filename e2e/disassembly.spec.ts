@@ -517,6 +517,14 @@ test("a target is what debugger.describe says it is: where its views open and en
   await expect(memory.getByText("0xFFFFF0", { exact: true })).toBeVisible();
   expect(slices().at(-1)).toEqual({ target: "sh4", address: 0xfffc40, length: 960 });
   await expect(page.getByRole("alert")).toHaveCount(0);
+
+  // Without the connection the views are still that server's: the boxes say where the views
+  // are in its six digits, not in the eight this UI has built in.
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await expect(view).toContainText("Not connected");
+  await expect(memory).toContainText("Not connected");
+  await expect(box).toHaveValue("0xFFFFFC");
+  await expect(memory.getByRole("textbox")).toHaveValue("0xFFFCE0");
 });
 
 test("ticks do not make a disassembly view read again or move; a stop does both", async ({ page, rpc }) => {

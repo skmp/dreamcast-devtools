@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { Panel } from "../layout/Panel";
 import { Box, List, ListItem, Typography } from "@mui/material";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
+import { NoData } from "../components/PanelNotice";
 
 const severityColor: Record<string, string> = {
   trace: "text.disabled",
@@ -11,12 +12,15 @@ const severityColor: Record<string, string> = {
 };
 
 export const EventLogPanel = () => {
+  const initialized = useDebuggerDataStore((state) => state.initialized);
   const entries = useDebuggerDataStore((state) => state.eventLog);
   const rendered = useMemo(() => (Array.isArray(entries) ? entries.slice().reverse() : []), [entries]);
 
   return (
     <Panel>
-      {rendered.length === 0 ? (
+      {!initialized ? (
+        <NoData />
+      ) : rendered.length === 0 ? (
         <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
           No runtime events yet.
         </Typography>

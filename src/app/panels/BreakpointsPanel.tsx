@@ -24,7 +24,8 @@ import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { isCategoryActive, type BreakpointCategory } from "../../state/breakpointCategoryState";
 import { useCapability, useTarget } from "../../state/debuggerSelectors";
 import { breakpointCategory, describeBreakpoint, parseAddress } from "../../state/targets";
-import { PanelNotice } from "../components/PanelNotice";
+import { NoData, PanelNotice } from "../components/PanelNotice";
+import { UNUSABLE_SX } from "../components/unusable";
 import { useCallback, useMemo, useState } from "react";
 import { CAPABILITIES, type BreakpointDescriptor, type TargetProcessor } from "../../lib/debuggerSchema";
 
@@ -60,6 +61,57 @@ const CategoryControls = ({
   );
 };
 
+interface BreakpointRowProps {
+  breakpoint: BreakpointDescriptor;
+  /** the breakpoint as the list prints it */
+  text: string;
+  /** its category is muted, or another one is soloed */
+  dimmed?: boolean;
+  onRemove: (id: number) => Promise<void>;
+  onToggle: (id: number, enabled: boolean) => Promise<void>;
+}
+
+const BreakpointRow = ({ breakpoint, text, dimmed = false, onRemove, onToggle }: BreakpointRowProps) => {
+  return (
+    <ListItem
+      sx={dimmed ? { opacity: 0.4 } : undefined}
+      secondaryAction={
+        <Tooltip title="Remove breakpoint">
+          <IconButton
+            edge="end"
+            size="small"
+            onClick={() => {
+              void onRemove(breakpoint.id);
+            }}
+          >
+            <DeleteOutlineIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      }
+    >
+      <ListItemText
+        primary={
+          <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
+            {text}
+          </Typography>
+        }
+        secondary={
+          <Typography variant="caption" color="text.secondary" sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+            <Chip label={breakpoint.kind} size="small" color="primary" variant="outlined" />
+            <Switch
+              size="small"
+              checked={breakpoint.enabled}
+              onChange={(e) => {
+                void onToggle(breakpoint.id, e.target.checked);
+              }}
+            />
+          </Typography>
+        }
+      />
+    </ListItem>
+  );
+};
+
 const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
   const addMode = mode;
   const showCategoryControls = mode === "event";
@@ -87,10 +139,11 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
   const formatBreakpointDisplay = useCallback((bp: BreakpointDescriptor) => describeBreakpoint(shape, bp), [shape]);
   const categorizeBreakpoint = useCallback((bp: BreakpointDescriptor) => breakpointCategory(shape, bp), [shape]);
 
-  // what the server cannot do is said, in place of the box that would ask for it
-  const unsupported = !initialized
-    ? undefined
-    : mode === "event"
+  // What the server cannot do is said, in place of the box that would ask for it. It is the
+  // server's to say, so it stays said while the connection is away (a page that has not had a
+  // server yet has every target, and the box).
+  const unsupported =
+    mode === "event"
       ? eventBreakpoints
         ? undefined
         : "This server has no event breakpoints."
@@ -130,7 +183,9 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
 
   const handleAdd = useCallback(async () => {
     const trimmed = newBreakpoint.trim();
-    if (!trimmed) {
+    // Without a server there is nothing to add to. The box stays, with what is in it: it is
+    // there to be sent when the connection is back.
+    if (!trimmed || !initialized) {
       return;
     }
 
@@ -156,7 +211,7 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
 
     await addBreakpoint(event, address, kind);
     setNewBreakpoint("");
-  }, [newBreakpoint, addBreakpoint, addMode, target]);
+  }, [newBreakpoint, addBreakpoint, addMode, target, initialized]);
 
   const placeholder =
     addMode === "event"
@@ -235,12 +290,15 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
               sx={{ "& .MuiOutlinedInput-root": { fontSize: "0.875rem", fontFamily: "monospace" } }}
             />
           )}
+          {/* without a connection it cannot be used, and is not `disabled`: that would take the keyboard focus away from it */}
           <Button
             size="small"
             variant="contained"
             startIcon={<AddIcon />}
             onClick={() => void handleAdd()}
             disabled={!newBreakpoint.trim()}
+            aria-disabled={!initialized || undefined}
+            sx={[!initialized && UNUSABLE_SX]}
           >
             Add
           </Button>
@@ -248,7 +306,10 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
       </Box>
       )}
 
-      {showCategoryControls ? (
+      {!initialized ? (
+        // the breakpoints are the server's: without a connection there is no list
+        <NoData />
+      ) : showCategoryControls ? (
         // Show grouped view with category controls
         <Box sx={{ overflowY: "auto", flex: 1 }}>
           {(["sh4", "arm7", "dsp", "events"] as BreakpointCategory[]).map((category) => {
@@ -284,43 +345,14 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
                 </Box>
                 <List dense disablePadding>
                   {categoryBps.map((bp: BreakpointDescriptor) => (
-                    <ListItem
+                    <BreakpointRow
                       key={bp.id}
-                      sx={{ opacity: isActive ? 1 : 0.4 }}
-                      secondaryAction={
-                        <Tooltip title="Remove breakpoint">
-                          <IconButton
-                            edge="end"
-                            size="small"
-                            onClick={() => {
-                              void handleRemove(bp.id);
-                            }}
-                          >
-                            <DeleteOutlineIcon fontSize="small" />
-                          </IconButton>
-                        </Tooltip>
-                      }
-                    >
-                      <ListItemText
-                        primary={
-                          <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
-                            {formatBreakpointDisplay(bp)}
-                          </Typography>
-                        }
-                        secondary={
-                          <Typography variant="caption" color="text.secondary" sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                            <Chip label={bp.kind} size="small" color="primary" variant="outlined" />
-                            <Switch
-                              size="small"
-                              checked={bp.enabled}
-                              onChange={(e) => {
-                                void handleToggle(bp.id, e.target.checked);
-                              }}
-                            />
-                          </Typography>
-                        }
-                      />
-                    </ListItem>
+                      breakpoint={bp}
+                      text={formatBreakpointDisplay(bp)}
+                      dimmed={!isActive}
+                      onRemove={handleRemove}
+                      onToggle={handleToggle}
+                    />
                   ))}
                 </List>
               </Box>
@@ -342,42 +374,13 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
           ) : (
             <List dense disablePadding sx={{ overflowY: "auto", flex: 1 }}>
               {filteredBreakpoints.map((bp) => (
-                <ListItem
+                <BreakpointRow
                   key={bp.id}
-                  secondaryAction={
-                    <Tooltip title="Remove breakpoint">
-                      <IconButton
-                        edge="end"
-                        size="small"
-                        onClick={() => {
-                          void handleRemove(bp.id);
-                        }}
-                      >
-                        <DeleteOutlineIcon fontSize="small" />
-                      </IconButton>
-                    </Tooltip>
-                  }
-                >
-                  <ListItemText
-                    primary={
-                      <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
-                        {formatBreakpointDisplay(bp)}
-                      </Typography>
-                    }
-                    secondary={
-                      <Typography variant="caption" color="text.secondary" sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                        <Chip label={bp.kind} size="small" color="primary" variant="outlined" />
-                        <Switch
-                          size="small"
-                          checked={bp.enabled}
-                          onChange={(e) => {
-                            void handleToggle(bp.id, e.target.checked);
-                          }}
-                        />
-                      </Typography>
-                    }
-                  />
-                </ListItem>
+                  breakpoint={bp}
+                  text={formatBreakpointDisplay(bp)}
+                  onRemove={handleRemove}
+                  onToggle={handleToggle}
+                />
               ))}
             </List>
           )}
