@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useId, useMemo, useRef, useState } from "react";
 import { Panel } from "../layout/Panel";
 import {
   Autocomplete,
@@ -15,6 +15,7 @@ import {
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { useCapability } from "../../state/debuggerSelectors";
+import { ListFocusKeeper } from "../components/ListFocusKeeper";
 import { NoData } from "../components/PanelNotice";
 import { UNUSABLE_SX } from "../components/unusable";
 import { CAPABILITIES, type DeviceNodeDescriptor } from "../../lib/debuggerSchema";
@@ -23,9 +24,11 @@ const VALUE_TITLE = "Double-click to write the register";
 const READ_ONLY_TITLE = "Read-only: this server cannot write registers";
 
 // Component for individual watch item with inline editing
-const WatchItem = ({ expression, value, writable, onRemove, onEdit, onModifyExpression }: {
+const WatchItem = ({ expression, value, writable, focusKey, onRemove, onEdit, onModifyExpression }: {
   expression: string;
   value: unknown;
+  /** names the Remove button of this watch for the keyboard focus (see ListFocusKeeper) */
+  focusKey: string;
   /** false: the server has no register writes, and the value cannot be edited */
   writable: boolean;
   onRemove: () => void;
@@ -110,6 +113,7 @@ const WatchItem = ({ expression, value, writable, onRemove, onEdit, onModifyExpr
           edge="end"
           size="small"
           aria-label={`Remove ${expression}`}
+          data-focus-key={focusKey}
           onClick={onRemove}
         >
           <DeleteOutlineIcon fontSize="small" />
@@ -334,6 +338,8 @@ export const WatchesPanel = () => {
   const modifyWatchExpression = useDebuggerDataStore((state) => state.modifyWatchExpression);
   // state.editWatch is a register write: a server without them (milestone M1) refuses it
   const writable = useCapability(CAPABILITIES.REGISTER_WRITE);
+  const scope = useId();
+  const lostFocus = useRef<string | undefined>(undefined);
 
   const handleRemove = useCallback(
     async (watchId: number) => {
@@ -361,6 +367,7 @@ export const WatchesPanel = () => {
       <Box sx={{ p: 1.5, borderBottom: "1px solid", borderColor: "divider" }}>
         <AddWatchForm />
       </Box>
+      {initialized && <ListFocusKeeper scope={scope} lost={lostFocus} />}
       {!initialized ? (
         <NoData />
       ) : watches.length === 0 ? (
@@ -375,6 +382,8 @@ export const WatchesPanel = () => {
               expression={watch.expression}
               value={watch.value}
               writable={writable}
+              // the expression, not the id: it is what the user sees, and it is the same watch after the server was restarted
+              focusKey={`${scope}:${watch.expression}:remove`}
               onRemove={() => void handleRemove(watch.id)}
               onEdit={(newValue) => handleEdit(watch.id, newValue)}
               onModifyExpression={(newExpression) => handleModifyExpression(watch.id, newExpression)}

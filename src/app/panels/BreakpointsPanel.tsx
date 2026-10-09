@@ -24,9 +24,10 @@ import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { isCategoryActive, type BreakpointCategory } from "../../state/breakpointCategoryState";
 import { useCapability, useTarget } from "../../state/debuggerSelectors";
 import { breakpointCategory, describeBreakpoint, parseAddress } from "../../state/targets";
+import { ListFocusKeeper } from "../components/ListFocusKeeper";
 import { NoData, PanelNotice } from "../components/PanelNotice";
 import { UNUSABLE_SX } from "../components/unusable";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useId, useMemo, useRef, useState } from "react";
 import { CAPABILITIES, type BreakpointDescriptor, type TargetProcessor } from "../../lib/debuggerSchema";
 
 interface BreakpointsViewProps {
@@ -67,11 +68,17 @@ interface BreakpointRowProps {
   text: string;
   /** its category is muted, or another one is soloed */
   dimmed?: boolean;
+  /** of the panel: what the names of the row's controls start with (see ListFocusKeeper) */
+  scope: string;
   onRemove: (id: number) => Promise<void>;
   onToggle: (id: number, enabled: boolean) => Promise<void>;
 }
 
-const BreakpointRow = ({ breakpoint, text, dimmed = false, onRemove, onToggle }: BreakpointRowProps) => {
+const BreakpointRow = ({ breakpoint, text, dimmed = false, scope, onRemove, onToggle }: BreakpointRowProps) => {
+  // What the keyboard focus knows the row's controls by: the breakpoint, by its id and what it
+  // is of. The server keeps its breakpoints over a reconnect; one that was started again counts
+  // its ids from 1, and the same id is then the same control only if it is of the same thing.
+  const focusKey = `${scope}:${breakpoint.id}:${breakpoint.kind}:${breakpoint.event}:${breakpoint.address ?? ""}`;
   return (
     <ListItem
       sx={dimmed ? { opacity: 0.4 } : undefined}
@@ -80,6 +87,7 @@ const BreakpointRow = ({ breakpoint, text, dimmed = false, onRemove, onToggle }:
           <IconButton
             edge="end"
             size="small"
+            data-focus-key={`${focusKey}:remove`}
             onClick={() => {
               void onRemove(breakpoint.id);
             }}
@@ -98,13 +106,15 @@ const BreakpointRow = ({ breakpoint, text, dimmed = false, onRemove, onToggle }:
         secondary={
           <Typography variant="caption" color="text.secondary" sx={{ display: "flex", gap: 1, alignItems: "center" }}>
             <Chip label={breakpoint.kind} size="small" color="primary" variant="outlined" />
-            <Switch
-              size="small"
-              checked={breakpoint.enabled}
-              onChange={(e) => {
-                void onToggle(breakpoint.id, e.target.checked);
-              }}
-            />
+            <span data-focus-key={`${focusKey}:enabled`}>
+              <Switch
+                size="small"
+                checked={breakpoint.enabled}
+                onChange={(e) => {
+                  void onToggle(breakpoint.id, e.target.checked);
+                }}
+              />
+            </span>
           </Typography>
         }
       />
@@ -130,6 +140,8 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
   const target = useTarget(mode === "event" ? "sh4" : mode);
   const eventBreakpoints = useCapability(CAPABILITIES.EVENT_BREAKPOINTS);
   const [newBreakpoint, setNewBreakpoint] = useState("");
+  const scope = useId();
+  const lostFocus = useRef<string | undefined>(undefined);
 
   // the panel of a target lists the code breakpoints of that target
   const filteredBreakpoints = useMemo(
@@ -306,6 +318,7 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
       </Box>
       )}
 
+      {initialized && <ListFocusKeeper scope={scope} lost={lostFocus} />}
       {!initialized ? (
         // the breakpoints are the server's: without a connection there is no list
         <NoData />
@@ -350,6 +363,7 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
                       breakpoint={bp}
                       text={formatBreakpointDisplay(bp)}
                       dimmed={!isActive}
+                      scope={scope}
                       onRemove={handleRemove}
                       onToggle={handleToggle}
                     />
@@ -378,6 +392,7 @@ const BreakpointsView = ({ mode }: BreakpointsViewProps) => {
                   key={bp.id}
                   breakpoint={bp}
                   text={formatBreakpointDisplay(bp)}
+                  scope={scope}
                   onRemove={handleRemove}
                   onToggle={handleToggle}
                 />

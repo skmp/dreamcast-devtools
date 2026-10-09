@@ -276,6 +276,9 @@ test("a connection the server closes is taken up again, and the server is descri
 test("the keyboard focus is where it was when a lost connection is back", async ({ page }) => {
   // the scripted server is paused, so Run and the step buttons can be used
   const server = await serveScriptedDebugger(page);
+  // the server has a breakpoint and a watch, and keeps them over a reconnect, as servers do
+  server.state.breakpoints = { "1": { id: 1, event: "dc.sh4.cpu.pc", address: 0x8c001004, kind: "code", enabled: true } };
+  server.state.watches = [{ id: 1, expression: "dc.sh4.cpu.pc", value: "0x8C001000" }];
   const treeTexts = await recordText(page, '[data-panel-id="device-tree"]');
   await gotoRoute(page, "/workspace/sh4-debugger");
   await expect(statusBar(page)).toContainText("Connection: connected");
@@ -283,6 +286,8 @@ test("the keyboard focus is where it was when a lost connection is back", async 
   const view = panel(page, "sh4-disassembly");
   await expect(view.locator(".current-instruction")).toHaveCount(1);
   const search = panel(page, "device-tree").getByPlaceholder("Search components...");
+  const breakpoint = panel(page, "sh4-breakpoints").getByRole("listitem");
+  await expect(breakpoint).toHaveText(/dc\.sh4\.cpu\.pc == 0x8C001004/);
 
   const places: Array<[string, Locator]> = [
     ["the search box of the device tree", search],
@@ -300,6 +305,11 @@ test("the keyboard focus is where it was when a lost connection is back", async 
     ["the expression box of the watches", panel(page, "watches").getByPlaceholder("Enter expression")],
     ["Add Watch", panel(page, "watches").getByRole("button", { name: "Add Watch" })],
     ["the address box of the breakpoints", panel(page, "sh4-breakpoints").getByPlaceholder("Address (e.g., 0x8C0000A0)")],
+    // The rows of the lists are the server's: they go with the connection and are back with
+    // it. A control in a row that had the focus has it again.
+    ["the enable switch of a breakpoint", breakpoint.getByRole("switch")],
+    ["Remove of a breakpoint", tooltipButton(breakpoint, "Remove breakpoint")],
+    ["Remove of a watch", panel(page, "watches").getByRole("button", { name: "Remove dc.sh4.cpu.pc" })],
   ];
   let connections = 1;
   for (const [name, place] of places) {
