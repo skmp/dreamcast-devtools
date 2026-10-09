@@ -525,11 +525,12 @@ describe("the contract runner against the mock", () => {
   it("S07: VBR is read at a stop the target has run up to, not where the run found it", async () => {
     // a program that installs its vector base when it starts: at the StartPaused stop VBR is still 0
     const mock = new MockDebugger({ startPaused: true });
-    const machine = mock as unknown as { values: Map<string, Map<string, unknown>>; emulationStep(): void };
+    const machine = mock as unknown as { values: Map<string, Map<string, unknown>>; emulationStep(): void; running: boolean };
     machine.values.get("dc.sh4.cpu")!.set("VBR", 0);
     const step = machine.emulationStep.bind(mock);
     machine.emulationStep = () => {
-      machine.values.get("dc.sh4.cpu")!.set("VBR", 0x8c000000);
+      // (the timer of the machine goes on while it is parked: the program sets VBR when it runs)
+      if (machine.running) machine.values.get("dc.sh4.cpu")!.set("VBR", 0x8c000000);
       step();
     };
     const added: number[] = [];
@@ -542,11 +543,15 @@ describe("the contract runner against the mock", () => {
       },
       mock,
     );
-    const found = (await stateOf(url)).registers as Record<string, Array<{ name: string; value: string }>>;
-    expect(found["dc.sh4.cpu"].find((register) => register.name === "VBR")!.value).toBe("0x00000000");
+    const vbr = async () => ((await stateOf(url)).registers as Record<string, Array<{ name: string; value: string }>>)["dc.sh4.cpu"].find((register) => register.name === "VBR")!.value;
+    // (the machine has been at its start stop for a while: several of its frames long)
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await vbr()).toBe("0x00000000");
     const summary = await runContract({ url, profile: "mock", only: new Set(["S07"]) });
     expect(reportOf(summary)).toEqual(["S07 passed "]);
+    // the one breakpoint that is added with its kind: at the interrupt entry the program has installed by then
     expect(added).toEqual([0x8c000600]);
+    expect(await vbr()).toBe("0x8C000000");
   }, 90_000);
 
   it("S07: a program that takes no interrupt makes the scenario partial, which fails a gate and is no failure otherwise", async () => {
