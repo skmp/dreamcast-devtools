@@ -5,6 +5,7 @@ import {
   breakpointGutter,
   disassemblyRow,
   disassemblyRows,
+  dockTab,
   gotoRoute,
   openWorkspace,
   panel,
@@ -74,7 +75,7 @@ test.describe("a server of milestone M1", () => {
     expect(rpc.received.filter((frame) => JSON.stringify(frame).includes("-32004"))).toEqual([]);
   });
 
-  test("the DSP is listed, and the SGC capture is not asked for", async ({ page, rpc }, testInfo) => {
+  test("the DSP is listed, and the SGC capture is not asked for", async ({ page, rpc, mock, diagnostics }, testInfo) => {
     await openWorkspace(page, "audio-debugger");
     await pauseFromToolbar(page);
     const view = panel(page, "dsp-disassembly");
@@ -93,6 +94,16 @@ test.describe("a server of milestone M1", () => {
     expect(rpc.requests("state.getSgcFrameData")).toEqual([]);
     expect(rpc.requests("state.recordSgcFrames")).toEqual([]);
     expect(rpc.received.filter((frame) => JSON.stringify(frame).includes("-32004"))).toEqual([]);
+
+    // it is this server that cannot: that stays said while its connection is away
+    diagnostics.allow(/^console\.error: WebSocket connection to/, "the server is down on purpose");
+    await mock.stop();
+    await expect(statusBar(page)).toContainText("Connection: reconnecting");
+    await expect(view).toContainText("Not connected");
+    await expect(sgc.getByRole("note")).toHaveText("This server cannot capture SGC frames.");
+    await expect(sgc.getByRole("button")).toHaveCount(0);
+    await expect(view.getByRole("note")).toHaveText("This server cannot step the DSP or set code breakpoints on it.");
+    await expect(panel(page, "dsp-breakpoints").getByRole("note")).toHaveText("This server cannot set code breakpoints on the DSP.");
   });
 
   test("no register writes: the value of a watch is not an editor", async ({ page, rpc }) => {
@@ -167,7 +178,7 @@ test.describe("a server of milestone M1, when its connection is lost", () => {
 test.describe("a server without the ARM7", () => {
   test.use({ mockOptions: { supports: { targets: ["sh4", "dsp"] } } });
 
-  test("every ARM7 panel says so, and asks the server for nothing", async ({ page, rpc }, testInfo) => {
+  test("every ARM7 panel says so, and asks the server for nothing", async ({ page, rpc, mock, diagnostics }, testInfo) => {
     await openWorkspace(page, "arm7-debugger");
     for (const id of ["arm7-disassembly", "arm7-memory", "arm7-breakpoints", "arm7-callstack"]) {
       await expect(panel(page, id).getByRole("note"), id).toHaveText("This server does not support the ARM7 target.");
@@ -187,13 +198,26 @@ test.describe("a server without the ARM7", () => {
     // the SH4 panels, opened in the same workspace, work
     await treeItemRow(page, "dc.sh4.cpu").getByLabel("Open SH4: Disassembly").click();
     await expect(panel(page, "sh4-disassembly").locator(".current-instruction")).toHaveCount(1);
+
+    // it is this server that has no ARM7: its panels go on saying so while the connection is away
+    diagnostics.allow(/^console\.error: WebSocket connection to/, "the server is down on purpose");
+    await mock.stop();
+    await expect(statusBar(page)).toContainText("Connection: reconnecting");
+    await expect(panel(page, "sh4-disassembly")).toContainText("Not connected");
+    for (const id of ["arm7-memory", "arm7-breakpoints", "arm7-callstack"]) {
+      await expect(panel(page, id).getByRole("note"), id).toHaveText("This server does not support the ARM7 target.");
+      await expect(panel(page, id).getByRole("textbox"), id).toHaveCount(0);
+    }
+    await dockTab(page, "ARM7: Disassembly").click();
+    await expect(panel(page, "arm7-disassembly").getByRole("note")).toHaveText("This server does not support the ARM7 target.");
+    await expect(panel(page, "arm7-disassembly").getByRole("button")).toHaveCount(0);
   });
 });
 
 test.describe("a server without event breakpoints and without a callstack", () => {
   test.use({ mockOptions: { supports: { capabilities: ["register-write", "sgc-capture"] } } });
 
-  test("the event box and the frames give way to notices; code breakpoints are listed as ever", async ({ page }) => {
+  test("the event box and the frames give way to notices; code breakpoints are listed as ever", async ({ page, mock, diagnostics }) => {
     await openWorkspace(page, "sh4-debugger");
     await pauseFromToolbar(page);
     await addPanelFromSelector(page, 3, "Events: Breakpoints");
@@ -210,6 +234,16 @@ test.describe("a server without event breakpoints and without a callstack", () =
 
     await expect(panel(page, "sh4-callstack").getByRole("note")).toHaveText("This server has no callstack.");
     await expect(panel(page, "sh4-callstack").getByRole("listitem")).toHaveCount(0);
+
+    // both notices are this server's, and stay while its connection is away
+    diagnostics.allow(/^console\.error: WebSocket connection to/, "the server is down on purpose");
+    await mock.stop();
+    await expect(statusBar(page)).toContainText("Connection: reconnecting");
+    await expect(events).toContainText("Not connected");
+    await expect(events.getByRole("note")).toHaveText("This server has no event breakpoints.");
+    await expect(events.getByRole("combobox")).toHaveCount(0);
+    await expect(panel(page, "sh4-callstack").getByRole("note")).toHaveText("This server has no callstack.");
+    await expect(panel(page, "sh4-callstack")).not.toContainText("Not connected");
   });
 });
 
