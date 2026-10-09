@@ -298,6 +298,8 @@ export const checkResponseEnvelope = (frame: Record<string, unknown>): string[] 
       }
       if (!Number.isInteger(error.code) || typeof error.message !== "string") {
         violations.push("3.5: error.code is an integer and error.message a string");
+      } else if (error.message.length === 0) {
+        violations.push(`3.5: the error ${String(error.code)} has an empty message; error.message is a non-empty string`);
       }
       if (frame.id === null && error.code !== -32700 && error.code !== -32600) {
         violations.push(`3.0: id null in a response with code ${String(error.code)}`);

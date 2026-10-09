@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import type { z } from "zod";
 import {
   ConformanceSchemas,
-  DEBUGGER_ERROR_MESSAGES,
   DebuggerErrorCode,
   DebuggerRpcMethodSchemas,
   IN_BAND_ERROR_METHODS,
@@ -54,12 +53,16 @@ describe("protocol constants", () => {
     }
   });
 
-  it("has a message for every error code", () => {
-    for (const code of Object.values(DebuggerErrorCode)) {
-      expect(DEBUGGER_ERROR_MESSAGES[code], String(code)).toBeInstanceOf(RegExp);
-    }
-    expect(DEBUGGER_ERROR_MESSAGES[DebuggerErrorCode.NOT_SUPPORTED].test("not supported: control.reset")).toBe(true);
-    expect(DEBUGGER_ERROR_MESSAGES[DebuggerErrorCode.NOT_PAUSED].test("Not paused")).toBe(false);
+  it("has one number per error code, and the strict copy asks an in-band error for a message that is not empty", () => {
+    const codes = Object.values(DebuggerErrorCode);
+    expect(new Set(codes).size).toBe(codes.length);
+    expect(codes.every((code) => Number.isInteger(code) && code <= -32000 && code >= -32700)).toBe(true);
+    // the code is the contract; the wording of the message is the server's
+    const inBand = StrictDebuggerRpcMethodSchemas[RpcMethod.CONTROL_STEP].result;
+    expect(inBand.safeParse({ error: { code: DebuggerErrorCode.NOT_PAUSED, message: "Not paused" } }).success).toBe(true);
+    expect(inBand.safeParse({ error: { code: DebuggerErrorCode.NOT_PAUSED, message: "the target runs" } }).success).toBe(true);
+    expect(issuePaths(inBand.safeParse({ error: { code: DebuggerErrorCode.NOT_PAUSED, message: "" } }))).toEqual(["error.message"]);
+    expect(DebuggerRpcMethodSchemas[RpcMethod.CONTROL_STEP].result.safeParse({ error: { code: DebuggerErrorCode.NOT_PAUSED, message: "" } }).success).toBe(true);
   });
 
   it("recognises the panel ids", () => {

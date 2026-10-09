@@ -190,6 +190,16 @@ const inBand = (request: Json, code: number, message: string): Json => ({ jsonrp
 const rpcError = (request: Json, code: number, message: string): Json => ({ jsonrpc: "2.0", id: request.id, error: { code, message } });
 const paramsOf = (request: Json): Json => (request.params ?? {}) as Json;
 
+/** A frame of the server with the message of every error it carries, on either channel, replaced by `text(code, message)`. */
+const worded = (frame: Json, text: (code: number, message: string) => string): Json => {
+  const reword = (error: Json) => ({ ...error, message: text(error.code as number, error.message as string) });
+  if (frame.error) {
+    return { ...frame, error: reword(frame.error as Json) };
+  }
+  const inBandError = (frame.result as Json | undefined)?.error as Json | undefined;
+  return inBandError && typeof inBandError === "object" ? { ...frame, result: { ...(frame.result as Json), error: reword(inBandError) } } : frame;
+};
+
 const statusOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.status;
 const detailsOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.details.join("\n") ?? "";
 
@@ -1626,7 +1636,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(summary, "S09")).toMatch(/lists unreadable undefined, expected \[\[16,16\]\]/);
   });
 
-  it("S12: an error with a data member, an error on the wrong channel, a wrong message", async () => {
+  it("S12: an error with a data member, an error on the wrong channel, an error without a message", async () => {
     const withData = await run(
       {
         toClient: (frame) => (frame.error ? { ...frame, error: { ...(frame.error as Json), data: { stack: "at dispatch" } } } : frame),
@@ -1648,15 +1658,27 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(wrongChannel, "S12")).toBe("failed");
     expect(detailsOf(wrongChannel, "S12")).toMatch(/control\.step \{"target":4\}: the error -32602 came as a JSON-RPC error, this method reports failures in-band/);
 
-    const wrongMessage = await run(
-      {
-        toClient: (frame) => ((frame.error as Json | undefined)?.code === -32601 ? { ...frame, error: { code: -32601, message: "Unhandled JSON-RPC method" } } : frame),
-      },
-      ["S12"],
-    );
-    expect(statusOf(wrongMessage, "S12")).toBe("failed");
-    expect(detailsOf(wrongMessage, "S12")).toMatch(/the message of -32601 is .*got "Unhandled JSON-RPC method"/);
-  });
+    // a message has to be there: on either channel, and in the answer to a frame that is no request
+    const emptied = (code: number): Faults => ({ toClient: (frame) => worded(frame, (sent, text) => (sent === code ? "" : text)) });
+    const noMessage = await run(emptied(-32601), ["S12"]);
+    expect(statusOf(noMessage, "S12")).toBe("failed");
+    expect(detailsOf(noMessage, "S12")).toMatch(/^no\.such\.method \{\}: the error -32601 has no message; error\.message is a non-empty string$/m);
+    expect(noMessage.invariantViolations.join("\n")).toMatch(/3\.5: the error -32601 has an empty message; error\.message is a non-empty string/);
+    const noInBandMessage = await run(emptied(-32003), ["S12"]);
+    expect(statusOf(noInBandMessage, "S12")).toBe("failed");
+    expect(noInBandMessage.invariantViolations.join("\n")).toMatch(/I1: Response validation failed for control\.step: error\.message: /);
+    const noParseMessage = await run(emptied(-32700), ["S12"]);
+    expect(detailsOf(noParseMessage, "S12")).toMatch(/^the answer to malformed JSON is \{"jsonrpc":"2\.0","id":null,"error":\{"code":-32700,"message":""\}\}, expected /);
+  }, 30_000);
+
+  it("the wording of error messages is the server's: a server that words every one of them differently passes", async () => {
+    // "Invalid params", as JSON-RPC libraries write it, and a text of its own for everything else
+    const summary = await run({ toClient: (frame) => worded(frame, (code) => (code === -32602 ? "Invalid params" : `the request failed (${-code})`)) });
+    expect(reportOf(summary).filter((line) => !/ (passed|not-applicable|partial) /.test(line))).toEqual([]);
+    expect(statusesOf(summary)).toEqual(MOCK_STATUSES);
+    expect(summary.invariantViolations).toEqual([]);
+    expect(summary.ok).toBe(true);
+  }, 180_000);
 
   it("S12: a server without register-write that answers {} to state.editWatch", async () => {
     const summary = await run(
@@ -1677,7 +1699,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
     expect(statusOf(batch, "S12")).toBe("failed");
     expect(detailsOf(batch, "S12")).toBe(
-      'a batch (a JSON array of requests) is answered with [{"jsonrpc":"2.0","id":1,"result":{}}], expected the JSON-RPC error -32600 "invalid request"',
+      'a batch (a JSON array of requests) is answered with [{"jsonrpc":"2.0","id":1,"result":{}}], expected the JSON-RPC error -32600 with a message, and nothing else',
     );
 
     // each of the frames that is no request of this protocol, lost without an answer
@@ -1698,7 +1720,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       ["S12"],
     );
     expect(detailsOf(lenient, "S12")).toBe(
-      'a request whose id is a string is answered with {"jsonrpc":"2.0","id":"1","result":{}}, expected the JSON-RPC error -32600 "invalid request"',
+      'a request whose id is a string is answered with {"jsonrpc":"2.0","id":"1","result":{}}, expected the JSON-RPC error -32600 with a message, and nothing else',
     );
   }, 30_000);
 

@@ -1,7 +1,7 @@
 import { request as httpRequest } from "node:http";
 import WebSocket from "ws";
 import { BINARY_FRAME_HEADER_BYTES, BinaryFrameKind, SGC_BYTES_PER_FRAME, parseBinaryFrame } from "../../src/lib/binaryFrame";
-import { CAPABILITIES, DEBUGGER_ERROR_MESSAGES, PROTOCOL_BOUNDS, PanelIdSchema, TABLE_IDS } from "../../src/lib/debuggerSchema";
+import { CAPABILITIES, PROTOCOL_BOUNDS, PanelIdSchema, TABLE_IDS } from "../../src/lib/debuggerSchema";
 import type {
   BreakpointCategoryState,
   BreakpointDescriptor,
@@ -1349,6 +1349,32 @@ const rawExchange = (url: string, text: string, timeoutMs: number, what: string)
     });
   });
 
+/**
+ * Whether `text` is a JSON-RPC error response with `code`: the keys jsonrpc, id and error, and
+ * an error of `code` and a message that is not empty (its wording is the server's, design 3.5).
+ */
+const isErrorAnswer = (text: string, code: number): boolean => {
+  let reply: unknown;
+  try {
+    reply = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  if (typeof reply !== "object" || reply === null || Array.isArray(reply)) {
+    return false;
+  }
+  const { jsonrpc, error, ...rest } = reply as Record<string, unknown>;
+  const { code: sent, message, ...more } = (typeof error === "object" && error !== null ? error : {}) as Record<string, unknown>;
+  return (
+    jsonrpc === "2.0" &&
+    sent === code &&
+    typeof message === "string" &&
+    message.length > 0 &&
+    Object.keys(more).length === 0 &&
+    Object.keys(rest).every((key) => key === "id")
+  );
+};
+
 const s12: Scenario = {
   id: "S12",
   title: "errors",
@@ -1421,18 +1447,11 @@ const s12: Scenario = {
       await unwatch(context, id);
     }
 
-    // malformed JSON: -32700 with id null, and nothing else in the answer
+    // malformed JSON: -32700 with id null, a message, and nothing else in the answer
     const answer = await rawExchange(context.url, "{nope", session.scale(2000), "malformed JSON");
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(answer);
-    } catch {
-      fail(`the answer to malformed JSON is not JSON: ${answer.slice(0, 120)}`);
-    }
-    const expected = { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } };
     check(
-      JSON.stringify(sortKeys(parsed)) === JSON.stringify(sortKeys(expected)),
-      `the answer to malformed JSON is ${answer.slice(0, 200)}, expected ${JSON.stringify(expected)}`,
+      isErrorAnswer(answer, -32700) && JSON.parse(answer).id === null,
+      `the answer to malformed JSON is ${answer.slice(0, 200)}, expected {"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"..."}}`,
     );
 
     // What is JSON and not a request object of this protocol: -32600. There are no batches (a
@@ -1448,22 +1467,7 @@ const s12: Scenario = {
     ];
     for (const [what, frame] of invalid) {
       const text = await rawExchange(context.url, JSON.stringify(frame), session.scale(2000), what);
-      let reply: unknown;
-      try {
-        reply = JSON.parse(text);
-      } catch {
-        fail(`the answer to ${what} is not JSON: ${text.slice(0, 120)}`);
-      }
-      const { jsonrpc, error, ...rest } = (typeof reply === "object" && reply !== null && !Array.isArray(reply) ? reply : {}) as Record<string, unknown>;
-      const { code, message, ...more } = (typeof error === "object" && error !== null ? error : {}) as Record<string, unknown>;
-      check(
-        jsonrpc === "2.0" && code === -32600 && typeof message === "string" && DEBUGGER_ERROR_MESSAGES[-32600].test(message),
-        `${what} is answered with ${text.slice(0, 200)}, expected the JSON-RPC error -32600 "invalid request"`,
-      );
-      check(
-        Object.keys(more).length === 0 && Object.keys(rest).every((key) => key === "id"),
-        `the answer to ${what} is ${text.slice(0, 200)}: a response has jsonrpc, id and error, and an error code and message only`,
-      );
+      check(isErrorAnswer(text, -32600), `${what} is answered with ${text.slice(0, 200)}, expected the JSON-RPC error -32600 with a message, and nothing else`);
     }
     // "no data member anywhere" is checked on every response of the run by the session
   },

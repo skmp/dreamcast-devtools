@@ -1,10 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseBinaryFrame } from "../src/lib/binaryFrame";
-import {
-  DEBUGGER_ERROR_MESSAGES,
-  IN_BAND_ERROR_METHODS,
-  StrictDebuggerRpcMethodSchemas,
-} from "../src/lib/debuggerSchema";
+import { IN_BAND_ERROR_METHODS, StrictDebuggerRpcMethodSchemas } from "../src/lib/debuggerSchema";
 import type { DebuggerShape, DebuggerTick } from "../src/lib/debuggerSchema";
 import { MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger, mockNextAddress } from "./mockDebugger";
 import type { MockDebuggerOptions } from "./mockDebugger";
@@ -65,7 +61,10 @@ const connect = (mock: MockDebugger) => {
       expect((response.result as { error?: unknown }).error, `${method}: ${JSON.stringify(response.result)}`).toBeUndefined();
       return response.result;
     },
-    /** The error of a request that must fail, checked for its channel and its message. */
+    /**
+     * The error of a request that must fail, checked for its channel and its code. The texts are
+     * the mock's own: a message has to be there, and no test depends on what it says.
+     */
     fail(method: string, params: unknown, code: number): { code: number; message: string } {
       const response = api.call(method, params);
       const inBand = IN_BAND_ERROR_METHODS.has(method) && code !== -32601;
@@ -74,7 +73,7 @@ const connect = (mock: MockDebugger) => {
       expect(inBand ? response.error : response.result).toBeUndefined();
       expect(Object.keys(error).sort()).toEqual(["code", "message"]);
       expect(error.code).toBe(code);
-      expect(error.message).toMatch(DEBUGGER_ERROR_MESSAGES[code]);
+      expect(typeof error.message === "string" && error.message.length > 0, `${method}: a message that is not empty`).toBe(true);
       return error;
     },
     send: (text: string) => client.receive(text),
@@ -625,7 +624,7 @@ describe("tick policy", () => {
       ["state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" }],
       ["state.recordSgcFrames", {}],
     ] as const) {
-      expect(session.fail(method, params, -32001).message).toBe("emulator stopped by host UI");
+      session.fail(method, params, -32001);
     }
 
     mock.setLifetime("running");
@@ -639,7 +638,7 @@ describe("tick policy", () => {
     expect(session.lastTick().registers).toEqual({});
     expect(session.lastTick().callstacks).toEqual({ sh4: [], arm7: [] });
     expect(session.lastTick().watches).toEqual([{ id: 1, expression: "dc.sh4.cpu.r0", value: "n/a" }]);
-    expect(session.fail("state.getMemorySlice", { address: 0x8c010000, length: 4 }, -32002).message).toBe("no game loaded");
+    session.fail("state.getMemorySlice", { address: 0x8c010000, length: 4 }, -32002);
     session.fail("state.getDisassembly", { address: 0x8c010000, count: 1 }, -32002);
     session.fail("control.runUntil", {}, -32002);
     // the static tree, every value "n/a"; bookkeeping still works
@@ -742,7 +741,7 @@ describe("a server that implements less (the option `supports`)", () => {
       ["control.step", { target: "arm7" }],
       ["breakpoints.add", { event: "dc.aica.arm7.pc", address: 0x00200010 }],
     ] as const) {
-      expect(session.fail(method, params, -32004).message).toMatch(/arm7/);
+      session.fail(method, params, -32004);
     }
     expect(session.lastTick().callstacks!.sh4.length).toBeGreaterThan(0);
     expect(session.lastTick().callstacks!.arm7).toEqual([]);
@@ -757,7 +756,7 @@ describe("a server that implements less (the option `supports`)", () => {
     session.ok("control.pause");
     expect(session.lastTick().callstacks).toEqual({ sh4: [], arm7: [] });
     session.fail("state.getCallstack", { target: "sh4" }, -32004);
-    expect(session.fail("breakpoints.add", { event: "dc.sh4.exception" }, -32004).message).toBe("not supported: event breakpoints");
+    session.fail("breakpoints.add", { event: "dc.sh4.exception" }, -32004);
     // code breakpoints and register writes are what it has
     session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: 0x8c0000a4 });
     session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" });
@@ -781,12 +780,12 @@ describe("error table", () => {
   it("answers a frame that is not JSON with -32700 and id null", () => {
     const { session } = setup();
     session.send("{nope");
-    expect(session.frames).toEqual([{ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }]);
+    expect(session.frames).toEqual([{ jsonrpc: "2.0", id: null, error: { code: -32700, message: expect.stringMatching(/./) } }]);
   });
 
   it("answers what is not a JSON-RPC 2.0 request object, and a batch, with -32600", () => {
     const { session } = setup();
-    const invalid = { code: -32600, message: "invalid request" };
+    const invalid = { code: -32600, message: expect.stringMatching(/./) };
     session.send(JSON.stringify([{ jsonrpc: "2.0", id: 1, method: "debugger.describe", params: {} }]));
     session.send("42");
     session.send(JSON.stringify({ id: 2, method: "debugger.describe", params: {} }));
@@ -816,18 +815,18 @@ describe("error table", () => {
     // the session's first request was debugger.describe, so these are requests 2 to 6
     for (const [index, method] of ["no.such.method", "event.tick", "toString", "constructor", "control.Pause"].entries()) {
       const response = session.call(method);
-      expect(response).toEqual({ jsonrpc: "2.0", id: index + 2, error: { code: -32601, message: `method not found: ${method}` } });
+      expect(response).toEqual({ jsonrpc: "2.0", id: index + 2, error: { code: -32601, message: expect.stringMatching(/./) } });
     }
     expect(session.frames).toHaveLength(5);
   });
 
   it("reports invalid params as -32602: in-band for the RpcError methods, as a JSON-RPC error for the others", () => {
     const { session } = setup();
-    expect(session.fail("state.getMemorySlice", { address: "0x8c010000", length: 16 }, -32602).message).toMatch(/^invalid params: address: /);
+    session.fail("state.getMemorySlice", { address: "0x8c010000", length: 16 }, -32602);
     session.fail("state.getMemorySlice", { length: 16 }, -32602);
     session.fail("state.getDisassembly", { address: 0x8c010000 }, -32602);
     session.fail("state.getCallstack", { target: "dsp" }, -32602);
-    expect(session.fail("control.step", { target: 4 }, -32602).message).toMatch(/^invalid params: target: /);
+    session.fail("control.step", { target: 4 }, -32602);
     session.fail("control.step", {}, -32602);
     session.fail("breakpoints.toggle", { id: 1 }, -32602);
     session.fail("breakpoints.setCategoryStates", { categories: { sh4: { muted: "yes", soloed: false } } }, -32602);
@@ -869,7 +868,7 @@ describe("error table", () => {
       session.ok("state.watch", { expressions: expressions.slice(offset, offset + 64) });
     }
     expect(session.lastTick().watches).toHaveLength(256);
-    expect(session.fail("state.watch", { expressions: [expressions[256]] }, -32602).message).toBe("invalid params: at most 256 watches");
+    session.fail("state.watch", { expressions: [expressions[256]] }, -32602);
     // a stored expression is not added twice, so this is no 257th
     session.ok("state.watch", { expressions: [expressions[0]] });
     expect(session.lastTick().watches).toHaveLength(256);
@@ -878,16 +877,16 @@ describe("error table", () => {
       session.client.receive(JSON.stringify({ jsonrpc: "2.0", id: 10_000 + index, method: "breakpoints.add", params: { event: "dc.sh4.interrupt", enabled: false } }));
     }
     expect(Object.keys(session.lastTick().breakpoints)).toHaveLength(1024);
-    expect(session.fail("breakpoints.add", { event: "dc.sh4.interrupt" }, -32602).message).toBe("invalid params: at most 1024 breakpoints");
+    session.fail("breakpoints.add", { event: "dc.sh4.interrupt" }, -32602);
   });
 
   it("refuses a step while running with -32003, and what it does not implement with -32004 on the method's channel", () => {
     const { session } = setup();
     for (const method of ["control.step", "control.stepOver", "control.stepOut"]) {
-      expect(session.fail(method, { target: "sh4" }, -32003).message).toBe("not paused");
+      session.fail(method, { target: "sh4" }, -32003);
     }
     // later milestones: in-band for the RpcError methods ...
-    expect(session.fail("control.reset", {}, -32004).message).toBe("not supported: control.reset");
+    session.fail("control.reset", {}, -32004);
     session.fail("state.writeMemory", { target: "sh4", address: 0x8c010000, data: [0] }, -32004);
     // ... a JSON-RPC error for the others, whatever the params
     session.fail("state.getMemoryBinary", { address: 0x8c010000, length: 16 }, -32004);
@@ -895,7 +894,7 @@ describe("error table", () => {
     session.fail("state.captureHolly", {}, -32004);
     // a target without memory, an event the server does not raise, DSP step over / out
     session.fail("state.getMemorySlice", { target: "dsp", address: 0, length: 16 }, -32004);
-    expect(session.fail("breakpoints.add", { event: "dc.sh4.tlb_miss" }, -32004).message).toBe("not supported: event dc.sh4.tlb_miss");
+    session.fail("breakpoints.add", { event: "dc.sh4.tlb_miss" }, -32004);
     session.fail("breakpoints.add", { event: "dc.sh4.cpu.pc", kind: "event" }, -32004);
     session.fail("breakpoints.add", { event: "dc.sh4.interrupt", address: 0x8c010000 }, -32004);
     session.ok("control.pause");
@@ -912,7 +911,7 @@ describe("error table", () => {
     session.ok("breakpoints.add", { event: "dc.aica.dsp.step", address: 127 });
     session.ok("breakpoints.add", { event: "dc.aica.arm7.pc", address: 0x00200004 });
     // unknown ids
-    expect(session.fail("breakpoints.remove", { id: 3 }, -32602).message).toBe("invalid params: unknown breakpoint id 3");
+    session.fail("breakpoints.remove", { id: 3 }, -32602);
     session.fail("breakpoints.toggle", { id: 3, enabled: true }, -32602);
     session.ok("breakpoints.remove", { id: 1 });
     session.fail("breakpoints.remove", { id: 1 }, -32602);
@@ -923,9 +922,9 @@ describe("error table", () => {
     session.ok("control.pause");
     session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C0000A1" });
     const stopId = session.lastTick().executionState.stopId;
-    expect(session.fail("control.step", { target: "sh4" }, -32005).message).toBe("cannot step: pc is odd");
+    session.fail("control.step", { target: "sh4" }, -32005);
     session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x10000000" });
-    expect(session.fail("control.step", { target: "sh4" }, -32005).message).toBe("cannot step: pc not readable");
+    session.fail("control.step", { target: "sh4" }, -32005);
     expect(session.lastTick().executionState.stopId).toBe(stopId);
     // outside of the loop the mock goes straight on
     session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C010000" });
@@ -943,9 +942,7 @@ describe("error table", () => {
     session.ok("state.watch", { expressions: ["DC.SH4.CPU.PC"] });
     expect(session.lastTick().watches).toHaveLength(2);
 
-    expect(session.fail("state.watch", { expressions: ["dc.sh4.cpu.sr", "dc.sh4.cpu.nope"] }, -32602).message).toBe(
-      'invalid params: "dc.sh4.cpu.nope" is not a register of the device tree',
-    );
+    session.fail("state.watch", { expressions: ["dc.sh4.cpu.sr", "dc.sh4.cpu.nope"] }, -32602);
     session.fail("state.watch", { expressions: ["pc"] }, -32602);
     session.fail("state.watch", { expressions: ["dc.sh4.dmac.dmaor.x"] }, -32602);
     expect(session.lastTick().watches).toHaveLength(2);
@@ -953,7 +950,7 @@ describe("error table", () => {
     // the id is kept; unknown ids and unresolvable expressions are -32602
     session.ok("state.modifyWatchExpression", { watchId: 1, newExpression: "dc.sh4.cpu.PR" });
     expect(session.lastTick().watches![0]).toMatchObject({ id: 1, expression: "dc.sh4.cpu.pr" });
-    expect(session.fail("state.modifyWatchExpression", { watchId: 9, newExpression: "dc.sh4.cpu.pr" }, -32602).message).toBe("invalid params: unknown watch id 9");
+    session.fail("state.modifyWatchExpression", { watchId: 9, newExpression: "dc.sh4.cpu.pr" }, -32602);
     session.fail("state.modifyWatchExpression", { watchId: 1, newExpression: "dc.sh4.cpu.nope" }, -32602);
 
     // unknown ids are ignored; ids are not reused
@@ -993,7 +990,7 @@ describe("error table", () => {
     session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "twelve" }, -32602);
     session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "r0", value: "1" }, -32602);
     session.fail("state.setRegister", { path: "dc.sh4.nope", name: "R0", value: "1" }, -32602);
-    expect(session.fail("state.setRegister", { path: "dc", name: "SYSCLK", value: "1" }, -32013).message).toBe("not writable: dc.SYSCLK");
+    session.fail("state.setRegister", { path: "dc", name: "SYSCLK", value: "1" }, -32013);
     session.fail("state.setRegister", { path: "dc.timing", name: "SH4_CYCLES", value: "1" }, -32013);
     session.fail("state.setRegister", { path: "dc.sh4.scif", name: "SCFRDR2", value: "1" }, -32013);
 
@@ -1027,7 +1024,7 @@ describe("error table", () => {
     // the last bytes of the address space
     expect(read("sh4", 0xfffffff8, 16).unreadable).toEqual([[8, 8]]);
 
-    expect(session.fail("state.getMemorySlice", { address: 0x10000000, length: 16 }, -32010).message).toBe("address not readable");
+    session.fail("state.getMemorySlice", { address: 0x10000000, length: 16 }, -32010);
     session.fail("state.getMemorySlice", { address: 0x00600000, length: 0x800 }, -32010);
 
     // ARM7: wave RAM and the AICA registers
@@ -1065,7 +1062,7 @@ describe("error table", () => {
     ]);
 
     // a misaligned address, and one beyond the target's address space
-    expect(session.fail("state.getDisassembly", { address: 0x8c010001, count: 1 }, -32602).message).toMatch(/^invalid params: address: /);
+    session.fail("state.getDisassembly", { address: 0x8c010001, count: 1 }, -32602);
     session.fail("state.getDisassembly", { target: "arm7", address: 0x00200002, count: 1 }, -32602);
     session.fail("state.getDisassembly", { target: "arm7", address: 0x01000000, count: 1 }, -32602);
     session.fail("state.getDisassembly", { target: "dsp", address: 128, count: 1 }, -32602);
@@ -1083,7 +1080,7 @@ describe("error table", () => {
 
   it("answers state.getSgcFrameData with -32011 and no binary frame before the first capture", async () => {
     const { session } = setup();
-    expect(session.fail("state.getSgcFrameData", {}, -32011).message).toBe("no capture available");
+    session.fail("state.getSgcFrameData", {}, -32011);
     await vi.advanceTimersByTimeAsync(1000);
     expect(session.binary).toEqual([]);
   });

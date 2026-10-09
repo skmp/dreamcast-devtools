@@ -1,6 +1,5 @@
 import { JsonRpcException } from "../../src/lib/jsonRpc";
 import {
-  DEBUGGER_ERROR_MESSAGES,
   DebuggerRpcMethodSchemas,
   IN_BAND_ERROR_METHODS,
   PROTOCOL_VERSION,
@@ -281,7 +280,8 @@ export class ContractSession {
   /**
    * A request that has to fail with `code`, on the channel of its method: in-band for the
    * methods whose result type is RpcError, a JSON-RPC error for the others (and for -32601).
-   * The message has to be the one the protocol gives for the code.
+   * The code is the contract. The message is a line for a person: it has to be there, and
+   * what it says is the server's business (design 3.5).
    */
   async expectError(method: string, params: unknown, code: number): Promise<{ code: number; message: string }> {
     const inBandExpected = IN_BAND_ERROR_METHODS.has(method) && code !== -32601;
@@ -306,8 +306,7 @@ export class ContractSession {
       error = { code: failure.code, message: failure.message };
     }
     check(error.code === code, `${what}: expected the error ${code}, got ${error.code} "${error.message}"`);
-    const pattern = DEBUGGER_ERROR_MESSAGES[code];
-    check(!pattern || pattern.test(error.message), `${what}: the message of ${code} is ${String(pattern)}, got "${error.message}"`);
+    check(typeof error.message === "string" && error.message.length > 0, `${what}: the error ${code} has no message; error.message is a non-empty string`);
     return error;
   }
 

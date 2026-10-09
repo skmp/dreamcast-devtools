@@ -198,7 +198,11 @@ export const IN_BAND_ERROR_METHODS: ReadonlySet<string> = new Set([
   RpcMethod.STATE_RECORD_SGC_FRAMES,
 ]);
 
-/** Error codes of the protocol, on either channel. */
+/**
+ * Error codes of the protocol, on either channel. The codes are normative; the text of
+ * `error.message` is not: it is a non-empty line for a person, and nothing may depend on its
+ * wording.
+ */
 export const DebuggerErrorCode = {
   /** the frame is not JSON; the response `id` is `null` */
   PARSE_ERROR: -32700,
@@ -229,26 +233,6 @@ export const DebuggerErrorCode = {
 } as const;
 
 export type DebuggerErrorCodeValue = (typeof DebuggerErrorCode)[keyof typeof DebuggerErrorCode];
-
-/** The message a v3 server sends with each code. `<what>` parts are free text. */
-export const DEBUGGER_ERROR_MESSAGES: Readonly<Record<number, RegExp>> = {
-  [DebuggerErrorCode.PARSE_ERROR]: /^parse error$/,
-  [DebuggerErrorCode.INVALID_REQUEST]: /^invalid request$/,
-  [DebuggerErrorCode.METHOD_NOT_FOUND]: /^method not found: .+/,
-  [DebuggerErrorCode.INVALID_PARAMS]: /^invalid params: .+/,
-  [DebuggerErrorCode.INTERNAL_ERROR]: /^internal error$/,
-  [DebuggerErrorCode.EMULATOR_BUSY]: /^emulator busy$/,
-  [DebuggerErrorCode.STOPPED_BY_HOST]: /^emulator stopped by host UI$/,
-  [DebuggerErrorCode.NO_GAME]: /^no game loaded$/,
-  [DebuggerErrorCode.NOT_PAUSED]: /^not paused$/,
-  [DebuggerErrorCode.NOT_SUPPORTED]: /^not supported: .+/,
-  [DebuggerErrorCode.CANNOT_STEP]: /^cannot step: .+/,
-  [DebuggerErrorCode.NOT_READABLE]: /^address not readable$/,
-  [DebuggerErrorCode.NO_CAPTURE]: /^no capture available$/,
-  [DebuggerErrorCode.NOT_CLOCKED]: /^(arm7 held in reset|aica not clocked \(arm7 in reset\))$/,
-  [DebuggerErrorCode.NOT_WRITABLE]: /^not writable: .+/,
-  [DebuggerErrorCode.CAPTURE_TIMED_OUT]: /^capture timed out$/,
-};
 
 /** Bounds of request parameters and of what a tick carries. A violation is -32602. */
 export const PROTOCOL_BOUNDS = {
@@ -595,11 +579,14 @@ const defineProtocol = (conformance: boolean) => {
     >,
   });
 
-  /** `{}` on success */
+  /**
+   * `{}` on success. The code is what a client acts on; the message is for a person, and no
+   * client depends on its wording. A v3 server sends one that is not empty.
+   */
   const RpcErrorSchema = object({
     error: object({
       code: conformance ? z.number().int() : z.number(),
-      message: z.string(),
+      message: conformance ? z.string().min(1) : z.string(),
     }).optional(),
   });
 
