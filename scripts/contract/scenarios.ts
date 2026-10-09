@@ -721,17 +721,22 @@ const s02: Scenario = {
     check(stopIdOf(paused.tick) > stopIdOf(running.tick), `stopId ${stopIdOf(paused.tick)} is not new (it was ${stopIdOf(running.tick)} while running)`);
     check(paused.tick.executionState.breakpointId === undefined, "a pause carries no breakpointId");
 
-    // a second pause returns {} and changes nothing, whatever target it names
-    const other = (session.shape.targets ?? []).map((target) => target.id).find((id) => id !== "sh4");
-    const second = session.mark();
-    await session.call("control.pause", other ? { target: other } : {});
+    // A further pause returns {} and changes nothing, whatever target it names: there is one run
+    // state, so the target is ignored when it is one of the three target ids, also when the
+    // server does not list that target.
+    const again = session.mark();
+    for (const target of TARGET_IDS) {
+      await session.call("control.pause", { target });
+    }
     const later = await session.collectTicks(300);
-    for (const record of [...session.ticksSince(second), ...later]) {
+    for (const record of [...session.ticksSince(again), ...later]) {
       check(
         isPaused(record.tick) && stopIdOf(record.tick) === stopIdOf(paused.tick),
-        `a second control.pause changes nothing; a tick says ${describeState(record.tick)}`,
+        `a further control.pause changes nothing; a tick says ${describeState(record.tick)}`,
       );
     }
+    // any other string is not a target id: in-band -32602
+    await session.expectError("control.pause", { target: "gpu" }, -32602);
   },
 };
 

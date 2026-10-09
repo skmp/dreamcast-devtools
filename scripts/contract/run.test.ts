@@ -1151,7 +1151,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(noReason, "S05")).toBe('after breakpoints.remove {1} the paused tick of the same stop has reason "pause"; the reason stays "breakpoint"');
   }, 30_000);
 
-  it("S02: control.pause that is refused when it names a target, as the UI's request does", async () => {
+  it("S02: control.pause that is refused for a target id, listed or not, or accepted for a string that is none", async () => {
     const refusing = (targets: string[]): Faults => ({
       answer: (request) =>
         request.method === "control.pause" && targets.includes(paramsOf(request).target as string)
@@ -1163,10 +1163,36 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(any, "S02")).toMatch(/^control\.pause \{"target":"sh4"\}: in-band error -32004/);
     expect(any.cleanUpProblems).toEqual([]);
 
-    // the target is ignored: a pause is not a request to one target
-    const others = await run(refusing(["arm7", "dsp"]), ["S02"]);
-    expect(statusOf(others, "S02")).toBe("failed");
-    expect(detailsOf(others, "S02")).toMatch(/^control\.pause \{"target":"arm7"\}: in-band error -32004/);
+    // the target is ignored: a pause is not a request to one target, and each id is tried
+    for (const target of ["arm7", "dsp"]) {
+      const one = await run(refusing([target]), ["S02"]);
+      expect(statusOf(one, "S02"), target).toBe("failed");
+      expect(detailsOf(one, "S02"), target).toBe(`control.pause {"target":"${target}"}: in-band error -32004 "not supported: pause of one target"`);
+    }
+
+    // also for a target the server does not list: a server of the SH4 alone that takes the pause for a request to a target
+    const mock = new MockDebugger({ supports: { targets: ["sh4"] } });
+    const control = mock as unknown as { handlers: Record<string, { run(params: Json, context: Json): unknown }>; supportedTarget(id: string): unknown };
+    const pause = control.handlers["control.pause"].run;
+    control.handlers["control.pause"].run = (params, context) => {
+      if (params.target !== undefined) control.supportedTarget(params.target as string);
+      return pause(params, context);
+    };
+    const unlisted = await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S02"]) });
+    expect(reportOf(unlisted)).toEqual(['S02 failed control.pause {"target":"arm7"}: in-band error -32004 "not supported: target arm7"']);
+    // ... which the mock, listing the SH4 alone, does not do
+    expect(reportOf(await run(undefined, ["S02"], { supports: { targets: ["sh4"] } }))).toEqual(["S02 passed "]);
+
+    // a string that is no target id is a mistyped parameter (control.runUntil is what the mock answers with {} here)
+    const lenient = await run({ toServer: (frame) => (frame.method === "control.pause" && paramsOf(frame).target === "gpu" ? { ...frame, method: "control.runUntil", params: {} } : frame) }, ["S02"]);
+    expect(reportOf(lenient)).toEqual(['S02 failed control.pause {"target":"gpu"}: expected the error -32602, got the result {}']);
+    // (the run state is put back whatever the server made of it)
+    expect(lenient.cleanUpProblems).toEqual([]);
+    const wrongCode = await run(
+      { answer: (request) => (request.method === "control.pause" && paramsOf(request).target === "gpu" ? inBand(request, -32004, "not supported: target gpu") : undefined) },
+      ["S02"],
+    );
+    expect(reportOf(wrongCode)).toEqual(['S02 failed control.pause {"target":"gpu"}: expected the error -32602, got -32004 "not supported: target gpu"']);
   }, 30_000);
 
   it("S05: a second breakpoint on the same address that is not added, or that is the one a stop reports", async () => {
