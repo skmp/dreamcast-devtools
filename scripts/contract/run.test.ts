@@ -1423,13 +1423,45 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
   }, 90_000);
 
-  it("S11: a server without the ARM7 callstack: no frames in the tick, or state.getCallstack {arm7} refused", async () => {
-    const empty = await run(
+  it("S11: the ARM7 callstack is [] while the ARM7 is held in reset, or at least the PC and R14 with location lr", async () => {
+    /** The mock with an ARM7 callstack of its own making, in the ticks and from state.getCallstack alike. */
+    const withArm7Stack = (rewrite: (frames: Json[]) => Json[]): MockDebugger => {
+      const mock = new MockDebugger();
+      const machine = mock as unknown as { callstack(target: string, maxFrames: number): Json[] };
+      const callstack = machine.callstack.bind(mock);
+      machine.callstack = (target, maxFrames) => (target === "arm7" ? rewrite(callstack(target, 64)).slice(0, maxFrames) : callstack(target, maxFrames));
+      return mock;
+    };
+    const s11 = async (mock: MockDebugger) => reportOf(await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S11"]) }));
+
+    // held in reset: no frames anywhere. That is a server the design allows.
+    expect(await s11(withArm7Stack(() => []))).toEqual(["S11 passed the ARM7 is held in reset: its callstack is empty"]);
+    // running, and the unwinder finds nothing on the stack: the PC and the link register
+    expect(await s11(withArm7Stack((frames) => frames.slice(0, 2)))).toEqual(["S11 passed "]);
+
+    // one frame is neither
+    expect(await s11(withArm7Stack((frames) => frames.slice(0, 1)))).toEqual([
+      "S11 failed the ARM7 callstack of a paused tick is [] (the ARM7 is held in reset) or has at least two frames (frame 0 the PC, frame 1 the link register); this one has 1 frame",
+    ]);
+    // the link register is R14, and the frame says where it came from
+    expect(await s11(withArm7Stack((frames) => frames.map((frame) => (frame.index === 1 ? { ...frame, location: "pr" } : frame))))).toEqual([
+      'S11 failed arm7: frame 1 has location "pr", expected "lr"',
+    ]);
+    expect(await s11(withArm7Stack((frames) => frames.map((frame) => (frame.index === 1 ? { ...frame, pc: 0x00200000 } : frame))))).toEqual([
+      "S11 failed arm7: frame 1 is at 0x00200000, R14 is 0x0020000C",
+    ]);
+    expect(await s11(withArm7Stack((frames) => frames.map((frame) => (frame.index === 0 ? { ...frame, location: "pc" } : frame))))).toEqual([
+      'S11 failed arm7: frame 0 is the PC and has no location, this one has "pc"',
+    ]);
+
+    // no frames in the ticks, and frames on request: the two do not say the same of a paused target
+    const ticksOnly = await run(
       { toClient: (frame) => (isTick(frame) ? { ...frame, params: { ...frame.params, callstacks: { ...(frame.params.callstacks as Json), arm7: [] } } } : frame) },
       ["S11"],
     );
-    expect(statusOf(empty, "S11")).toBe("failed");
-    expect(detailsOf(empty, "S11")).toBe("a paused tick carries the ARM7 callstack (frame 0 the PC, frame 1 the link register); this one has 0 frame(s)");
+    expect(detailsOf(ticksOnly, "S11").split("\n")[0]).toBe(
+      "the paused tick carries no ARM7 frames (the ARM7 is held in reset), and state.getCallstack {arm7} returns 8; it answers frames: [] then",
+    );
 
     const refused = await run(
       {
@@ -1441,23 +1473,19 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(refused, "S11")).toBe("failed");
     expect(detailsOf(refused, "S11")).toBe('state.getCallstack {"target":"arm7","maxFrames":8}: JSON-RPC error -32004 "not supported: arm7 callstack"');
 
-    // the link register is R14, and the frame says where it came from
-    const wrongLink = await run(
-      {
-        toClient: (frame) => {
-          if (!isTick(frame)) return frame;
-          const arm7 = ((frame.params.callstacks as Json).arm7 as Json[]).map((entry) => (entry.index === 1 ? { ...entry, location: "pr" } : entry));
-          return { ...frame, params: { ...frame.params, callstacks: { ...(frame.params.callstacks as Json), arm7 } } };
-        },
-      },
-      ["S11"],
-    );
-    expect(detailsOf(wrongLink, "S11")).toBe('arm7: frame 1 has location "pr", expected "lr"');
-
     // a server that does not list the ARM7 is not asked for its callstack
     const withoutArm7 = await run(undefined, ["S11"], { supports: { targets: ["sh4", "dsp"] } });
     expect(reportOf(withoutArm7)).toEqual(["S11 passed "]);
-  }, 30_000);
+  }, 60_000);
+
+  it("S11: the SH4 callstack has the PC and PR on either server", async () => {
+    const mock = new MockDebugger();
+    const machine = mock as unknown as { callstack(target: string, maxFrames: number): Json[] };
+    const callstack = machine.callstack.bind(mock);
+    machine.callstack = (target, maxFrames) => callstack(target, target === "sh4" ? 1 : maxFrames);
+    const { url } = await startServer(undefined, mock);
+    expect(reportOf(await runContract({ url, profile: "mock", only: new Set(["S11"]) }))).toEqual(["S11 failed frame 1 is PR; the SH4 callstack of the tick has 1 frame"]);
+  });
 
   it("the strict copy: a callstack frame without sp, more than 64 frames from state.getCallstack, an event breakpoint with an address", async () => {
     const withoutSp = (frames: Json[]) => frames.map(({ sp: _sp, ...frame }) => frame);

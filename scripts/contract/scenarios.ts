@@ -1443,11 +1443,10 @@ const s11: Scenario = {
     check(frames[0].pc === pcOf(paused.tick, sh4), `frame 0 is at ${hex(frames[0].pc)}, the PC is ${hex(pcOf(paused.tick, sh4))}`);
     frames.forEach((frame, position) => check(frame.index === position, `frame ${position} of the tick has index ${frame.index}`));
     check(frames.length <= 32, `a tick carries at most 32 frames, this one ${frames.length}`);
-    if (context.profile === "emulator" || frames.length > 1) {
-      check(frames.length >= 2, "frame 1 is PR");
-      check(frames[1].pc === numberOf(paused.tick, sh4.pcPath, "PR"), `frame 1 is at ${hex(frames[1].pc)}, PR is ${registerOf(paused.tick, sh4.pcPath, "PR")}`);
-      check(frames[1].location === "pr", `frame 1 has location "${frames[1].location}", expected "pr"`);
-    }
+    check(frames[0].location === undefined, `frame 0 is the PC and has no location, this one has "${frames[0].location}"`);
+    check(frames.length >= 2, `frame 1 is PR; the SH4 callstack of the tick has ${frames.length} frame`);
+    check(frames[1].pc === numberOf(paused.tick, sh4.pcPath, "PR"), `frame 1 is at ${hex(frames[1].pc)}, PR is ${registerOf(paused.tick, sh4.pcPath, "PR")}`);
+    check(frames[1].location === "pr", `frame 1 has location "${frames[1].location}", expected "pr"`);
     for (const frame of frames.slice(2)) {
       check(/^stack\+0x[0-9A-Fa-f]+$/.test(frame.location ?? ""), `frame ${frame.index} has location "${frame.location}", expected "stack+0x.."`);
     }
@@ -1470,26 +1469,46 @@ const s11: Scenario = {
       `state.getCallstack without maxFrames returned ${byDefault.frames.length} frames, with maxFrames 32 ${named.frames.length}; maxFrames defaults to 32`,
     );
 
-    // the ARM7, if the server lists it: frame 0 is its PC, frame 1 its link register
+    // The ARM7, if the server lists it. While it runs: at least two frames, frame 0 its PC and
+    // frame 1 its link register R14, and what the stack scan finds behind them. While it is
+    // held in reset: no frames, in the tick and from state.getCallstack.
     const arm7 = targetOf(session.shape, "arm7");
     if (arm7) {
       const arm7Frames = paused.tick.callstacks?.arm7 ?? [];
-      check(arm7Frames.length >= 2, `a paused tick carries the ARM7 callstack (frame 0 the PC, frame 1 the link register); this one has ${arm7Frames.length} frame(s)`);
-      check(arm7Frames[0].pc === pcOf(paused.tick, arm7), `arm7: frame 0 is at ${hex(arm7Frames[0].pc)}, the PC is ${hex(pcOf(paused.tick, arm7))}`);
       check(
-        arm7Frames[1].pc === numberOf(paused.tick, arm7.pcPath, "R14"),
-        `arm7: frame 1 is at ${hex(arm7Frames[1].pc)}, R14 is ${registerOf(paused.tick, arm7.pcPath, "R14")}`,
+        arm7Frames.length === 0 || arm7Frames.length >= 2,
+        `the ARM7 callstack of a paused tick is [] (the ARM7 is held in reset) or has at least two frames (frame 0 the PC, frame 1 the link register); this one has ${arm7Frames.length} frame`,
       );
-      check(arm7Frames[1].location === "lr", `arm7: frame 1 has location "${arm7Frames[1].location}", expected "lr"`);
-      arm7Frames.forEach((frame, position) => check(frame.index === position, `arm7: frame ${position} of the tick has index ${frame.index}`));
-      for (const frame of arm7Frames.slice(2)) {
-        check(/^stack\+0x[0-9A-Fa-f]+$/.test(frame.location ?? ""), `arm7: frame ${frame.index} has location "${frame.location}", expected "stack+0x.."`);
+      if (arm7Frames.length > 0) {
+        check(arm7Frames[0].pc === pcOf(paused.tick, arm7), `arm7: frame 0 is at ${hex(arm7Frames[0].pc)}, the PC is ${hex(pcOf(paused.tick, arm7))}`);
+        check(arm7Frames[0].location === undefined, `arm7: frame 0 is the PC and has no location, this one has "${arm7Frames[0].location}"`);
+        check(
+          arm7Frames[1].pc === numberOf(paused.tick, arm7.pcPath, "R14"),
+          `arm7: frame 1 is at ${hex(arm7Frames[1].pc)}, R14 is ${registerOf(paused.tick, arm7.pcPath, "R14")}`,
+        );
+        check(arm7Frames[1].location === "lr", `arm7: frame 1 has location "${arm7Frames[1].location}", expected "lr"`);
+        arm7Frames.forEach((frame, position) => check(frame.index === position, `arm7: frame ${position} of the tick has index ${frame.index}`));
+        for (const frame of arm7Frames.slice(2)) {
+          check(/^stack\+0x[0-9A-Fa-f]+$/.test(frame.location ?? ""), `arm7: frame ${frame.index} has location "${frame.location}", expected "stack+0x.."`);
+        }
+      } else {
+        context.note("the ARM7 is held in reset: its callstack is empty");
       }
       const fromArm7 = await session.call("state.getCallstack", { target: "arm7", maxFrames: 8 });
       check(fromArm7.target === "arm7", `state.getCallstack {arm7} answers for target "${fromArm7.target}"`);
       check(fromArm7.frames.length <= 8, `state.getCallstack {arm7, maxFrames: 8} returned ${fromArm7.frames.length} frames`);
       fromArm7.frames.forEach((frame, position) => check(frame.index === position, `arm7: frame ${position} has index ${frame.index}`));
-      check(fromArm7.frames[0]?.pc === arm7Frames[0].pc, "arm7: frame 0 of state.getCallstack is the PC");
+      if (arm7Frames.length > 0) {
+        check(fromArm7.frames[0]?.pc === arm7Frames[0].pc, "arm7: frame 0 of state.getCallstack is the PC");
+      } else {
+        check(
+          fromArm7.frames.length === 0,
+          `the paused tick carries no ARM7 frames (the ARM7 is held in reset), and state.getCallstack {arm7} returns ${fromArm7.frames.length}; it answers frames: [] then`,
+        );
+      }
+      // without maxFrames it works
+      const whole = await session.call("state.getCallstack", { target: "arm7" });
+      check(whole.frames.length <= PROTOCOL_BOUNDS.callstackMaxFrames.default, `state.getCallstack {arm7} without maxFrames returned ${whole.frames.length} frames; maxFrames defaults to 32`);
     }
 
     // running ticks carry both arrays, empty
