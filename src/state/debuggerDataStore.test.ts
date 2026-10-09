@@ -326,6 +326,44 @@ describe("ticks", () => {
     expect(store().toasts).toEqual([]);
   });
 
+  it("the address of the announced breakpoint is written as debugger.describe says its target writes them, not from a built-in table", async () => {
+    // an SH4 of six digits, an ARM7 whose addresses are decimal, a DSP whose steps are hex
+    const target = (id: string, pcPath: string, pcRegister: string, breakpointEvent: string, addressRadix: number, addressDigits: number) => ({
+      id,
+      label: id.toUpperCase(),
+      pcPath,
+      pcRegister,
+      breakpointEvent,
+      instructionSize: 2,
+      addressMax: 0x00ffffff,
+      addressRadix,
+      addressDigits,
+      defaultDisassemblyAddress: 0,
+      defaultMemoryAddress: 0,
+      memory: true,
+      stepping: true,
+    });
+    const targets = [
+      target("sh4", "dc.sh4.cpu", "PC", "dc.sh4.cpu.pc", 16, 6),
+      target("arm7", "dc.aica.arm7", "PC", "dc.aica.arm7.pc", 10, 7),
+      target("dsp", "dc.aica.dsp", "STEP", "dc.aica.dsp.step", 16, 2),
+    ];
+    const breakpoints = {
+      "1": { id: 1, event: "dc.sh4.cpu.pc", address: 0x1008, kind: "code", enabled: true },
+      "2": { id: 2, event: "dc.aica.arm7.pc", address: 2097168, kind: "code", enabled: true },
+      "3": { id: 3, event: "dc.aica.dsp.step", address: 0x1f, kind: "code", enabled: true },
+    };
+    const { transport } = await initialise(tickFrame({ state: "running", stopId: 1 }), describeResult({ targets }));
+    for (const breakpointId of [1, 2, 3]) {
+      transport.deliver(tickFrame({ state: "paused", stopId: 1 + breakpointId, reason: "breakpoint", breakpointId }, { breakpoints }));
+    }
+    expect(store().toasts.map(({ message }) => message)).toEqual([
+      "Breakpoint hit: dc.sh4.cpu.pc == 0x001008",
+      "Breakpoint hit: dc.aica.arm7.pc == 2097168",
+      "Breakpoint hit: dc.aica.dsp.step == 0x1F",
+    ]);
+  });
+
   it("a subscriber that throws on a tick does not keep it from the subscribers after it, or its breakpoint from being announced", async () => {
     const { transport } = await initialise(tickFrame({ state: "running", stopId: 1 }));
 

@@ -12,6 +12,7 @@ import {
   KNOWN,
 } from "./support/fixtures";
 import { requestAsAnotherClient } from "./support/mockServer";
+import { serveScriptedDebugger, V3_TARGETS } from "./support/scriptedDebugger";
 import type { Locator, Page } from "@playwright/test";
 
 const entry = (view: Locator, text: string): Locator => view.getByRole("listitem").filter({ hasText: text });
@@ -463,4 +464,85 @@ test("the list of a target has that target's code breakpoints, each in the addre
   const arm7 = panel(page, "arm7-breakpoints");
   await expect(arm7.getByRole("listitem")).toHaveCount(1);
   await expect(entry(arm7, "dc.aica.arm7.pc == 0x00200014")).toBeVisible();
+});
+
+test("the address box, the hit notice and the reason of a stop write addresses as debugger.describe says the target does", async ({
+  page,
+}) => {
+  // A server none of whose targets writes addresses the way this UI has built in for a server
+  // that says nothing: an SH4 of 24 bits and six digits, an ARM7 whose addresses are decimal,
+  // a DSP whose steps are hex. A client that formats or reads with its own table passes every
+  // test against a server that agrees with the table.
+  const server = await serveScriptedDebugger(page);
+  server.setRegister("dc.sh4.cpu", "PC", "0x00001000");
+  server.describeAgain();
+  const targets = V3_TARGETS.map((target) => ({ ...target }));
+  Object.assign(targets[0], { addressMax: 0x00ffffff, addressDigits: 6 });
+  Object.assign(targets[1], { addressRadix: 10, addressDigits: 7 });
+  Object.assign(targets[2], { addressRadix: 16, addressDigits: 2 });
+  server.shape.targets = targets;
+  let ids = 0;
+  server.answer("breakpoints.add", (params) => {
+    const id = ++ids;
+    server.state.breakpoints = { ...server.state.breakpoints, [String(id)]: { id, event: params.event, address: params.address, kind: params.kind, enabled: true } };
+    setTimeout(() => server.tick(), 0);
+    return {};
+  });
+  await page.goto("/#/workspace/sh4-debugger");
+  await server.described();
+  await expect(panel(page, "sh4-disassembly").locator(".current-instruction")).toHaveCount(1);
+  const status = page.getByRole("status", { name: "Execution state" });
+  const alerts = page.getByRole("alert");
+  await expect(status).toHaveText("Paused · paused by the debugger · stop 1");
+
+  // --- the box of each panel reads what is typed in the radix of its target ---
+  const sh4 = panel(page, "sh4-breakpoints");
+  await sh4.getByRole("textbox").fill("1008");
+  await sh4.getByRole("textbox").press("Enter");
+  await expect(sh4.getByRole("listitem")).toHaveText(/dc\.sh4\.cpu\.pc == 0x001008/);
+
+  // decimal: "2097168" is that number, not 0x2097168; and what is no decimal number is not sent
+  await addPanelFromSelector(page, 3, "ARM7: Breakpoints");
+  const arm7 = panel(page, "arm7-breakpoints");
+  await arm7.getByRole("textbox").fill("20001f");
+  await arm7.getByRole("textbox").press("Enter");
+  await arm7.getByRole("textbox").fill("2097168");
+  await arm7.getByRole("textbox").press("Enter");
+  await expect(arm7.getByRole("listitem")).toHaveText(/dc\.aica\.arm7\.pc == 2097168/);
+
+  // hex: "1f" is 31, and "10" is 16
+  await addPanelFromSelector(page, 3, "DSP: Breakpoints");
+  const dsp = panel(page, "dsp-breakpoints");
+  await dsp.getByRole("textbox").fill("1f");
+  await dsp.getByRole("textbox").press("Enter");
+  await expect(dsp.getByRole("listitem")).toHaveText(/dc\.aica\.dsp\.step == 0x1F/);
+  await dsp.getByRole("textbox").fill("10");
+  await dsp.getByRole("textbox").press("Enter");
+  await expect(dsp.getByRole("listitem")).toHaveText([/dc\.aica\.dsp\.step == 0x1F/, /dc\.aica\.dsp\.step == 0x10/]);
+
+  expect(server.requestsOf("breakpoints.add")).toEqual([
+    { event: "dc.sh4.cpu.pc", address: 0x1008, kind: "code", enabled: true },
+    { event: "dc.aica.arm7.pc", address: 2097168, kind: "code", enabled: true },
+    { event: "dc.aica.dsp.step", address: 0x1f, kind: "code", enabled: true },
+    { event: "dc.aica.dsp.step", address: 0x10, kind: "code", enabled: true },
+  ]);
+  await expect(alerts).toHaveCount(0);
+
+  // --- a hit of each: the notice and the reason next to the run controls say where, the same way ---
+  let stopId = 1;
+  for (const [breakpointId, text] of [
+    [1, "dc.sh4.cpu.pc == 0x001008"],
+    [2, "dc.aica.arm7.pc == 2097168"],
+    [3, "dc.aica.dsp.step == 0x1F"],
+  ] as const) {
+    server.state.execution = { state: "paused", stopId: ++stopId, reason: "breakpoint", breakpointId };
+    server.tick();
+    await expect(status).toHaveText(`Paused · breakpoint ${text} · stop ${stopId}`);
+    await expect(alerts.filter({ hasText: "Breakpoint hit" }).last()).toHaveText(`Breakpoint hit: ${text}`);
+  }
+  await expect(alerts).toHaveText([
+    "Breakpoint hit: dc.sh4.cpu.pc == 0x001008",
+    "Breakpoint hit: dc.aica.arm7.pc == 2097168",
+    "Breakpoint hit: dc.aica.dsp.step == 0x1F",
+  ]);
 });
