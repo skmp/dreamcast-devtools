@@ -935,59 +935,59 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             );
           })}
         </Stack>
-          <Stack direction="row" spacing={1} alignItems="center">
-            {stepping && (config.showMuteSolo ?? true) && (
-              <>
-                <Tooltip title={categoryState?.muted ? "Unmute category" : "Mute category"}>
-                  <IconButton size="small" onClick={handleMuteToggle} color={categoryState?.muted ? "warning" : "default"}>
-                    {categoryState?.muted ? <VolumeOffIcon fontSize="small" /> : <VolumeUpIcon fontSize="small" />}
-                  </IconButton>
-                </Tooltip>
-                <Tooltip title={categoryState?.soloed ? "Unsolo category" : "Solo category"}>
-                  <IconButton size="small" onClick={handleSoloToggle} color={categoryState?.soloed ? "primary" : "default"}>
-                    {categoryState?.soloed ? <RadioButtonCheckedIcon fontSize="small" /> : <RadioButtonUncheckedIcon fontSize="small" />}
-                  </IconButton>
-                </Tooltip>
-              </>
-            )}
-            <Tooltip title="Go to current PC">
-              <RunControlButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
-                <MyLocationIcon fontSize="small" />
-              </RunControlButton>
-            </Tooltip>
-          </Stack>
-          <Stack direction="row" spacing={1} alignItems="center">
-            <TextField
-              size="small"
-              value={unplaced ? "" : addressInput}
-              disabled={unplaced}
-              onChange={(event) => setAddressInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  handleAddressSubmit();
-                }
-              }}
-              // wide enough for an address of eight digits next to its button
-              sx={{ width: 180 }}
-              slotProps={{
-                input: {
-                  endAdornment: (
-                    <InputAdornment position="end">
-                      <Button size="small" onClick={handleAddressSubmit} disabled={unplaced} sx={{ minWidth: "auto", px: 1 }}>
-                        Go
-                      </Button>
-                    </InputAdornment>
-                  ),
-                },
-              }}
-            />
-            <Tooltip title="Refresh">
-              <RunControlButton size="small" onClick={handleRefresh} disabled={loading || unplaced}>
-                <RefreshIcon fontSize="small" />
-              </RunControlButton>
-            </Tooltip>
-          </Stack>
+        <Stack direction="row" spacing={1} alignItems="center">
+          {stepping && (config.showMuteSolo ?? true) && (
+            <>
+              <Tooltip title={categoryState?.muted ? "Unmute category" : "Mute category"}>
+                <IconButton size="small" onClick={handleMuteToggle} color={categoryState?.muted ? "warning" : "default"}>
+                  {categoryState?.muted ? <VolumeOffIcon fontSize="small" /> : <VolumeUpIcon fontSize="small" />}
+                </IconButton>
+              </Tooltip>
+              <Tooltip title={categoryState?.soloed ? "Unsolo category" : "Solo category"}>
+                <IconButton size="small" onClick={handleSoloToggle} color={categoryState?.soloed ? "primary" : "default"}>
+                  {categoryState?.soloed ? <RadioButtonCheckedIcon fontSize="small" /> : <RadioButtonUncheckedIcon fontSize="small" />}
+                </IconButton>
+              </Tooltip>
+            </>
+          )}
+          <Tooltip title="Go to current PC">
+            <RunControlButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
+              <MyLocationIcon fontSize="small" />
+            </RunControlButton>
+          </Tooltip>
+        </Stack>
+        <Stack direction="row" spacing={1} alignItems="center">
+          <TextField
+            size="small"
+            value={unplaced ? "" : addressInput}
+            disabled={unplaced}
+            onChange={(event) => setAddressInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                handleAddressSubmit();
+              }
+            }}
+            // wide enough for an address of eight digits next to its button
+            sx={{ width: 180 }}
+            slotProps={{
+              input: {
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <Button size="small" onClick={handleAddressSubmit} disabled={unplaced} sx={{ minWidth: "auto", px: 1 }}>
+                      Go
+                    </Button>
+                  </InputAdornment>
+                ),
+              },
+            }}
+          />
+          <Tooltip title="Refresh">
+            <RunControlButton size="small" onClick={handleRefresh} disabled={loading || unplaced}>
+              <RefreshIcon fontSize="small" />
+            </RunControlButton>
+          </Tooltip>
+        </Stack>
       </Box>
       {/* The frame of the listing. What is said about the lines (that they are being read
           again, that the server repeated some) is said here, and stays where it is when the
@@ -1002,93 +1002,93 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         )}
         {/* This box scrolls to the side when the panel is narrower than a line of the listing.
             Its scroll bar is below the listing, not over the last of its lines. */}
-      <Box sx={{ flex: 1, overflow: "auto" }}>
-        {!initialized ? (
-          <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
-            <Typography variant="body2" color="text.secondary">
-              {noDataText}
+        <Box sx={{ flex: 1, overflow: "auto" }}>
+          {!initialized ? (
+            <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
+              <Typography variant="body2" color="text.secondary">
+                {noDataText}
+              </Typography>
+            </Stack>
+          ) : error ? (
+            <Typography variant="body2" color="error" sx={{ p: 2 }}>
+              {error}
             </Typography>
-          </Stack>
-        ) : error ? (
-          <Typography variant="body2" color="error" sx={{ p: 2 }}>
-            {error}
-          </Typography>
-        ) : lines.length === 0 && loading ? (
-          <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }} spacing={1}>
-            <CircularProgress size={18} />
-            <Typography variant="body2" color="text.secondary">
-              Loading disassembly.
-            </Typography>
-          </Stack>
-        ) : (
-          <Box
-            ref={attachContainer}
-            sx={{
-              flex: 1,
-              height: "100%",
+          ) : lines.length === 0 && loading ? (
+            <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }} spacing={1}>
+              <CircularProgress size={18} />
+              <Typography variant="body2" color="text.secondary">
+                Loading disassembly.
+              </Typography>
+            </Stack>
+          ) : (
+            <Box
+              ref={attachContainer}
+              sx={{
+                flex: 1,
+                height: "100%",
                 // Never narrower than its lines are at their narrowest (`gridColumns`, with the
                 // minimum of the instruction column): what the panel has no room for is scrolled
                 // to, and no column is squeezed or cut off for it.
                 minWidth: "min-content",
-              overflow: "hidden",
-              fontFamily: "monospace",
-              fontSize: "13px",
-              p: 1.5,
-              position: "relative",
-              cursor: "default",
-            }}
-          >
-            {lines.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">
-                No disassembly returned.
-              </Typography>
-            ) : (
-              <Stack
-                spacing={0}
-                sx={{
-                  "& .current-instruction": {
-                    color: "primary.main",
-                    fontWeight: 600,
-                    border: "2px solid",
-                    borderColor: "success.main",
-                    "&:hover": {
-                      borderColor: "success.main !important",
+                overflow: "hidden",
+                fontFamily: "monospace",
+                fontSize: "13px",
+                p: 1.5,
+                position: "relative",
+                cursor: "default",
+              }}
+            >
+              {lines.length === 0 ? (
+                <Typography variant="body2" color="text.secondary">
+                  No disassembly returned.
+                </Typography>
+              ) : (
+                <Stack
+                  spacing={0}
+                  sx={{
+                    "& .current-instruction": {
+                      color: "primary.main",
+                      fontWeight: 600,
+                      border: "2px solid",
+                      borderColor: "success.main",
+                      "&:hover": {
+                        borderColor: "success.main !important",
+                      },
                     },
-                  },
-                  "& .target-address": {
-                    border: "2px solid",
-                    borderColor: "warning.main",
-                    animation: "fadeOutTarget 2s forwards",
-                    "&:hover": {
-                      borderColor: "inherit !important",
-                    },
-                  },
-                  "@keyframes fadeOutTarget": {
-                    "0%": {
+                    "& .target-address": {
+                      border: "2px solid",
                       borderColor: "warning.main",
+                      animation: "fadeOutTarget 2s forwards",
+                      "&:hover": {
+                        borderColor: "inherit !important",
+                      },
                     },
-                    "100%": {
-                      borderColor: "transparent",
+                    "@keyframes fadeOutTarget": {
+                      "0%": {
+                        borderColor: "warning.main",
+                      },
+                      "100%": {
+                        borderColor: "transparent",
+                      },
                     },
-                  },
-                }}
-              >
-                {lines.map((line) => (
-                  <DisassemblyLineItem
-                    key={line.address}
-                    line={line}
-                    breakpoint={breakpointsByAddress.get(line.address)}
-                    config={config}
-                    onBreakpointClick={handleBreakpointClick}
-                    onBreakpointToggle={handleBreakpointToggle}
-                    lineRef={handleLineRef}
-                  />
-                ))}
-              </Stack>
-            )}
-          </Box>
-        )}
-      </Box>
+                  }}
+                >
+                  {lines.map((line) => (
+                    <DisassemblyLineItem
+                      key={line.address}
+                      line={line}
+                      breakpoint={breakpointsByAddress.get(line.address)}
+                      config={config}
+                      onBreakpointClick={handleBreakpointClick}
+                      onBreakpointToggle={handleBreakpointToggle}
+                      lineRef={handleLineRef}
+                    />
+                  ))}
+                </Stack>
+              )}
+            </Box>
+          )}
+        </Box>
         {listed && loading && (
           <Stack direction="row" spacing={1} alignItems="center" sx={{ position: "absolute", top: 8, right: 16 }}>
             <CircularProgress size={12} thickness={5} />
