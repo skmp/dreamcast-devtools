@@ -28,6 +28,14 @@ interface Faults {
   beforeRequest?: (request: Json) => Json[];
   /** answers a request in the server's place: the server does not see a request this returns a frame for */
   answer?: (request: Json) => Json | undefined;
+  /** the same for a frame as it arrived, before it is parsed: for what depends on its size, or is no JSON */
+  answerText?: (text: string) => Json | undefined;
+  /** rewrites a frame of the client as it arrived, before anything else looks at it */
+  toServerText?: (text: string) => string;
+  /** the largest message the front takes from a client (default: what the mock takes, 1 MiB); above it the connection is closed with 1009 */
+  maxPayload?: number;
+  /** the close code the client gets when the server closes the connection, in place of the server's */
+  closeCode?: (code: number) => number;
   /** a frame of the client for which this is true is lost: the server does not see it, and nothing answers it */
   lose?: (request: unknown) => boolean;
   /** rewrites a binary frame of the server */
@@ -63,7 +71,9 @@ const startServer = async (
     return { url: listener.url, direct: listener.url, mock };
   }
 
-  const proxy = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  // (the front takes any size, unless told otherwise: what is too large is the server's to refuse)
+  const limits = typeof source === "function" ? source() : source;
+  const proxy = new WebSocketServer({ port: 0, host: "127.0.0.1", maxPayload: limits.maxPayload ?? 64 * 1048576 });
   await new Promise<void>((resolve) => proxy.once("listening", resolve));
   closers.unshift(
     () =>
@@ -78,8 +88,12 @@ const startServer = async (
     const early: string[] = [];
     const held: Json[] = [];
     client.on("message", (data) => {
-      let text = data.toString();
-      let answered: Json | undefined;
+      let text = faults.toServerText ? faults.toServerText(data.toString()) : data.toString();
+      let answered: Json | undefined = faults.answerText?.(text);
+      if (answered) {
+        client.send(JSON.stringify(answered));
+        return;
+      }
       try {
         const request = JSON.parse(text) as Json;
         if (faults.lose?.(request)) {
@@ -122,8 +136,13 @@ const startServer = async (
       }
     });
     client.on("close", () => upstream.close());
-    upstream.on("close", () => client.close());
-    upstream.on("error", () => client.close());
+    // the client is told how the server ended the connection (1009: the message was too big)
+    upstream.on("close", (code) => {
+      const told = faults.closeCode ? faults.closeCode(code) : code;
+      client.close(told >= 1000 && told !== 1004 && told !== 1005 && told !== 1006 ? told : undefined);
+    });
+    upstream.on("error", () => undefined);
+    client.on("error", () => undefined);
   });
   return { url: `ws://127.0.0.1:${(proxy.address() as AddressInfo).port}/ws`, direct: listener.url, mock };
 };
@@ -2300,6 +2319,118 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
   }, 30_000);
 
+  it("S12: the id of a -32600 answer is the request's when that is a number and null otherwise; a malformed message without an id is answered", async () => {
+    const expected = "the answer echoes the id of the request when that is a number, and is null otherwise";
+    // null in every -32600 answer, also where the request had a number
+    const alwaysNull = await run({ toClient: (frame) => ((frame.error as Json | undefined)?.code === -32600 ? { ...frame, id: null } : frame) }, ["S12"]);
+    expect(reportOf(alwaysNull)).toEqual([`S12 failed a request without the jsonrpc member is answered with id null, expected 7: ${expected}`]);
+    // a string id that is echoed
+    const echoed = await run(
+      { answerText: (text) => (text.includes('"id":"1"') ? { jsonrpc: "2.0", id: "1", error: { code: -32600, message: "invalid request" } } : undefined) },
+      ["S12"],
+    );
+    expect(reportOf(echoed)).toEqual([`S12 failed a request whose id is a string is answered with id "1", expected null: ${expected}`]);
+    // an id of the server's own for a batch
+    const invented = await run({ answer: (request) => (Array.isArray(request) ? rpcError({ id: 0 }, -32600, "invalid request") : undefined) }, ["S12"]);
+    expect(reportOf(invented)).toEqual([`S12 failed a batch (a JSON array of requests) is answered with id 0, expected null: ${expected}`]);
+
+    // a malformed message without an id is not a notification: it is answered. And so are the two other kinds of -32600.
+    const isObject = (frame: unknown): frame is Json => typeof frame === "object" && frame !== null && !Array.isArray(frame);
+    for (const [lost, what] of [
+      [(frame: unknown) => isObject(frame) && frame.jsonrpc === undefined && frame.id === undefined, "a message without the jsonrpc member and without an id"],
+      [(frame: unknown) => isObject(frame) && frame.method === undefined, "a request without a method"],
+      [(frame: unknown) => isObject(frame) && Array.isArray(frame.params), "a request whose params is not an object"],
+    ] as const) {
+      expect(reportOf(await run({ lose: lost }, ["S12"]))).toEqual([`S12 failed no answer to ${what} within 2000 ms`]);
+    }
+    // params that are not an object, executed as if there were none
+    const lenient = await run({ toServer: (frame) => (Array.isArray(frame.params) ? { ...frame, params: {} } : frame) }, ["S12"]);
+    expect(detailsOf(lenient, "S12")).toMatch(/^a request whose params is not an object is answered with \{"jsonrpc":"2\.0","id":9,"result":\{.*, expected the JSON-RPC error -32600 with a message, and nothing else$/);
+  }, 60_000);
+
+  it("S12: a notification that is answered, or executed", async () => {
+    const isNotification = (frame: Json) => frame.jsonrpc === "2.0" && typeof frame.method === "string" && frame.id === undefined;
+    const answered = await run({ answer: (request) => (isNotification(request) ? { jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } } : undefined) }, ["S12"]);
+    expect(reportOf(answered)).toEqual([
+      'S12 failed a notification gets no answer; the first frame behind one, and behind a request with id 2, is {"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid request"}}',
+    ]);
+
+    // executed without an answer: the server takes it for a request, and the front loses what it says to it
+    const executed = await startServer({
+      toServer: (frame) => (isNotification(frame) ? { ...frame, id: 4711 } : frame),
+      toClient: (frame) => (frame.id === 4711 ? undefined : frame),
+    });
+    const summary = await runContract({ url: executed.url, profile: "mock", only: new Set(["S12"]) });
+    expect(reportOf(summary)).toEqual(["S12 failed a notification is ignored: breakpoints.add without an id added a breakpoint"]);
+    // (and what it left behind is removed again)
+    expect(summary.cleanUpProblems).toEqual([]);
+    expect((await stateOf(executed.direct)).breakpoints).toEqual({});
+  }, 30_000);
+
+  it("S12: a request with a member, or a parameter, that the protocol does not name is refused", async () => {
+    const strictMembers = await run({ answer: (request) => (request.meta !== undefined ? rpcError(request, -32600, "invalid request") : undefined) }, ["S12"]);
+    expect(reportOf(strictMembers)).toEqual([
+      'S12 failed a request with an unknown top-level member and an unknown params key is answered with {"jsonrpc":"2.0","id":3,"error":{"code":-32600,"message":"invalid request"}}, ' +
+        "expected the answer to the request without them",
+    ]);
+    const strictParams = await run({ answer: (request) => (paramsOf(request).flavour !== undefined ? rpcError(request, -32602, "invalid params: flavour") : undefined) }, ["S12"]);
+    expect(detailsOf(strictParams, "S12")).toMatch(/^a request with an unknown top-level member and an unknown params key is answered with \{"jsonrpc":"2\.0","id":3,"error":\{"code":-32602,/);
+    // a parameter the server does not know that changes what it answers
+    const used = await run({ toServer: (frame) => (paramsOf(frame).flavour !== undefined ? { ...frame, params: { ...paramsOf(frame), count: 1 } } : frame) }, ["S12"]);
+    expect(detailsOf(used, "S12")).toMatch(/^a request with an unknown top-level member and an unknown params key is answered with \{"jsonrpc":"2\.0","id":3,"result":\{"lines":\[\{[^\]]*\]\}\}, expected the answer to the request without them$/);
+  }, 30_000);
+
+  it("S12: the bound of 1 MiB on an inbound message", async () => {
+    const MiB = 1048576;
+    const oversized = "a text message of 1048577 bytes (1 MiB + 1 byte)";
+    // no bound: the message is executed like any other (the front hands it on without its padding)
+    const unbounded = await startServer({ toServerText: (text) => (text.length > MiB ? text.replace(/ {2,}/, "") : text) });
+    const noLimit = await runContract({ url: unbounded.url, profile: "mock", only: new Set(["S12"]) });
+    expect(reportOf(noLimit)).toEqual([`S12 failed ${oversized} is answered with {"jsonrpc":"2.0","id":5,"result":{}}; it closes the connection (1009) or is answered with an error`]);
+    expect(noLimit.cleanUpProblems).toEqual([]);
+    expect((await stateOf(unbounded.direct)).breakpoints).toEqual({});
+
+    // the connection is closed, with a code that does not say why
+    const wrongCode = await run({ closeCode: (code) => (code === 1009 ? 1000 : code) }, ["S12"]);
+    expect(reportOf(wrongCode)).toEqual([`S12 failed ${oversized} closed the connection with code 1000, expected 1009 (message too big)`]);
+    // nothing happens at all
+    const silent = await run({ lose: (frame) => typeof frame === "object" && frame !== null && (frame as Json).id === 5 && (frame as Json).method === "breakpoints.add" }, ["S12"]);
+    expect(reportOf(silent)).toEqual([`S12 failed ${oversized} neither closed the connection nor was answered within 5000 ms`]);
+    // a bound that is smaller than the protocol's: half a MiB
+    const smaller = await run({ maxPayload: MiB / 2 }, ["S12"]);
+    expect(reportOf(smaller)).toEqual(["S12 failed the connection was closed (code 1009) in answer to a message of 1048575 bytes, just under 1 MiB"]);
+
+    // answered with an error in place of the close: that is a server the design allows
+    const answering = await run(
+      { answerText: (text) => (text.length > MiB ? { jsonrpc: "2.0", id: 5, result: { error: { code: -32602, message: "message too large" } } } : undefined) },
+      ["S12"],
+    );
+    expect(reportOf(answering)).toEqual(["S12 passed "]);
+    const answeringNull = await run({ answerText: (text) => (text.length > MiB ? { jsonrpc: "2.0", id: null, error: { code: -32600, message: "too large" } } : undefined) }, ["S12"]);
+    expect(reportOf(answeringNull)).toEqual(["S12 passed "]);
+  }, 90_000);
+
+  it("S12: -32004 for a method whose capability is not advertised, whatever its parameters", async () => {
+    // an M1 server that has the method and looks at its parameters first, as the mock did
+    const paramsFirst = await run(
+      { answer: (request) => (request.method === "state.setRegister" && paramsOf(request).value === undefined ? inBand(request, -32602, "invalid params: value") : undefined) },
+      ["S12"],
+      { supports: MOCK_M1_SUPPORT },
+    );
+    expect(reportOf(paramsFirst)).toEqual(['S12 failed state.setRegister {"path":"dc.sh4.cpu","name":"R0"}: expected the error -32004, got -32602 "invalid params: value"']);
+    const editWatch = await run(
+      { answer: (request) => (request.method === "state.editWatch" && paramsOf(request).value === undefined ? inBand(request, -32602, "invalid params: value") : undefined) },
+      ["S12"],
+      { supports: MOCK_M1_SUPPORT },
+    );
+    expect(reportOf(editWatch)).toEqual(['S12 failed state.editWatch {"watchId":1}: expected the error -32004, got -32602 "invalid params: value"']);
+    expect(editWatch.cleanUpProblems).toEqual([]);
+    // the mock as an M1 server answers every one of these probes with -32004
+    expect(reportOf(await run(undefined, ["S12"], { supports: MOCK_M1_SUPPORT }))).toEqual(["S12 passed "]);
+    // a server that does not list the DSP refuses to step over it all the same
+    expect(reportOf(await run(undefined, ["S12"], { supports: { targets: ["sh4", "arm7"] } }))).toEqual(["S12 passed "]);
+  }, 60_000);
+
   it("reports a scenario whose capability the server does not advertise as not applicable, never as passed; a run of nothing else has verified nothing", async () => {
     const lines: string[] = [];
     const { url } = await startServer({
@@ -2594,7 +2725,9 @@ describe("the emulator profile", () => {
         upstream.on("open", () => early.splice(0).forEach((text) => upstream.send(text)));
         upstream.on("message", (data, isBinary) => client.send(isBinary ? data : data.toString(), { binary: isBinary }));
         client.on("close", () => upstream.close());
-        upstream.on("close", () => client.close());
+        upstream.on("close", (code) => client.close(code >= 1000 && code !== 1004 && code !== 1005 && code !== 1006 ? code : undefined));
+        upstream.on("error", () => undefined);
+        client.on("error", () => undefined);
       });
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));

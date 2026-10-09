@@ -1518,33 +1518,89 @@ const s11: Scenario = {
   },
 };
 
+/** What a raw WebSocket saw next: a text frame that is not a tick, or the end of the connection with its close code. */
+type RawOutcome = { text: string } | { closed: number };
+
 /**
- * One exchange on a raw WebSocket (the `ws` package, for what the client classes cannot
- * send): what the server answers to `text`. Ticks, which every connection receives, are
- * skipped.
+ * A raw WebSocket (the `ws` package), for what the client classes cannot send. Ticks, which
+ * every connection receives, are skipped.
  */
-const rawExchange = (url: string, text: string, timeoutMs: number, what: string): Promise<string> =>
+interface RawSocket {
+  send(text: string): void;
+  /** the next frame that is not a tick, or how the connection ended; undefined when neither came within `timeoutMs` */
+  next(timeoutMs: number): Promise<RawOutcome | undefined>;
+  close(): void;
+}
+
+const openRaw = (url: string): Promise<RawSocket> =>
   new Promise((resolve, reject) => {
     const socket = new WebSocket(url);
-    const timer = setTimeout(() => {
-      socket.terminate();
-      reject(new ContractFailure(`no answer to ${what} within ${timeoutMs} ms`));
-    }, timeoutMs);
-    socket.once("error", (error) => {
-      clearTimeout(timer);
-      reject(new ContractFailure(`raw WebSocket: ${error.message}`));
-    });
-    socket.once("open", () => socket.send(text));
+    const seen: RawOutcome[] = [];
+    let waiting: (() => void) | undefined;
+    const push = (outcome: RawOutcome) => {
+      seen.push(outcome);
+      waiting?.();
+    };
+    // (after the connection is open, an error is followed by its close event: that is what is reported)
+    socket.on("error", (error) => reject(new ContractFailure(`raw WebSocket: ${error.message}`)));
     socket.on("message", (data, isBinary) => {
-      const answer = data.toString();
-      if (isBinary || /"method"\s*:\s*"event\.tick"/.test(answer.slice(0, 200))) {
-        return;
+      const text = data.toString();
+      if (!isBinary && !/"method"\s*:\s*"event\.tick"/.test(text.slice(0, 200))) {
+        push({ text });
       }
-      clearTimeout(timer);
-      socket.close();
-      resolve(answer);
     });
+    socket.on("close", (code) => push({ closed: code }));
+    socket.once("open", () =>
+      resolve({
+        send: (text) => socket.send(text),
+        close: () => socket.close(),
+        next: (timeoutMs) =>
+          new Promise((done) => {
+            const take = () => {
+              clearTimeout(timer);
+              waiting = undefined;
+              done(seen.shift());
+            };
+            const timer = setTimeout(take, timeoutMs);
+            if (seen.length > 0) {
+              take();
+            } else {
+              waiting = take;
+            }
+          }),
+      }),
+    );
   });
+
+/** One exchange on a raw WebSocket: what the server answers to `text`. */
+const rawExchange = async (url: string, text: string, timeoutMs: number, what: string): Promise<string> => {
+  const socket = await openRaw(url);
+  try {
+    socket.send(text);
+    const outcome = await socket.next(timeoutMs);
+    if (!outcome) {
+      return fail(`no answer to ${what} within ${timeoutMs} ms`);
+    }
+    return "text" in outcome ? outcome.text : fail(`the connection was closed (code ${outcome.closed}) in answer to ${what}`);
+  } finally {
+    socket.close();
+  }
+};
+
+/** A JSON object as a text of exactly `bytes` bytes: padded with white space, which JSON allows between its tokens. */
+const paddedTo = (message: Record<string, unknown>, bytes: number): string => {
+  const text = JSON.stringify(message);
+  return `${text.slice(0, -1)}${" ".repeat(bytes - Buffer.byteLength(text))}}`;
+};
+
+const parsedObject = (text: string): Record<string, unknown> | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 /**
  * Whether `text` is a JSON-RPC error response with `code`: the keys jsonrpc, id and error, and
@@ -1602,10 +1658,8 @@ const s12: Scenario = {
     await session.expectError("control.stepOut", { target: "sh4" }, -32003);
     // DSP step over / out: -32004 always (checked while paused, where it is not -32003)
     await ensurePaused(context);
-    if (targetOf(session.shape, "dsp")) {
-      await session.expectError("control.stepOver", { target: "dsp" }, -32004);
-      await session.expectError("control.stepOut", { target: "dsp" }, -32004);
-    }
+    await session.expectError("control.stepOver", { target: "dsp" }, -32004);
+    await session.expectError("control.stepOut", { target: "dsp" }, -32004);
     // a target without stepping: its steps and code breakpoints are -32004
     for (const target of session.shape.targets ?? []) {
       if (!target.stepping) {
@@ -1613,60 +1667,142 @@ const s12: Scenario = {
         await session.expectError("breakpoints.add", { event: target.breakpointEvent, address: 0 }, -32004);
       }
     }
-    // methods of a milestone the server does not advertise: -32004 on the method's channel
-    if (!hasCapability(context, CAPABILITIES.RESET)) {
-      await session.expectError("control.reset", {}, -32004);
-    }
-    if (!hasCapability(context, CAPABILITIES.MEMORY_WRITE)) {
-      await session.expectError("state.writeMemory", { target: "sh4", address: 0x8c010000, data: [0] }, -32004);
-    }
-    if (!hasCapability(context, CAPABILITIES.MEMORY_BINARY)) {
-      await session.expectError("state.getMemoryBinary", { target: "sh4", address: 0x8c010000, length: 16 }, -32004);
-    }
-    if (!hasCapability(context, CAPABILITIES.TABLES)) {
-      await session.expectError("state.getTable", { id: "sq" }, -32004);
-    }
-    if (!hasCapability(context, CAPABILITIES.HOLLY_CAPTURE)) {
-      await session.expectError("state.captureHolly", { what: "ta" }, -32004);
-    }
-    if (!hasCapability(context, CAPABILITIES.SGC_CAPTURE)) {
-      await session.expectError("state.recordSgcFrames", { frames: 1 }, -32004);
-      await session.expectError("state.getSgcFrameData", {}, -32004);
+    // A method whose capability the server does not advertise: -32004 on the method's channel.
+    // That is decided before the parameters are looked at (3.0, which error wins): the same
+    // request without a parameter it requires is still "not supported", not "invalid params".
+    const optional: Array<{ capability: string; method: string; params: Record<string, unknown>; required?: string }> = [
+      { capability: CAPABILITIES.RESET, method: "control.reset", params: {} },
+      { capability: CAPABILITIES.MEMORY_WRITE, method: "state.writeMemory", params: { target: "sh4", address: 0x8c010000, data: [0] }, required: "data" },
+      { capability: CAPABILITIES.MEMORY_BINARY, method: "state.getMemoryBinary", params: { target: "sh4", address: 0x8c010000, length: 16 }, required: "length" },
+      { capability: CAPABILITIES.TABLES, method: "state.getTable", params: { id: "sq" }, required: "id" },
+      { capability: CAPABILITIES.HOLLY_CAPTURE, method: "state.captureHolly", params: { what: "ta" }, required: "what" },
+      { capability: CAPABILITIES.SGC_CAPTURE, method: "state.recordSgcFrames", params: { frames: 1 } },
+      { capability: CAPABILITIES.SGC_CAPTURE, method: "state.getSgcFrameData", params: {} },
+      { capability: CAPABILITIES.REGISTER_WRITE, method: "state.setRegister", params: { path: sh4.pcPath, name: "R0", value: "0" }, required: "value" },
+    ];
+    for (const probe of optional) {
+      if (hasCapability(context, probe.capability)) {
+        continue;
+      }
+      await session.expectError(probe.method, probe.params, -32004);
+      if (probe.required) {
+        const { [probe.required]: _omitted, ...incomplete } = probe.params;
+        await session.expectError(probe.method, incomplete, -32004);
+      }
     }
     if (!hasCapability(context, CAPABILITIES.REGISTER_WRITE)) {
-      await session.expectError("state.setRegister", { path: sh4.pcPath, name: "R0", value: "0" }, -32004);
       // state.editWatch is state.setRegister on the watched register, and -32004 until then. The
       // request is a valid one: a watch that exists, and the value its register has.
       const register = unwatchedRegister(context, sh4.pcPath, ["R0", "R1", "R2"]);
       const { id, record } = await addWatch(context, register.expression, register.expression);
       const value = record.tick.watches?.find((watch) => watch.id === id)?.value;
       await session.expectError("state.editWatch", { watchId: id, value: typeof value === "string" && value.startsWith("0x") ? value : "0" }, -32004);
+      await session.expectError("state.editWatch", { watchId: id }, -32004);
       await unwatch(context, id);
     }
 
+    // What follows is sent on raw sockets. A request that would leave something behind if it
+    // were executed, where it must not be: a disabled code breakpoint.
+    const wait = session.scale(2000);
+    const leftBehind = { event: sh4.breakpointEvent, address: (sh4.defaultDisassemblyAddress & ~1) >>> 0, kind: "code", enabled: false };
+    const breakpointCount = async () => Object.keys((await session.describe()).tick.breakpoints).length;
+    const describe = (id: number) => ({ jsonrpc: "2.0", id, method: "debugger.describe", params: {} });
+
     // malformed JSON: -32700 with id null, a message, and nothing else in the answer
-    const answer = await rawExchange(context.url, "{nope", session.scale(2000), "malformed JSON");
+    const answer = await rawExchange(context.url, "{nope", wait, "malformed JSON");
     check(
-      isErrorAnswer(answer, -32700) && JSON.parse(answer).id === null,
+      isErrorAnswer(answer, -32700) && parsedObject(answer)?.id === null,
       `the answer to malformed JSON is ${answer.slice(0, 200)}, expected {"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"..."}}`,
     );
 
     // What is JSON and not a request object of this protocol: -32600. There are no batches (a
-    // JSON array is not executed), requests are objects with jsonrpc "2.0", and their id is a
-    // number. What the id of such an answer is, the design does not say: it is not looked at.
-    const request = { jsonrpc: "2.0", id: 1, method: "debugger.describe", params: {} };
-    const { jsonrpc: _version, ...withoutVersion } = request;
-    const invalid: Array<[what: string, frame: unknown]> = [
-      ["a batch (a JSON array of requests)", [request]],
-      ["a frame that is JSON and not an object (42)", 42],
-      ["a request without the jsonrpc member", withoutVersion],
-      ["a request whose id is a string", { ...request, id: "1" }],
+    // JSON array is not executed), requests are objects with jsonrpc "2.0", a numeric id, a
+    // method and, if any, params that are an object. The id of the answer echoes the id of the
+    // request when that is a number, and is null otherwise: also for a malformed message
+    // without an id, which is answered, not taken for a notification.
+    const { jsonrpc: _version, ...withoutVersion } = describe(7);
+    const { id: _id, ...withoutVersionOrId } = withoutVersion;
+    const { method: _method, ...withoutMethod } = describe(8);
+    const invalid: Array<[what: string, frame: unknown, id: number | null]> = [
+      ["a batch (a JSON array of requests)", [describe(1)], null],
+      ["a frame that is JSON and not an object (42)", 42, null],
+      ["a request without the jsonrpc member", withoutVersion, 7],
+      ["a message without the jsonrpc member and without an id", withoutVersionOrId, null],
+      ["a request whose id is a string", { ...describe(1), id: "1" }, null],
+      ["a request without a method", withoutMethod, 8],
+      ["a request whose params is not an object", { ...describe(9), params: [3] }, 9],
     ];
-    for (const [what, frame] of invalid) {
-      const text = await rawExchange(context.url, JSON.stringify(frame), session.scale(2000), what);
+    for (const [what, frame, id] of invalid) {
+      const text = await rawExchange(context.url, JSON.stringify(frame), wait, what);
       check(isErrorAnswer(text, -32600), `${what} is answered with ${text.slice(0, 200)}, expected the JSON-RPC error -32600 with a message, and nothing else`);
+      const echoed = parsedObject(text)?.id;
+      check(
+        echoed === id,
+        `${what} is answered with id ${JSON.stringify(echoed)}, expected ${JSON.stringify(id)}: the answer echoes the id of the request when that is a number, and is null otherwise`,
+      );
     }
-    // "no data member anywhere" is checked on every response of the run by the session
+
+    // A well-formed message without an id is a notification from the client: it is ignored, and
+    // gets no answer. The first thing the socket hears is the answer to the request behind it.
+    const before = await breakpointCount();
+    const quiet = await openRaw(context.url);
+    try {
+      quiet.send(JSON.stringify({ jsonrpc: "2.0", method: "breakpoints.add", params: leftBehind }));
+      quiet.send(JSON.stringify(describe(2)));
+      const heard = await quiet.next(wait);
+      const reply = heard && "text" in heard ? parsedObject(heard.text) : undefined;
+      check(
+        reply?.id === 2 && reply.result !== undefined,
+        `a notification gets no answer; the first frame behind one, and behind a request with id 2, is ${heard ? ("text" in heard ? heard.text.slice(0, 200) : `the end of the connection (code ${heard.closed})`) : `none within ${wait} ms`}`,
+      );
+    } finally {
+      quiet.close();
+    }
+    check((await breakpointCount()) === before, "a notification is ignored: breakpoints.add without an id added a breakpoint");
+
+    // Members of a request, and keys of params, that the protocol does not name are ignored: the
+    // request is answered as without them (a later client can add an optional parameter).
+    const lines = { target: "sh4", address: leftBehind.address, count: 2 };
+    const plain = await session.call("state.getDisassembly", lines);
+    const extended = await rawExchange(
+      context.url,
+      JSON.stringify({ jsonrpc: "2.0", id: 3, method: "state.getDisassembly", params: { ...lines, flavour: "att" }, meta: { trace: "s12" } }),
+      wait,
+      "a request with an unknown top-level member and an unknown params key",
+    );
+    const extendedReply = parsedObject(extended);
+    check(
+      extendedReply?.id === 3 && JSON.stringify(sortKeys(extendedReply.result)) === JSON.stringify(sortKeys(plain)),
+      `a request with an unknown top-level member and an unknown params key is answered with ${extended.slice(0, 200)}, expected the answer to the request without them`,
+    );
+
+    // An inbound message is at most 1 MiB. One of just under that is answered ...
+    const limit = PROTOCOL_BOUNDS.inboundMessageBytes;
+    const large = parsedObject(await rawExchange(context.url, paddedTo(describe(4), limit - 1), session.scale(5000), `a message of ${limit - 1} bytes, just under 1 MiB`));
+    check(large?.id === 4 && large.result !== undefined, `a message of ${limit - 1} bytes, just under 1 MiB, is answered with ${JSON.stringify(large).slice(0, 200)}, expected its result`);
+    // ... and one of 1 MiB + 1 byte closes the connection (1009) or is answered with an error.
+    // Either way it is not executed, and the server answers a new connection afterwards.
+    const oversized = `a text message of ${limit + 1} bytes (1 MiB + 1 byte)`;
+    const big = await openRaw(context.url);
+    try {
+      big.send(paddedTo({ jsonrpc: "2.0", id: 5, method: "breakpoints.add", params: leftBehind }, limit + 1));
+      const outcome = await big.next(session.scale(5000));
+      if (!outcome) {
+        fail(`${oversized} neither closed the connection nor was answered within ${session.scale(5000)} ms`);
+      } else if ("closed" in outcome) {
+        check(outcome.closed === 1009, `${oversized} closed the connection with code ${outcome.closed}, expected 1009 (message too big)`);
+      } else {
+        const reply = parsedObject(outcome.text);
+        const refused = reply?.error !== undefined || (reply?.result as { error?: unknown } | undefined)?.error !== undefined;
+        check(refused, `${oversized} is answered with ${outcome.text.slice(0, 200)}; it closes the connection (1009) or is answered with an error`);
+      }
+    } finally {
+      big.close();
+    }
+    const alive = parsedObject(await rawExchange(context.url, JSON.stringify(describe(6)), wait, `debugger.describe on a new connection after ${oversized}`));
+    check(alive?.id === 6 && alive.result !== undefined, `after ${oversized} a new connection is answered; debugger.describe got ${JSON.stringify(alive).slice(0, 200)}`);
+    check((await breakpointCount()) === before, `${oversized} was executed: its breakpoints.add added a breakpoint`);
+    // "no data member anywhere" and "a message that is not empty" are checked on every response of the run by the session
   },
 };
 
