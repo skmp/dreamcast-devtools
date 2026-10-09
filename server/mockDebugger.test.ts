@@ -792,6 +792,46 @@ describe("a server that implements less (the option `supports`)", () => {
     session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" });
   });
 
+  it("answers a method whose capability it lacks with -32004 before it looks at the parameters or at the lifetime", () => {
+    const mock = createMock({ supports: MOCK_M1_SUPPORT });
+    const session = connect(mock);
+    session.describe();
+    // a parameter is missing, or of the wrong type: still "not supported", as for a method of a later milestone
+    const probes: Array<[string, unknown]> = [
+      ["state.setRegister", { path: "dc.sh4.cpu", name: "R0" }],
+      ["state.setRegister", {}],
+      ["state.editWatch", { watchId: "one" }],
+      ["state.recordSgcFrames", { frames: 0 }],
+      ["state.getSgcFrameData", { anything: 1 }],
+      ["state.writeMemory", { target: "sh4" }],
+      ["control.reset", { target: 4 }],
+    ];
+    for (const [method, params] of probes) {
+      session.fail(method, params, -32004);
+    }
+    expect(connect(createMock({ supports: { capabilities: [] } })).call("state.getCallstack", { target: "dsp", maxFrames: 0 }).error).toMatchObject({ code: -32004 });
+    // with the capability the parameters are looked at
+    const full = connect(createMock());
+    full.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0" }, -32602);
+    full.fail("state.getCallstack", { target: "dsp", maxFrames: 0 }, -32602);
+
+    // the lifetime comes behind it too: no game loaded, and a machine the host stopped
+    mock.setLifetime("no-machine");
+    for (const [method, params] of probes) {
+      session.fail(method, params, -32004);
+    }
+    session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" }, -32004);
+    mock.setLifetime("stopped");
+    session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" }, -32004);
+    session.fail("state.recordSgcFrames", {}, -32004);
+    // ... where a server that has the method answers with the lifetime
+    const stopped = createMock();
+    const other = connect(stopped);
+    stopped.setLifetime("stopped");
+    other.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" }, -32001);
+    other.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0" }, -32602);
+  });
+
   it("reports the protocol version it is told to report", () => {
     expect(connect(createMock()).call("debugger.describe").result).toMatchObject({ protocol: 3 });
     expect(connect(createMock({ protocol: 4 })).call("debugger.describe").result).toMatchObject({ protocol: 4 });

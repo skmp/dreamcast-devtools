@@ -718,6 +718,19 @@ const notSupported = (what: string) => new MockRpcError(DebuggerErrorCode.NOT_SU
 
 type CallClass = "describe" | "read" | "table" | "write" | "exec";
 
+/**
+ * The capability behind a method. A server without it answers the method with -32004 before
+ * it looks at the parameters or at the lifetime, exactly as it answers a method of a later
+ * milestone (design 3.0, which error wins).
+ */
+const METHOD_CAPABILITY: Readonly<Record<string, string>> = {
+  [RpcMethod.STATE_GET_CALLSTACK]: CAPABILITIES.CALLSTACK,
+  [RpcMethod.STATE_SET_REGISTER]: CAPABILITIES.REGISTER_WRITE,
+  [RpcMethod.STATE_EDIT_WATCH]: CAPABILITIES.REGISTER_WRITE,
+  [RpcMethod.STATE_RECORD_SGC_FRAMES]: CAPABILITIES.SGC_CAPTURE,
+  [RpcMethod.STATE_GET_SGC_FRAME_DATA]: CAPABILITIES.SGC_CAPTURE,
+};
+
 interface ClientState {
   id: number;
   connection: MockConnection;
@@ -1344,7 +1357,10 @@ export class MockDebugger {
     let result: unknown;
     try {
       const handler = this.handlers[method];
-      if (!handler) {
+      // A method of a later milestone, and one whose capability this server was configured
+      // without: -32004, whatever the parameters are and whatever the lifetime is.
+      const capability = METHOD_CAPABILITY[method];
+      if (!handler || (capability !== undefined && !this.has(capability))) {
         throw notSupported(method);
       }
       const schema = DebuggerRpcMethodSchemas[method as keyof typeof DebuggerRpcMethodSchemas];
@@ -1500,7 +1516,6 @@ export class MockDebugger {
 
   private getCallstack(params: Record<string, unknown>): { target: "sh4" | "arm7"; frames: CallstackFrame[] } {
     const target = params.target as "sh4" | "arm7";
-    this.requireCapability(CAPABILITIES.CALLSTACK, RpcMethod.STATE_GET_CALLSTACK);
     this.supportedTarget(target);
     const maxFrames = (params.maxFrames as number | undefined) ?? PROTOCOL_BOUNDS.callstackMaxFrames.default;
     return { target, frames: this.callstack(target, maxFrames) };
@@ -1559,7 +1574,6 @@ export class MockDebugger {
   }
 
   private editWatch(params: Record<string, unknown>, context: RequestContext): Record<string, never> {
-    this.requireCapability(CAPABILITIES.REGISTER_WRITE, RpcMethod.STATE_EDIT_WATCH);
     const watch = this.watchById(params.watchId as number);
     this.writeRegister(watch.path, watch.register, params.value as string);
     this.tickAfter(context);
@@ -1567,7 +1581,6 @@ export class MockDebugger {
   }
 
   private setRegister(params: Record<string, unknown>, context: RequestContext): Record<string, never> {
-    this.requireCapability(CAPABILITIES.REGISTER_WRITE, RpcMethod.STATE_SET_REGISTER);
     const path = params.path as string;
     const name = params.name as string;
     const register = this.nodes.get(path)?.registers?.find((candidate) => candidate.name === name);
@@ -1756,7 +1769,6 @@ export class MockDebugger {
    * with reason "capture".
    */
   private recordSgcFrames(params: Record<string, unknown>, context: RequestContext): void {
-    this.requireCapability(CAPABILITIES.SGC_CAPTURE, RpcMethod.STATE_RECORD_SGC_FRAMES);
     const frames = (params.frames as number | undefined) ?? PROTOCOL_BOUNDS.sgcFrames.default;
     const wasPaused = !this.running;
     context.deferred = true;
@@ -1777,7 +1789,6 @@ export class MockDebugger {
   }
 
   private getSgcFrameData(context: RequestContext): unknown {
-    this.requireCapability(CAPABILITIES.SGC_CAPTURE, RpcMethod.STATE_GET_SGC_FRAME_DATA);
     const capture = this.capture;
     if (!capture) {
       throw new MockRpcError(DebuggerErrorCode.NO_CAPTURE, "no capture available");
