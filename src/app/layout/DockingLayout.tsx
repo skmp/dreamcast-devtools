@@ -15,6 +15,7 @@ import AddIcon from "@mui/icons-material/Add";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { PanelSelectorModal } from "./PanelSelectorModal";
 import { loadLayout, saveLayout, withKnownPanels } from "./dockingLayoutStorage";
+import { isCompactDock, type DefaultLayoutMode } from "./defaultLayout";
 import "dockview/dist/styles/dockview.css";
 
 export type PanelDefinition = {
@@ -28,7 +29,7 @@ type DockingLayoutProps = {
   allPanels?: PanelDefinition[]; // All available panels for cross-instance drag and drop
   onReady?: (api: DockviewApi) => void;
   workspaceId?: string;
-  defaultLayoutMode?: 'tabs' | 'vertical-stack' | 'sh4-layout' | 'mixed-mode-debugger-layout'; // How to layout initial panels
+  defaultLayoutMode?: DefaultLayoutMode; // How to layout initial panels
   onAddPanelRequest?: (panelId: string) => void;
 };
 
@@ -57,6 +58,8 @@ const PanelFrame = ({ panel }: { panel: PanelDefinition }) => {
 
 export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, defaultLayoutMode = 'tabs' }: DockingLayoutProps) => {
   const apiRef = useRef<DockviewApi | null>(null);
+  // the element the dock fills: what room a default layout has is measured on it
+  const dockRef = useRef<HTMLDivElement | null>(null);
   const { mode } = useThemeMode();
   const isDarkMode = mode === "dark";
   const [modalOpen, setModalOpen] = useState(false);
@@ -98,15 +101,19 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
       const stored = loadLayout(workspaceId);
       const savedLayout = stored ? withKnownPanels(stored, (allPanels ?? panels).map((panel) => panel.id)) : null;
 
+      // A default layout is made for the room the dock has when it is made (a saved layout is
+      // the user's, whatever the window is now; "Reset layout" makes the default again).
+      const room = dockRef.current?.getBoundingClientRect();
+      const size = { width: room?.width ?? 0, height: room?.height ?? 0 };
       if (savedLayout) {
         try {
           event.api.fromJSON(savedLayout);
         } catch (error) {
           console.warn("Failed to restore docking layout, using default", error);
-          createDefaultLayout(event.api, panels, defaultLayoutMode);
+          createDefaultLayout(event.api, panels, defaultLayoutMode, size);
         }
       } else {
-        createDefaultLayout(event.api, panels, defaultLayoutMode);
+        createDefaultLayout(event.api, panels, defaultLayoutMode, size);
       }
 
       // Save layout on changes
@@ -310,6 +317,7 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
   return (
     <>
       <Box
+        ref={dockRef}
         sx={{
           height: "100%",
           width: "100%",
@@ -352,10 +360,52 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
 };
 
 // Helper functions
-function createDefaultLayout(api: DockviewApi, panels: PanelDefinition[], mode: 'tabs' | 'vertical-stack' | 'sh4-layout' | 'mixed-mode-debugger-layout' = 'tabs') {
+
+/**
+ * The default of a centre dock that has no room for two views side by side (a laptop screen
+ * with both side docks open): the first panel above, over the whole width, and the others as
+ * tabs of one group below it. `topShare` is the part of the height the first panel gets.
+ */
+function createStackedLayout(api: DockviewApi, panels: PanelDefinition[], height: number, topShare: number) {
+  const firstPanel = api.addPanel({
+    id: panels[0].id,
+    component: panels[0].id,
+    title: panels[0].title,
+  });
+  if (panels.length > 1) {
+    api.addPanel({
+      id: panels[1].id,
+      component: panels[1].id,
+      title: panels[1].title,
+      position: { referencePanel: firstPanel, direction: 'below' },
+      ...(height > 0 ? { initialHeight: Math.round(height * (1 - topShare)) } : {}),
+    });
+  }
+  for (let i = 2; i < panels.length; i++) {
+    api.addPanel({
+      id: panels[i].id,
+      component: panels[i].id,
+      title: panels[i].title,
+      position: { referencePanel: panels[1].id, direction: 'within' },
+      // the second panel stays the one its group shows
+      inactive: true,
+    });
+  }
+  firstPanel.api.setActive();
+}
+
+function createDefaultLayout(
+  api: DockviewApi,
+  panels: PanelDefinition[],
+  mode: DefaultLayoutMode = 'tabs',
+  size: { width: number; height: number } = { width: 0, height: 0 },
+) {
   if (panels.length === 0) return;
 
-  if (mode === 'mixed-mode-debugger-layout') {
+  if (isCompactDock(mode, size.width)) {
+    // two views one above the other in the mixed-mode workspace; a view above its memory and breakpoints in the others
+    createStackedLayout(api, panels, size.height, mode === 'mixed-mode-debugger-layout' ? 0.5 : 0.6);
+  } else if (mode === 'mixed-mode-debugger-layout') {
     // Custom debugger layout: SH4 Disassembly (left) | ARM7 Disassembly (right)
     if (panels.length === 0) return;
 
