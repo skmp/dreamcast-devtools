@@ -193,10 +193,14 @@ panel says `Not connected`. The boxes stay with what is in them (what is typed i
 the watches or of a breakpoint panel is not sent and not thrown away), the toolbars stay, and
 so do the notices of what the server cannot do: what a server said about itself is kept until
 the next server has described itself. The keyboard focus is where it was when the connection
-is back, also in a row of the breakpoint or the watch list. The disassembly and memory views
-are where they were, unless the new connection starts in a stop. A page that has not had a
-server yet shows the same frames; a disassembly or memory view then has its toolbar with an
-empty box, because where it opens is the server's to say.
+is back, also in a row of the breakpoint or the watch list; a focus that was moved while the
+connection was away stays where it was put. The disassembly and memory views are where they
+were, unless the new connection starts in a stop. Their address boxes say where the views
+are, and are written over when a view moves or when a server writes its addresses in another
+way (`addressRadix`, `addressDigits`), and not otherwise: what is typed into one and not sent
+is still there when the connection is back. A page that has not had a server yet shows the
+same frames; a disassembly or memory view then has its toolbar with an empty box, because
+where it opens is the server's to say.
 
 ## What the UI does with a session
 
@@ -244,7 +248,12 @@ empty box, because where it opens is the server's to say.
   takes a second line where one is not enough, and the font of the memory listing follows the
   width of its panel (down to 10 px) so that a row of sixteen bytes and their text fits from
   520 px on. A saved layout is not touched; `Reset layout` makes the default for the window as
-  it is then.
+  it is then. A layout is not made again when the window gets narrower either, so two views
+  that were side by side at 1600 px still are at 1366 px, in 315 px each. A listing whose
+  panel is narrower than its columns (about 360 px for the SH4) is scrolled to the side, by its
+  scroll bar or a turn of the wheel to the side: no column is squeezed or cut off for it. Its
+  toolbar takes a line for each of its three groups when it has to: the step buttons at the
+  left, the rest at the right.
 - **Problems.** A server of another protocol version, a `debugger.describe` that failed and
   every message that was dropped because it does not match the schema (with the path of what
   is wrong) are shown in a bar under the toolbar. A `debugger.describe` that failed (the
