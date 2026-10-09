@@ -889,6 +889,8 @@ const s04: Scenario = {
   async run(context) {
     const sh4 = requireTarget(context, "sh4");
     let record = await ensurePaused(context);
+    /** the step before the one that is being made ended at an exception vector */
+    let afterVector = false;
 
     /** One step from where the target is, with what holds for every step; `atVector`: it ended at an exception vector. */
     const step = async (method: "control.step" | "control.stepOver" = "control.step"): Promise<{ pc0: number; pc1: number; atVector: boolean }> => {
@@ -906,6 +908,15 @@ const s04: Scenario = {
       check(cycles1 >= cycles0, `dc.timing.SH4_CYCLES went back from ${cycles0} to ${cycles1} in a step`);
       // a deferred interrupt can end the step before an instruction runs
       check(cycles1 > cycles0 || atVector, "dc.timing.SH4_CYCLES did not increase in a step that did not end at an exception vector");
+      // One step may end that way. The step after it starts at the first instruction of the
+      // handler with SR.BL set, and cannot be interrupted: a second one in a row that ends at a
+      // vector is a step that does not execute.
+      check(
+        !(atVector && afterVector),
+        `two steps in a row ended at an exception vector: the step to ${hex(pc0)}, and ${method} {sh4} from there, which ended at ${hex(pc1)}. ` +
+          "One step may (a deferred interrupt is accepted before an instruction runs); the step after it starts in the handler with SR.BL set and cannot be interrupted",
+      );
+      afterVector = atVector;
       // Mock: its program is known. A step in its loop ends at the next address of the loop (no
       // vertical blank falls into a step); in its interrupt handler the general rule is all there is.
       if (context.profile === "mock" && pc0 >= MOCK_SH4_RING.base && pc0 < MOCK_SH4_RING.base + MOCK_SH4_RING.length * MOCK_SH4_RING.instructionSize) {
@@ -934,27 +945,25 @@ const s04: Scenario = {
       }
     };
 
-    // One instruction per step. A step that an interrupt ended at its vector shows nothing about
-    // that, so the next plain line is tried, a few times.
-    const attempts = 4;
-    for (let attempt = 1; ; attempt++) {
-      const text = await stepToPlainLine();
-      const { pc0, pc1, atVector } = await step();
-      if (!atVector) {
-        check(
-          pc1 === ((pc0 + 2) >>> 0),
-          `"${text}" at ${hex(pc0)} is not control flow, and the step ended at ${hex(pc1)}, not at ${hex(pc0 + 2)} or an exception vector`,
-        );
-        break;
-      }
-      if (attempt === attempts) {
-        context.note(`${attempts} steps from lines that are not control flow ended at an exception vector each: that a step executes one instruction was not seen`);
-        break;
-      }
+    // One instruction per step: from a line that is not control flow the step ends at PC + 2.
+    // One step may end at an exception vector instead, which shows nothing about that. The
+    // target is then in the handler, where no interrupt is accepted, and the step from the next
+    // plain line has to show it.
+    let text = await stepToPlainLine();
+    let made = await step();
+    const deferred = made.atVector;
+    if (deferred) {
+      text = await stepToPlainLine();
+      made = await step();
     }
+    check(
+      made.pc1 === ((made.pc0 + 2) >>> 0),
+      `"${text}" at ${hex(made.pc0)} is not control flow, and the step ended at ${hex(made.pc1)}, not at ${hex(made.pc0 + 2)}` +
+        (deferred ? ": a step before it ended at an exception vector, which one step may, and the step from the next plain line has to show the instruction" : " or an exception vector"),
+    );
 
     // control.stepOver on a line that is not a call is a step
-    const text = await stepToPlainLine();
+    text = await stepToPlainLine();
     const over = await step("control.stepOver");
     check(
       over.pc1 === ((over.pc0 + 2) >>> 0) || over.atVector,

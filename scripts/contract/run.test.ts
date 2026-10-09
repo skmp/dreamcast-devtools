@@ -3216,6 +3216,69 @@ describe("the emulator profile", () => {
     expect(kinds.afterDelayedBranch).toBeGreaterThan(0);
   }, 120_000);
 
+  it("S04: one step may end at an exception vector, a second one in a row may not: a step that never executes an instruction fails", async () => {
+    type Machine = {
+      step(kind: string, params: { target?: string }, context: { afterResponse: Array<() => void> }): unknown;
+      advance(target: string): unknown;
+      acceptSh4Interrupt(): unknown;
+      enterStop(reason: string): void;
+      running: boolean;
+    };
+    /**
+     * The mock at its StartPaused stop. `ends(n)` says how its n-th control.step or
+     * control.stepOver of the SH4 ends: "vector", the interrupt is accepted and nothing is
+     * executed (the time stands); "twice", two instructions are executed; undefined, as ever.
+     */
+    const stepping = (ends: (n: number) => "vector" | "twice" | undefined): MockDebugger => {
+      const mock = new MockDebugger({ startPaused: true });
+      const machine = mock as unknown as Machine;
+      const step = machine.step.bind(mock);
+      let steps = 0;
+      machine.step = (kind, params, context) => {
+        const how = machine.running || params.target !== "sh4" || kind === "stepOut" ? undefined : ends(++steps);
+        if (how === "vector") {
+          context.afterResponse.push(() => {
+            machine.acceptSh4Interrupt();
+            machine.enterStop("step");
+          });
+          return {};
+        }
+        if (how === "twice") {
+          context.afterResponse.push(() => machine.advance("sh4"));
+        }
+        return step(kind, params, context);
+      };
+      return mock;
+    };
+    const s04 = async (mock: MockDebugger) => {
+      const listener = await listenMockDebugger(mock);
+      try {
+        return reportOf(await runContract({ url: listener.url, profile: "emulator", timeoutFactor: 1, only: new Set(["S04"]) }));
+      } finally {
+        await listener.close();
+      }
+    };
+
+    // An interrupt that was deferred is accepted in the first step, before an instruction runs:
+    // the step ends at the interrupt entry. The step after it shows the instruction. No note:
+    // the scenario saw what it asks for.
+    expect(await s04(stepping((n) => (n === 1 ? "vector" : undefined)))).toEqual(["S04 passed "]);
+
+    // Every step ends at the interrupt entry and executes nothing. The second one fails the
+    // scenario: it started in the handler, where no interrupt is accepted.
+    expect(await s04(stepping(() => "vector"))).toEqual([
+      "S04 failed two steps in a row ended at an exception vector: the step to 0x8C000600, and control.step {sh4} from there, which ended at 0x8C000600. " +
+        "One step may (a deferred interrupt is accepted before an instruction runs); the step after it starts in the handler with SR.BL set and cannot be interrupted",
+    ]);
+
+    // The step that follows the one at the vector has to show one instruction: PC + 2, and no
+    // "or an exception vector" for it.
+    const [twice] = await s04(stepping((n) => (n === 1 ? "vector" : "twice")));
+    expect(twice).toMatch(
+      /^S04 failed ".+" at 0x8C00060[0-9A-F] is not control flow, and the step ended at 0x8C[0-9A-F]{6}, not at 0x8C00060[0-9A-F]: a step before it ended at an exception vector, which one step may, and the step from the next plain line has to show the instruction$/,
+    );
+  }, 60_000);
+
   it("S00: reports a server that is not at its StartPaused stop, and one whose program does not reach the entry point", async () => {
     // a running mock is not an emulator at its start stop
     const { url: running } = await startServer();
