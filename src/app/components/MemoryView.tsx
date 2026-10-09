@@ -16,6 +16,25 @@ const WHEEL_PIXEL_THRESHOLD = 60;
 const MEMORY_SCROLL_BYTES = 96;
 const BYTES_PER_ROW = 16;
 
+// The three columns of a row, in characters: an address of up to ten ("0x8C010000"), sixteen
+// bytes with the spaces between them, sixteen characters of text; two characters between
+// columns. 79 characters in all, which a monospace font draws about 48 em wide.
+const ADDRESS_COLUMN = "10ch";
+const HEX_COLUMN = `${BYTES_PER_ROW * 3 - 1}ch`;
+const ASCII_COLUMN = `${BYTES_PER_ROW}ch`;
+const COLUMN_GAP = "2ch";
+const ROW_EM = 48;
+/** what is around the columns of a row, in px: the padding of the listing and of the row, and the row's border */
+const ROW_FRAME_PX = 36;
+/**
+ * The size of the listing's font: the size of the rest of the UI where a row fits at that
+ * size, smaller in a narrower panel, so that the row still fits and no column is cut off, and
+ * not smaller than can be read. (`cqw` is a hundredth of the width of the panel's listing.)
+ */
+const LISTING_FONT_SIZE = `clamp(10px, calc((100cqw - ${ROW_FRAME_PX}px) / ${ROW_EM}), 1rem)`;
+/** a cell of the listing: the listing's font, whatever the theme gives a text by itself */
+const CELL_SX = { font: "inherit", letterSpacing: 0, flexShrink: 0 } as const;
+
 export interface MemoryViewConfig {
   /** Format an address value for display */
   formatAddress: (value: number) => string;
@@ -376,7 +395,8 @@ export const MemoryView = ({
           </Tooltip>
         </Stack>
       </Box>
-      <Box sx={{ flex: 1, overflow: "auto" }}>
+      {/* the listing's font is sized by the width of this box (LISTING_FONT_SIZE) */}
+      <Box sx={{ flex: 1, overflow: "auto", containerType: "inline-size" }}>
         {!initialized ? (
           <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
             <Typography variant="body2" color="text.secondary">
@@ -401,8 +421,8 @@ export const MemoryView = ({
               height: "100%",
               flex: 1,
               overflow: "hidden",
-              fontFamily: "monospace",
-              fontSize: 13,
+              typography: "body1",
+              fontSize: LISTING_FONT_SIZE,
               p: 1.5,
               position: "relative",
             }}
@@ -415,14 +435,14 @@ export const MemoryView = ({
                 </Typography>
               </Stack>
             )}
-            <Box sx={{ display: "flex", mb: 1, color: "text.secondary", fontWeight: 600, fontFamily: "monospace", fontSize: 13 }}>
-              <Typography component="span" sx={{ width: 100, flexShrink: 0, mr: "1.5em" }}>
+            <Box sx={{ display: "flex", mb: 1, px: "6px", color: "text.secondary", fontWeight: 600 }}>
+              <Typography component="span" sx={{ ...CELL_SX, width: ADDRESS_COLUMN, mr: COLUMN_GAP }}>
                 Address
               </Typography>
-              <Typography component="span" sx={{ width: 380, flexShrink: 0, mr: "4em" }}>
+              <Typography component="span" sx={{ ...CELL_SX, width: HEX_COLUMN, mr: COLUMN_GAP }}>
                 Hex
               </Typography>
-              <Typography component="span" sx={{ width: 130, flexShrink: 0 }}>
+              <Typography component="span" sx={{ ...CELL_SX, width: ASCII_COLUMN }}>
                 ASCII
               </Typography>
             </Box>
@@ -459,8 +479,6 @@ export const MemoryView = ({
                   }}
                   sx={{
                     display: "flex",
-                    fontFamily: "monospace",
-                    fontSize: 13,
                     alignItems: "baseline",
                     border: "2px solid transparent",
                     borderRadius: 1,
@@ -471,13 +489,13 @@ export const MemoryView = ({
                     },
                   }}
                 >
-                  <Typography component="span" sx={{ width: 100, flexShrink: 0, mr: "1.5em" }}>
+                  <Typography component="span" sx={{ ...CELL_SX, width: ADDRESS_COLUMN, mr: COLUMN_GAP }}>
                     {config.formatAddress(row.address)}
                   </Typography>
-                  <Typography component="span" sx={{ width: 380, flexShrink: 0, whiteSpace: "nowrap", letterSpacing: 0, mr: "4em" }}>
+                  <Typography component="span" sx={{ ...CELL_SX, width: HEX_COLUMN, whiteSpace: "nowrap", mr: COLUMN_GAP }}>
                     {row.hex}
                   </Typography>
-                  <Typography component="span" sx={{ width: 130, flexShrink: 0, whiteSpace: "pre", letterSpacing: "0.05em" }}>
+                  <Typography component="span" sx={{ ...CELL_SX, width: ASCII_COLUMN, whiteSpace: "pre" }}>
                     {row.ascii}
                   </Typography>
                 </Box>
