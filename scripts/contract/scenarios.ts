@@ -5,6 +5,7 @@ import { CAPABILITIES, PROTOCOL_BOUNDS, PanelIdSchema, TABLE_IDS } from "../../s
 import type {
   BreakpointCategoryState,
   BreakpointDescriptor,
+  DebuggerRpcSchema,
   DebuggerShape,
   DebuggerTarget,
   DebuggerTick,
@@ -266,7 +267,13 @@ const tickShowing = async (
 const addBreakpoint = async (
   context: RunContext,
   params: { event: string; address?: number; kind?: "code" | "event"; enabled?: boolean },
-): Promise<BreakpointDescriptor> => {
+): Promise<BreakpointDescriptor> => (await addBreakpointShown(context, params)).breakpoint;
+
+/** `addBreakpoint`, with the tick that shows the new breakpoint. */
+const addBreakpointShown = async (
+  context: RunContext,
+  params: { event: string; address?: number; kind?: "code" | "event"; enabled?: boolean },
+): Promise<{ breakpoint: BreakpointDescriptor; record: TickRecord }> => {
   const { session } = context;
   const listed = new Set(Object.keys(session.latestTick().tick.breakpoints));
   const used = new Set(context.seen.breakpoints);
@@ -293,7 +300,7 @@ const addBreakpoint = async (
   }
   check(breakpoint.enabled === (params.enabled ?? true), `breakpoints.add: the tick lists enabled ${breakpoint.enabled}`);
   check(breakpoint.id >= 1, "breakpoint ids are allocated from 1");
-  return breakpoint;
+  return { breakpoint, record: next };
 };
 
 const removeBreakpoint = async (context: RunContext, id: number): Promise<void> => {
@@ -1060,9 +1067,27 @@ const eventIdOf = (entry: { eventId: string }): bigint => (/^\d+$/.test(entry.ev
 /** The newest eventId in the log of a tick; -1 for an empty log. */
 const newestEventId = (tick: DebuggerTick): bigint => tick.eventLog.reduce((newest, entry) => (eventIdOf(entry) > newest ? eventIdOf(entry) : newest), -1n);
 
-/** How many entries of the vertical blank the log of a tick has that are newer than `after`. */
-const vblanksSince = (tick: DebuggerTick, after: bigint): number =>
-  tick.eventLog.filter((entry) => (entry.metadata as { event?: unknown } | undefined)?.event === VBLANK_EVENT && eventIdOf(entry) > after).length;
+/** How many entries of `event` the log of a tick has that are newer than `after`. */
+const eventsSince = (tick: DebuggerTick, event: string, after: bigint): number =>
+  tick.eventLog.filter((entry) => (entry.metadata as { event?: unknown } | undefined)?.event === event && eventIdOf(entry) > after).length;
+
+const vblanksSince = (tick: DebuggerTick, after: bigint): number => eventsSince(tick, VBLANK_EVENT, after);
+
+/** The event of the SH4 accepting an interrupt, if the server has it (2.6): each one is an arrival at `VBR + 0x600`. */
+const INTERRUPT_EVENT = "dc.sh4.interrupt";
+
+/**
+ * Disabled event breakpoints that put events into the event log (high-rate events are logged
+ * only while a breakpoint on them exists): on the vertical blank, and, when the device tree
+ * lists it, on the interrupts the SH4 accepts.
+ */
+const addEventCounters = async (context: RunContext): Promise<BreakpointDescriptor[]> => {
+  const counters = [await addBreakpoint(context, { event: VBLANK_EVENT, kind: "event", enabled: false })];
+  if (context.session.index?.events.has(INTERRUPT_EVENT)) {
+    counters.push(await addBreakpoint(context, { event: INTERRUPT_EVENT, kind: "event", enabled: false }));
+  }
+  return counters;
+};
 
 /** A paused tick that reports the stop of a breakpoint at the interrupt entry (the PC can be a mirror of it). */
 const checkEntryStop = (tick: DebuggerTick, sh4: DebuggerTarget, id: number, entry: number): void => {
@@ -1071,9 +1096,23 @@ const checkEntryStop = (tick: DebuggerTick, sh4: DebuggerTarget, id: number, ent
   check(((pcOf(tick, sh4) ^ entry) & SH4_CODE_ADDRESS_MASK) === 0, `the stop is at ${hex(pcOf(tick, sh4))}, the breakpoint at the interrupt entry ${hex(entry)}`);
 };
 
-/** What a scenario says when the breakpoint at the interrupt entry is not hit: the program takes no interrupt, and the scenario is partial. */
-const noInterrupt = (session: ContractSession, entry: number, notShown: string): string =>
-  `the target took no interrupt within ${session.scale(2000)} ms: the breakpoint at its interrupt entry ${hex(entry)} (VBR + 0x600) was not hit, so ${notShown}`;
+/**
+ * The breakpoint at the interrupt entry was not hit in the scenario's window. That makes the
+ * scenario partial: the program takes no interrupt, and what the scenario wants to show
+ * cannot be shown with it. This returns the reason. Unless the event log says otherwise: when
+ * it has at least `least` entries of the SH4 accepting an interrupt that are newer than
+ * `after`, the SH4 came to its interrupt entry and was not stopped, and the scenario fails.
+ */
+const missedInterruptEntry = (session: ContractSession, entry: number, after: bigint, least: number, notShown: string): string => {
+  const accepted = eventsSince(session.latestTick().tick, INTERRUPT_EVENT, after);
+  if (accepted >= least) {
+    fail(
+      `the breakpoint at the interrupt entry ${hex(entry)} (VBR + 0x600) was not hit within ${session.scale(2000)} ms, ` +
+        `and the event log has ${accepted} entries of ${INTERRUPT_EVENT} from that time: the SH4 came there and was not stopped`,
+    );
+  }
+  return `the target took no interrupt within ${session.scale(2000)} ms: the breakpoint at its interrupt entry ${hex(entry)} (VBR + 0x600) was not hit, so ${notShown}`;
+};
 
 /**
  * Re-enabling a breakpoint, shown where the program is certain to come again: at the interrupt
@@ -1087,8 +1126,9 @@ const reenableAtInterruptEntry = async (context: RunContext, sh4: DebuggerTarget
   const stop = (await ensurePaused(context)).tick;
   const entry = interruptEntryOf(stop, sh4);
   // a disabled event breakpoint on the vertical blank puts its events into the event log
-  const counter = await addBreakpoint(context, { event: VBLANK_EVENT, kind: "event", enabled: false });
+  const counters = await addEventCounters(context);
   const atEntry = await addBreakpoint(context, { event: sh4.breakpointEvent, address: entry, kind: "code", enabled: true });
+  const armed = newestEventId(session.latestTick().tick);
   let partial: string | undefined;
 
   const mark = session.mark();
@@ -1097,7 +1137,7 @@ const reenableAtInterruptEntry = async (context: RunContext, sh4: DebuggerTarget
     .waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(stop), 2000, `a paused tick at the interrupt entry ${hex(entry)}`, mark)
     .catch(() => undefined);
   if (!first) {
-    partial = noInterrupt(session, entry, "it was not shown that a breakpoint that is enabled again is hit");
+    partial = missedInterruptEntry(session, entry, armed, 1, "it was not shown that a breakpoint that is enabled again is hit");
     await ensurePaused(context);
   } else {
     checkEntryStop(first.tick, sh4, atEntry.id, entry);
@@ -1126,7 +1166,9 @@ const reenableAtInterruptEntry = async (context: RunContext, sh4: DebuggerTarget
     checkEntryStop(again.tick, sh4, atEntry.id, entry);
   }
   await removeBreakpoint(context, atEntry.id);
-  await removeBreakpoint(context, counter.id);
+  for (const counter of counters) {
+    await removeBreakpoint(context, counter.id);
+  }
   return partial;
 };
 
@@ -1920,6 +1962,169 @@ const s14: Scenario = {
   },
 };
 
+const s19: Scenario = {
+  id: "S19",
+  title: "running target: reads",
+  async run(context) {
+    const { session } = context;
+    const running = await ensureRunning(context);
+    const mark = session.mark();
+    const asked = (what: string) => `${what} while the target runs`;
+
+    // debugger.describe: valid, and followed by a full tick; the target still runs
+    const described = await session.describe();
+    check(session.describeProblems.length === 0, `${asked("debugger.describe")}: the result does not follow the schema: ${session.describeProblems.slice(0, 3).join("; ")}`);
+    check(isRunning(described.tick), `${asked("debugger.describe")}: the tick that follows it is ${describeState(described.tick)}`);
+    const missing = missingPaths(session, described.tick);
+    check(missing.length === 0, `${asked("debugger.describe")}: the tick that follows it is full; it lacks ${missing.slice(0, 5).join(", ")}`);
+
+    // the reads, for the SH4 and for the ARM7: valid answers, and none of them "not paused" or "busy"
+    for (const id of ["sh4", "arm7"] as const) {
+      const target = targetOf(session.shape, id);
+      if (!target) {
+        context.note(`the server lists no ${id}: its memory, disassembly and callstack were not read`);
+        continue;
+      }
+      if (target.memory) {
+        const address = target.defaultMemoryAddress ?? fail(`target ${id} has memory and no defaultMemoryAddress`);
+        const slice = await session.call("state.getMemorySlice", { target: id, address, length: 16 });
+        check(slice.baseAddress === address && slice.data.length === 16, `${asked(`state.getMemorySlice {${id}}`)}: ${slice.data.length} bytes at ${hex(slice.baseAddress)}, asked for 16 at ${hex(address)}`);
+      }
+      const from = target.defaultDisassemblyAddress;
+      const lines = await disassemble(context, id, from, 16);
+      check(lines.length === 16 && lines[0].address === from, `${asked(`state.getDisassembly {${id}}`)}: ${lines.length} lines from ${hex(lines[0]?.address ?? 0)}, asked for 16 at ${hex(from)}`);
+      const stack = await session.call("state.getCallstack", { target: id, maxFrames: 8 });
+      check(stack.target === id && stack.frames.length <= 8, `${asked(`state.getCallstack {${id}}`)}: ${stack.frames.length} frames for target "${stack.target}", asked for at most 8 of ${id}`);
+      stack.frames.forEach((frame, position) => check(frame.index === position, `${asked(`state.getCallstack {${id}}`)}: frame ${position} has index ${frame.index}`));
+    }
+
+    // none of them stopped the target: no paused tick since, and the periodic tick goes on
+    const stopped = session.ticksSince(mark).find((record) => isPaused(record.tick));
+    check(!stopped, `a request to a running target stopped it: ${stopped ? describeState(stopped.tick) : ""}`);
+    const still = await session.waitForTick(isRunning, 1000, "a running tick after the reads of a running target", session.mark());
+    check(stopIdOf(still.tick) === stopIdOf(running.tick), `the reads of a running target made a stop: stopId is ${stopIdOf(still.tick)}, it was ${stopIdOf(running.tick)}`);
+  },
+};
+
+const s20: Scenario = {
+  id: "S20",
+  title: "running target: bookkeeping",
+  async run(context) {
+    const { session } = context;
+    const sh4 = requireTarget(context, "sh4");
+    // S20 needs what milestone M1 has: without event breakpoints it fails, it is not skipped
+    check(hasCapability(context, CAPABILITIES.EVENT_BREAKPOINTS), 'the capability "event-breakpoints" is part of milestone M1');
+    const running = await ensureRunning(context);
+    const original = categoriesOf(running.tick);
+    let partial: string | undefined;
+    /** The tick that shows the effect of a request to the running target is a running one: the request did not stop it. */
+    const stillRunning = (record: TickRecord, what: string): TickRecord => {
+      check(
+        isRunning(record.tick) && stopIdOf(record.tick) === stopIdOf(running.tick),
+        `${what} while the target runs: the tick that shows it is ${describeState(record.tick)}; the target was ${describeState(running.tick)}, and bookkeeping does not stop it`,
+      );
+      return record;
+    };
+    /** A request to the running target: `{}`, and a tick within 1 s that shows the effect, the target still running. */
+    const request = async (method: keyof DebuggerRpcSchema & string, params: unknown, problem: (tick: DebuggerTick) => string | undefined): Promise<TickRecord> => {
+      const mark = session.mark();
+      await session.call(method, params);
+      return stillRunning(await tickShowing(session, mark, method, problem), method);
+    };
+    const listed = (id: number, enabled?: boolean) => (tick: DebuggerTick) => {
+      const breakpoint = tick.breakpoints[String(id)];
+      if (enabled === undefined) {
+        return breakpoint ? `breakpoint ${id} is still listed` : undefined;
+      }
+      return breakpoint?.enabled === enabled ? undefined : `breakpoint ${id} is not listed as ${enabled ? "enabled" : "disabled"}`;
+    };
+
+    try {
+      // breakpoints.setCategoryStates: one key, echoed. Then sh4 is muted, so that the code
+      // breakpoint below can be enabled without stopping anything.
+      const flipped = { muted: !original.dsp.muted, soloed: original.dsp.soloed };
+      stillRunning(await setCategories(context, { dsp: flipped }), "breakpoints.setCategoryStates");
+      stillRunning(await setCategories(context, { dsp: original.dsp, sh4: { muted: true, soloed: false } }), "breakpoints.setCategoryStates");
+
+      // breakpoints.add: a code breakpoint and an event breakpoint, both disabled. (The one on
+      // the vertical blank also puts its events into the event log, for what follows.)
+      const code = await addBreakpointShown(context, { event: sh4.breakpointEvent, address: (sh4.defaultDisassemblyAddress & ~1) >>> 0, kind: "code", enabled: false });
+      stillRunning(code.record, "breakpoints.add");
+      const counted = session.mark();
+      const counter = await addBreakpointShown(context, { event: VBLANK_EVENT, kind: "event", enabled: false });
+      stillRunning(counter.record, "breakpoints.add");
+      const counters = [counter.breakpoint];
+      if (session.index?.events.has(INTERRUPT_EVENT)) {
+        counters.push(await addBreakpoint(context, { event: INTERRUPT_EVENT, kind: "event", enabled: false }));
+      }
+      // breakpoints.toggle, both ways (the category is muted), and breakpoints.remove
+      await request("breakpoints.toggle", { id: code.breakpoint.id, enabled: true }, listed(code.breakpoint.id, true));
+      await request("breakpoints.toggle", { id: code.breakpoint.id, enabled: false }, listed(code.breakpoint.id, false));
+      await request("breakpoints.remove", { id: code.breakpoint.id }, listed(code.breakpoint.id));
+      stillRunning(await setCategories(context, original), "breakpoints.setCategoryStates");
+
+      // state.watch, state.modifyWatchExpression, state.unwatch
+      const first = unwatchedRegister(context, sh4.pcPath, ["SR", "GBR", "VBR"]);
+      const watch = await addWatch(context, first.expression, first.expression);
+      stillRunning(watch.record, "state.watch");
+      const second = unwatchedRegister(context, sh4.pcPath, ["PR", "MACH", "MACL"]);
+      await request("state.modifyWatchExpression", { watchId: watch.id, newExpression: second.expression }, (tick) =>
+        tick.watches?.find((entry) => entry.id === watch.id)?.expression === second.expression ? undefined : `watch ${watch.id} is not listed as "${second.expression}"`,
+      );
+      await request("state.unwatch", { watchIds: [watch.id] }, (tick) => ((tick.watches ?? []).some((entry) => entry.id === watch.id) ? `watch ${watch.id} is still listed` : undefined));
+
+      // A code breakpoint that is added enabled while the target runs is armed, and hit at its
+      // next arrival. Where the arrival is certain: at the interrupt entry VBR + 0x600. VBR is
+      // read at a pause the scenario makes itself, and resumes from, once the vertical blank has
+      // been seen in the event log (not at the anchor, where the program has not installed its
+      // vector base).
+      await session.waitForTick(
+        (tick) => vblanksSince(tick, -1n) > 0,
+        2000,
+        `an entry of ${VBLANK_EVENT} in the event log of the running target (a disabled event breakpoint on it puts them there)`,
+        counted,
+      );
+      const paused = await ensurePaused(context);
+      const entry = interruptEntryOf(paused.tick, sh4);
+      await ensureRunning(context);
+      const adding = session.mark();
+      const atEntry = await addBreakpointShown(context, { event: sh4.breakpointEvent, address: entry, kind: "code", enabled: true });
+      const hit = await session
+        .waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(paused.tick), 2000, `a paused tick at the interrupt entry ${hex(entry)}`, adding)
+        .catch(() => undefined);
+      if (hit) {
+        checkEntryStop(hit.tick, sh4, atEntry.breakpoint.id, entry);
+      } else {
+        // (it is armed at the next slice end: the first interrupt behind the tick that lists it can come before that)
+        const listedAt = newestEventId(atEntry.record.tick);
+        partial = missedInterruptEntry(session, entry, listedAt, 2, "it was not shown that a code breakpoint that is added while the target runs is hit");
+        await ensurePaused(context);
+      }
+      await removeBreakpoint(context, atEntry.breakpoint.id);
+      for (const added of counters) {
+        await removeBreakpoint(context, added.id);
+      }
+
+      // an event breakpoint on the vertical blank, added enabled while the target runs, stops it
+      const resumed = await ensureRunning(context);
+      const waiting = session.mark();
+      const onVblank = await addBreakpoint(context, { event: VBLANK_EVENT, kind: "event", enabled: true });
+      const stop = await session.waitForTick(
+        (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(resumed.tick),
+        2000,
+        `a paused tick at the event breakpoint on ${VBLANK_EVENT} that was added while the target runs`,
+        waiting,
+      );
+      check(stop.tick.executionState.reason === "event", `the stop of the event breakpoint has reason "${stop.tick.executionState.reason}", expected "event"`);
+      check(stop.tick.executionState.breakpointId === onVblank.id, `the stop reports breakpointId ${stop.tick.executionState.breakpointId}, expected ${onVblank.id}`);
+      await removeBreakpoint(context, onVblank.id);
+    } finally {
+      await session.call("breakpoints.setCategoryStates", { categories: original }).catch(() => undefined);
+    }
+    return partial === undefined ? undefined : { partial };
+  },
+};
+
 const httpGet = (
   url: URL,
   options: { method?: string; path: string; host?: string },
@@ -2348,7 +2553,7 @@ const s21: Scenario = {
 };
 
 /** In the order they are run: ids are names, and S19 and S20 come behind S14. */
-export const SCENARIOS: Scenario[] = [s00, s01, s02, s03, s04, s05, s06, s07, s08, s09, s10, s11, s12, s13, s14, s15, s16, s17, s18, s21];
+export const SCENARIOS: Scenario[] = [s00, s01, s02, s03, s04, s05, s06, s07, s08, s09, s10, s11, s12, s13, s14, s19, s20, s15, s16, s17, s18, s21];
 
 /**
  * The scenarios a server of `milestone` has to pass, i.e. the gate of that milestone: those

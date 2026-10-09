@@ -240,6 +240,8 @@ const MOCK_STATUSES = {
   S12: "passed",
   S13: "passed",
   S14: "passed",
+  S19: "passed",
+  S20: "passed",
   S15: "not-applicable", // emulator only
   S16: "partial", // the mock steps the ARM7 and writes registers; it has no memory write and no reset
   S17: "passed",
@@ -350,7 +352,7 @@ describe("the contract runner against the mock", () => {
     expect(summary.cleanUpProblems).toEqual([]);
     expect(statusesOf(summary)).toEqual(MOCK_STATUSES);
     expect(summary.ok).toBe(true);
-    expect(summary).toMatchObject({ passed: 15, failed: 0, partial: 1, notApplicable: 4, profile: "mock", timeoutFactor: 1 });
+    expect(summary).toMatchObject({ passed: 17, failed: 0, partial: 1, notApplicable: 4, profile: "mock", timeoutFactor: 1 });
     // nothing was asked to pass: the runner looked at a server
     expect(summary).toMatchObject({ required: [], requiredNotPassed: [], nothingVerified: false, dspProgram: false });
     expect(summary.selected).toEqual(SCENARIOS.map((scenario) => scenario.id));
@@ -1350,7 +1352,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     // the server answers {} to {enabled: true} and leaves the breakpoint disabled
     const ignored = await run({ toServer: (frame) => (frame.method === "breakpoints.toggle" ? { ...frame, params: { ...paramsOf(frame), enabled: false } } : frame) }, ["S07"]);
     expect(statusOf(ignored, "S07")).toBe("failed");
-    expect(detailsOf(ignored, "S07")).toMatch(/^breakpoints\.toggle: breakpoint 3 is not listed as enabled \(\d+ ticks? within 1000 ms of the request/);
+    expect(detailsOf(ignored, "S07")).toMatch(/^breakpoints\.toggle: breakpoint 4 is not listed as enabled \(\d+ ticks? within 1000 ms of the request/);
 
     // the server lists it as enabled, and has not armed it
     const listedOnly = await run(() => {
@@ -1423,7 +1425,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     machine.isActive = (breakpoint) => isActive(breakpoint.address === 0x8c000600 ? { ...breakpoint, enabled: true } : breakpoint);
     const armed = await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S07"]) });
     expect(statusOf(armed, "S07")).toBe("failed");
-    expect(detailsOf(armed, "S07")).toMatch(/^a disabled breakpoint at the interrupt entry 0x8C000600: the target stopped \(#\d+ paused stop \d+ breakpoint bp 3\)$/m);
+    expect(detailsOf(armed, "S07")).toMatch(/^a disabled breakpoint at the interrupt entry 0x8C000600: the target stopped \(#\d+ paused stop \d+ breakpoint bp 4\)$/m);
 
     // a disabled event breakpoint on the vertical blank has to put its events into the log (2.6)
     const quiet = new MockDebugger();
@@ -2431,6 +2433,214 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(reportOf(await run(undefined, ["S12"], { supports: { targets: ["sh4", "arm7"] } }))).toEqual(["S12 passed "]);
   }, 60_000);
 
+  /** A front that knows whether the target runs: from the ticks it hands on. */
+  const whileRunning = (refuse: (request: Json) => Json | undefined): FaultSource => () => {
+    let running = false;
+    return {
+      toClient: (frame) => {
+        if (isTick(frame)) running = frame.params.executionState.state === "running";
+        return frame;
+      },
+      answer: (request) => (running ? refuse(request) : undefined),
+    };
+  };
+
+  it("S19: reads and debugger.describe that are refused while the target runs", async () => {
+    const reads = ["state.getMemorySlice", "state.getDisassembly", "state.getCallstack"];
+    const notPaused = await run(
+      whileRunning((request) => (reads.includes(request.method as string) ? rpcError(request, -32003, "not paused") : undefined)),
+      ["S09", "S10", "S11", "S19"],
+    );
+    // the same server is fine with every read of a paused target
+    expect(reportOf(notPaused)).toEqual([
+      "S09 passed ",
+      "S10 passed ",
+      "S11 passed ",
+      'S19 failed state.getMemorySlice {"target":"sh4","address":2348875776,"length":16}: JSON-RPC error -32003 "not paused"',
+    ]);
+    for (const [method, request] of [
+      ["state.getDisassembly", 'state.getDisassembly {"target":"sh4","address":2348875776,"count":16}'],
+      ["state.getCallstack", 'state.getCallstack {"target":"sh4","maxFrames":8}'],
+    ]) {
+      const one = await run(
+        whileRunning((incoming) => (incoming.method === method ? rpcError(incoming, -32000, "emulator busy") : undefined)),
+        ["S19"],
+      );
+      expect(reportOf(one), method).toEqual([`S19 failed ${request}: JSON-RPC error -32000 "emulator busy"`]);
+    }
+    // only the ARM7 is not read while it runs
+    const arm7 = await run(
+      whileRunning((request) => (reads.includes(request.method as string) && paramsOf(request).target === "arm7" ? rpcError(request, -32003, "not paused") : undefined)),
+      ["S19"],
+    );
+    expect(reportOf(arm7)).toEqual(['S19 failed state.getMemorySlice {"target":"arm7","address":0,"length":16}: JSON-RPC error -32003 "not paused"']);
+
+    // debugger.describe: busy while the target runs (the run finds the server at its start stop, and is answered there)
+    const describe = await run(
+      whileRunning((request) => (request.method === "debugger.describe" ? rpcError(request, -32000, "emulator busy") : undefined)),
+      ["S19"],
+      { startPaused: true },
+    );
+    expect(statusOf(describe, "S19")).toBe("failed");
+    expect(detailsOf(describe, "S19")).toMatch(/^debugger\.describe \{"protocol":3,"client":"nullDC contract runner"\}: JSON-RPC error -32000 "emulator busy"$/m);
+
+    // a read that stops the target, and a describe whose tick is not full while the target runs
+    const mock = new MockDebugger();
+    const machine = mock as unknown as { getCallstack(params: Json): unknown; enterStop(reason: string): void; running: boolean };
+    const getCallstack = machine.getCallstack.bind(mock);
+    machine.getCallstack = (params) => {
+      const result = getCallstack(params);
+      if (machine.running) machine.enterStop("pause");
+      return result;
+    };
+    const stopping = await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S19"]) });
+    expect(detailsOf(stopping, "S19")).toMatch(/^a request to a running target stopped it: #\d+ paused stop 1 pause$/m);
+
+    // a server that lists the SH4 alone is read for what it lists
+    expect(reportOf(await run(undefined, ["S19"], { supports: { targets: ["sh4"] } }))).toEqual([
+      "S19 passed the server lists no arm7: its memory, disassembly and callstack were not read",
+    ]);
+  }, 60_000);
+
+  it("S20: bookkeeping that is refused while the target runs", async () => {
+    const refusing = (methods: string[]) =>
+      run(
+        whileRunning((request) => (methods.includes(request.method as string) ? inBand(request, -32003, "not paused") : undefined)),
+        ["S13", "S20"],
+      );
+    // (S13 does all of it to a paused target: the server is fine with that)
+    const expected: Array<[string, RegExp]> = [
+      ["breakpoints.setCategoryStates", /^breakpoints\.setCategoryStates \{"categories":\{"dsp":\{"muted":true,"soloed":false\}\}\}: in-band error -32003 "not paused"$/],
+      ["breakpoints.add", /^breakpoints\.add \{"event":"dc\.sh4\.cpu\.pc","address":2348875776,"kind":"code","enabled":false\}: in-band error -32003 "not paused"$/],
+      ["breakpoints.toggle", /^breakpoints\.toggle \{"id":\d+,"enabled":true\}: in-band error -32003 "not paused"$/],
+      ["breakpoints.remove", /^breakpoints\.remove \{"id":\d+\}: in-band error -32003 "not paused"$/],
+      ["state.watch", /^state\.watch \{"expressions":\["dc\.sh4\.cpu\.sr"\]\}: in-band error -32003 "not paused"$/],
+      ["state.modifyWatchExpression", /^state\.modifyWatchExpression \{"watchId":\d+,"newExpression":"dc\.sh4\.cpu\.pr"\}: in-band error -32003 "not paused"$/],
+      ["state.unwatch", /^state\.unwatch \{"watchIds":\[\d+\]\}: in-band error -32003 "not paused"$/],
+    ];
+    for (const [method, detail] of expected) {
+      const summary = await refusing([method]);
+      expect(statusOf(summary, "S13"), method).toBe("passed");
+      expect(statusOf(summary, "S20"), method).toBe("failed");
+      expect(detailsOf(summary, "S20").split("\n")[0], method).toMatch(detail);
+    }
+    // (what the run cannot put back on a server that refuses it the means, it says)
+    const kept = await refusing(["state.unwatch"]);
+    expect(kept.cleanUpProblems).toEqual([expect.stringMatching(/^removing the watches \d+: state\.unwatch .*: in-band error -32003 "not paused"$/), expect.stringMatching(/^watch \d+ \(dc\.sh4\.cpu\.pr\) is left behind$/)]);
+  }, 120_000);
+
+  it("S20: a request to a running target that stops it, or whose tick does not show it", async () => {
+    // the server parks the target to change its tables, and does not let it go again
+    const mock = new MockDebugger();
+    const machine = mock as unknown as { toggleBreakpoint(params: Json, context: Json): unknown; enterStop(reason: string): void; running: boolean };
+    const toggle = machine.toggleBreakpoint.bind(mock);
+    machine.toggleBreakpoint = (params, context) => {
+      if (machine.running) machine.enterStop("pause");
+      return toggle(params, context);
+    };
+    const parked = await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S20"]) });
+    expect(statusOf(parked, "S20")).toBe("failed");
+    expect(detailsOf(parked, "S20")).toMatch(/^breakpoints\.toggle while the target runs: the tick that shows it is #\d+ paused stop 1 pause; the target was #\d+ running stop 0, and bookkeeping does not stop it$/m);
+    expect(parked.cleanUpProblems).toEqual([]);
+
+    // while the target runs the server sends no tick for a watch
+    const noTick = await run(() => {
+      let running = false;
+      const quiet = noTickAfter((frame) => running && frame.method === "state.watch");
+      return {
+        toServer: quiet.toServer,
+        toClient: (frame) => {
+          if (isTick(frame)) {
+            running = frame.params.executionState.state === "running";
+            // the periodic ticks of a running target would show the watch a moment later: this server never does
+            const out = quiet.toClient!(frame) as Json | undefined;
+            return out && running ? { ...out, params: { ...(out.params as Json), watches: [] } } : out;
+          }
+          return quiet.toClient!(frame);
+        },
+      };
+    }, ["S20"]);
+    expect(detailsOf(noTick, "S20")).toMatch(/^state\.watch: no tick lists a new watch \(\d+ ticks within 1000 ms of the request, the last one is #\d+ running stop 0\)$/m);
+  }, 60_000);
+
+  it("S20: a breakpoint that is added while the target runs and never hit, and a program that takes no interrupt", async () => {
+    /** The mock with the breakpoints for which `dead` is true, added while it runs, listed and never hit. */
+    const neverArmed = (dead: (breakpoint: Json) => boolean, prepare?: (mock: MockDebugger) => void) => {
+      const mock = new MockDebugger();
+      const machine = mock as unknown as {
+        addBreakpoint(params: Json, context: Json): unknown;
+        isActive(breakpoint: Json & { id: number }): boolean;
+        breakpoints: Map<number, Json>;
+        nextBreakpointId: number;
+        running: boolean;
+      };
+      const ignored = new Set<number>();
+      const add = machine.addBreakpoint.bind(mock);
+      machine.addBreakpoint = (params, context) => {
+        const id = machine.nextBreakpointId;
+        const result = add(params, context);
+        if (machine.running && machine.breakpoints.has(id) && dead(machine.breakpoints.get(id)!)) ignored.add(id);
+        return result;
+      };
+      const isActive = machine.isActive.bind(mock);
+      machine.isActive = (breakpoint) => !ignored.has(breakpoint.id) && isActive(breakpoint);
+      prepare?.(mock);
+      return mock;
+    };
+    const s20 = async (mock: MockDebugger, milestone?: "M1") =>
+      runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", milestone, only: new Set(["S07", "S20"]) });
+
+    // The armed set is changed only while the target is parked: S07, which adds its breakpoints
+    // to a paused target, passes. The SH4 goes on taking the interrupt of every vertical blank,
+    // which the event log shows: the breakpoint was passed, and that is a failure.
+    const code = await s20(neverArmed((breakpoint) => breakpoint.kind === "code"));
+    expect(statusOf(code, "S07")).toBe("passed");
+    expect(statusOf(code, "S20")).toBe("failed");
+    expect(detailsOf(code, "S20")).toMatch(
+      /^the breakpoint at the interrupt entry 0x8C000600 \(VBR \+ 0x600\) was not hit within 2000 ms, and the event log has \d+ entries of dc\.sh4\.interrupt from that time: the SH4 came there and was not stopped$/m,
+    );
+    expect(code.cleanUpProblems).toEqual([]);
+    const event = await s20(neverArmed((breakpoint) => breakpoint.kind === "event"));
+    expect(statusOf(event, "S20")).toBe("failed");
+    expect(detailsOf(event, "S20")).toMatch(/^a paused tick at the event breakpoint on dc\.holly\.core\.vblank that was added while the target runs: not seen within 2000 ms/);
+
+    // A program that takes no interrupt (SR.BL): nothing comes to the interrupt entry, the event
+    // log has no interrupt, and the scenario is partial. That fails a gate, and nothing else.
+    const blocked = () => {
+      const mock = new MockDebugger();
+      ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "SR", value: "0x50000000" });
+      return mock;
+    };
+    const reason =
+      "the target took no interrupt within 2000 ms: the breakpoint at its interrupt entry 0x8C000600 (VBR + 0x600) was not hit, " +
+      "so it was not shown that a code breakpoint that is added while the target runs is hit";
+    const looked = await runContract({ url: (await startServer(undefined, blocked())).url, profile: "mock", only: new Set(["S19", "S20"]) });
+    expect(reportOf(looked)).toEqual(["S19 passed ", `S20 partial ${reason}`]);
+    expect(looked).toMatchObject({ ok: true, cleanUpProblems: [] });
+    const gate = await runContract({ url: (await startServer(undefined, blocked())).url, profile: "mock", milestone: "M1", only: new Set(["S19", "S20"]) });
+    expect(gate).toMatchObject({ ok: false, requiredNotPassed: [{ id: "S20", status: "partial" }] });
+
+    // a server that does not list the event of an interrupt: the same miss cannot be told from "no interrupt", and is partial
+    const unlisted = neverArmed((breakpoint) => breakpoint.kind === "code");
+    const front = await startServer(
+      {
+        toClient: (frame) => {
+          const result = frame.result as Json | undefined;
+          const without = (nodes: Json[]): Json[] =>
+            nodes.map((node) => {
+              const { events, children, ...rest } = node as Json & { events?: string[]; children?: Json[] };
+              const kept = events?.filter((name) => name !== "dc.sh4.interrupt");
+              return { ...rest, ...(kept?.length ? { events: kept } : {}), ...(children ? { children: without(children) } : {}) };
+            });
+          return result?.deviceTree ? { ...frame, result: { ...result, deviceTree: without(result.deviceTree as Json[]) } } : frame;
+        },
+      },
+      unlisted,
+    );
+    const cannotTell = await runContract({ url: front.url, profile: "mock", only: new Set(["S20"]) });
+    expect(reportOf(cannotTell)).toEqual([`S20 partial ${reason}`]);
+  }, 120_000);
+
   it("reports a scenario whose capability the server does not advertise as not applicable, never as passed; a run of nothing else has verified nothing", async () => {
     const lines: string[] = [];
     const { url } = await startServer({
@@ -2546,16 +2756,19 @@ describe("the contract runner against a server that breaks the protocol", () => 
 
   it("names the scenarios of the gate of each milestone, and what a run selects and requires", () => {
     const upTo = (last: number) => Array.from({ length: last }, (_, index) => `S${String(index + 1).padStart(2, "0")}`);
-    expect(scenariosOfMilestone("M1", "mock")).toEqual(upTo(14));
-    expect(scenariosOfMilestone("M1", "emulator")).toEqual(["S00", ...upTo(15)]);
-    expect(scenariosOfMilestone("M2", "emulator")).toEqual(["S00", ...upTo(16)]);
-    expect(scenariosOfMilestone("M3", "mock")).toEqual([...upTo(14), "S16", "S17"]);
+    // (ids are names, not an order: S19 and S20 are run behind S14)
+    const m1 = [...upTo(14), "S19", "S20"];
+    expect(scenariosOfMilestone("M1", "mock")).toEqual(m1);
+    expect(scenariosOfMilestone("M1", "emulator")).toEqual(["S00", ...m1, "S15"]);
+    expect(scenariosOfMilestone("M2", "emulator")).toEqual(["S00", ...m1, "S15", "S16"]);
+    expect(scenariosOfMilestone("M3", "mock")).toEqual([...m1, "S16", "S17"]);
     // the gate of M3 is two runs: everything but S21 with the test program of M1, S00 and S21 with the DSP test program
-    expect(scenariosOfMilestone("M3", "emulator")).toEqual(["S00", ...upTo(17)]);
+    expect(scenariosOfMilestone("M3", "emulator")).toEqual(["S00", ...m1, "S15", "S16", "S17"]);
     expect(scenariosOfMilestone("M3", "emulator", true)).toEqual(["S00", "S21"]);
     expect(scenariosOfMilestone("M3", "mock", true)).toEqual(["S21"]);
     expect(scenariosOfMilestone("M4", "emulator")).toEqual(SCENARIOS.map((scenario) => scenario.id).filter((id) => id !== "S21"));
     expect(scenariosOfMilestone("M4", "emulator", true)).toEqual(["S00", "S21"]);
+    expect(SCENARIOS.map((scenario) => scenario.id)).toEqual(["S00", ...m1, "S15", "S16", "S17", "S18", "S21"]);
 
     const all = SCENARIOS.map((scenario) => scenario.id);
     // looking at a server: everything is run, nothing has to pass
@@ -2563,8 +2776,8 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(selectScenarios({ profile: "emulator", only: new Set(["S05", "S02"]) })).toEqual({ selected: ["S02", "S05"], required: [] });
     expect(selectScenarios({ profile: "emulator", dspProgram: true })).toEqual({ selected: ["S00", "S21"], required: [] });
     // a gate: its scenarios, each required
-    const m1 = scenariosOfMilestone("M1", "emulator");
-    expect(selectScenarios({ profile: "emulator", milestone: "M1" })).toEqual({ selected: m1, required: m1 });
+    const gate = scenariosOfMilestone("M1", "emulator");
+    expect(selectScenarios({ profile: "emulator", milestone: "M1" })).toEqual({ selected: gate, required: gate });
     expect(selectScenarios({ profile: "emulator", milestone: "M3", dspProgram: true })).toEqual({ selected: ["S00", "S21"], required: ["S00", "S21"] });
     expect(selectScenarios({ profile: "mock", milestone: "M1", only: new Set(["S02", "S16"]) })).toEqual({ selected: ["S02"], required: ["S02"] });
     expect(selectScenarios({ profile: "mock", milestone: "M1", only: new Set(["S16", "S17", "S18"]) })).toEqual({ selected: [], required: [] });
