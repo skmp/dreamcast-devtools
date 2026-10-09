@@ -16,7 +16,7 @@ import {
   type WorkspaceId,
 } from "./support/fixtures";
 import { requestAsAnotherClient } from "./support/mockServer";
-import { serveScriptedDebugger, V3_TARGETS } from "./support/scriptedDebugger";
+import { defaultAnswer, serveScriptedDebugger, V3_TARGETS } from "./support/scriptedDebugger";
 import type { Locator } from "@playwright/test";
 
 interface Target {
@@ -567,6 +567,53 @@ test("ticks do not make a disassembly view read again or move; a stop does both"
   await expect(view.locator(".current-instruction")).toHaveCount(1);
   await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
   await expect.poll(fetches).toBe(6);
+});
+
+test("an answer that lists an address twice shows it once, and leaves no line behind in the next listing", async ({ page }) => {
+  // A server that breaks the protocol here: the lines of a listing ascend. The view knows a line
+  // by its address, and two lines of one address used to leave one of them on screen for good.
+  const server = await serveScriptedDebugger(page);
+  let repeating = false;
+  server.answer("state.getDisassembly", (params) => {
+    const listing = defaultAnswer("state.getDisassembly", params) as { lines: Array<{ address: number; bytes: string; disassembly: string }> };
+    if (!repeating) {
+      return listing;
+    }
+    // every address a second time, with another text
+    return { lines: listing.lines.flatMap((line, index) => [line, { ...line, disassembly: `odd ${index}` }]) };
+  });
+  await page.goto("/#/workspace/sh4-debugger");
+  await server.described();
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const start = 0x8c001000 - 20;
+  await expect(rows).toHaveCount(64);
+  await expect(view.getByRole("note")).toHaveCount(0);
+
+  repeating = true;
+  await tooltipButton(view, "Refresh").click();
+  // 128 lines for 64 addresses: each address once, with its first line, and the view says so
+  await expect(view.getByRole("note")).toHaveText(
+    "The server listed 64 lines for addresses it had already listed; each address is shown once.",
+  );
+  await expect(rows).toHaveCount(64);
+  await expect(view).not.toContainText("odd");
+  expect(await rows.evaluateAll((elements) => elements.map((element) => Number(element.getAttribute("data-address"))))).toEqual(
+    Array.from({ length: 64 }, (_, index) => start + index * 2),
+  );
+  // the line of the stop is one line, and is marked
+  await expect(view.locator(".current-instruction")).toHaveCount(1);
+
+  // a correct listing again: its 64 lines and nothing else, here and after the view has moved
+  repeating = false;
+  await tooltipButton(view, "Refresh").click();
+  await expect(view.getByRole("note")).toHaveCount(0);
+  await expect(rows).toHaveCount(64);
+  await rows.nth(3).hover();
+  await page.mouse.wheel(0, 60);
+  await expect(rows.first()).toHaveAttribute("data-address", String(start + 12));
+  await expect(rows).toHaveCount(64);
+  await expect(view).not.toContainText("odd");
 });
 
 test.describe("a breakpoint request that is answered late", () => {

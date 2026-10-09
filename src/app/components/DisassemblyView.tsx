@@ -15,6 +15,7 @@ import RefreshIcon from "@mui/icons-material/Refresh";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import PauseIcon from "@mui/icons-material/Pause";
 import type { DisassemblyLine } from "../../lib/debuggerSchema";
+import { uniqueLines } from "./disassemblyLines";
 
 const WHEEL_PIXEL_THRESHOLD = 60;
 const INSTRUCTIONS_PER_TICK = 6;
@@ -259,6 +260,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   canStep = true,
 }, ref) => {
   const [lines, setLines] = useState<DisassemblyLine[]>([]);
+  // how many lines of the answer on screen repeated an address, and were left out
+  const [repeated, setRepeated] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
   // The request whose answer (lines, or an error) is on screen, and the address it asked for.
@@ -406,7 +409,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         if (requestIdRef.current !== requestId) {
           return;
         }
-        setLines(result);
+        const unique = uniqueLines(result);
+        setLines(unique);
+        setRepeated(result.length - unique.length);
         setAnswered({ requestId, address: addr });
       } catch (err) {
         if (requestIdRef.current === requestId) {
@@ -978,6 +983,13 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
                   Updating
                 </Typography>
               </Stack>
+            )}
+            {repeated > 0 && (
+              <Typography variant="caption" color="warning.main" role="note" sx={{ display: "block", mb: 0.5 }}>
+                {repeated === 1
+                  ? "The server listed an address twice; it is shown once."
+                  : `The server listed ${repeated} lines for addresses it had already listed; each address is shown once.`}
+              </Typography>
             )}
             {lines.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
