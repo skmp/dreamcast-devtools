@@ -1048,6 +1048,9 @@ const s06: Scenario = {
       const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address });
       await setCategories(context, { ...original, sh4: { muted: false, soloed: true } });
       await resumeToBreakpoint(context, sh4, breakpoint.id, address);
+      // A step from the stop of a breakpoint that is still listed executes the instruction of the
+      // stop: it is a stop of its own, with reason "step", and does not carry the id of that breakpoint.
+      await stepOnce(context, "sh4");
       await setCategories(context, original);
       await removeBreakpoint(context, breakpoint.id);
     } finally {

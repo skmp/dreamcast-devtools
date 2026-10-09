@@ -1674,6 +1674,45 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect((await stateOf(url)).categories.sh4).toEqual({ muted: false, soloed: false });
   }, 30_000);
 
+  it("S06: a step from the stop of a breakpoint that keeps the id of that breakpoint", async () => {
+    const mock = new MockDebugger();
+    const machine = mock as unknown as { enterStop(reason: string, breakpointId?: number, fallbackStep?: boolean): void; stopBreakpointId: number | undefined };
+    const enterStop = machine.enterStop.bind(mock);
+    machine.enterStop = (reason, breakpointId, fallbackStep) => {
+      const stale = machine.stopBreakpointId;
+      enterStop(reason, breakpointId, fallbackStep);
+      if (reason === "step" && stale !== undefined) machine.stopBreakpointId = stale;
+    };
+    const { url } = await startServer(undefined, mock);
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S04", "S05", "S06"]) });
+    // (the steps of S04 and S05 are steps from a pause, or from a stop whose breakpoint is gone)
+    expect(reportOf(summary).slice(0, 2)).toEqual(["S04 passed ", "S05 passed "]);
+    expect(statusOf(summary, "S06")).toBe("failed");
+    // (the tick of the step itself is right; the ticks behind it carry the id of the stop before)
+    expect(detailsOf(summary, "S06")).toMatch(/^invariant: I7: breakpointId with reason "step" \(tick \d+\)$/m);
+
+    // ... and one whose own tick carries it
+    const own = await run(
+      () => {
+        let last: unknown;
+        return {
+          toClient: (frame) => {
+            if (!isTick(frame)) return frame;
+            const state = frame.params.executionState;
+            if (state.reason === "step" && typeof last === "number" && String(last) in (frame.params.breakpoints as Json)) {
+              return { ...frame, params: { ...frame.params, executionState: { ...state, breakpointId: last } } };
+            }
+            last = state.breakpointId;
+            return frame;
+          },
+        };
+      },
+      ["S06"],
+    );
+    expect(detailsOf(own, "S06")).toMatch(/^control\.step \{sh4\}: a step stop carries no breakpointId$/m);
+    expect(summary.cleanUpProblems).toEqual([]);
+  }, 30_000);
+
   it("S13: a change of the watches, or of the categories, whose tick goes to the client that asked for it only", async () => {
     /** The mock, with the tick after the methods that match `quiet` sent to the requesting client only. */
     const notBroadcasting = (quiet: RegExp): MockDebugger => {
