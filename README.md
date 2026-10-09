@@ -33,7 +33,7 @@ Run `npm ci` once, then:
 | `npm run test:ui` | Vitest with its browser UI. |
 | `npm run test:e2e` | Playwright smoke suite in headless Chromium (see [End-to-end tests](#end-to-end-tests)). Not part of `check`. |
 | `npm run contract` | The contract runner: holds a debugger server to the protocol (see [Contract runner](#contract-runner)). Without arguments it tests the mock, in-process. |
-| `npm run check` | `lint`, `typecheck`, `test:run`, `contract`, `build:native`; stops at the first failure. CI runs this. |
+| `npm run check` | `lint`, `typecheck`, `test:run`, the contract gate of milestone M1 on the mock (`contract -- --milestone M1`), `build:native`, `build:wasm`; stops at the first failure. CI runs this. |
 
 ## Serving the build
 

@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import { readElfSymbols } from "./contract/elfSymbols";
 import type { ElfSymbols } from "./contract/elfSymbols";
 import { runContract, runIdleBreakpoint } from "./contract/run";
-import { MILESTONES, SCENARIOS, scenariosOfMilestone } from "./contract/scenarios";
+import { MILESTONES, SCENARIOS } from "./contract/scenarios";
 import type { Milestone, Profile } from "./contract/scenarios";
 import { ContractFailure } from "./contract/session";
 
@@ -10,22 +10,28 @@ import { ContractFailure } from "./contract/session";
  * The contract runner: holds a debugger server to protocol v3.
  *
  *   npm run contract -- [--url ws://host:port/ws] [--profile mock|emulator] [--elf <path>]
- *                       [--milestone M1|M2|M3|M4] [--require S16,S17] [--only S05,S06]
- *                       [--json] [--json-file <path>] [--verbose]
+ *                       [--milestone M1|M2|M3|M4] [--dsp-program] [--require S16,S17]
+ *                       [--only S05,S06] [--json] [--json-file <path>] [--verbose]
  *   npm run contract -- --url ws://host:port/ws --idle-breakpoint <address|symbol> [--elf <path>]
  *
  * Without --url it starts the mock debugger in this process (no page, no Vite) and runs
  * against that. It talks to the server with the client's own JsonRpcClient and
  * WebSocketTransport, validates every response and every tick with the strict copy of the
- * schema, checks the invariants I1 to I5 on every tick, and runs the scenarios S00 to S18
+ * schema, checks the invariants I1 to I8 on every tick, and runs the scenarios S00 to S21
  * (scripts/contract/). It leaves the server with the breakpoints, watches, categories and run
- * state it found, and exits with 1 when a scenario failed, an invariant was violated or the
- * server could not be put back. A scenario the server does not advertise the capabilities of
- * is "not applicable" (or "partial"), which is neither a pass nor a failure: the gate of a
- * milestone names the scenarios that have to pass with --milestone (or --require), and then
- * such a scenario is exit code 1 as well. 2 means that there was no run: a wrong option, or a server
- * that could not be connected to. What a connected server answers is always a result, with
- * the summary: a debugger.describe that cannot be used is S01 failed.
+ * state it found.
+ *
+ * A gate is a run that names a milestone: --milestone selects the scenarios of that
+ * milestone and requires each of them to pass, so "not applicable" and "partial" fail it.
+ * Without --milestone the runner looks at a server, and a scenario the server does not claim
+ * to support is not applicable, which is no failure; but a run in which no scenario passed has
+ * verified nothing and fails. --only narrows the selection and never turns an empty result
+ * into a success.
+ *
+ * Exit codes: 0, every selected scenario that had to pass passed, no invariant was violated
+ * and the server was put back; 1, anything else that is a result; 2, there was no run: a
+ * wrong option, or a server that could not be connected to. What a connected server answers
+ * is always a result, with the summary: a debugger.describe that cannot be used is S01 failed.
  */
 
 const USAGE = `usage: npm run contract -- [options]
@@ -35,12 +41,16 @@ const USAGE = `usage: npm run contract -- [options]
                               emulator: waits for the StartPaused stop, runs S00 and S15,
                               multiplies every timeout by 5
   --elf <path>                the test program, for its entry point and symbols
-  --milestone M1|M2|M3|M4     the gate of a milestone: its scenarios and those of the milestones
-                              before it have to pass (M1: S00 to S15, M2: and S16, M3: and S17,
-                              M4: and S18; S00 and S15 only in the emulator profile). One that
-                              is "not applicable" or "partial" fails the run
-  --require <ids>             the same for the scenarios named, e.g. --require S16,S17
-  --only <ids>                run only these scenarios, e.g. --only S05,S06
+  --milestone M1|M2|M3|M4     the gate of a milestone: its scenarios, and those of the milestones
+                              before it, are selected, and each of them has to pass (M1: S00 to
+                              S15, S19, S20; M2: and S16; M3: and S17; M4: and S18; S00 and S15
+                              in the emulator profile only). One that is "not applicable" or
+                              "partial" fails the gate
+  --dsp-program               the server runs the DSP test program: the second run of the gate
+                              of M3 (and M4), which selects S00 and S21 alone
+  --require <ids>             further scenarios that are run and have to pass, e.g. --require S16
+  --only <ids>                narrow the selection to these scenarios, e.g. --only S05,S06; a
+                              selection that leaves nothing to pass is a failed run
   --timeout-factor <n>        multiply every timeout by n instead of the profile's factor
   --json                      print the summary as JSON on stdout (the scenario lines go to stderr)
   --json-file <path>          also write the JSON summary to a file
@@ -51,6 +61,8 @@ const USAGE = `usage: npm run contract -- [options]
                               not a test run: at the StartPaused stop mute the sh4 category, add
                               a breakpoint there, resume, and stay connected until the server
                               closes the connection (for the "listed but never hit" measurement)
+
+exit code: 0 passed; 1 a result that is not a pass; 2 no run (a wrong option, no connection)
 `;
 
 interface Options {
@@ -60,6 +72,7 @@ interface Options {
   only?: Set<string>;
   require?: Set<string>;
   milestone?: Milestone;
+  dspProgram: boolean;
   timeoutFactor?: number;
   json: boolean;
   jsonFile?: string;
@@ -69,7 +82,7 @@ interface Options {
 }
 
 const parseArguments = (argv: string[]): Options => {
-  const options: Options = { profile: "mock", json: false, verbose: false, list: false };
+  const options: Options = { profile: "mock", dspProgram: false, json: false, verbose: false, list: false };
   let profileGiven = false;
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
@@ -110,6 +123,9 @@ const parseArguments = (argv: string[]): Options => {
         options.milestone = milestone as Milestone;
         break;
       }
+      case "--dsp-program":
+        options.dspProgram = true;
+        break;
       case "--timeout-factor": {
         const factor = Number(value(index++, flag));
         if (!(factor > 0)) {
@@ -165,6 +181,9 @@ const parseArguments = (argv: string[]): Options => {
       throw new Error(`--require ${id}: --only leaves that scenario out`);
     }
   }
+  if (options.dspProgram && options.milestone && MILESTONES.indexOf(options.milestone) < MILESTONES.indexOf("M3")) {
+    throw new Error(`--dsp-program is the second run of the gate of M3: the gate of ${options.milestone} has no scenario for it`);
+  }
   return options;
 };
 
@@ -176,18 +195,6 @@ const idsOf = (list: string): Set<string> =>
       .filter(Boolean),
   );
 
-/**
- * The scenarios that have to pass: those of --require, and those of the gate of --milestone
- * (of them, the ones that --only selects: a gate can be run in pieces).
- */
-const requiredOf = (options: Options): Set<string> | undefined => {
-  if (!options.require && !options.milestone) {
-    return undefined;
-  }
-  const gate = options.milestone ? scenariosOfMilestone(options.milestone, options.profile) : [];
-  return new Set([...(options.require ?? []), ...gate.filter((id) => !options.only || options.only.has(id))]);
-};
-
 const main = async (): Promise<number> => {
   const options = parseArguments(process.argv.slice(2));
   // with --json, stdout carries the JSON document and nothing else
@@ -195,7 +202,8 @@ const main = async (): Promise<number> => {
 
   if (options.list) {
     for (const scenario of SCENARIOS) {
-      say(`${scenario.id} ${scenario.title}`);
+      const notes = [scenario.milestone ?? "M1", ...(scenario.emulatorOnly ? ["emulator profile"] : []), ...(scenario.dspProgram ? ["--dsp-program"] : [])];
+      say(`${scenario.id} ${scenario.title} (${notes.join(", ")})`);
     }
     return 0;
   }
@@ -209,8 +217,10 @@ const main = async (): Promise<number> => {
     url: options.url,
     profile: options.profile,
     elf,
+    milestone: options.milestone,
+    dspProgram: options.dspProgram,
     only: options.only,
-    require: requiredOf(options),
+    require: options.require,
     timeoutFactor: options.timeoutFactor,
     verbose: options.verbose,
     say,

@@ -37,9 +37,10 @@ export type Profile = "mock" | "emulator";
  * - passed: every assertion of the scenario held;
  * - failed: one did not, or an invariant was violated while it ran;
  * - not-applicable: the server does not advertise what the scenario needs (or the scenario
- *   belongs to the other profile). Never a pass;
- * - partial: the server advertises only some of the capabilities of the scenario; the parts
- *   it advertises passed. Never a pass of the scenario as a whole.
+ *   belongs to the other profile, or to the run with the DSP test program). Never a pass;
+ * - partial: some of its parts passed and the rest could not be shown: a capability that is
+ *   not advertised, a program that takes no interrupt. Never a pass of the scenario as a
+ *   whole.
  */
 export type ScenarioStatus = "passed" | "failed" | "not-applicable" | "partial";
 
@@ -84,7 +85,7 @@ export interface RunContext {
 export { MILESTONES };
 export type { Milestone };
 
-type Outcome = void | { notApplicable: string } | { parts: PartResult[] };
+type Outcome = void | { notApplicable: string } | { parts: PartResult[] } | { partial: string };
 type Scenario = {
   id: string;
   title: string;
@@ -92,6 +93,8 @@ type Scenario = {
   milestone?: Milestone;
   /** it applies to the emulator profile only */
   emulatorOnly?: boolean;
+  /** it needs a program that loads the DSP: it belongs to the run with the DSP test program, and to no other */
+  dspProgram?: boolean;
   run: (context: RunContext) => Promise<Outcome>;
 };
 
@@ -1908,7 +1911,7 @@ const s16: Scenario = {
 
 const s17: Scenario = {
   id: "S17",
-  title: "M3: SGC capture, DSP",
+  title: "M3: SGC capture",
   milestone: "M3",
   run: (context) =>
     runParts([
@@ -1984,12 +1987,6 @@ const s17: Scenario = {
           await session.expectError("state.recordSgcFrames", { frames: 4097 }, -32602);
         },
       },
-      {
-        name: "dsp step and breakpoint",
-        applicable: targetOf(context.session.shape, "dsp")?.stepping === true,
-        why: "targets: dsp.stepping is false",
-        run: () => stepAndBreakpoint(context, "dsp"),
-      },
     ]),
 };
 
@@ -2041,16 +2038,121 @@ const s18: Scenario = {
     ]),
 };
 
-export const SCENARIOS: Scenario[] = [s00, s01, s02, s03, s04, s05, s06, s07, s08, s09, s10, s11, s12, s13, s14, s15, s16, s17, s18];
+const s21: Scenario = {
+  id: "S21",
+  title: "M3: DSP",
+  milestone: "M3",
+  dspProgram: true,
+  async run(context) {
+    const { session } = context;
+    if (!context.dspProgram) {
+      return { notApplicable: "the run with the DSP test program only (--dsp-program): this program is not known to load the DSP" };
+    }
+    const dsp = targetOf(session.shape, "dsp");
+    if (!dsp?.stepping) {
+      return { notApplicable: dsp ? "targets: dsp.stepping is false" : 'targets: no "dsp"' };
+    }
+    const steps = dsp.addressMax + 1;
+    const stepOf = (tick: DebuggerTick) => pcOf(tick, dsp);
+
+    // control.step {dsp} from a stop: a paused tick with reason "step", and STEP advanced by one
+    const before = await ensurePaused(context);
+    const stepped = await stepOnce(context, "dsp");
+    check(stepOf(stepped.tick) === (stepOf(before.tick) + 1) % steps, `a DSP step from ${stepOf(before.tick)} ended at ${stepOf(stepped.tick)}`);
+
+    // The program the test ELF loaded: every step has its four MPRO words (8 pairs) and its line,
+    // and they are not all empty. 16 lines at STEP, as the disassembly view asks for them.
+    const program = await disassemble(context, "dsp", 0, steps);
+    check(program.length === steps, `the DSP has ${steps} steps, state.getDisassembly {dsp} returned ${program.length} lines for them`);
+    const loaded = program.filter((line) => /[1-9A-F]/.test(line.bytes));
+    check(loaded.length > 0, "every step of the DSP is empty (all MPRO words are zero): the DSP test program loads a DSP program");
+    const from = Math.min(stepOf(stepped.tick), steps - 16);
+    const lines = await disassemble(context, "dsp", from, 16);
+    check(lines.length === 16, `${lines.length} lines of DSP disassembly for count 16 at step ${from}`);
+    lines.forEach((line, position) => {
+      check(line.address === from + position, `dsp: line ${position} at step ${from} is step ${line.address}`);
+      check(/^[0-9A-F]{2}( [0-9A-F]{2}){7}$/.test(line.bytes), `dsp: the bytes of step ${line.address} are "${line.bytes}", expected the four MPRO words as 8 pairs`);
+      check(line.disassembly.length > 0, `dsp: step ${line.address} has no text`);
+      check(JSON.stringify(line) === JSON.stringify(program[line.address]), `dsp: step ${line.address} reads differently in two requests while the target is paused`);
+    });
+
+    // A code breakpoint on a step of the loaded program is hit, with STEP equal to its address;
+    // and one on the last step, from which a step wraps to step 0.
+    const hitAt = async (address: number): Promise<TickRecord> => {
+      const breakpoint = await addBreakpoint(context, { event: dsp.breakpointEvent, address });
+      const armed = session.latestTick().tick;
+      const mark = session.mark();
+      await session.call("control.runUntil", {});
+      const hit = await session.waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(armed), 5000, `a paused tick at the dsp breakpoint on step ${address}`, mark);
+      check(hit.tick.executionState.breakpointId === breakpoint.id, `the stop reports breakpointId ${hit.tick.executionState.breakpointId}, expected ${breakpoint.id}`);
+      check(hit.tick.executionState.reason === "breakpoint", `the stop has reason "${hit.tick.executionState.reason}", expected "breakpoint"`);
+      check(stepOf(hit.tick) === address, `the stop is at step ${stepOf(hit.tick)}, the breakpoint at step ${address}`);
+      await removeBreakpoint(context, breakpoint.id);
+      return hit;
+    };
+    const current = stepOf(session.latestTick().tick);
+    await hitAt((loaded.find((line) => line.address > current && line.address !== dsp.addressMax) ?? loaded[0]).address);
+    await hitAt(dsp.addressMax);
+    const wrapped = await stepOnce(context, "dsp");
+    check(stepOf(wrapped.tick) === 0, `a DSP step from step ${dsp.addressMax} ended at ${stepOf(wrapped.tick)}; the last step is followed by step 0`);
+
+    // there is nothing to step over or out of in a DSP program
+    await session.expectError("control.stepOver", { target: "dsp" }, -32004);
+    await session.expectError("control.stepOut", { target: "dsp" }, -32004);
+  },
+};
+
+/** In the order they are run: ids are names, and S19 and S20 come behind S14. */
+export const SCENARIOS: Scenario[] = [s00, s01, s02, s03, s04, s05, s06, s07, s08, s09, s10, s11, s12, s13, s14, s15, s16, s17, s18, s21];
 
 /**
  * The scenarios a server of `milestone` has to pass, i.e. the gate of that milestone: those
- * of the milestone and of the ones before it, without those of the other profile.
+ * of the milestone and of the ones before it, without those of the other profile. A gate
+ * from M3 on is two runs: this one, with the test program of M1, has everything but what
+ * needs a program that loads the DSP; the second one (`dspProgram`), against a server started
+ * with the DSP test program, has the anchor and those scenarios alone.
  */
-export const scenariosOfMilestone = (milestone: Milestone, profile: Profile): string[] =>
+export const scenariosOfMilestone = (milestone: Milestone, profile: Profile, dspProgram = false): string[] =>
   SCENARIOS.filter(
-    (scenario) => MILESTONES.indexOf(scenario.milestone ?? "M1") <= MILESTONES.indexOf(milestone) && (profile === "emulator" || !scenario.emulatorOnly),
+    (scenario) =>
+      MILESTONES.indexOf(scenario.milestone ?? "M1") <= MILESTONES.indexOf(milestone) &&
+      (profile === "emulator" || !scenario.emulatorOnly) &&
+      (dspProgram ? scenario.dspProgram === true || scenario.id === "S00" : scenario.dspProgram !== true),
   ).map((scenario) => scenario.id);
+
+export interface Selection {
+  /** the scenarios the run runs, in the order of SCENARIOS */
+  selected: string[];
+  /** the scenarios that have to pass: every selected one under the gate of a milestone, and those `require` names */
+  required: string[];
+}
+
+/**
+ * What a run runs and what of it has to pass (design 5.5.3). `milestone` selects the gate of
+ * that milestone and requires each of its scenarios to pass. Without it every scenario is
+ * selected (with `dspProgram`: the anchor and the scenarios of the DSP test program), and
+ * none is required. `require` names further scenarios that are run and have to pass. `only`
+ * narrows the selection, also inside a gate: what it leaves out is not run, and a gate
+ * scenario it leaves out is not asked for. It never makes an empty result a success: that is
+ * the run's verdict when nothing passed.
+ */
+export const selectScenarios = (options: {
+  profile: Profile;
+  milestone?: Milestone;
+  dspProgram?: boolean;
+  only?: Set<string>;
+  require?: Set<string>;
+}): Selection => {
+  const { profile, milestone, dspProgram = false, only, require } = options;
+  const order = SCENARIOS.map((scenario) => scenario.id);
+  const gate = milestone ? scenariosOfMilestone(milestone, profile, dspProgram) : undefined;
+  const base = gate ?? (dspProgram ? SCENARIOS.filter((scenario) => scenario.dspProgram || (scenario.id === "S00" && profile === "emulator")).map((scenario) => scenario.id) : order);
+  const kept = (id: string) => !only || only.has(id);
+  return {
+    selected: order.filter((id) => (base.includes(id) || require?.has(id)) && kept(id)),
+    required: order.filter((id) => require?.has(id) || (gate?.includes(id) && kept(id))),
+  };
+};
 
 /**
  * Runs one scenario. It fails when an assertion fails, when the scenario throws, or when
@@ -2069,6 +2171,9 @@ export const runScenario = async (scenario: Scenario, context: RunContext): Prom
     if (outcome && "notApplicable" in outcome) {
       status = "not-applicable";
       details.unshift(outcome.notApplicable);
+    } else if (outcome && "partial" in outcome) {
+      status = "partial";
+      details.unshift(outcome.partial);
     } else if (outcome && "parts" in outcome) {
       parts = outcome.parts;
       if (parts.some((part) => part.status === "failed")) {

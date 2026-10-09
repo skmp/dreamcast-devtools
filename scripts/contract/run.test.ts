@@ -6,8 +6,9 @@ import { MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger } from "../../server/mockD
 import type { MockClient, MockConnection, MockDebuggerOptions } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
 import { isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
+import { spawn } from "node:child_process";
 import { runContract } from "./run";
-import { SCENARIOS, scenariosOfMilestone } from "./scenarios";
+import { SCENARIOS, scenariosOfMilestone, selectScenarios } from "./scenarios";
 import type { ContractSummary } from "./run";
 import { ContractFailure } from "./session";
 
@@ -224,6 +225,7 @@ const MOCK_STATUSES = {
   S16: "partial", // the mock steps the ARM7 and writes registers; it has no memory write and no reset
   S17: "passed",
   S18: "not-applicable", // no tables, no Holly capture
+  S21: "not-applicable", // the run with the DSP test program only
 };
 
 const statusesOf = (summary: ContractSummary) => Object.fromEntries(summary.scenarios.map((scenario) => [scenario.id, scenario.status]));
@@ -329,7 +331,10 @@ describe("the contract runner against the mock", () => {
     expect(summary.cleanUpProblems).toEqual([]);
     expect(statusesOf(summary)).toEqual(MOCK_STATUSES);
     expect(summary.ok).toBe(true);
-    expect(summary).toMatchObject({ passed: 15, failed: 0, partial: 1, notApplicable: 3, profile: "mock", timeoutFactor: 1 });
+    expect(summary).toMatchObject({ passed: 15, failed: 0, partial: 1, notApplicable: 4, profile: "mock", timeoutFactor: 1 });
+    // nothing was asked to pass: the runner looked at a server
+    expect(summary).toMatchObject({ required: [], requiredNotPassed: [], nothingVerified: false, dspProgram: false });
+    expect(summary.selected).toEqual(SCENARIOS.map((scenario) => scenario.id));
     expect(summary.scenarios.find((scenario) => scenario.id === "S16")?.parts).toEqual([
       { name: "arm7 step and breakpoint", status: "passed" },
       { name: "writeMemory", status: "not-applicable", detail: 'no capability "memory-write"' },
@@ -363,6 +368,38 @@ describe("the contract runner against the mock", () => {
     expect(statusesOf(summary)).toEqual({ ...MOCK_STATUSES, S16: "not-applicable", S17: "not-applicable" });
     expect(summary.ok).toBe(true);
     expect(summary.server.capabilities).toEqual(["event-breakpoints", "callstack", "sh4-debug-native"]);
+  }, 180_000);
+
+  it("the gate of M1: the mock, and the mock as an M1 server, pass every scenario of it; nothing is partial or not applicable", async () => {
+    for (const options of [undefined, { supports: MOCK_M1_SUPPORT }]) {
+      const { url } = await startServer(undefined, options);
+      const lines: string[] = [];
+      const summary = await runContract({ url, profile: "mock", milestone: "M1", say: (line) => lines.push(line) });
+      expect(reportOf(summary).filter((line) => !/^S\d\d passed /.test(line))).toEqual([]);
+      expect(summary.selected).toEqual(scenariosOfMilestone("M1", "mock"));
+      expect(summary.required).toEqual(summary.selected);
+      expect(summary).toMatchObject({ ok: true, milestone: "M1", failed: 0, partial: 0, notApplicable: 0, requiredNotPassed: [], invariantViolations: [], cleanUpProblems: [] });
+      expect(summary.passed).toBe(summary.selected.length);
+      expect(lines.at(-1)).toBe("contract: OK");
+    }
+  }, 180_000);
+
+  it("S21: the run with the DSP test program selects the scenarios of that program alone, and the mock passes it", async () => {
+    const { url } = await startServer();
+    const summary = await runContract({ url, profile: "mock", milestone: "M3", dspProgram: true });
+    expect(reportOf(summary)).toEqual(["S21 passed "]);
+    expect(summary).toMatchObject({ ok: true, selected: ["S21"], required: ["S21"], dspProgram: true, cleanUpProblems: [] });
+    expect((await stateOf(url)).breakpoints).toEqual({});
+
+    // without the option the scenario is not for this program; a server whose DSP does not step is not asked
+    expect(reportOf(await runContract({ url, profile: "mock", only: new Set(["S21"]) }))).toEqual([
+      "S21 not-applicable the run with the DSP test program only (--dsp-program): this program is not known to load the DSP",
+    ]);
+    const m1 = await run(undefined, undefined, { supports: MOCK_M1_SUPPORT });
+    expect(statusOf(m1, "S21")).toBe("not-applicable");
+    const m1Dsp = await runContract({ url: (await startServer(undefined, { supports: MOCK_M1_SUPPORT })).url, profile: "mock", milestone: "M3", dspProgram: true });
+    expect(reportOf(m1Dsp)).toEqual(["S21 not-applicable targets: dsp.stepping is false"]);
+    expect(m1Dsp).toMatchObject({ ok: false, nothingVerified: true, requiredNotPassed: [{ id: "S21", status: "not-applicable" }] });
   }, 180_000);
 
   it("restores a paused server to paused, and keeps the watches it found", async () => {
@@ -1932,69 +1969,150 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
   }, 30_000);
 
-  it("reports a scenario whose capability the server does not advertise as not applicable, never as passed", async () => {
-    const summary = await run(
-      {
-        toClient: (frame) => {
-          const result = frame.result as Json | undefined;
-          if (!result?.deviceTree) return frame;
-          return {
-            ...frame,
-            result: {
-              ...result,
-              capabilities: ["event-breakpoints", "callstack", "sh4-debug-native"],
-              targets: (result.targets as Json[]).map((target) => (target.id === "sh4" ? target : { ...target, stepping: false })),
-            },
-          };
-        },
+  it("reports a scenario whose capability the server does not advertise as not applicable, never as passed; a run of nothing else has verified nothing", async () => {
+    const lines: string[] = [];
+    const { url } = await startServer({
+      toClient: (frame) => {
+        const result = frame.result as Json | undefined;
+        if (!result?.deviceTree) return frame;
+        return {
+          ...frame,
+          result: {
+            ...result,
+            capabilities: ["event-breakpoints", "callstack", "sh4-debug-native"],
+            targets: (result.targets as Json[]).map((target) => (target.id === "sh4" ? target : { ...target, stepping: false })),
+          },
+        };
       },
-      ["S16", "S17", "S18"],
-    );
+    });
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S16", "S17", "S18"]), say: (line) => lines.push(line) });
     expect(summary.scenarios.map((scenario) => scenario.status)).toEqual(["not-applicable", "not-applicable", "not-applicable"]);
     expect(summary).toMatchObject({ passed: 0, failed: 0, partial: 0, notApplicable: 3 });
-    expect(detailsOf(summary, "S17")).toBe('no capability "sgc-capture"; targets: dsp.stepping is false');
-    // nothing failed, and nothing was asked to pass
-    expect(summary).toMatchObject({ ok: true, required: [], requiredNotPassed: [] });
-  });
-
-  it("fails the gate of a milestone when a scenario of it is not applicable or partial: a capability that is not advertised", async () => {
-    // an M1 server at the gate of M2 and M3
-    const lines: string[] = [];
-    const { url } = await startServer(undefined, { supports: MOCK_M1_SUPPORT });
-    const m1 = await runContract({ url, profile: "mock", only: new Set(["S16", "S17", "S18"]), require: new Set(["S17", "S16"]), say: (line) => lines.push(line) });
-    expect(m1).toMatchObject({ passed: 0, failed: 0, partial: 0, notApplicable: 3, ok: false });
-    expect(m1.required).toEqual(["S16", "S17"]);
-    expect(m1.requiredNotPassed).toEqual([
-      { id: "S16", status: "not-applicable" },
-      { id: "S17", status: "not-applicable" },
-    ]);
-    expect(lines.slice(-4)).toEqual([
-      "required: S16 is not applicable; it has to pass",
-      "required: S17 is not applicable; it has to pass",
+    expect(detailsOf(summary, "S17")).toBe('no capability "sgc-capture"');
+    // nothing failed and nothing was asked to pass, and still this is no success: nothing passed
+    expect(summary).toMatchObject({ ok: false, nothingVerified: true, required: [], requiredNotPassed: [] });
+    expect(lines.slice(-3)).toEqual([
+      "nothing verified: no scenario passed",
       expect.stringMatching(/^0 passed, 0 failed, 0 partial, 3 not applicable; /),
       "contract: FAILED",
     ]);
+    // one scenario that passes is enough for a run that looks at a server
+    const looked = await runContract({ url, profile: "mock", only: new Set(["S01", "S16", "S17", "S18"]) });
+    expect(looked).toMatchObject({ ok: true, nothingVerified: false, passed: 1, notApplicable: 3 });
+  });
 
-    // the mock, which has two of the four parts of S16, and all of S17
-    const mock = await runContract({ url: (await startServer()).url, profile: "mock", only: new Set(["S16", "S17"]), require: new Set(["S16", "S17"]) });
-    expect(mock.requiredNotPassed).toEqual([{ id: "S16", status: "partial" }]);
-    expect(mock.ok).toBe(false);
-    const m3only = await runContract({ url: (await startServer()).url, profile: "mock", only: new Set(["S16", "S17"]), require: new Set(["S17"]) });
+  it("fails the gate of a milestone when a scenario of it is not applicable or partial: a capability that is not advertised", async () => {
+    // an M1 server at the gate of M2: S16 is selected with the scenarios of M1, and it is not applicable
+    const lines: string[] = [];
+    const { url } = await startServer(undefined, { supports: MOCK_M1_SUPPORT });
+    const m2 = await runContract({ url, profile: "mock", milestone: "M2", only: new Set(["S02", "S16"]), say: (line) => lines.push(line) });
+    expect(m2).toMatchObject({ passed: 1, failed: 0, partial: 0, notApplicable: 1, ok: false, selected: ["S02", "S16"], required: ["S02", "S16"] });
+    expect(m2.requiredNotPassed).toEqual([{ id: "S16", status: "not-applicable" }]);
+    expect(lines.slice(-3)).toEqual(["required: S16 is not applicable; it has to pass", expect.stringMatching(/^1 passed, 0 failed, 0 partial, 1 not applicable; /), "contract: FAILED"]);
+    // the same with --require, without a gate
+    const required = await runContract({ url, profile: "mock", only: new Set(["S01", "S16", "S17"]), require: new Set(["S17", "S16"]) });
+    expect(required).toMatchObject({ ok: false, required: ["S16", "S17"] });
+    expect(required.requiredNotPassed).toEqual([
+      { id: "S16", status: "not-applicable" },
+      { id: "S17", status: "not-applicable" },
+    ]);
+    // a scenario --require names is run although the gate does not have it
+    const further = await runContract({ url, profile: "mock", milestone: "M1", only: new Set(["S01", "S17"]), require: new Set(["S17"]) });
+    expect(further).toMatchObject({ ok: false, selected: ["S01", "S17"], required: ["S01", "S17"], requiredNotPassed: [{ id: "S17", status: "not-applicable" }] });
+
+    // the mock, which has two of the four parts of S16: partial fails the gate of M2, and S17 passes that of M3
+    const full = (await startServer()).url;
+    const partial = await runContract({ url: full, profile: "mock", milestone: "M2", only: new Set(["S16"]) });
+    expect(partial).toMatchObject({ ok: false, nothingVerified: true, partial: 1, requiredNotPassed: [{ id: "S16", status: "partial" }] });
+    const m3only = await runContract({ url: full, profile: "mock", milestone: "M3", only: new Set(["S17"]) });
     expect(m3only).toMatchObject({ ok: true, required: ["S17"], requiredNotPassed: [] });
 
     // a required scenario that was not run has not passed
-    const notRun = await runContract({ url: (await startServer()).url, profile: "mock", only: new Set(["S01"]), require: new Set(["S01", "S02"]) });
+    const notRun = await runContract({ url: full, profile: "mock", only: new Set(["S01"]), require: new Set(["S01", "S02"]) });
     expect(notRun.requiredNotPassed).toEqual([{ id: "S02", status: "not-run" }]);
     expect(notRun.ok).toBe(false);
   }, 30_000);
 
-  it("names the scenarios of the gate of each milestone", () => {
+  it("S01 at the gate of a milestone: the three targets are listed, and the capabilities of the milestone advertised", async () => {
+    // a server that lists the SH4 alone can be looked at, and is no server of milestone M1
+    const sh4Only = { supports: { targets: ["sh4" as const], stepping: ["sh4" as const], capabilities: ["event-breakpoints", "callstack"] } };
+    const { url } = await startServer(undefined, sh4Only);
+    expect(reportOf(await runContract({ url, profile: "mock", only: new Set(["S01"]) }))).toEqual(["S01 passed "]);
+    const gate = await runContract({ url, profile: "mock", milestone: "M1", only: new Set(["S01"]) });
+    expect(gate.scenarios[0].details).toEqual([
+      "the gate of M1: the target arm7 is not listed; a server of a milestone lists sh4, arm7 and dsp (3.1)",
+      "the gate of M1: the target dsp is not listed; a server of a milestone lists sh4, arm7 and dsp (3.1)",
+    ]);
+    expect(gate.ok).toBe(false);
+
+    // the capabilities of M1, and those M2 adds
+    const noCallstack = await runContract({
+      url: (await startServer(undefined, { supports: { ...MOCK_M1_SUPPORT, capabilities: ["event-breakpoints"] } })).url,
+      profile: "mock",
+      milestone: "M1",
+      only: new Set(["S01"]),
+    });
+    expect(noCallstack.scenarios[0].details).toEqual(['the gate of M1: the capability "callstack" is not advertised (3.1)']);
+    const m1 = (await startServer(undefined, { supports: MOCK_M1_SUPPORT })).url;
+    expect(reportOf(await runContract({ url: m1, profile: "mock", milestone: "M1", only: new Set(["S01"]) }))).toEqual(["S01 passed "]);
+    const atM2 = await runContract({ url: m1, profile: "mock", milestone: "M2", only: new Set(["S01"]) });
+    expect(atM2.scenarios[0].details).toEqual([
+      'the gate of M2: the capability "memory-write" is not advertised (3.1)',
+      'the gate of M2: the capability "register-write" is not advertised (3.1)',
+      'the gate of M2: the capability "reset" is not advertised (3.1)',
+    ]);
+  }, 30_000);
+
+  it("--only never turns an empty result into a success: a selection that leaves nothing to pass is a failed run", async () => {
+    const { url } = await startServer(undefined, { supports: MOCK_M1_SUPPORT });
+    // the scenarios of later milestones, which the gate of M1 does not have
+    const lines: string[] = [];
+    const outside = await runContract({ url, profile: "mock", milestone: "M1", only: new Set(["S16", "S17", "S18"]), say: (line) => lines.push(line) });
+    expect(outside).toMatchObject({ ok: false, nothingVerified: true, selected: [], required: [], scenarios: [], passed: 0, failed: 0 });
+    expect(lines.slice(-3)).toEqual([
+      "nothing verified: the selection leaves no scenario to run",
+      expect.stringMatching(/^0 passed, 0 failed, 0 partial, 0 not applicable; /),
+      "contract: FAILED",
+    ]);
+    expect(await runContract({ url, profile: "mock", milestone: "M2", only: new Set(["S17"]) })).toMatchObject({ ok: false, nothingVerified: true, selected: [] });
+    // inside a gate --only narrows it: what is left has to pass, and does
+    const piece = await runContract({ url, profile: "mock", milestone: "M1", only: new Set(["S01", "S02"]) });
+    expect(piece).toMatchObject({ ok: true, selected: ["S01", "S02"], required: ["S01", "S02"], passed: 2 });
+    // the server was connected to and left as it was
+    expect((await stateOf(url)).executionState.state).toBe("running");
+  }, 30_000);
+
+  it("names the scenarios of the gate of each milestone, and what a run selects and requires", () => {
     const upTo = (last: number) => Array.from({ length: last }, (_, index) => `S${String(index + 1).padStart(2, "0")}`);
     expect(scenariosOfMilestone("M1", "mock")).toEqual(upTo(14));
     expect(scenariosOfMilestone("M1", "emulator")).toEqual(["S00", ...upTo(15)]);
     expect(scenariosOfMilestone("M2", "emulator")).toEqual(["S00", ...upTo(16)]);
     expect(scenariosOfMilestone("M3", "mock")).toEqual([...upTo(14), "S16", "S17"]);
-    expect(scenariosOfMilestone("M4", "emulator")).toEqual(SCENARIOS.map((scenario) => scenario.id));
+    // the gate of M3 is two runs: everything but S21 with the test program of M1, S00 and S21 with the DSP test program
+    expect(scenariosOfMilestone("M3", "emulator")).toEqual(["S00", ...upTo(17)]);
+    expect(scenariosOfMilestone("M3", "emulator", true)).toEqual(["S00", "S21"]);
+    expect(scenariosOfMilestone("M3", "mock", true)).toEqual(["S21"]);
+    expect(scenariosOfMilestone("M4", "emulator")).toEqual(SCENARIOS.map((scenario) => scenario.id).filter((id) => id !== "S21"));
+    expect(scenariosOfMilestone("M4", "emulator", true)).toEqual(["S00", "S21"]);
+
+    const all = SCENARIOS.map((scenario) => scenario.id);
+    // looking at a server: everything is run, nothing has to pass
+    expect(selectScenarios({ profile: "mock" })).toEqual({ selected: all, required: [] });
+    expect(selectScenarios({ profile: "emulator", only: new Set(["S05", "S02"]) })).toEqual({ selected: ["S02", "S05"], required: [] });
+    expect(selectScenarios({ profile: "emulator", dspProgram: true })).toEqual({ selected: ["S00", "S21"], required: [] });
+    // a gate: its scenarios, each required
+    const m1 = scenariosOfMilestone("M1", "emulator");
+    expect(selectScenarios({ profile: "emulator", milestone: "M1" })).toEqual({ selected: m1, required: m1 });
+    expect(selectScenarios({ profile: "emulator", milestone: "M3", dspProgram: true })).toEqual({ selected: ["S00", "S21"], required: ["S00", "S21"] });
+    expect(selectScenarios({ profile: "mock", milestone: "M1", only: new Set(["S02", "S16"]) })).toEqual({ selected: ["S02"], required: ["S02"] });
+    expect(selectScenarios({ profile: "mock", milestone: "M1", only: new Set(["S16", "S17", "S18"]) })).toEqual({ selected: [], required: [] });
+    expect(selectScenarios({ profile: "mock", milestone: "M2", only: new Set(["S17"]) })).toEqual({ selected: [], required: [] });
+    // --require: run and required, also outside the gate
+    expect(selectScenarios({ profile: "mock", require: new Set(["S16"]), only: new Set(["S01", "S16"]) })).toEqual({ selected: ["S01", "S16"], required: ["S16"] });
+    expect(selectScenarios({ profile: "mock", milestone: "M1", require: new Set(["S17"]) })).toEqual({
+      selected: [...scenariosOfMilestone("M1", "mock"), "S17"],
+      required: [...scenariosOfMilestone("M1", "mock"), "S17"],
+    });
   });
 
   it("S17: a binary frame whose header does not belong to the result", async () => {
@@ -2315,5 +2433,63 @@ describe("the emulator profile", () => {
     expect(summary.server.capabilities).toContain("sh4-debug-native");
     expect(summary.ok).toBe(true);
     expect(summary.finalState).toMatch(/paused/);
+  }, 30_000);
+});
+
+describe("the command line", () => {
+  /** `npm run contract -- <args>` as a child process: its exit code and what it printed. */
+  const cli = (args: string[]): Promise<{ code: number | null; output: string }> =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["node_modules/tsx/dist/cli.mjs", "--tsconfig", "tsconfig.scripts.json", "scripts/contract-test.ts", ...args], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const chunks: Buffer[] = [];
+      child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+      child.stderr.on("data", (chunk: Buffer) => chunks.push(chunk));
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code, output: Buffer.concat(chunks).toString("utf8") }));
+    });
+
+  it("exits with 0 for a gate that passed, 1 for a result that is not a pass, 2 when there was no run", async () => {
+    const { url } = await startServer(undefined, { supports: MOCK_M1_SUPPORT });
+    const target = ["--url", url, "--profile", "mock"];
+
+    // a piece of the gate of M1
+    const passed = await cli([...target, "--milestone", "M1", "--only", "S01,S02"]);
+    expect(passed.output).toMatch(/^2 passed, 0 failed, 0 partial, 0 not applicable; .*\ncontract: OK\n$/m);
+    expect(passed.code).toBe(0);
+
+    // nothing of what was asked for is in the gate, or applies to the server: no success
+    for (const args of [
+      ["--only", "S16,S17,S18"],
+      ["--milestone", "M1", "--only", "S16,S17,S18"],
+      ["--milestone", "M2", "--only", "S17"],
+    ]) {
+      const nothing = await cli([...target, ...args]);
+      expect(nothing.output, args.join(" ")).toMatch(/^nothing verified: .*\n0 passed, 0 failed, .*\ncontract: FAILED\n$/m);
+      expect(nothing.code, args.join(" ")).toBe(1);
+    }
+    // a gate whose scenario is not applicable
+    const gate = await cli([...target, "--milestone", "M2", "--only", "S02,S16"]);
+    expect(gate.output).toMatch(/^required: S16 is not applicable; it has to pass$/m);
+    expect(gate.code).toBe(1);
+
+    // a wrong option, and a server that is not there
+    for (const args of [["--milestone", "M5"], ["--only", "S99"], ["--require", "S16", "--only", "S01"], ["--milestone", "M2", "--dsp-program"], ["--no-such-option"]]) {
+      const wrong = await cli([...target, ...args]);
+      expect(wrong.code, args.join(" ")).toBe(2);
+      expect(wrong.output, args.join(" ")).toMatch(/^contract: /m);
+    }
+    const gone = await listenMockDebugger(new MockDebugger());
+    await gone.close();
+    expect((await cli(["--url", gone.url, "--profile", "mock", "--only", "S01"])).code).toBe(2);
+  }, 120_000);
+
+  it("--list names every scenario with its milestone", async () => {
+    const listed = await cli(["--list"]);
+    expect(listed.code).toBe(0);
+    expect(listed.output.trim().split("\n")).toHaveLength(SCENARIOS.length);
+    expect(listed.output).toMatch(/^S00 anchor \(M1, emulator profile\)$/m);
+    expect(listed.output).toMatch(/^S21 M3: DSP \(M3, --dsp-program\)$/m);
   }, 30_000);
 });

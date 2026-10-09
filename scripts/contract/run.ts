@@ -4,8 +4,8 @@ import type { MockListener } from "../../server/mockWebSocket";
 import type { DebuggerShape, DebuggerTick } from "../../src/lib/debuggerSchema";
 import { resolveAddress } from "./elfSymbols";
 import type { ElfSymbols } from "./elfSymbols";
-import { SCENARIOS, baselineOf, cleanUp, runScenario } from "./scenarios";
-import type { Profile, RunContext, ScenarioResult } from "./scenarios";
+import { SCENARIOS, baselineOf, cleanUp, runScenario, selectScenarios } from "./scenarios";
+import type { Milestone, Profile, RunContext, ScenarioResult } from "./scenarios";
 import { ContractFailure, ContractSession, describeState } from "./session";
 
 export interface ContractOptions {
@@ -13,14 +13,18 @@ export interface ContractOptions {
   url?: string;
   profile: Profile;
   elf?: ElfSymbols;
-  /** run only these scenarios */
-  only?: Set<string>;
   /**
-   * Scenarios that have to pass: one of them that ends as not applicable or partial (the
-   * server does not advertise what it needs), or that was not run, fails the run. Without it a
-   * scenario the server does not claim to support is skipped, and a run of nothing but such
-   * scenarios is OK: right for looking at a server, wrong for the gate of a milestone.
+   * The gate of a milestone: its scenarios are selected, and each of them has to pass. One
+   * that ends as not applicable or partial, or that is not run, fails the run. Without it the
+   * runner looks at a server: a scenario the server does not claim to support is not
+   * applicable, and that is no failure.
    */
+  milestone?: Milestone;
+  /** the server runs the DSP test program: the anchor and the scenarios of that program alone (the second run of the M3 gate) */
+  dspProgram?: boolean;
+  /** narrows the selection to these scenarios, also inside a gate */
+  only?: Set<string>;
+  /** further scenarios that are run and have to pass */
   require?: Set<string>;
   /** multiplies every timeout; default 1 for the mock profile, 5 for the emulator profile */
   timeoutFactor?: number;
@@ -31,9 +35,19 @@ export interface ContractOptions {
 
 /** The machine-readable result of a run (`--json`). */
 export interface ContractSummary {
-  /** no scenario failed, every required scenario passed, no invariant was violated, everything was cleaned up */
+  /**
+   * At least one scenario passed, none failed, every scenario that had to pass did, no
+   * invariant was violated, and the server was put back.
+   */
   ok: boolean;
-  /** the scenarios that had to pass (`require`), and those of them that did not, with how they ended */
+  /** no scenario passed: the run verified nothing, whatever else it says */
+  nothingVerified: boolean;
+  /** the gate the run was (`--milestone`), and whether it was its run with the DSP test program */
+  milestone?: Milestone;
+  dspProgram: boolean;
+  /** the scenarios the run selected, in the order they were run */
+  selected: string[];
+  /** the scenarios that had to pass (those of the gate, and `require`), and those of them that did not, with how they ended */
   required: string[];
   requiredNotPassed: Array<{ id: string; status: ScenarioResult["status"] | "not-run" }>;
   url: string;
@@ -166,6 +180,8 @@ const describeServer = (session: ContractSession): string => {
  */
 export const runContract = async (options: ContractOptions): Promise<ContractSummary> => {
   const { url, timeoutFactor, sessions, seen, openSession, close, say } = await prepare(options);
+  const selection = selectScenarios(options);
+  const selected = SCENARIOS.filter((scenario) => selection.selected.includes(scenario.id));
   try {
     // A server that cannot be connected to cannot be tested: that error leaves this function.
     // A server that is connected to and does not get as far as the first scenario (no usable
@@ -199,14 +215,13 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
         session,
         openSession,
         elf: options.elf,
+        milestone: options.milestone,
+        dspProgram: options.dspProgram,
         seen,
         note: () => undefined,
       };
 
-      for (const scenario of SCENARIOS) {
-        if (options.only && !options.only.has(scenario.id)) {
-          continue;
-        }
+      for (const scenario of selected) {
         if (context.session.isClosed) {
           results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: ["the connection is closed"] });
         } else {
@@ -227,10 +242,7 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
       // S01 with what was found; nothing else can be asked of this server, and nothing was changed on it
       say("");
       const found = unusable ? [unusable.message, ...unusable.more] : ["debugger.describe gave no result"];
-      for (const scenario of SCENARIOS) {
-        if (options.only && !options.only.has(scenario.id)) {
-          continue;
-        }
+      for (const scenario of selected) {
         const details = scenario.id === "S01" ? found : [`not run: ${found[0]}`];
         results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details });
         formatScenario(results.at(-1)!).forEach(say);
@@ -243,13 +255,20 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
     const violations = Array.from(new Set(sessions.flatMap((entry) => entry.violations)));
     const ticksChecked = sessions.reduce((sum, entry) => sum + entry.ticksChecked, 0);
     const count = (status: ScenarioResult["status"]) => results.filter((result) => result.status === status).length;
-    const required = SCENARIOS.map((scenario) => scenario.id).filter((id) => options.require?.has(id));
+    const required = selection.required;
     const requiredNotPassed = required
       .map((id) => ({ id, status: results.find((result) => result.id === id)?.status ?? ("not-run" as const) }))
       .filter((entry) => entry.status !== "passed");
-    const ok = count("failed") === 0 && requiredNotPassed.length === 0 && violations.length === 0 && problems.length === 0;
+    // A run in which no scenario passed has verified nothing: not applicable and partial are
+    // no failures of their own, and they are no passes either.
+    const nothingVerified = count("passed") === 0;
+    const ok = !nothingVerified && count("failed") === 0 && requiredNotPassed.length === 0 && violations.length === 0 && problems.length === 0;
     const summary: ContractSummary = {
       ok,
+      nothingVerified,
+      ...(options.milestone ? { milestone: options.milestone } : {}),
+      dspProgram: options.dspProgram === true,
+      selected: selection.selected,
       required,
       requiredNotPassed,
       url,
@@ -284,6 +303,9 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
     }
     for (const { id, status } of requiredNotPassed.filter((entry) => entry.status !== "failed")) {
       say(`required: ${id} is ${status === "not-run" ? "not run" : STATUS_TEXT[status]}; it has to pass`);
+    }
+    if (nothingVerified) {
+      say(selected.length === 0 ? "nothing verified: the selection leaves no scenario to run" : "nothing verified: no scenario passed");
     }
     say(
       `${count("passed")} passed, ${count("failed")} failed, ${count("partial")} partial, ${count("not-applicable")} not applicable; ` +
