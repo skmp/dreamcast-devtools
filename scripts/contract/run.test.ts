@@ -723,54 +723,96 @@ describe("the contract runner against a server that breaks the protocol", () => 
     ]);
   });
 
-  it("S01: targets that do not have the values of the table of 3.1, and a tree without nodes of milestone M1", async () => {
-    const describing = (rewrite: (result: Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) => Json): Faults => ({
-      toClient: (frame) => {
-        const result = frame.result as (Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) | undefined;
-        return result?.deviceTree ? { ...frame, result: rewrite(result) } : frame;
-      },
+  /** A server whose debugger.describe result is rewritten, and whose ticks are (for a tree that lists other registers). */
+  const describing = (
+    rewrite: (result: Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) => Json,
+    registers?: (registers: Record<string, Json[]>) => Record<string, Json[]>,
+  ): Faults => ({
+    toClient: (frame) => {
+      if (isTick(frame)) {
+        return registers ? { ...frame, params: { ...frame.params, registers: registers(frame.params.registers) } } : frame;
+      }
+      const result = frame.result as (Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) | undefined;
+      return result?.deviceTree ? { ...frame, result: rewrite(result) } : frame;
+    },
+  });
+  /** Every node of a tree, rewritten (undefined: the node is left out). */
+  const mapNodes = (nodes: Json[], rewrite: (node: Json) => Json | undefined): Json[] =>
+    nodes.flatMap((node) => {
+      const rewritten = rewrite(node);
+      if (!rewritten) return [];
+      const children = rewritten.children as Json[] | undefined;
+      return [children ? { ...rewritten, children: mapNodes(children, rewrite) } : rewritten];
     });
+
+  it("S01: targets that do not have the normative values of the table of 3.1; labels and default addresses are the server's", async () => {
     const constants = await run(
       describing((result) => ({
         ...result,
         targets: result.targets.map((target) =>
           target.id === "dsp"
-            ? { ...target, addressRadix: 16, addressDigits: 2, label: "" }
+            ? { ...target, addressRadix: 16, addressDigits: 2, instructionSize: 4 }
             : target.id === "arm7"
-              ? { ...target, addressDigits: 6, defaultDisassemblyAddress: 0x00200000, defaultMemoryAddress: 0x00200000 }
-              : { ...target, addressMax: 0x1fffffff, breakpointEvent: "dc.sh4.pc" },
+              ? { ...target, addressDigits: 6, addressMax: 0x001fffff, pcRegister: "R15" }
+              : { ...target, addressMax: 0x1fffffff, breakpointEvent: "dc.sh4.pc", pcPath: "dc.sh4" },
         ),
       })),
       ["S01"],
     );
     expect(constants.scenarios[0].details).toEqual([
+      "target sh4: dc.sh4.PC is not in the device tree",
+      "target arm7: dc.aica.arm7.R15 is not in the device tree",
+      "target sh4: pcPath is \"dc.sh4\", the table of 3.1 says \"dc.sh4.cpu\"",
       "target sh4: breakpointEvent is \"dc.sh4.pc\", the table of 3.1 says \"dc.sh4.cpu.pc\"",
       "target sh4: addressMax is 0x1FFFFFFF, the table of 3.1 says 0xFFFFFFFF",
+      "target arm7: pcRegister is \"R15\", the table of 3.1 says \"PC\"",
+      "target arm7: addressMax is 0x001FFFFF, the table of 3.1 says 0x00FFFFFF",
       "target arm7: addressDigits is 6, the table of 3.1 says 8",
-      "target arm7: defaultDisassemblyAddress is 0x00200000, the table of 3.1 says 0",
-      "target arm7: defaultMemoryAddress is 0x00200000, the table of 3.1 says 0",
+      "target dsp: instructionSize is 4, the table of 3.1 says 1",
       "target dsp: addressRadix is 16, the table of 3.1 says 10",
       "target dsp: addressDigits is 2, the table of 3.1 says 3",
     ]);
 
+    // a target that says it has memory where the table says it has none
+    const memory = await run(
+      describing((result) => ({ ...result, targets: result.targets.map((target) => (target.id === "dsp" ? { ...target, memory: true, defaultMemoryAddress: 0 } : target)) })),
+      ["S01"],
+    );
+    expect(memory.scenarios[0].details).toEqual(["target dsp: memory is true, the table of 3.1 says false"]);
+
+    // The label and the default addresses are the server's choice: an emulator gives the entry
+    // of the loaded program. And a target may step before, or not yet in, the emulator's milestone.
+    const own = await run(
+      describing((result) => ({
+        ...result,
+        targets: result.targets.map((target) =>
+          target.id === "sh4"
+            ? { ...target, label: "Hitachi SH-4", defaultDisassemblyAddress: 0x8c0000a0, defaultMemoryAddress: 0x0c000000 }
+            : target.id === "arm7"
+              ? { ...target, label: "", defaultDisassemblyAddress: 0x00200010, defaultMemoryAddress: 0x00200000, stepping: false }
+              : { ...target, label: "AICA DSP", defaultDisassemblyAddress: 64, stepping: false },
+        ),
+      })),
+      ["S01", "S09", "S10"],
+    );
+    expect(reportOf(own)).toEqual(["S01 passed ", "S09 passed ", "S10 passed "]);
+    expect(own.ok).toBe(true);
+  }, 30_000);
+
+  it("S01: a tree without nodes or actions of milestone M1, nested by the dots of its paths, or without the vertical blank", async () => {
     // without the timer unit and the interrupt controller of Holly, and with a core node that opens no panel
-    const prune = (nodes: Json[]): Json[] =>
-      nodes
-        .filter((node) => node.path !== "dc.sh4.tmu" && node.path !== "dc.holly.intc")
-        .map((node) => {
-          const { actions, children, ...rest } = node as Json & { actions?: string[]; children?: Json[] };
-          return { ...rest, ...(actions && node.path !== "dc.holly.core" ? { actions } : {}), ...(children ? { children: prune(children) } : {}) };
-        });
-    const pruned = describing((result) => ({ ...result, deviceTree: prune(result.deviceTree) }));
     const nodes = await run(
-      {
-        ...pruned,
-        toClient: (frame) => {
-          if (!isTick(frame)) return pruned.toClient!(frame);
-          const { "dc.sh4.tmu": _tmu, "dc.holly.intc": _intc, ...registers } = frame.params.registers;
-          return { ...frame, params: { ...frame.params, registers } };
-        },
-      },
+      describing(
+        (result) => ({
+          ...result,
+          deviceTree: mapNodes(result.deviceTree, (node) => {
+            if (node.path === "dc.sh4.tmu" || node.path === "dc.holly.intc") return undefined;
+            const { actions, ...rest } = node as Json & { actions?: string[] };
+            return node.path === "dc.holly.core" ? rest : node;
+          }),
+        }),
+        ({ "dc.sh4.tmu": _tmu, "dc.holly.intc": _intc, ...registers }) => registers,
+      ),
       ["S01"],
     );
     expect(nodes.scenarios[0].details).toEqual([
@@ -779,6 +821,117 @@ describe("the contract runner against a server that breaks the protocol", () => 
       'dc.holly.core: the action "holly-core" of the table of 2.8 is missing',
     ]);
     expect(nodes.invariantViolations).toEqual([]);
+
+    // Every node where the dots of its path put it: the SH4 modules directly under dc.sh4 (no
+    // dc.sh4.pbus in between), dc.gdrom, dc.maple and dc.timing under dc.
+    const byDots = await run(
+      describing((result) => {
+        const [dc] = result.deviceTree as Array<Json & { children: Array<Json & { children: Json[] }> }>;
+        const children = dc.children.flatMap((node) => {
+          if (node.path === "dc.system") {
+            const { children: moved, ...system } = node;
+            return [system, ...moved];
+          }
+          if (node.path === "dc.sh4") {
+            const pbus = node.children.find((child) => child.path === "dc.sh4.pbus") as Json & { children: Json[] };
+            const { children: modules, ...bare } = pbus;
+            return [{ ...node, children: [...node.children.filter((child) => child !== pbus), bare, ...modules] }];
+          }
+          return [node];
+        });
+        return { ...result, deviceTree: [{ ...dc, children }] };
+      }),
+      ["S01"],
+    );
+    expect(statusOf(byDots, "S01")).toBe("failed");
+    expect(byDots.scenarios[0].details).toEqual([
+      ...["bsc", "ccn", "cpg", "dmac", "intc", "rtc", "sci", "scif", "tmu", "ubc", "sq", "icache", "ocache", "ocram", "tlb"].map(
+        (name) => `dc.sh4.${name} is under dc.sh4, the table of 2.8 has it under dc.sh4.pbus`,
+      ),
+      ...["gdrom", "maple", "timing"].map((name) => `dc.${name} is under dc, the table of 2.8 has it under dc.system`),
+    ]);
+    // (the paths, the registers and the ticks are all as they were)
+    expect(byDots.invariantViolations).toEqual([]);
+
+    // a second root
+    const twoRoots = await run(
+      describing((result) => {
+        const [dc] = result.deviceTree as Array<Json & { children: Json[] }>;
+        return { ...result, deviceTree: [{ ...dc, children: dc.children.filter((node) => node.path !== "dc.system") }, dc.children.find((node) => node.path === "dc.system")!] };
+      }),
+      ["S01"],
+    );
+    expect(twoRoots.scenarios[0].details).toEqual(["dc.system is a root of the device tree, the table of 2.8 has it under dc"]);
+
+    // the event every running machine raises is listed by every server
+    const noVblank = await run(
+      describing((result) => ({
+        ...result,
+        deviceTree: mapNodes(result.deviceTree, (node) => {
+          const { events, ...rest } = node as Json & { events?: string[] };
+          const kept = events?.filter((event) => event !== "dc.holly.core.vblank");
+          return kept?.length ? { ...rest, events: kept } : rest;
+        }),
+      })),
+      ["S01"],
+    );
+    expect(noVblank.scenarios[0].details).toEqual(["no node of the device tree lists the event dc.holly.core.vblank, which every server lists (2.6)"]);
+  }, 30_000);
+
+  it("S01: the register list of dc.sh4.cpu is that of 2.8, and the three anchor registers are there", async () => {
+    /** The SH4's register list rewritten in the tree and in every tick, so that the ticks agree with the tree. */
+    const cpu = (rewrite: (registers: Json[]) => Json[]): Faults =>
+      describing(
+        (result) => ({ ...result, deviceTree: mapNodes(result.deviceTree, (node) => (node.path === "dc.sh4.cpu" ? { ...node, registers: rewrite(node.registers as Json[]) } : node)) }),
+        (registers) => (registers["dc.sh4.cpu"] ? { ...registers, "dc.sh4.cpu": rewrite(registers["dc.sh4.cpu"]) } : registers),
+      );
+
+    // without the floating-point registers and the other bank
+    const integerOnly = await run(
+      cpu((registers) => registers.filter((register) => !/^(FR|XF)\d+$|_BANK$/.test(String(register.name)))),
+      ["S01"],
+    );
+    expect(integerOnly.scenarios[0].details).toEqual([
+      `dc.sh4.cpu lacks ${[0, 1, 2, 3, 4, 5, 6, 7].map((n) => `R${n}_BANK`).join(" ")} ${Array.from({ length: 16 }, (_, n) => `FR${n}`).join(" ")} ${Array.from({ length: 16 }, (_, n) => `XF${n}`).join(" ")}; its register list is that of 2.8`,
+    ]);
+    expect(integerOnly.invariantViolations).toEqual([]);
+
+    // another order, a register of its own, a width that is not 32
+    const reordered = await run(
+      cpu((registers) => [registers[1], registers[0], ...registers.slice(2)]),
+      ["S01"],
+    );
+    expect(reordered.scenarios[0].details).toEqual([expect.stringMatching(/^the registers of dc\.sh4\.cpu are not in the order of 2\.8: they are PR PC SR GBR VBR /)]);
+    const extra = await run(
+      cpu((registers) => [...registers, { name: "PTEH", value: "0x00000000", width: 32 }]),
+      ["S01"],
+    );
+    expect(extra.scenarios[0].details).toEqual(["dc.sh4.cpu lists PTEH, which the register list of 2.8 does not have"]);
+    const narrow = await run(
+      cpu((registers) => registers.map((register) => (register.name === "FPUL" ? { ...register, width: 16, value: "0x0000" } : register))),
+      ["S01"],
+    );
+    expect(narrow.scenarios[0].details).toEqual(["the registers of dc.sh4.cpu have width 32; not so FPUL (16)"]);
+
+    // The DSP's step under another name, with a target that points at it: the tree and the
+    // target agree with each other, and neither is what the design names.
+    const renamed = (registers: Json[]) => registers.map((register) => (register.name === "STEP" ? { ...register, name: "POSITION" } : register));
+    const anchor = await run(
+      describing(
+        (result) => ({
+          ...result,
+          targets: result.targets.map((target) => (target.id === "dsp" ? { ...target, pcRegister: "POSITION" } : target)),
+          deviceTree: mapNodes(result.deviceTree, (node) => (node.path === "dc.aica.dsp" ? { ...node, registers: renamed(node.registers as Json[]) } : node)),
+        }),
+        (registers) => (registers["dc.aica.dsp"] ? { ...registers, "dc.aica.dsp": renamed(registers["dc.aica.dsp"]) } : registers),
+      ),
+      ["S01"],
+    );
+    expect(anchor.scenarios[0].details).toEqual([
+      'target dsp: pcRegister is "POSITION", the table of 3.1 says "STEP"',
+      "dc.aica.dsp has no register STEP, one of the three anchor registers of 2.8",
+    ]);
+    expect(anchor.invariantViolations).toEqual([]);
   }, 30_000);
 
   it("S01: a server that answers debugger.describe with nothing the client can read, or sends no tick after it, fails S01; nothing else is run", async () => {

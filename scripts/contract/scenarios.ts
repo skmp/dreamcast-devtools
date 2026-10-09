@@ -13,7 +13,18 @@ import type {
   TargetProcessor,
 } from "../../src/lib/debuggerSchema";
 import { MOCK_SH4_RING, mockNextAddress } from "../../server/mockDebugger";
-import { M1_DEVICE_TREE, TARGET_TABLE } from "./design";
+import {
+  ANCHOR_REGISTERS,
+  M1_DEVICE_TREE,
+  MILESTONES,
+  SH4_CPU_REGISTERS,
+  SH4_CPU_REGISTER_WIDTH,
+  TARGET_IDS,
+  TARGET_TABLE,
+  VBLANK_EVENT,
+  capabilitiesOfMilestone,
+} from "./design";
+import type { Milestone } from "./design";
 import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
 import { indexDescribe, registerValuePattern } from "./invariants";
 import { ContractFailure, ContractSession, check, describeState, fail } from "./session";
@@ -56,6 +67,13 @@ export interface RunContext {
   openSession: () => Promise<ContractSession>;
   elf?: ElfSymbols;
   /**
+   * The milestone whose gate the run is (`--milestone`): the server claims it, so S01 also
+   * requires what a server of that milestone lists and advertises.
+   */
+  milestone?: Milestone;
+  /** the server runs the DSP test program (`--dsp-program`): the second run of the M3 gate */
+  dspProgram?: boolean;
+  /**
    * Every breakpoint id and watch id that any tick of the run listed, on any connection: an
    * id that is in here has been used, and the server gives it to nothing new.
    */
@@ -63,9 +81,8 @@ export interface RunContext {
   note: (text: string) => void;
 }
 
-/** The milestones of the design: each adds scenarios to the gate of the one before it. */
-export const MILESTONES = ["M1", "M2", "M3", "M4"] as const;
-export type Milestone = (typeof MILESTONES)[number];
+export { MILESTONES };
+export type { Milestone };
 
 type Outcome = void | { notApplicable: string } | { parts: PartResult[] };
 type Scenario = {
@@ -81,8 +98,6 @@ type Scenario = {
 const hex = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
 /** SH4 code addresses are compared under this mask: the same code is reachable at 0x0C.., 0x8C.. and 0xAC.. (design 2.3.3) */
 const SH4_CODE_ADDRESS_MASK = 0x1fffffff;
-/** The event of the vertical blank: raised by every program that runs, about sixty times a second (design 2.6). */
-const VBLANK_EVENT = "dc.holly.core.vblank";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------------------
@@ -601,8 +616,8 @@ const s01: Scenario = {
       const registers = session.index!.registers.get(target.pcPath);
       expectThat(registers?.some((register) => register.name === target.pcRegister), `target ${target.id}: ${target.pcPath}.${target.pcRegister} is not in the device tree`);
     }
-    expectThat(ids.includes("sh4"), "the SH4 target is listed");
-    // ... and has the values the table of 3.1 gives it
+    // ... and has the values the normative columns of the table of 3.1 give it. Its label and
+    // its default addresses are the server's choice, and its stepping follows the milestone.
     const written = (value: unknown) => (typeof value === "number" && value > 255 ? hex(value) : JSON.stringify(value));
     for (const target of targets) {
       for (const [key, fixed] of Object.entries(TARGET_TABLE[target.id] ?? {})) {
@@ -611,19 +626,68 @@ const s01: Scenario = {
       }
     }
 
-    // the nodes the device tree has from milestone M1 on, and the panels they open (2.8)
+    // What is normative of the device tree (2.8): the nodes it has from milestone M1 on, the
+    // node each is shown under (as the table nests them, not by the dots of the path), and the
+    // panels they open.
     const nodes = new Map<string, DeviceNodeDescriptor>();
-    const collect = (list: DeviceNodeDescriptor[]) =>
+    const parents = new Map<string, string | undefined>();
+    const events = new Set<string>();
+    const collect = (list: DeviceNodeDescriptor[], parent?: string) =>
       list.forEach((node) => {
         nodes.set(node.path, node);
-        collect(node.children ?? []);
+        parents.set(node.path, parent);
+        (node.events ?? []).forEach((event) => events.add(event));
+        collect(node.children ?? [], node.path);
       });
     collect(shape.deviceTree);
     for (const row of M1_DEVICE_TREE) {
       const node = nodes.get(row.path);
       expectThat(node, `the device tree has no node ${row.path}, which the table of 2.8 lists for milestone M1`);
-      for (const action of node ? (row.actions ?? []) : []) {
-        expectThat(node?.actions?.includes(action), `${row.path}: the action "${action}" of the table of 2.8 is missing`);
+      if (!node) {
+        continue;
+      }
+      const parent = parents.get(row.path);
+      expectThat(
+        parent === row.parent,
+        `${row.path} is ${parent === undefined ? "a root of the device tree" : `under ${parent}`}, the table of 2.8 has it ${row.parent === undefined ? "as the root" : `under ${row.parent}`}`,
+      );
+      for (const action of row.actions ?? []) {
+        expectThat(node.actions?.includes(action), `${row.path}: the action "${action}" of the table of 2.8 is missing`);
+      }
+    }
+    // ... the three anchor registers ...
+    for (const anchor of ANCHOR_REGISTERS) {
+      expectThat(
+        nodes.get(anchor.path)?.registers?.some((register) => register.name === anchor.name),
+        `${anchor.path} has no register ${anchor.name}, one of the three anchor registers of 2.8`,
+      );
+    }
+    // ... the register list of dc.sh4.cpu: the names of 2.8 in their order, all of width 32 ...
+    const cpu = nodes.get("dc.sh4.cpu")?.registers;
+    if (cpu) {
+      const names = cpu.map((register) => register.name);
+      const missing = SH4_CPU_REGISTERS.filter((name) => !names.includes(name));
+      const extra = names.filter((name) => !SH4_CPU_REGISTERS.includes(name));
+      expectThat(missing.length === 0, `dc.sh4.cpu lacks ${missing.join(" ")}; its register list is that of 2.8`);
+      expectThat(extra.length === 0, `dc.sh4.cpu lists ${extra.join(" ")}, which the register list of 2.8 does not have`);
+      expectThat(
+        missing.length > 0 || extra.length > 0 || names.join(" ") === SH4_CPU_REGISTERS.join(" "),
+        `the registers of dc.sh4.cpu are not in the order of 2.8: they are ${names.join(" ")}`,
+      );
+      const widths = cpu.filter((register) => register.width !== SH4_CPU_REGISTER_WIDTH).map((register) => `${register.name} (${register.width})`);
+      expectThat(widths.length === 0, `the registers of dc.sh4.cpu have width ${SH4_CPU_REGISTER_WIDTH}; not so ${widths.join(", ")}`);
+    }
+    // ... and the event of the vertical blank, which every running machine raises
+    expectThat(events.has(VBLANK_EVENT), `no node of the device tree lists the event ${VBLANK_EVENT}, which every server lists (2.6)`);
+
+    // Under the gate of a milestone the server claims that milestone: it lists the three
+    // targets, and advertises the capabilities of the milestone.
+    if (context.milestone) {
+      for (const id of TARGET_IDS) {
+        expectThat(ids.includes(id), `the gate of ${context.milestone}: the target ${id} is not listed; a server of a milestone lists sh4, arm7 and dsp (3.1)`);
+      }
+      for (const capability of capabilitiesOfMilestone(context.milestone)) {
+        expectThat(shape.capabilities?.includes(capability), `the gate of ${context.milestone}: the capability "${capability}" is not advertised (3.1)`);
       }
     }
 
