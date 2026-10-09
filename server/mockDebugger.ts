@@ -169,7 +169,8 @@ const FALLBACK_NOTICE =
 
 // ---------------------------------------------------------------------------------------
 // Events (design 2.6). Low-rate events are logged whenever a client is connected, high-rate
-// events only while an event breakpoint on them exists.
+// events only while an event breakpoint on them exists. These are the events the mock can
+// raise, and exactly the events its device tree lists: a breakpoint is accepted on each.
 // ---------------------------------------------------------------------------------------
 
 interface EventSpec {
@@ -202,7 +203,6 @@ export const MOCK_EVENTS: Readonly<Record<string, EventSpec>> = {
   "dc.system.reset": { subsystem: "system", severity: "info", rate: "low", message: () => "machine reset" },
   "dc.system.state": { subsystem: "system", severity: "info", rate: "low", message: () => "machine state changed" },
   "dc.debugger.engine": { subsystem: "debugger", severity: "info", rate: "low", message: () => "SH4 debug engine changed" },
-  "dc.debugger.dsp_forced": { subsystem: "debugger", severity: "info", rate: "low", message: () => "per-sample DSP forcing changed" },
   "dc.debugger.note": { subsystem: "debugger", severity: "info", rate: "low", message: () => "note" },
 };
 
@@ -309,7 +309,8 @@ const DEVICE_TREE: NodeSpec[] = [
     label: "Dreamcast",
     description: "beloved console",
     registers: [reg("SYSCLK", 0, "200MHz"), reg("BUILD", 0, "nullDC 3.0.0 mock")],
-    events: ["dc.system.reset", "dc.system.state", "dc.debugger.engine", "dc.debugger.dsp_forced", "dc.debugger.note"],
+    // a server lists the events it can raise: nothing raises dc.debugger.dsp_forced
+    events: ["dc.system.reset", "dc.system.state", "dc.debugger.engine", "dc.debugger.note"],
     children: [
       {
         path: "dc.sh4",

@@ -424,10 +424,10 @@ test("the list of a target has that target's code breakpoints, each in the addre
   await expect(page.getByRole("alert")).toHaveCount(0);
   await step.fill("");
 
-  // two events whose names say "dsp" and "aica", in the panel of all breakpoints (a tab of the same group)
+  // two events whose names say "sh4" and "aica", in the panel of all breakpoints (a tab of the same group)
   const events = await openEventsBreakpoints(page);
   const input = events.getByPlaceholder("Event name (e.g., dc.aica.channel[0].step)");
-  for (const event of ["dc.debugger.dsp_forced", "dc.aica.timer"]) {
+  for (const event of ["dc.sh4.exception", "dc.aica.timer"]) {
     await input.fill(event);
     await input.press("Enter");
     await expect(entry(events, event)).toBeVisible();

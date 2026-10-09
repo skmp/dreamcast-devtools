@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseBinaryFrame } from "../src/lib/binaryFrame";
 import { IN_BAND_ERROR_METHODS, StrictDebuggerRpcMethodSchemas } from "../src/lib/debuggerSchema";
 import type { DebuggerShape, DebuggerTick } from "../src/lib/debuggerSchema";
-import { MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger, mockNextAddress } from "./mockDebugger";
+import { MOCK_EVENTS, MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger, mockNextAddress } from "./mockDebugger";
 import type { MockDebuggerOptions } from "./mockDebugger";
 
 interface Frame {
@@ -371,6 +371,29 @@ describe("tick policy", () => {
       ["RBP", 16],
       ["RBL", 8],
     ]);
+  });
+
+  it("lists in the device tree exactly the events it can raise, and accepts a breakpoint on each of them", () => {
+    const mock = createMock();
+    const session = connect(mock);
+    const listed: string[] = [];
+    const visit = (nodes: DebuggerShape["deviceTree"]) => {
+      for (const node of nodes) {
+        listed.push(...(node.events ?? []));
+        if (node.children) visit(node.children);
+      }
+    };
+    visit(session.describe().deviceTree);
+    expect(listed.slice().sort()).toEqual(Object.keys(MOCK_EVENTS).sort());
+    expect(new Set(listed).size).toBe(listed.length);
+    expect(listed).toContain("dc.holly.core.vblank");
+    // nothing raises the forcing event, so it is neither listed nor accepted
+    expect(listed).not.toContain("dc.debugger.dsp_forced");
+    session.fail("breakpoints.add", { event: "dc.debugger.dsp_forced", kind: "event", enabled: false }, -32004);
+    for (const event of listed) {
+      session.ok("breakpoints.add", { event, kind: "event", enabled: false });
+    }
+    expect(Object.keys(session.lastTick().breakpoints)).toHaveLength(listed.length);
   });
 
   it("logs low-rate events while a client is connected, high-rate events only while a breakpoint on them exists", async () => {
