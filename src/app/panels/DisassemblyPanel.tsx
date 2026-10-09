@@ -124,13 +124,18 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
   // Build configuration
   const config: DisassemblyViewConfig = useMemo(() => {
     const isDsp = target === "dsp";
+    // as wide as the longest address of the target, and as its bytes ("5A 89"), with a character to spare
+    const addressColumn = `${formatAddress(info, info.addressMax).length + 1}ch`;
+    const bytesColumn = `${info.instructionSize * 3}ch`;
+    // what is left is the instruction's, and never less than twelve characters
+    const instructionColumn = "minmax(12ch, 1fr)";
     return {
       instructionSize: info.instructionSize,
       maxAddress: info.addressMax,
       formatAddressInput: (value: number) => formatAddressInput(info, value),
       formatAddressDisplay: (value: number) => formatAddress(info, value),
       parseAddressInput: (input: string) => parseAddress(info, input),
-      gridColumns: isDsp ? "24px 80px 1fr" : "24px 140px 140px 1fr",
+      gridColumns: isDsp ? `24px ${addressColumn} ${instructionColumn}` : `24px ${addressColumn} ${bytesColumn} ${instructionColumn}`,
       stepLabel: isDsp ? "Step" : "Step Over",
       stepIcon: isDsp ? ArrowForwardIcon : SubdirectoryArrowRightIcon,
       showStepInOut: target === "sh4" || target === "arm7",

@@ -33,7 +33,11 @@ export interface DisassemblyViewConfig {
   formatAddressDisplay: (value: number) => string;
   /** Parse an address string from user input */
   parseAddressInput: (input: string) => number | undefined;
-  /** Column widths for the grid layout */
+  /**
+   * Column widths for the grid layout. The columns in front of the instruction are as wide as
+   * what they hold, and the instruction column has a minimum: in a narrow panel it is the
+   * instruction that has to stay readable.
+   */
   gridColumns: string;
   /** Label for the primary step button */
   stepLabel: string;
@@ -186,6 +190,8 @@ const DisassemblyLineItem = memo(({
       ref={(el: HTMLDivElement | null) => lineRef(line.address, el)}
       data-address={line.address}
       sx={{
+        // the font of the cells, so that a `ch` in the column widths is a character of theirs
+        typography: "body1",
         display: "grid",
         gridTemplateColumns: config.gridColumns,
         gap: 1,
@@ -820,12 +826,15 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         height: "100%",
       }}
     >
+      {/* In a panel too narrow for it in one line the toolbar takes a second one, for the
+          address box and Refresh: nothing of it is cut off. */}
       <Box
         sx={{
           px: 2,
           py: 1,
           display: "flex",
-          alignItems: "center",
+          // the step buttons stay on the first line when the other half takes two
+          alignItems: "flex-start",
           gap: 1,
           borderBottom: "1px solid",
           borderColor: "divider",
@@ -908,7 +917,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             );
           })}
         </Stack>
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ flex: 1, justifyContent: "flex-end" }}>
+        <Stack direction="row" spacing={1} useFlexGap alignItems="center" sx={{ flex: 1, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <Stack direction="row" spacing={1} alignItems="center">
           {stepping && (config.showMuteSolo ?? true) && (
             <>
               <Tooltip title={categoryState?.muted ? "Unmute category" : "Mute category"}>
@@ -928,6 +938,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
               <MyLocationIcon fontSize="small" />
             </RunControlButton>
           </Tooltip>
+          </Stack>
+          <Stack direction="row" spacing={1} alignItems="center">
           <TextField
             size="small"
             value={addressInput}
@@ -938,7 +950,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
                 handleAddressSubmit();
               }
             }}
-            sx={{ width: 160 }}
+            // wide enough for an address of eight digits next to its button
+            sx={{ width: 180 }}
             slotProps={{
               input: {
                 endAdornment: (
@@ -956,6 +969,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
               <RefreshIcon fontSize="small" />
             </RunControlButton>
           </Tooltip>
+          </Stack>
         </Stack>
       </Box>
       <Box sx={{ flex: 1, overflow: "auto" }}>
