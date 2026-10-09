@@ -237,4 +237,9 @@ test("the event log shows what it does not know as it comes: a new subsystem, a 
   await expect(entries.nth(1).getByText("@18446744073709551615")).toHaveAttribute("title", "SH4 cycles when the event was raised");
   await expect(entries.nth(1).getByText("dc.netplay.desync")).toHaveAttribute("title", "Event (the name an event breakpoint takes)");
   await expect(page.getByRole("alert")).toHaveCount(0);
+
+  // without a connection there is no log: the panel says that, not that nothing has happened yet
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await expect(panel(page, "events")).toHaveText("Not connected");
+  await expect(entries).toHaveCount(0);
 });
