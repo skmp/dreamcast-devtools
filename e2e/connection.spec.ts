@@ -447,6 +447,40 @@ test("the keyboard focus is where it was when a lost connection is back", async 
   // every time the tree had gone in between, with the data of the lost connection
   const without = (await treeTexts()).filter(({ text }) => text.includes("Not connected"));
   expect(without.length).toBeGreaterThanOrEqual(places.length);
+
+  // A control of a row gets the focus back only when the focus is nowhere (on the page body).
+  // Where the user has put it while the connection was away it stays: taken back to "Remove",
+  // the next Enter or Space in the search box would remove a breakpoint.
+  await test.step("the focus is moved while the connection is away: it stays where it was put", async () => {
+    const remove = tooltipButton(breakpoint, "Remove breakpoint");
+    await remove.focus();
+    await expect(remove).toBeFocused();
+    // the server takes its time to describe itself on the next connection: until it has,
+    // the page has no rows, and the user is somewhere else
+    let describe = () => {};
+    const asked = new Promise<void>((resolve) => {
+      describe = resolve;
+    });
+    server.answer("debugger.describe", async () => {
+      await asked;
+      // the tick of a new connection, behind the answer
+      setTimeout(() => server.tick(), 0);
+      return server.shape;
+    });
+    server.drop();
+    await expect(breakpoint).toHaveCount(0);
+    await search.focus();
+    await expect(search).toBeFocused();
+    await expect.poll(() => server.requestsOf("debugger.describe").length).toBe(connections + 1);
+    describe();
+
+    // the rows are back, and what keeps their focus has had the sixty frames it looks during
+    await expect(breakpoint).toHaveText(/dc\.sh4\.cpu\.pc == 0x8C001004/);
+    await expect(remove).toBeVisible();
+    await page.waitForTimeout(1500);
+    await expect(search).toBeFocused();
+    await expect(remove).not.toBeFocused();
+  });
 });
 
 test("a step button that cannot be used keeps the focus and does nothing: stepping with the keyboard goes on from where it is", async ({
