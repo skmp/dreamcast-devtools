@@ -11,7 +11,9 @@ import {
   statusBar,
   tooltipButton,
   treeItemRow,
+  KNOWN,
 } from "./support/fixtures";
+import type { Locator, Page } from "@playwright/test";
 import { inBandError, jsonRpcError, serveScriptedDebugger } from "./support/scriptedDebugger";
 
 test("Run and Pause follow the execution state reported by the ticks", async ({ page, rpc }) => {
@@ -334,4 +336,53 @@ test("the reason of a stop can be read in a window that is not wide: it wraps be
       await saveScreenshot(page, testInfo, `toolbar-status-${width}`);
     });
   }
+});
+
+test.describe("the run controls, the step buttons and Go to current PC", () => {
+  test.use({ mockOptions: { startPaused: true, graceMs: 600_000 } });
+
+  test("are buttons with names: what the tooltip says is what the button is called", async ({ page, diagnostics }) => {
+    // The tooltip of an icon button is its only text. On an element around the button it names
+    // that element, and the button, which is what has the focus and what is announced, has no
+    // name: by role and name it is then not found.
+    await openWorkspace(page, "sh4-debugger");
+    const named = (scope: Page | Locator, name: string) => scope.getByRole("button", { name, exact: true });
+    for (const name of ["Run", "Pause", "Run to next breakpoint"]) {
+      await expect(named(page.locator("header"), name), name).toHaveCount(1);
+    }
+    const view = panel(page, "sh4-disassembly");
+    for (const name of ["Step Over", "Step In", "Step Out", "Go to current PC", "Refresh"]) {
+      await expect(named(view, name), name).toHaveCount(1);
+    }
+    // the button itself has the name, and it is the one the keyboard reaches
+    for (const [scope, name] of [
+      [page.locator("header"), "Run"],
+      [view, "Step In"],
+      [view, "Go to current PC"],
+    ] as const) {
+      const button = named(scope, name);
+      await expect(button).toHaveAttribute("aria-label", name);
+      expect(await button.evaluate((element) => element.tagName)).toBe("BUTTON");
+      await button.focus();
+      await expect(button).toBeFocused();
+    }
+
+    // a button that cannot be used keeps its name: Pause while the target is stopped,
+    // and the step buttons while it runs
+    await expect(named(page.locator("header"), "Pause")).toHaveAttribute("aria-disabled", "true");
+    await named(page.locator("header"), "Run").click();
+    await expect(page.getByRole("status", { name: "Execution state" })).toHaveText("Running");
+    for (const name of ["Step Over", "Step In", "Step Out"]) {
+      await expect(named(view, name), name).toHaveAttribute("aria-disabled", "true");
+    }
+    await expect(named(page.locator("header"), "Run")).toHaveAttribute("aria-disabled", "true");
+
+    // the step button of the DSP view is called Step
+    diagnostics.allow(...KNOWN.sgcNoData);
+    await openWorkspace(page, "audio-debugger");
+    const dsp = panel(page, "dsp-disassembly");
+    for (const name of ["Step", "Go to current PC", "Refresh"]) {
+      await expect(named(dsp, name), name).toHaveCount(1);
+    }
+  });
 });

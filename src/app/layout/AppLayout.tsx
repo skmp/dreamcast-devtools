@@ -426,26 +426,23 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
           centerSection={
             <Box sx={{ position: "relative" }}>
               <Stack direction="row" spacing={1} alignItems="center">
+                {/* The tooltip is on the button itself: its title is the button's name. (A button
+                    that cannot be used is not `disabled`, so it needs no element around it to
+                    carry the tooltip.) */}
                 <Tooltip title="Run">
-                  <span>
-                    <RunControlButton size="small" color="success" disabled={!resumable} onClick={handleRun}>
-                      <PlayArrowIcon />
-                    </RunControlButton>
-                  </span>
+                  <RunControlButton size="small" color="success" disabled={!resumable} onClick={handleRun}>
+                    <PlayArrowIcon />
+                  </RunControlButton>
                 </Tooltip>
                 <Tooltip title="Pause">
-                  <span>
-                    <RunControlButton size="small" color="warning" disabled={runState !== "running"} onClick={handlePause}>
-                      <PauseIcon />
-                    </RunControlButton>
-                  </span>
+                  <RunControlButton size="small" color="warning" disabled={runState !== "running"} onClick={handlePause}>
+                    <PauseIcon />
+                  </RunControlButton>
                 </Tooltip>
                 <Tooltip title="Run to next breakpoint">
-                  <span>
-                    <RunControlButton size="small" color="primary" disabled={!resumable} onClick={handleRun}>
-                      <SkipNextIcon />
-                    </RunControlButton>
-                  </span>
+                  <RunControlButton size="small" color="primary" disabled={!resumable} onClick={handleRun}>
+                    <SkipNextIcon />
+                  </RunControlButton>
                 </Tooltip>
               </Stack>
               {/* next to the run controls: why the target is stopped, and what the server has to say */}

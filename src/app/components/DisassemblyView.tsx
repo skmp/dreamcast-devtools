@@ -832,12 +832,11 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             );
           })}
           {stepping ? (
+            // the tooltips of the step buttons are on the buttons: the title is the button's name
             <Tooltip title={config.stepLabel}>
-              <span>
-                <RunControlButton size="small" onClick={handleStep} disabled={stepDisabled || !initialized}>
-                  <StepIcon fontSize="small" />
-                </RunControlButton>
-              </span>
+              <RunControlButton size="small" onClick={handleStep} disabled={stepDisabled || !initialized}>
+                <StepIcon fontSize="small" />
+              </RunControlButton>
             </Tooltip>
           ) : (
             <Typography variant="caption" color="text.secondary" role="note" sx={{ maxWidth: 260, lineHeight: 1.2 }}>
@@ -847,18 +846,14 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
           {stepping && config.showStepInOut && (
             <>
               <Tooltip title="Step In">
-                <span>
-                  <RunControlButton size="small" onClick={handleStepIn} disabled={stepDisabled || !initialized}>
-                    <ArrowDownwardRoundedIcon fontSize="small" />
-                  </RunControlButton>
-                </span>
+                <RunControlButton size="small" onClick={handleStepIn} disabled={stepDisabled || !initialized}>
+                  <ArrowDownwardRoundedIcon fontSize="small" />
+                </RunControlButton>
               </Tooltip>
               <Tooltip title="Step Out">
-                <span>
-                  <RunControlButton size="small" onClick={handleStepOut} disabled={stepDisabled || !initialized}>
-                    <ArrowUpwardRoundedIcon fontSize="small" />
-                  </RunControlButton>
-                </span>
+                <RunControlButton size="small" onClick={handleStepOut} disabled={stepDisabled || !initialized}>
+                  <ArrowUpwardRoundedIcon fontSize="small" />
+                </RunControlButton>
               </Tooltip>
             </>
           )}
@@ -895,11 +890,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             </>
           )}
           <Tooltip title="Go to current PC">
-            <span>
-              <RunControlButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
-                <MyLocationIcon fontSize="small" />
-              </RunControlButton>
-            </span>
+            <RunControlButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
+              <MyLocationIcon fontSize="small" />
+            </RunControlButton>
           </Tooltip>
           <TextField
             size="small"
