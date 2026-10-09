@@ -1321,6 +1321,60 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(reportOf(withoutArm7)).toEqual(["S11 passed "]);
   }, 30_000);
 
+  it("the strict copy: a callstack frame without sp, more than 64 frames from state.getCallstack, an event breakpoint with an address", async () => {
+    const withoutSp = (frames: Json[]) => frames.map(({ sp: _sp, ...frame }) => frame);
+    const noSp = await run(
+      {
+        toClient: (frame) => {
+          if (isTick(frame)) {
+            const { sh4, arm7 } = frame.params.callstacks as { sh4: Json[]; arm7: Json[] };
+            return { ...frame, params: { ...frame.params, callstacks: { sh4: withoutSp(sh4), arm7: withoutSp(arm7) } } };
+          }
+          const result = frame.result as { frames?: Json[] } | undefined;
+          return result?.frames ? { ...frame, result: { ...result, frames: withoutSp(result.frames) } } : frame;
+        },
+      },
+      ["S11"],
+    );
+    expect(statusOf(noSp, "S11")).toBe("failed");
+    expect(noSp.invariantViolations.join("\n")).toMatch(/I1: tick\.callstacks\.sh4\.0\.sp: Invalid input: expected number, received undefined/);
+    expect(noSp.invariantViolations.join("\n")).toMatch(/I1: Response validation failed for state\.getCallstack: frames\.0\.sp: /);
+
+    // 65 frames for the largest maxFrames there is
+    const tooMany = await run(
+      {
+        toClient: (frame) => {
+          const result = frame.result as { frames?: Json[] } | undefined;
+          if (!result?.frames || result.frames.length < 16) return frame;
+          const frames = Array.from({ length: 65 }, (_, index) => ({ ...result.frames![index % result.frames!.length], index }));
+          return { ...frame, result: { ...result, frames } };
+        },
+      },
+      ["S11"],
+    );
+    expect(statusOf(tooMany, "S11")).toBe("failed");
+    expect(detailsOf(tooMany, "S11")).toMatch(/^state\.getCallstack \{"target":"sh4","maxFrames":64\}: Response validation failed for state\.getCallstack: frames: Too big: expected array to have <=64 items$/m);
+
+    // the server stores the address that came with an event breakpoint
+    const mock = new MockDebugger();
+    const tables = mock as unknown as { addBreakpoint(params: Json, context: Json): unknown; breakpoints: Map<number, Json>; nextBreakpointId: number };
+    const add = tables.addBreakpoint.bind(mock);
+    tables.addBreakpoint = (params, context) => {
+      const id = tables.nextBreakpointId;
+      const result = add(params, context);
+      if (params.kind === "event" && params.address !== undefined && tables.breakpoints.has(id)) {
+        tables.breakpoints.set(id, { ...tables.breakpoints.get(id), address: params.address });
+      }
+      return result;
+    };
+    const { url } = await startServer(undefined, mock);
+    const stored = await runContract({ url, profile: "mock", only: new Set(["S07"]) });
+    expect(statusOf(stored, "S07")).toBe("failed");
+    expect(detailsOf(stored, "S07")).toMatch(/^breakpoints\.add: the tick lists the event breakpoint with address 2348875776; an event breakpoint has none$/m);
+    expect(stored.invariantViolations.join("\n")).toMatch(/I1: tick\.breakpoints\.\d+\.address: an event breakpoint has no address/);
+    expect(stored.cleanUpProblems).toEqual([]);
+  }, 60_000);
+
   it("a watch that is not evaluated in every tick: the value of the last stop while running, or a value while the SH4 context is stale", async () => {
     const frozen = await run(() => {
       const atStop = new Map<unknown, unknown>();

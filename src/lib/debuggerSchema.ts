@@ -408,6 +408,10 @@ const defineProtocol = (conformance: boolean) => {
         if (breakpoint.kind === "code" && breakpoint.address === undefined) {
           ctx.addIssue({ code: "custom", message: "a code breakpoint has an address", path: ["address"] });
         }
+        // an address given with an event breakpoint is ignored and not stored
+        if (breakpoint.kind === "event" && breakpoint.address !== undefined) {
+          ctx.addIssue({ code: "custom", message: "an event breakpoint has no address", path: ["address"] });
+        }
       })
     : BreakpointDescriptorBaseSchema;
 
@@ -440,7 +444,8 @@ const defineProtocol = (conformance: boolean) => {
   const CallstackFrameSchema = object({
     index: conformance ? z.number().int().min(0) : z.number(),
     pc: unsigned(),
-    sp: unsigned().optional(),
+    /** a v3 server sends it in every frame; no client reads more into it than that it is there */
+    sp: always(unsigned()),
     /** `name+0xOFF` */
     symbol: z.string().optional(),
     /** v3: "pr", "lr" or "stack+0x.." */
@@ -626,7 +631,8 @@ const defineProtocol = (conformance: boolean) => {
       }),
       result: object({
         target: (conformance ? z.enum(["sh4", "arm7"]) : TargetProcessorSchema) as typeof TargetProcessorSchema,
-        frames: z.array(CallstackFrameSchema),
+        /** at most `maxFrames`, which is at most 64 */
+        frames: conformance ? z.array(CallstackFrameSchema).max(PROTOCOL_BOUNDS.callstackMaxFrames.max) : z.array(CallstackFrameSchema),
       }),
     },
     [RpcMethod.STATE_GET_MEMORY_SLICE]: {

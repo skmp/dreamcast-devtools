@@ -281,9 +281,15 @@ const addBreakpoint = async (
     `breakpoints.add: the new breakpoint has id ${breakpoint.id}, which an earlier breakpoint of this run had; ids are never reused`,
   );
   check(breakpoint.event === params.event, `breakpoints.add: the tick lists event "${breakpoint.event}"`);
-  check(breakpoint.address === params.address, `breakpoints.add: the tick lists address ${String(breakpoint.address)}, the request gave ${String(params.address)}`);
   // kind defaults to "code" when an address is given, else "event"; enabled defaults to true
-  check(breakpoint.kind === (params.kind ?? (params.address === undefined ? "event" : "code")), `breakpoints.add: the tick lists kind "${breakpoint.kind}"`);
+  const kind = params.kind ?? (params.address === undefined ? "event" : "code");
+  check(breakpoint.kind === kind, `breakpoints.add: the tick lists kind "${breakpoint.kind}"`);
+  if (kind === "event") {
+    // an address that is given with an event breakpoint is ignored and not stored
+    check(breakpoint.address === undefined, `breakpoints.add: the tick lists the event breakpoint with address ${String(breakpoint.address)}; an event breakpoint has none`);
+  } else {
+    check(breakpoint.address === params.address, `breakpoints.add: the tick lists address ${String(breakpoint.address)}, the request gave ${String(params.address)}`);
+  }
   check(breakpoint.enabled === (params.enabled ?? true), `breakpoints.add: the tick lists enabled ${breakpoint.enabled}`);
   check(breakpoint.id >= 1, "breakpoint ids are allocated from 1");
   return breakpoint;
@@ -1084,8 +1090,11 @@ const s07: Scenario = {
     check(events.includes(VBLANK_EVENT), `the device tree lists the event ${VBLANK_EVENT}, which every running program raises`);
     await ensurePaused(context);
     const disabled: BreakpointDescriptor[] = [];
-    for (const event of events.filter((name) => name !== VBLANK_EVENT)) {
-      disabled.push(await addBreakpoint(context, { event, kind: "event", enabled: false }));
+    const others = events.filter((name) => name !== VBLANK_EVENT);
+    for (const [position, event] of others.entries()) {
+      // (the last one is sent with an address, which an event breakpoint does not have: it is ignored, and not listed)
+      const address = position === others.length - 1 ? { address: sh4.defaultDisassemblyAddress } : {};
+      disabled.push(await addBreakpoint(context, { event, kind: "event", enabled: false, ...address }));
     }
     // The one on the vertical blank is sent without kind and enabled: without an address the
     // kind is "event", and it is enabled. (Nothing raises an event while the target is paused.)

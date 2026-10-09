@@ -242,7 +242,7 @@ describe("the strict copy", () => {
       },
     ],
     watches: [{ id: 1, expression: "dc.sh4.cpu.pc", value: "0x8C0000A0" }],
-    callstacks: { sh4: [{ index: 0, pc: 0x8c0000a0 }], arm7: [] },
+    callstacks: { sh4: [{ index: 0, pc: 0x8c0000a0, sp: 0x8cfff000 }], arm7: [] },
     categories: {
       events: { muted: false, soloed: false },
       sh4: { muted: false, soloed: false },
@@ -339,6 +339,29 @@ describe("the strict copy", () => {
     expect(paths(breakpoint)).toEqual(["breakpoints.1.address"]);
     breakpoint.breakpoints["1"].address = -1;
     expect(paths(breakpoint)).toEqual(["breakpoints.1.address"]);
+    // an event breakpoint never has an address: one that was given with the request is not stored
+    const event = tick() as { breakpoints: Record<string, Record<string, unknown>> };
+    event.breakpoints["1"] = { id: 1, event: "dc.holly.core.vblank", kind: "event", enabled: true };
+    expect(paths(event)).toEqual([]);
+    event.breakpoints["1"].address = 0x8c0000a0;
+    expect(paths(event)).toEqual(["breakpoints.1.address"]);
+    expect(DebuggerRpcMethodSchemas["event.tick"].params.safeParse(event).success).toBe(true);
+  });
+
+  it("requires sp in every callstack frame, and at most 64 frames of state.getCallstack; the client takes less and more", () => {
+    const frame = (index: number) => ({ index, pc: 0x8c0000a0 + index * 2, sp: 0x8cfff000 });
+    const withoutSp = tick() as { callstacks: Record<string, Array<Record<string, unknown>>> };
+    delete withoutSp.callstacks.sh4[0].sp;
+    expect(paths(withoutSp)).toEqual(["callstacks.sh4.0.sp"]);
+    expect(DebuggerRpcMethodSchemas["event.tick"].params.safeParse(withoutSp).success).toBe(true);
+
+    const result = StrictDebuggerRpcMethodSchemas["state.getCallstack"].result;
+    const frames = (count: number) => ({ target: "sh4", frames: Array.from({ length: count }, (_, index) => frame(index)) });
+    expect(issuePaths(result.safeParse(frames(64)))).toEqual([]);
+    expect(issuePaths(result.safeParse(frames(65)))).toEqual(["frames"]);
+    expect(issuePaths(result.safeParse({ target: "sh4", frames: [{ index: 0, pc: 0x8c0000a0 }] }))).toEqual(["frames.0.sp"]);
+    expect(DebuggerRpcMethodSchemas["state.getCallstack"].result.safeParse(frames(65)).success).toBe(true);
+    expect(DebuggerRpcMethodSchemas["state.getCallstack"].result.safeParse({ target: "sh4", frames: [{ index: 0, pc: 0x8c0000a0 }] }).success).toBe(true);
   });
 
   it("takes a register width as a number of bits: an integer, 0 for free text; the client takes any number", () => {
