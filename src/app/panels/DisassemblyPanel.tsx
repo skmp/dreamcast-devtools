@@ -99,6 +99,12 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
         return;
       }
       followed.current = current;
+      // A connection that has had no stop yet is a new one whose target runs: there is nothing
+      // to follow, and the view keeps the place it had before the connection was lost. (It
+      // reads its lines again by itself when the server has been described.)
+      if (refresh === 0) {
+        return;
+      }
       view.followPc(programCounter(useDebuggerDataStore.getState().registersByPath, info));
     }, 0);
     return () => clearTimeout(timer);

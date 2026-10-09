@@ -1,6 +1,7 @@
 import {
   test,
   expect,
+  disassemblyRows,
   gotoRoute,
   openWorkspace,
   panel,
@@ -271,6 +272,48 @@ test("a connection the server closes is taken up again, and the server is descri
   expect(back - lost).toBeGreaterThanOrEqual(900);
   await expect(panel(page, "device-tree").getByRole("treeitem").first()).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("when a lost connection is back the disassembly is where it was, unless the new connection starts in a stop", async ({ page }) => {
+  const server = await serveScriptedDebugger(page);
+  server.state.execution = { state: "running", stopId: 0 };
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const box = view.getByRole("textbox");
+  const pc = 0x8c001000;
+  const listings = () => server.requestsOf("state.getDisassembly").map((params) => params.address);
+  // it opened where the target runs; the user looks at code elsewhere
+  await expect(rows.first()).toHaveAttribute("data-address", String(pc - 20));
+  const away = 0x8c004000;
+  await box.fill("0x8C004000");
+  await box.press("Enter");
+  await expect(rows.first()).toHaveAttribute("data-address", String(away - 20));
+  expect(listings()).toEqual([pc - 20, away - 20]);
+
+  // --- the connection is lost and comes back, the target still running ---
+  server.drop();
+  await expect.poll(() => server.connections()).toBe(2);
+  await server.described();
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  // the view reads its lines again, where it was: a running target is not followed
+  await expect.poll(listings).toEqual([pc - 20, away - 20, away - 20]);
+  await expect(rows).toHaveCount(64);
+  await page.waitForTimeout(500);
+  expect(listings()).toEqual([pc - 20, away - 20, away - 20]);
+  await expect(rows.first()).toHaveAttribute("data-address", String(away - 20));
+  await expect(box).toHaveValue("0x8C004000");
+
+  // --- lost again; this time the server is in a stop when the page is back: that one is followed ---
+  server.state.execution = { state: "paused", stopId: 1, reason: "pause" };
+  server.drop();
+  await expect.poll(() => server.connections()).toBe(3);
+  await server.described();
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(pc));
+  await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(pc - 20));
 });
 
 test("the keyboard focus is where it was when a lost connection is back", async ({ page }) => {
