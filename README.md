@@ -305,7 +305,9 @@ clients, and also steps the ARM7 and the DSP, records SGC frames and writes regi
 walks a loop of eight instructions at `0x8C0000A0` and, like a program with interrupts enabled,
 takes an interrupt at every vertical blank: the PC leaves the loop for the handler at
 `VBR + 0x600` (`0x8C000600`: two instructions, `rte` and its delay slot) and comes back, so
-between two frames it is in the loop, and a breakpoint in the handler stops it there.
+between two frames it is in the loop, and a breakpoint in the handler stops it there. Its ARM7
+always runs: the register `ENABLED` of `dc.aica.arm7` (one bit: 1, the ARM7 is clocked; 0, it is
+held in reset) reads 1 in every tick, and it is not the debugger's to write (`-32004`).
 
 ## Contract runner
 
@@ -323,7 +325,10 @@ found: after a failed scenario and at the end of the run it removes every breakp
 that was not there when it connected (so nobody else should add any while it runs), and it
 reports what it could not put back. Whatever a connected server answers is a result, with the
 summary of `--json`: a `debugger.describe` result that does not follow the schema is S01 failed,
-with every issue, and the run goes on with what the client reads from it.
+with every issue, and the run goes on with what the client reads from it. A server that stops
+answering is a result too: after three request timeouts in a row (an answered request ends the
+row, an answered `debugger.describe` does not) nothing more is sent to it, the scenarios that
+are left are failed as "not run", and the clean-up reports that nothing could be put back.
 
 ```
 npm run contract                                  # look at the mock, started in the same process
@@ -342,7 +347,9 @@ advertised, a program that takes no interrupt). Only `passed` is a pass. S07 and
 a breakpoint that is enabled again, or added while the target runs, is hit where every program
 with interrupts enabled comes at each vertical blank: at the interrupt entry `VBR + 0x600`, with
 `VBR` read at a stop the target has run up to. The mock passes them the way a program does,
-through its interrupt handler.
+through its interrupt handler. S11 reads the ARM7 callstack against the register `ENABLED` of
+`dc.aica.arm7` in the same paused tick: no frames while it reads 0, the PC and `R14` (and what
+the stack scan finds) while it reads 1, and `state.getCallstack` agrees.
 
 **What a gate is.** A gate is a run that names a milestone.
 
@@ -378,7 +385,8 @@ selects everything of M3 but S21, and a second one against an emulator started w
 test program, `--elf <dsptest.elf> --milestone M3 --dsp-program`, which selects S00 and S21
 alone. The mock's gate is `npm run contract -- --milestone M1` (in-process, profile mock), which
 `npm run check` runs; the mock is "M1 plus", so without `--milestone` its S16 is partial and its
-S17 passes.
+S17 passes. The gates are run against a server with the default tick period (200 ms, every
+fifth periodic tick full): the time bounds of the scenarios are written for it.
 
 `--idle-breakpoint <address|symbol>` is not a test run: it mutes the `sh4` category, adds one
 breakpoint, resumes and stays connected until the server closes the connection.
