@@ -592,7 +592,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(shorter.invariantViolations.join("\n")).toMatch(/I4: registers\["dc\.nowhere"\] is not a path of the describe tree/);
   });
 
-  it("I5: a paused tick that is not full, a running tick without a hard-wired path, a stopId that goes back", async () => {
+  it("I5: a paused tick that is not full, a running tick without one of the four base paths, a stopId that goes back", async () => {
     const summary = await run(
       {
         toClient: (frame) => {
@@ -603,6 +603,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
             delete registers["dc.holly.intc"];
           } else {
             delete registers["dc.aica.arm7"];
+            delete registers["dc.timing"];
             executionState.stopId = 0;
           }
           return { ...frame, params: { ...frame.params, registers, executionState } };
@@ -614,6 +615,8 @@ describe("the contract runner against a server that breaks the protocol", () => 
     const violations = summary.invariantViolations.join("\n");
     expect(violations).toMatch(/I5: a paused tick is full, this one lacks dc\.holly\.intc/);
     expect(violations).toMatch(/I5: a running tick carries dc\.aica\.arm7/);
+    // the time is the fourth base path
+    expect(violations).toMatch(/I5: a running tick carries dc\.timing/);
     expect(violations).toMatch(/I5: stopId 0 follows stopId 1/);
   });
 
@@ -621,6 +624,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     const tickFault = (rewrite: (params: Json & { executionState: Json; eventLog: Json[]; timestamp: number }) => Json): Faults => ({
       toClient: (frame) => (isTick(frame) ? { ...frame, params: rewrite(frame.params as never) } : frame),
     });
+    const started = Date.now();
 
     const stale = await run(
       tickFault((params) => (params.executionState.state === "paused" ? { ...params, executionState: { ...params.executionState, registersStale: true } } : params)),
@@ -635,7 +639,20 @@ describe("the contract runner against a server that breaks the protocol", () => 
       tickFault((params) => ({ ...params, timestamp: Math.floor(params.timestamp / 1000) })),
       ["S01"],
     );
-    expect(reportOf(seconds)).toEqual([expect.stringMatching(/^S01 failed invariant: 2\.9: timestamp \d{10} is not the wall clock in ms; the clock of this machine reads \d{13} \(tick \d+\)/)]);
+    expect(reportOf(seconds)).toEqual([expect.stringMatching(/^S01 failed invariant: I2: timestamp \d{10} is not the wall clock in ms; the clock of this machine reads \d{13} \(tick \d+\)/)]);
+
+    // The entries of the event log have a timestamp of their own, which is what the UI shows as a
+    // time of day: in seconds, or in ms since the server started, while the tick's own is right.
+    for (const entryTime of [(timestamp: number) => Math.floor(timestamp / 1000), (timestamp: number) => timestamp - started]) {
+      const entries = await run(
+        tickFault((params) => ({ ...params, eventLog: params.eventLog.map((entry) => ({ ...entry, timestamp: entryTime(entry.timestamp as number) })) })),
+        ["S01", "S03"],
+      );
+      expect(statusOf(entries, "S01")).toBe("passed");
+      expect(statusOf(entries, "S03")).toBe("failed");
+      expect(detailsOf(entries, "S03")).toMatch(/^invariant: I3: the timestamp \d+ of the event-log entry \d+ is not the wall clock in ms; the clock of this machine reads \d{13} \(tick \d+\)$/m);
+      expect(entries.invariantViolations.every((violation) => /^I3: the timestamp /.test(violation))).toBe(true);
+    }
 
     // (S03 runs for two seconds, in which the mock logs a key-on and a key-off twice a second)
     const newestFirst = await run(
@@ -654,6 +671,32 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(perTick, "S03")).toMatch(/^invariant: I3: eventId 0 named another entry in an earlier tick: it is \[\d+,"aica","info","key o(n|ff): channel \d+","dc\.aica\.channels\.key_o(n|ff)","\d+"\] now and was \[/m);
     // (nothing else is wrong with these ticks)
     expect(perTick.invariantViolations.every((violation) => /^I3: eventId \d named another entry/.test(violation))).toBe(true);
+  }, 30_000);
+
+  it("a tree that lists fewer events than the server raises: the event log names an event no node lists", async () => {
+    // the vertical blank and nothing else, where the server logs key-on, key-off and GD-ROM commands
+    const summary = await run(
+      {
+        toClient: (frame) => {
+          const result = frame.result as Json | undefined;
+          const only = (nodes: Json[]): Json[] =>
+            nodes.map((node) => {
+              const { events, children, ...rest } = node as Json & { events?: string[]; children?: Json[] };
+              const kept = events?.filter((event) => event === "dc.holly.core.vblank");
+              return { ...rest, ...(kept?.length ? { events: kept } : {}), ...(children ? { children: only(children) } : {}) };
+            });
+          return result?.deviceTree ? { ...frame, result: { ...result, deviceTree: only(result.deviceTree as Json[]) } } : frame;
+        },
+      },
+      ["S01", "S03"],
+    );
+    // what the tree lists is the server's to say, so S01 has nothing against it ...
+    expect(statusOf(summary, "S01")).toBe("passed");
+    // ... until the server raises what it does not list (S03 runs for two seconds)
+    expect(statusOf(summary, "S03")).toBe("failed");
+    expect(detailsOf(summary, "S03")).toMatch(
+      /^invariant: 2\.6: the event log has an entry of dc\.aica\.channels\.key_o(n|ff) \(eventId \d+\), which no node of the device tree lists; a server lists the events it can raise \(tick \d+\)$/m,
+    );
   }, 30_000);
 
   it("S01: the tick after the describe response is not full", async () => {
@@ -1295,8 +1338,8 @@ describe("the contract runner against a server that breaks the protocol", () => 
     }, ["S03"]);
     expect(statusOf(frozen, "S03")).toBe("failed");
     expect(detailsOf(frozen, "S03")).toMatch(/^the watch on dc\.timing\.sh4_cycles reads "0x[0-9A-F]{16}" in every running tick; watches are evaluated in every tick$/m);
-    expect(frozen.invariantViolations.join("\n")).toMatch(/2\.8: watch 1 \(dc\.timing\.sh4_cycles\) reads "0x[0-9A-F]{16}", the register in the same tick reads "0x[0-9A-F]{16}" \(tick \d+\)/);
-    expect(frozen.invariantViolations.join("\n")).toMatch(/2\.8: watch 2 \(dc\.sh4\.cpu\.pc\) reads "0x8C0000[0-9A-F]{2}", the register in the same tick reads/);
+    expect(frozen.invariantViolations.join("\n")).toMatch(/I6: watch 1 \(dc\.timing\.sh4_cycles\) reads "0x[0-9A-F]{16}", the register in the same tick reads "0x[0-9A-F]{16}" \(tick \d+\)/);
+    expect(frozen.invariantViolations.join("\n")).toMatch(/I6: watch 2 \(dc\.sh4\.cpu\.pc\) reads "0x8C0000[0-9A-F]{2}", the register in the same tick reads/);
     expect(frozen.cleanUpProblems).toEqual([]);
 
     // a backend without a context at the slice hook: its ticks say registersStale, and a watch on the SH4 reads "n/a"
@@ -1311,7 +1354,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       { sliceContext: false },
     );
     expect(statusOf(stale, "S03")).toBe("failed");
-    expect(detailsOf(stale, "S03")).toMatch(/invariant: 2\.2\.8: watch 2 \(dc\.sh4\.cpu\.pc\) reads "0x8C0000A0" in a tick that says registersStale, expected "n\/a"/);
+    expect(detailsOf(stale, "S03")).toMatch(/invariant: I6: watch 2 \(dc\.sh4\.cpu\.pc\) reads "0x8C0000A0" in a tick that says registersStale, expected "n\/a"/);
   }, 30_000);
 
   it("S06: a soloed category whose own breakpoints are not active either", async () => {
@@ -1419,7 +1462,10 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(reusedBreakpointIds, "S05")).toBe("passed");
     expect(statusOf(reusedBreakpointIds, "S06")).toBe("failed");
     expect(detailsOf(reusedBreakpointIds, "S06")).toMatch(/breakpoints\.add: the new breakpoint has id 1, which an earlier breakpoint of this run had; ids are never reused/);
-    expect(reusedBreakpointIds.invariantViolations).toEqual([]);
+    // I8 says the same of every tick, whoever added the breakpoint
+    expect(new Set(reusedBreakpointIds.invariantViolations.map((violation) => violation.replace(/ \(tick \d+\)$/, "")))).toEqual(
+      new Set(["I8: breakpoint id 1 is listed again after a tick that did not list it; ids are never reused"]),
+    );
 
     const watchIds = lowestFree();
     const reusedWatchIds = await run(
@@ -1443,7 +1489,9 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(reusedWatchIds, "S05")).toBe("passed");
     expect(statusOf(reusedWatchIds, "S08")).toBe("failed");
     expect(detailsOf(reusedWatchIds, "S08")).toMatch(/state\.watch: the new watch has id 1, which an earlier watch of this run had; ids are never reused/);
-    expect(reusedWatchIds.invariantViolations).toEqual([]);
+    expect(new Set(reusedWatchIds.invariantViolations.map((violation) => violation.replace(/ \(tick \d+\)$/, "")))).toEqual(
+      new Set(["I8: watch id 1 is listed again after a tick that did not list it; ids are never reused"]),
+    );
   });
 
   it("S03: periodic running ticks that are never full", async () => {

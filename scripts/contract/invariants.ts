@@ -1,17 +1,18 @@
 import { ConformanceSchemas, PROTOCOL_BOUNDS } from "../../src/lib/debuggerSchema";
 import type { DebuggerShape, DebuggerTick, DeviceNodeDescriptor } from "../../src/lib/debuggerSchema";
+import { BASE_PATHS } from "./design";
 
 /**
- * The invariants of the contract (design 5.5, I1 to I5), applied to every tick of every
- * connection of a run, and with them what sections 2.6, 2.8, 2.9 and 3.2 say of every tick:
- * the timestamp is the wall clock in ms; eventIds ascend in the log and name the same entry
- * in every tick; a watch reads what its register reads; registersStale is a matter of running
- * ticks; a running tick has no callstack; a breakpointId comes with its reason and names a
- * breakpoint the tick lists. Pure functions: the session feeds them what arrived.
+ * The invariants of the contract (design 5.5, I1 to I8), applied to every tick of every
+ * connection of a run: the strict schema and no null (I1); tickId and the timestamp, which
+ * is the wall clock in ms (I2); breakpoint keys, and an event log whose eventIds ascend and
+ * name the same entry in every tick, with wall-clock timestamps (I3); register lists that
+ * are the describe lists (I4); full paused ticks, four base paths while running, a stopId
+ * that never goes back (I5); watches in id order that read what their registers read (I6);
+ * a breakpointId that comes with its reason and names a breakpoint the tick lists (I7); ids
+ * that are never used again (I8). Pure functions: the session feeds them what arrived.
  */
 
-/** The three paths every running tick carries: the PC of every target. */
-export const HARD_WIRED_PATHS = ["dc.sh4.cpu", "dc.aica.arm7", "dc.aica.dsp"] as const;
 /** The path a running tick omits, with `registersStale: true`, on a backend without a context at the slice hook. */
 const SH4_CONTEXT_PATH = "dc.sh4.cpu";
 
@@ -20,13 +21,16 @@ export interface DescribeIndex {
   registers: Map<string, Array<{ name: string; width: number }>>;
   /** every node path */
   paths: Set<string>;
+  /** every event a node lists */
+  events: Set<string>;
 }
 
 export const indexDescribe = (shape: DebuggerShape): DescribeIndex => {
-  const index: DescribeIndex = { registers: new Map(), paths: new Set() };
+  const index: DescribeIndex = { registers: new Map(), paths: new Set(), events: new Set() };
   const visit = (nodes: DeviceNodeDescriptor[]) => {
     for (const node of nodes) {
       index.paths.add(node.path);
+      (node.events ?? []).forEach((event) => index.events.add(event));
       if (node.registers?.length) {
         index.registers.set(
           node.path,
@@ -76,7 +80,33 @@ export interface TickTracking {
   lastStopId?: number;
   /** eventId -> the entry it named when a tick of this connection first carried it */
   events?: Map<string, string>;
+  /** the breakpoint ids and the watch ids the last tick listed, and those an earlier tick listed and a later one did not */
+  breakpoints?: IdHistory;
+  watches?: IdHistory;
 }
+
+interface IdHistory {
+  listed: Set<number>;
+  gone: Set<number>;
+}
+
+/**
+ * I8 for one kind of id: an id that a tick of the connection listed and a later tick did
+ * not is gone for good. Returns the ids of `now` that had gone.
+ */
+const idsThatCameBack = (history: IdHistory, now: number[]): number[] => {
+  const current = new Set(now);
+  const back = now.filter((id) => history.gone.has(id));
+  // (said for the tick in which it comes back, not for every tick that lists it from then on)
+  back.forEach((id) => history.gone.delete(id));
+  for (const id of history.listed) {
+    if (!current.has(id)) {
+      history.gone.add(id);
+    }
+  }
+  history.listed = current;
+  return back;
+};
 
 /** `timestamp` is wall-clock ms: it is this far from the runner's clock at most (two machines, two clocks). */
 const CLOCK_TOLERANCE_MS = 24 * 60 * 60 * 1000;
@@ -110,15 +140,13 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
   const tick = raw as DebuggerTick;
   const state = tick.executionState;
 
-  // I2: tickId strictly increases per connection
+  // I2: tickId strictly increases per connection, and the timestamp is wall-clock ms
   if (tracking.lastTickId !== undefined && tick.tickId <= tracking.lastTickId) {
     violations.push(`I2: tickId ${tick.tickId} follows tickId ${tracking.lastTickId}`);
   }
   tracking.lastTickId = tick.tickId;
-
-  // 2.9: timestamp is wall-clock ms
   if (Math.abs(tick.timestamp - now) > CLOCK_TOLERANCE_MS) {
-    violations.push(`2.9: timestamp ${tick.timestamp} is not the wall clock in ms; the clock of this machine reads ${now}`);
+    violations.push(`I2: timestamp ${tick.timestamp} is not the wall clock in ms; the clock of this machine reads ${now}`);
   }
 
   // I3: breakpoint keys, event ids, size of the event log
@@ -139,7 +167,22 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
   const known = (tracking.events ??= new Map<string, string>());
   let descending = false;
   let renamed = false;
+  let offClock = false;
+  let unlisted = false;
   tick.eventLog.forEach((entry, position) => {
+    // the timestamp of an entry is wall-clock ms, like the tick's: the UI shows it as a time of day
+    if (Math.abs(entry.timestamp - now) > CLOCK_TOLERANCE_MS && !offClock) {
+      offClock = true;
+      violations.push(
+        `I3: the timestamp ${entry.timestamp} of the event-log entry ${entry.eventId} is not the wall clock in ms; the clock of this machine reads ${now}`,
+      );
+    }
+    // 2.6: a server lists in the events of its device tree exactly the events it can raise
+    const event = (entry.metadata as { event?: unknown } | undefined)?.event;
+    if (index && typeof event === "string" && !index.events.has(event) && !unlisted) {
+      unlisted = true;
+      violations.push(`2.6: the event log has an entry of ${event} (eventId ${entry.eventId}), which no node of the device tree lists; a server lists the events it can raise`);
+    }
     const before = position > 0 ? tick.eventLog[position - 1].eventId : undefined;
     if (before !== undefined && BigInt(entry.eventId) < BigInt(before) && !descending) {
       descending = true;
@@ -186,17 +229,21 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
       });
     }
 
-    // I5: a paused tick is full; a running tick has at least the hard-wired paths
+    // I5: a paused tick is full; a running tick has at least the four base paths
     if (state.state === "paused") {
       // with no game loaded there is no machine to read: ticks carry `registers: {}`
-      if (state.reason !== "no-game") {
+      if (state.reason === "no-game") {
+        if (Object.keys(tick.registers).length > 0) {
+          violations.push(`I5: a tick with reason "no-game" carries registers {}, this one carries ${Object.keys(tick.registers).slice(0, 3).join(", ")}`);
+        }
+      } else {
         const missing = Array.from(index.registers.keys()).filter((path) => !(path in tick.registers));
         if (missing.length > 0) {
           violations.push(`I5: a paused tick is full, this one lacks ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ` and ${missing.length - 5} more` : ""}`);
         }
       }
     } else {
-      for (const path of HARD_WIRED_PATHS) {
+      for (const path of BASE_PATHS) {
         if (path in tick.registers) {
           continue;
         }
@@ -224,9 +271,9 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
   }
   tracking.lastStopId = stopId;
 
-  // 2.9 / 2.10: running ticks carry empty callstacks
+  // I5: running ticks carry empty callstacks (and, by the strict schema, neither reason nor breakpointId)
   if (state.state === "running" && ((tick.callstacks?.sh4?.length ?? 0) > 0 || (tick.callstacks?.arm7?.length ?? 0) > 0)) {
-    violations.push("2.9: a running tick carries callstack frames");
+    violations.push("I5: a running tick carries callstack frames");
   }
   // I7: a breakpointId comes with the reason of a breakpoint stop, and it is a key of
   // `breakpoints` in the same tick: in every tick that carries one, not only in the first tick
@@ -240,12 +287,21 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
       violations.push(`I7: breakpointId with reason "${state.reason}"`);
     }
   }
-  // 2.8: watches in id order
+  // I8: ids are never reused. Every tick lists every breakpoint and every watch, so an id that
+  // a tick listed and a later tick did not has been removed, and nothing new gets it.
+  const breakpointIds = Object.values(tick.breakpoints).map((breakpoint) => breakpoint.id);
+  for (const id of idsThatCameBack((tracking.breakpoints ??= { listed: new Set(), gone: new Set() }), breakpointIds)) {
+    violations.push(`I8: breakpoint id ${id} is listed again after a tick that did not list it; ids are never reused`);
+  }
+  // I6: watches in id order
   const watchIds = (tick.watches ?? []).map((watch) => watch.id);
   if (watchIds.some((id, position) => position > 0 && id <= watchIds[position - 1])) {
-    violations.push(`2.8: watches are not in id order: ${watchIds.join(", ")}`);
+    violations.push(`I6: watches are not in id order: ${watchIds.join(", ")}`);
   }
-  // 2.8: watches are evaluated in every tick. A watch on <path>.<name> reads what that register
+  for (const id of idsThatCameBack((tracking.watches ??= { listed: new Set(), gone: new Set() }), watchIds)) {
+    violations.push(`I8: watch id ${id} is listed again after a tick that did not list it; ids are never reused`);
+  }
+  // I6: watches are evaluated in every tick. A watch on <path>.<name> reads what that register
   // reads in the same tick, when the tick carries the path; while the SH4 context is stale
   // (2.2.8) a watch on it reads "n/a".
   for (const watch of tick.watches ?? []) {
@@ -254,13 +310,13 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
     const name = watch.expression.slice(dot + 1);
     if (state.registersStale === true && path === SH4_CONTEXT_PATH) {
       if (watch.value !== "n/a") {
-        violations.push(`2.2.8: watch ${watch.id} (${watch.expression}) reads ${JSON.stringify(watch.value)} in a tick that says registersStale, expected "n/a"`);
+        violations.push(`I6: watch ${watch.id} (${watch.expression}) reads ${JSON.stringify(watch.value)} in a tick that says registersStale, expected "n/a"`);
       }
       continue;
     }
     const register = dot > 0 ? tick.registers[path]?.find((candidate) => candidate.name.toLowerCase() === name) : undefined;
     if (register && watch.value !== register.value) {
-      violations.push(`2.8: watch ${watch.id} (${watch.expression}) reads ${JSON.stringify(watch.value)}, the register in the same tick reads "${register.value}"`);
+      violations.push(`I6: watch ${watch.id} (${watch.expression}) reads ${JSON.stringify(watch.value)}, the register in the same tick reads "${register.value}"`);
     }
   }
 
