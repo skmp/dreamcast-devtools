@@ -497,7 +497,11 @@ const unwatch = async (context: RunContext, id: number): Promise<void> => {
   await tickShowing(session, mark, "state.unwatch", (tick) => ((tick.watches ?? []).some((watch) => watch.id === id) ? `watch ${id} is still listed` : undefined));
 };
 
-/** Resumes, expects only running ticks for 600 ms, then pauses again. */
+/**
+ * Resumes, requires that no paused tick comes for 600 ms, then pauses again. Nothing else is
+ * asked of that window: how many running ticks come in it is not looked at (the period of the
+ * running tick is S03's to see, and a server's to choose).
+ */
 const expectToKeepRunning = async (context: RunContext, why: string): Promise<void> => {
   const { session } = context;
   const before = stopIdOf(session.latestTick().tick);
@@ -509,7 +513,6 @@ const expectToKeepRunning = async (context: RunContext, why: string): Promise<vo
   // (one more tick of the stop that was left can still arrive before the running tick: that is not a stop)
   const stopped = window.find((record) => isPaused(record.tick) && (record.seq > resumed.seq || stopIdOf(record.tick) > before));
   check(!stopped, `${why}: the target stopped (${stopped ? describeState(stopped.tick) : ""})`);
-  check(window.length >= 2, `${why}: only ${window.length} tick(s) in 600 ms of running; the running tick is periodic`);
   await ensurePaused(context);
 };
 

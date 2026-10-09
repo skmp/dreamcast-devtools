@@ -504,6 +504,41 @@ describe("the contract runner against the mock", () => {
     expect((await stateOf(url)).categories.sh4).toEqual({ muted: true, soloed: false });
   }, 30_000);
 
+  it("S06, S07: the 600 ms in which no paused tick may come ask for no number of ticks: a server whose next periodic tick is a second away passes", async () => {
+    // A running tick once a second, counted from the resume: the windows in which a muted or a
+    // disabled breakpoint must not stop the target hold the tick of the resume, and no other.
+    const mock = new MockDebugger({ tickMs: 1000 });
+    const machine = mock as unknown as { leaveStop(): void };
+    const leave = machine.leaveStop.bind(mock);
+    machine.leaveStop = () => {
+      mock.stop();
+      mock.start();
+      leave();
+    };
+    // the ticks between a control.runUntil and the control.pause that follows it without another request in between
+    const windows: number[] = [];
+    let counting: number | undefined;
+    const { url } = await startServer(
+      {
+        toServer: (frame) => {
+          if (counting !== undefined && frame.method === "control.pause") windows.push(counting);
+          counting = frame.method === "control.runUntil" ? 0 : undefined;
+          return frame;
+        },
+        toClient: (frame) => {
+          if (isTick(frame) && counting !== undefined) counting++;
+          return frame;
+        },
+      },
+      mock,
+    );
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S06", "S07"]) });
+    expect(reportOf(summary)).toEqual(["S06 passed ", "S07 passed "]);
+    expect(summary.ok).toBe(true);
+    // two such windows in each of the two scenarios, with one tick each: that of the resume
+    expect(windows).toEqual([1, 1, 1, 1]);
+  }, 90_000);
+
   it("S14: reconnects, i.e. the server has no client between the two connections", async () => {
     const mock = new ForgetfulMock();
     const { url } = await startServer(undefined, mock);
