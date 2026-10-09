@@ -7,6 +7,7 @@ import type { ElfSymbols } from "./elfSymbols";
 import { SCENARIOS, baselineOf, cleanUp, runScenario, selectScenarios } from "./scenarios";
 import type { Milestone, Profile, RunContext, ScenarioResult } from "./scenarios";
 import { ContractFailure, ContractSession, describeState } from "./session";
+import type { AnswerLog } from "./session";
 
 export interface ContractOptions {
   /** the server to test; without it the mock is started in this process */
@@ -111,6 +112,8 @@ const prepare = async (options: ContractOptions) => {
   const target = url;
   const timeoutFactor = options.timeoutFactor ?? (options.profile === "emulator" ? 5 : 1);
   const sessions: ContractSession[] = [];
+  // the request timeouts in a row, over every connection of the run
+  const answers: AnswerLog = { unanswered: 0 };
   // every id any tick of the run lists, on any connection (ticks the schema rejected included)
   const seen = { breakpoints: new Set<number>(), watches: new Set<number>() };
   const onTick = (tick: DebuggerTick) => {
@@ -127,6 +130,7 @@ const prepare = async (options: ContractOptions) => {
       clientName: "nullDC contract runner",
       trace: options.verbose ? (line) => say(`    ${line}`) : undefined,
       onTick,
+      answers,
     });
     sessions.push(session);
     await session.open();
@@ -222,7 +226,13 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
       };
 
       for (const scenario of selected) {
-        if (context.session.isClosed) {
+        // A server that has stopped answering is not asked for the rest: every request of every
+        // scenario that is left would run into its timeout. They are failed, as scenarios that
+        // could not run; that is a result, not an aborted run.
+        const stopped = context.session.stoppedAnswering;
+        if (stopped) {
+          results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: [`not run: ${stopped}`] });
+        } else if (context.session.isClosed) {
           results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: ["the connection is closed"] });
         } else {
           const result = await runScenario(scenario, context);

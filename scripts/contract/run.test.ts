@@ -3209,6 +3209,115 @@ describe("what a failing run leaves behind", () => {
   }, 30_000);
 });
 
+describe("a server that stops answering", () => {
+  // (a tenth of every timeout: a request is given up after a second)
+  const timeoutFactor = 0.1;
+  const stopped = (latest: string) => `the server has stopped answering: 3 requests in a row were not answered within 1000 ms each (the latest: ${latest})`;
+
+  it("after three request timeouts in a row the scenarios that are left are failed as not run, and nothing more is sent", async () => {
+    // from its first control.pause on the server answers nothing: neither a request of a scenario nor debugger.describe
+    const lost: string[] = [];
+    const dying = (): Faults => {
+      let dead = false;
+      return {
+        lose: (request) => {
+          const method = String((request as Json).method);
+          dead ||= method === "control.pause";
+          if (dead) lost.push(method);
+          return dead;
+        },
+      };
+    };
+    const { url } = await startServer(dying());
+    const lines: string[] = [];
+    const summary = await runContract({ url, profile: "mock", timeoutFactor, only: new Set(["S01", "S02", "S03", "S04", "S05", "S12"]), say: (line) => lines.push(line) });
+    expect(reportOf(summary)).toEqual([
+      "S01 passed ",
+      // the request of the scenario, and the clean-up behind it, which reads the server first
+      'S02 failed control.pause {"target":"sh4"}: Request timed out: control.pause | ' +
+        'clean-up: reading the state of the server: debugger.describe {"protocol":3,"client":"nullDC contract runner"}: Request timed out: debugger.describe',
+      // the third one in a row
+      `S03 failed control.pause {}: Request timed out: control.pause | clean-up: nothing could be put back: ${stopped("control.pause")}`,
+      `S04 failed not run: ${stopped("control.pause")}`,
+      `S05 failed not run: ${stopped("control.pause")}`,
+      `S12 failed not run: ${stopped("control.pause")}`,
+    ]);
+    // three requests ran into their timeout, and no fourth one was sent: not by a scenario, and not by the clean-up at the end
+    expect(lost).toEqual(["control.pause", "debugger.describe", "control.pause"]);
+    expect(summary).toMatchObject({ ok: false, passed: 1, failed: 5, partial: 0, notApplicable: 0 });
+    expect(summary.cleanUpProblems).toEqual([`nothing could be put back: ${stopped("control.pause")}`]);
+    // a result, not an aborted run: every selected scenario has its line, and the run its verdict
+    expect(summary.scenarios.map((scenario) => scenario.id)).toEqual(summary.selected);
+    expect(lines.at(-1)).toBe("contract: FAILED");
+    // under a gate each of them is a scenario that had to pass and failed
+    expect(summary.requiredNotPassed).toEqual([]);
+    const gate = await runContract({ url: (await startServer(dying())).url, profile: "mock", timeoutFactor, milestone: "M1", only: new Set(["S02", "S03", "S04", "S12"]) });
+    expect(gate.requiredNotPassed).toEqual(["S02", "S03", "S04", "S12"].map((id) => ({ id, status: "failed" })));
+    expect(detailsOf(gate, "S12")).toBe(`not run: ${stopped("control.pause")}`);
+    expect(lost).toHaveLength(6);
+
+    // a server that answers nothing at all, not even the first debugger.describe, is S01 failed and the rest not run, after one timeout
+    const mute = await runContract({ url: (await startServer({ lose: () => true })).url, profile: "mock", timeoutFactor, only: new Set(["S01", "S02"]) });
+    expect(reportOf(mute)).toEqual([
+      'S01 failed debugger.describe {"protocol":3,"client":"nullDC contract runner"}: Request timed out: debugger.describe',
+      'S02 failed not run: debugger.describe {"protocol":3,"client":"nullDC contract runner"}: Request timed out: debugger.describe',
+    ]);
+  }, 60_000);
+
+  it("a server that answers debugger.describe and nothing else has stopped answering: an answered describe does not end the row", async () => {
+    // what the runner sees of a server whose responses it cannot match to its requests
+    const lost: string[] = [];
+    const { url, direct } = await startServer({
+      lose: (request) => {
+        const method = String((request as Json).method);
+        if (method !== "debugger.describe") lost.push(method);
+        return method !== "debugger.describe";
+      },
+    });
+    const summary = await runContract({ url, profile: "mock", timeoutFactor, only: new Set(["S01", "S02", "S03", "S04", "S05"]) });
+    const report = reportOf(summary);
+    expect(report[0]).toBe("S01 passed ");
+    // the clean-up behind S02 reads the server, which answers, and restores the categories, which is not answered
+    expect(report[1]).toMatch(
+      /^S02 failed control\.pause \{"target":"sh4"\}: Request timed out: control\.pause \| clean-up: restoring the categories: breakpoints\.setCategoryStates \{.*\}: Request timed out: breakpoints\.setCategoryStates$/,
+    );
+    expect(report.slice(2)).toEqual([
+      `S03 failed control.pause {}: Request timed out: control.pause | clean-up: nothing could be put back: ${stopped("control.pause")}`,
+      `S04 failed not run: ${stopped("control.pause")}`,
+      `S05 failed not run: ${stopped("control.pause")}`,
+    ]);
+    expect(lost).toEqual(["control.pause", "breakpoints.setCategoryStates", "control.pause"]);
+    expect(summary.cleanUpProblems).toEqual([`nothing could be put back: ${stopped("control.pause")}`]);
+    // the last tick is what the run knows of the server
+    expect(summary.finalState).toMatch(/running/);
+    expect((await stateOf(direct)).executionState.state).toBe("running");
+  }, 60_000);
+
+  it("request timeouts that are not in a row do not end the run: the scenarios behind them are run", async () => {
+    // the first control.pause, the first state.getMemorySlice and the first state.getDisassembly are lost, and everything else is answered
+    const lost = new Set<string>();
+    const { url } = await startServer({
+      lose: (request) => {
+        const method = String((request as Json).method);
+        if (!["control.pause", "state.getMemorySlice", "state.getDisassembly"].includes(method) || lost.has(method)) return false;
+        lost.add(method);
+        return true;
+      },
+    });
+    const summary = await runContract({ url, profile: "mock", timeoutFactor, only: new Set(["S02", "S09", "S10", "S11"]) });
+    expect(reportOf(summary)).toEqual([
+      'S02 failed control.pause {"target":"sh4"}: Request timed out: control.pause',
+      expect.stringMatching(/^S09 failed state\.getMemorySlice \{.*\}: Request timed out: state\.getMemorySlice$/),
+      expect.stringMatching(/^S10 failed state\.getDisassembly \{.*\}: Request timed out: state\.getDisassembly$/),
+      "S11 passed ",
+    ]);
+    expect(lost.size).toBe(3);
+    // the server was put back: it answers
+    expect(summary.cleanUpProblems).toEqual([]);
+    expect(summary.finalState).toMatch(/running/);
+  }, 60_000);
+});
+
 describe("the emulator profile", () => {
   /**
    * The mock behind an HTTP server that follows the rules of the emulator's own (GET only,

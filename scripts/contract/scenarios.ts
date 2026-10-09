@@ -2808,6 +2808,13 @@ export const cleanUp = async (
   restoreState: boolean,
 ): Promise<{ problems: string[]; tick: DebuggerTick | undefined }> => {
   const problems: string[] = [];
+  const stopped = context.session.stoppedAnswering;
+  if (stopped) {
+    // Nothing is sent to a server that has stopped answering, so nothing can be put back. What
+    // its last tick shows of the difference is reported: that much is known of what is left.
+    const last = context.session.ticks.at(-1)?.tick;
+    return { problems: [`nothing could be put back: ${stopped}`, ...(last ? differencesFrom(baseline, last, restoreState) : [])], tick: last };
+  }
   if (context.session.isClosed) {
     // a scenario lost the connection (S14 closes one on purpose): clean up on a new one
     try {

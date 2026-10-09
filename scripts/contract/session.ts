@@ -54,9 +54,39 @@ export interface BinaryRecord {
   data: ArrayBuffer;
 }
 
+/**
+ * How the server answers the requests of a run, over all of its connections: how many in a
+ * row ran into the request timeout. An answer ends the row, an error as well as a result.
+ * Not so an answer to `debugger.describe`: that is what the runner reads the server with
+ * between scenarios, and a server that answers it and nothing else does not answer the
+ * requests of the scenarios.
+ */
+export interface AnswerLog {
+  /** the requests in a row that were not answered within the request timeout */
+  unanswered: number;
+  /** the method of the latest of them */
+  latest?: string;
+}
+
+/**
+ * This many request timeouts in a row, and the server has stopped answering: nothing more is
+ * sent to it, and the scenarios that are left are failed as "not run" (design 5.5.1). A run
+ * does not send each of their requests into its timeout.
+ */
+export const UNANSWERED_REQUESTS_LIMIT = 3;
+
+/** The timeout of a request, before the factor of the profile. */
+const REQUEST_TIMEOUT_MS = 10_000;
+
+/** A request of the client that got no answer in time (the client's own error: it has no class of its own). */
+const isRequestTimeout = (error: unknown): boolean =>
+  error instanceof Error && !(error instanceof JsonRpcException) && !(error instanceof RpcValidationError) && error.message.startsWith("Request timed out: ");
+
 export interface SessionOptions {
   /** the emulator profile multiplies every timeout of the scenarios by 5 */
   timeoutFactor: number;
+  /** the log the connections of a run share; a session without one keeps its own */
+  answers?: AnswerLog;
   /** `client` of debugger.describe */
   clientName: string;
   /** receives one line per frame when --verbose is given */
@@ -93,6 +123,8 @@ export class ContractSession {
   private readonly transport: WebSocketTransport;
   private readonly rpc: JsonRpcClient<DebuggerRpcSchema>;
   private readonly tracking: TickTracking = {};
+  private readonly answers: AnswerLog;
+  private readonly requestTimeoutMs: number;
   private readonly waiters = new Set<() => void>();
   private readonly openedAt = Date.now();
   private seq = 0;
@@ -102,6 +134,8 @@ export class ContractSession {
   constructor(url: string, options: SessionOptions) {
     this.url = url;
     this.options = options;
+    this.answers = options.answers ?? { unanswered: 0 };
+    this.requestTimeoutMs = REQUEST_TIMEOUT_MS * options.timeoutFactor;
     this.transport = new WebSocketTransport((endpoint, protocols) => {
       const socket = new WebSocket(endpoint, protocols);
       // The transport says "closed" as soon as disconnect() is called. This is the close event
@@ -126,7 +160,7 @@ export class ContractSession {
     // client gets the schemas of the responses only, so that a tick is validated once.
     const { [RpcMethod.EVENT_TICK]: _tick, ...responseSchemas } = StrictDebuggerRpcMethodSchemas;
     this.rpc = new JsonRpcClient<DebuggerRpcSchema>(this.transport, {
-      requestTimeoutMs: 10_000 * options.timeoutFactor,
+      requestTimeoutMs: this.requestTimeoutMs,
       validationSchemas: responseSchemas,
       validateResponses: true,
       // the runner sends invalid requests on purpose
@@ -176,7 +210,7 @@ export class ContractSession {
     const mark = this.mark();
     this.describeProblems = [];
     try {
-      this.shape = await this.rpc.call(RpcMethod.DEBUGGER_DESCRIBE, params);
+      this.shape = (await this.request(RpcMethod.DEBUGGER_DESCRIBE, params)) as DebuggerShape;
     } catch (error) {
       const lenient =
         error instanceof RpcValidationError
@@ -195,6 +229,17 @@ export class ContractSession {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  /**
+   * Why the server counts as one that has stopped answering, if it does: several requests in a
+   * row, on any connection of the run, ran into their timeout. Nothing more is sent to it.
+   */
+  get stoppedAnswering(): string | undefined {
+    const { unanswered, latest } = this.answers;
+    return unanswered >= UNANSWERED_REQUESTS_LIMIT
+      ? `the server has stopped answering: ${unanswered} requests in a row were not answered within ${this.requestTimeoutMs} ms each (the latest: ${latest})`
+      : undefined;
   }
 
   close(): void {
@@ -256,13 +301,45 @@ export class ContractSession {
   // -------------------------------------------------------------------------------------
 
   /**
+   * Every request of the session goes through here, and is counted: one that runs into its
+   * timeout adds to the row, one that is answered (with a result, with an error, or with what
+   * the schema rejects) ends it, unless it is debugger.describe. To a server that has stopped
+   * answering nothing is sent: the request fails at once.
+   */
+  private async request(method: string, params: unknown): Promise<unknown> {
+    const stopped = this.stoppedAnswering;
+    if (stopped) {
+      throw new Error(`not sent: ${stopped}`);
+    }
+    const answered = () => {
+      if (method !== RpcMethod.DEBUGGER_DESCRIBE) {
+        this.answers.unanswered = 0;
+        this.answers.latest = undefined;
+      }
+    };
+    try {
+      const result: unknown = await this.rpc.call(method as never, params as never);
+      answered();
+      return result;
+    } catch (error) {
+      if (isRequestTimeout(error)) {
+        this.answers.unanswered++;
+        this.answers.latest = method;
+      } else if (error instanceof JsonRpcException || error instanceof RpcValidationError) {
+        answered();
+      }
+      throw error;
+    }
+  }
+
+  /**
    * A request that has to succeed: the result is validated with the strict schema, and for
    * an in-band method it has to be `{}`.
    */
   async call<M extends keyof DebuggerRpcSchema & string>(method: M, params: unknown): Promise<DebuggerRpcSchema[M]["result"]> {
     let result: unknown;
     try {
-      result = await this.rpc.call(method, params as never);
+      result = await this.request(method, params);
     } catch (error) {
       return fail(callFailure(method, params, error));
     }
@@ -288,7 +365,7 @@ export class ContractSession {
     const what = `${method} ${JSON.stringify(params)}`;
     let error: { code: number; message: string } | undefined;
     try {
-      const result = await this.rpc.call(method as never, params as never);
+      const result = await this.request(method, params);
       const inBand = (result as InBandResult | undefined)?.error;
       if (!inBand) {
         return fail(`${what}: expected the error ${code}, got the result ${JSON.stringify(result).slice(0, 200)}`);
