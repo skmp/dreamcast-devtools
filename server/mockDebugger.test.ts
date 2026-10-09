@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseBinaryFrame } from "../src/lib/binaryFrame";
 import { IN_BAND_ERROR_METHODS, StrictDebuggerRpcMethodSchemas } from "../src/lib/debuggerSchema";
 import type { DebuggerShape, DebuggerTick } from "../src/lib/debuggerSchema";
-import { MOCK_EVENTS, MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger, mockNextAddress } from "./mockDebugger";
+import { MOCK_EVENTS, MOCK_M1_SUPPORT, MOCK_SH4_HANDLER, MOCK_SH4_RING, MOCK_SH4_VBR, MockDebugger, mockNextAddress } from "./mockDebugger";
 import type { MockDebuggerOptions } from "./mockDebugger";
 
 interface Frame {
@@ -303,6 +303,138 @@ describe("tick policy", () => {
     expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 2, reason: "breakpoint" });
     session.ok("state.unwatch", { watchIds: [1] });
     expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 2, reason: "breakpoint" });
+  });
+
+  describe("the interrupt of the vertical blank", () => {
+    const HANDLER = MOCK_SH4_HANDLER.base;
+    const register = (tick: DebuggerTick, name: string) => Number.parseInt(tick.registers["dc.sh4.cpu"].find((entry) => entry.name === name)!.value, 16);
+    const inLoop = (pc: number) => pc >= MOCK_SH4_RING.base && pc < MOCK_SH4_RING.base + MOCK_SH4_RING.length * 2;
+
+    it("has its handler at VBR + 0x600: two instructions, rte and its delay slot", () => {
+      const session = connect(createMock());
+      session.describe();
+      expect(HANDLER).toBe(MOCK_SH4_VBR + 0x600);
+      expect(register(session.lastTick(), "VBR")).toBe(MOCK_SH4_VBR);
+      const { lines } = session.ok("state.getDisassembly", { target: "sh4", address: HANDLER, count: 4 }) as { lines: Array<{ address: number; disassembly: string }> };
+      expect(lines.map((line) => [line.address, line.disassembly])).toEqual([
+        [HANDLER, "mov.l r0, @-r15"],
+        [HANDLER + 2, "mov.l @r15+, r0"],
+        [HANDLER + 4, "rte"],
+        [HANDLER + 6, "nop"],
+      ]);
+    });
+
+    it("leaves the loop for the handler in every frame and comes back: between frames the PC is in the loop, one instruction on", async () => {
+      const session = connect(createMock());
+      session.describe();
+      session.ok("breakpoints.add", { event: "dc.sh4.interrupt", enabled: false });
+      const before = session.lastTick().eventLog.length;
+      let pc = session.pc();
+      for (let frame = 0; frame < 20; frame++) {
+        await vi.advanceTimersByTimeAsync(16);
+        session.ok("state.unwatch", { watchIds: [] });
+        expect(session.pc()).toBe(mockNextAddress("sh4", pc));
+        pc = session.pc();
+        // back from the handler: interrupts are not blocked, and SPC is where it came back to
+        expect(register(session.lastTick(), "SR") & 0x10000000).toBe(0);
+        expect(register(session.lastTick(), "SPC")).toBe(pc);
+      }
+      // one interrupt a frame
+      const accepted = session.lastTick().eventLog.slice(before).filter((entry) => (entry.metadata as { event: string }).event === "dc.sh4.interrupt");
+      expect(accepted).toHaveLength(20);
+      expect(session.lastTick().executionState.state).toBe("running");
+    });
+
+    it("stops at a breakpoint on the interrupt entry in the next frame, also when it is added while running; a disabled one is passed", async () => {
+      const session = connect(createMock());
+      session.describe();
+      const sr = register(session.lastTick(), "SR");
+      session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: HANDLER });
+      expect(session.lastTick().executionState.state).toBe("running");
+      await vi.advanceTimersByTimeAsync(16);
+      const stop = session.lastTick();
+      expect(stop.executionState).toEqual({ state: "paused", stopId: 1, reason: "breakpoint", breakpointId: 1 });
+      expect(session.pc()).toBe(HANDLER);
+      // the context of an accepted interrupt: where it came from, what SR was, interrupts blocked
+      expect(inLoop(register(stop, "SPC"))).toBe(true);
+      expect(register(stop, "SSR")).toBe(sr);
+      expect(register(stop, "SR")).toBe((sr | 0x30000000) >>> 0);
+      expect(stop.callstacks!.sh4[0]).toMatchObject({ pc: HANDLER, symbol: "_irq_handler+0x0" });
+
+      // resumed, the handler is left through its rte, and the next vertical blank stops there again
+      const returnTo = register(stop, "SPC");
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(16);
+      expect(session.lastTick().executionState).toEqual({ state: "running", stopId: 1 });
+      session.ok("state.unwatch", { watchIds: [] });
+      expect(session.pc()).toBe(returnTo);
+      await vi.advanceTimersByTimeAsync(16);
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: 2, reason: "breakpoint", breakpointId: 1 });
+      expect(session.pc()).toBe(HANDLER);
+      expect(register(session.lastTick(), "SPC")).toBe(mockNextAddress("sh4", returnTo));
+
+      // disabled, the target runs through its vertical blanks; enabled again while it runs, it is hit
+      session.ok("breakpoints.toggle", { id: 1, enabled: false });
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(10 * 16);
+      expect(session.lastTick().executionState.state).toBe("running");
+      session.ok("breakpoints.toggle", { id: 1, enabled: true });
+      await vi.advanceTimersByTimeAsync(16);
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: 3, reason: "breakpoint", breakpointId: 1 });
+      expect(session.pc()).toBe(HANDLER);
+    });
+
+    it("steps through the handler: rte executes with its delay slot and returns to SPC; a step out ends behind the rte", async () => {
+      const session = connect(createMock());
+      session.describe();
+      session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: HANDLER });
+      await vi.advanceTimersByTimeAsync(16);
+      const stop = session.lastTick();
+      const [spc, ssr] = [register(stop, "SPC"), register(stop, "SSR")];
+      session.ok("control.step", { target: "sh4" });
+      expect(session.pc()).toBe(HANDLER + 2);
+      session.ok("control.stepOver", { target: "sh4" });
+      expect(session.pc()).toBe(HANDLER + 4);
+      session.ok("control.step", { target: "sh4" });
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "step" });
+      expect(session.pc()).toBe(spc);
+      expect(register(session.lastTick(), "SR")).toBe(ssr);
+      // no interrupt is taken in a step: the next step is the next instruction of the loop
+      session.ok("control.step", { target: "sh4" });
+      expect(session.pc()).toBe(mockNextAddress("sh4", spc));
+
+      // a step out that is asked for in the handler: the return is the rte, in the next frame
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(16);
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
+      const back = register(session.lastTick(), "SPC");
+      const stopId = session.lastTick().executionState.stopId!;
+      session.ok("breakpoints.remove", { id: 1 });
+      session.frames.length = 0;
+      session.ok("control.stepOut", { target: "sh4" });
+      await vi.advanceTimersByTimeAsync(16);
+      expect(session.ticks().map((tick) => tick.executionState)).toEqual([
+        { state: "running", stopId },
+        { state: "paused", stopId: stopId + 1, reason: "step" },
+      ]);
+      expect(session.pc()).toBe(back);
+    });
+
+    it("takes no interrupt while SR.BL is set, as a program that blocks them", async () => {
+      const session = connect(createMock());
+      session.describe();
+      session.ok("control.pause");
+      const pc = session.pc();
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "SR", value: "0x50000000" });
+      session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: HANDLER });
+      session.ok("breakpoints.add", { event: "dc.sh4.interrupt", enabled: false });
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(8 * 16);
+      expect(session.lastTick().executionState.state).toBe("running");
+      session.ok("control.pause");
+      expect(session.pc()).toBe(pc);
+      expect(session.lastTick().eventLog.filter((entry) => (entry.metadata as { event: string }).event === "dc.sh4.interrupt")).toEqual([]);
+    });
   });
 
   it("compares SH4 code addresses masked, reports the lowest id when several match, and never reuses an id", async () => {

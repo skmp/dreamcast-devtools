@@ -45,7 +45,11 @@ import type { MockSgcCapture } from "./mockSgc";
  *
  * The machine: each target walks a ring of instructions, one instruction per emulation
  * step (16 ms). The last instruction of the SH4 and ARM7 rings is the branch back to the
- * first one, and the disassembly says so. Memory content is a hash of the address.
+ * first one, and the disassembly says so. An emulation step is also a frame, and at its
+ * vertical blank the SH4 takes an interrupt, as a program with interrupts enabled does: its
+ * PC leaves the loop for the handler at VBR + 0x600, which ends in `rte`, and comes back to
+ * where it was. So between two steps the PC is in the loop, and a breakpoint in the handler
+ * stops the SH4 there. Memory content is a hash of the address.
  */
 
 export interface MockDebuggerOptions {
@@ -143,13 +147,32 @@ interface Ring {
 
 /** The loops the mock's targets execute. The last SH4 and ARM7 instruction branches to `base`. */
 export const MOCK_SH4_RING: Readonly<Ring> = { base: 0x8c0000a0, length: 8, instructionSize: 2 };
+/** `VBR` of the mock's SH4, as its program has set it. */
+export const MOCK_SH4_VBR = 0x8c000000;
+/**
+ * The interrupt handler of the mock's SH4, at `VBR + 0x600`: two instructions, then `rte` and
+ * its delay slot, which execute together and return to `SPC`.
+ */
+export const MOCK_SH4_HANDLER: Readonly<Ring> = { base: MOCK_SH4_VBR + 0x600, length: 4, instructionSize: 2 };
+const SH4_HANDLER_TEXT = ["mov.l r0, @-r15", "mov.l @r15+, r0", "rte", "nop"];
+const SH4_HANDLER_RTE = MOCK_SH4_HANDLER.base + 2 * MOCK_SH4_HANDLER.instructionSize;
+const SH4_HANDLER_END = MOCK_SH4_HANDLER.base + MOCK_SH4_HANDLER.length * MOCK_SH4_HANDLER.instructionSize;
+const inSh4Handler = (address: number): boolean => address >= MOCK_SH4_HANDLER.base && address < SH4_HANDLER_END;
+/** `SR.BL`: interrupts are blocked. Set when an interrupt is accepted; `rte` restores `SR` from `SSR`. */
+const SH4_SR_BL = 0x10000000;
+/** `SR.RB`: the other register bank, selected when an interrupt is accepted. */
+const SH4_SR_RB = 0x20000000;
 export const MOCK_ARM7_RING: Readonly<Ring> = { base: 0x00200010, length: 8, instructionSize: 4 };
 /** The DSP executes its 128 steps once per sample. */
 export const MOCK_DSP_RING: Readonly<Ring> = { base: 0, length: 128, instructionSize: 1 };
 
 const RINGS: Record<TargetProcessor, Readonly<Ring>> = { sh4: MOCK_SH4_RING, arm7: MOCK_ARM7_RING, dsp: MOCK_DSP_RING };
 
-/** The address after `address` as the target executes: around the ring, or straight on outside of it. */
+/**
+ * The address after `address` as the target executes: around the ring, or straight on outside
+ * of it. (The `rte` of the SH4's handler goes to `SPC`, which only the machine knows: this
+ * answers for it as for any other address outside the ring.)
+ */
 export const mockNextAddress = (target: TargetProcessor, address: number): number => {
   const ring = RINGS[target];
   const end = ring.base + ring.length * ring.instructionSize;
@@ -184,7 +207,8 @@ interface EventSpec {
 }
 
 export const MOCK_EVENTS: Readonly<Record<string, EventSpec>> = {
-  "dc.sh4.interrupt": { subsystem: "sh4", severity: "info", rate: "high", every: 1, phase: 0, message: () => "interrupt accepted: IRL9 (HBLANK)" },
+  // raised when the SH4 accepts the interrupt of the vertical blank, once a frame
+  "dc.sh4.interrupt": { subsystem: "sh4", severity: "info", rate: "high", message: () => "interrupt accepted: vblank in" },
   "dc.sh4.exception": { subsystem: "sh4", severity: "warn", rate: "low", every: 512, phase: 300, message: () => "exception: TRAPA #0x20" },
   "dc.holly.dmac.transfer_start": { subsystem: "holly", severity: "info", rate: "high", every: 2, phase: 0, message: () => "ch2 DMA start: 0x0C080000, 0x4000 bytes" },
   "dc.holly.dmac.transfer_end": { subsystem: "holly", severity: "info", rate: "high", every: 2, phase: 1, message: () => "ch2 DMA end" },
@@ -252,9 +276,10 @@ const numbered = (prefix: string, count: number, width: number, suffix = "", ini
 const SH4_CPU_REGISTERS: RegisterSpec[] = [
   reg("PC", 32, MOCK_SH4_RING.base),
   reg("PR", 32, 0x8c0000a2),
-  reg("SR", 32, 0x400000f0),
+  // privileged, interrupts neither blocked nor masked: the SH4 takes the interrupt of every vertical blank
+  reg("SR", 32, 0x40000000),
   reg("GBR", 32, 0x8c000000),
-  reg("VBR", 32, 0x8c000000),
+  reg("VBR", 32, MOCK_SH4_VBR),
   reg("MACH", 32),
   reg("MACL", 32),
   reg("SSR", 32, 0x40000000),
@@ -662,6 +687,11 @@ const disassembleLine = (target: TargetProcessor, address: number): DisassemblyL
   // the bytes of an instruction are the bytes state.getMemorySlice returns for its address
   const bytes = Array.from({ length: size }, (_, offset) => hexByte(memoryByte(target, address + offset))).join(" ");
 
+  if (target === "sh4" && inSh4Handler(address)) {
+    // the interrupt handler: what the SH4 executes at every vertical blank
+    return { address, bytes, disassembly: SH4_HANDLER_TEXT[(address - MOCK_SH4_HANDLER.base) / size] };
+  }
+
   const instructions = target === "sh4" ? sh4Instructions : arm7Instructions;
   const hash = sha256Byte(`${target}:${address.toString(16)}`);
   const inRing = address >= ring.base && address < ring.base + ring.length * size;
@@ -679,6 +709,7 @@ const SYMBOLS: Record<"sh4" | "arm7", Array<{ address: number; name: string }>> 
   sh4: [
     { address: 0x8c000000, name: "_start" },
     { address: MOCK_SH4_RING.base, name: "_main_loop" },
+    { address: MOCK_SH4_HANDLER.base, name: "_irq_handler" },
     { address: 0x8c010000, name: "_main" },
   ],
   arm7: [
@@ -791,6 +822,8 @@ export class MockDebugger {
   /** the stop in force was made by a step on the fallback engine */
   private fallbackStep = false;
   private pendingStepOut: TargetProcessor | undefined;
+  /** the pending step-out of the SH4 was asked for in its interrupt handler: its return is the handler's `rte` */
+  private stepOutOfHandler = false;
   private emulationSteps = 0;
   private cycles = 0n;
 
@@ -997,12 +1030,55 @@ export class MockDebugger {
     return this.register(pcPath, pcRegister) as number;
   }
 
-  private advance(target: TargetProcessor): { wrapped: boolean } {
+  /**
+   * One instruction of a target. `wrapped`: it was the branch at the end of the loop.
+   * `returned`: it was the `rte` of the SH4's interrupt handler, which executes with its delay
+   * slot, restores `SR` from `SSR` and goes on at `SPC`.
+   */
+  private advance(target: TargetProcessor): { wrapped: boolean; returned?: boolean } {
     const { pcPath, pcRegister } = targetById(target);
     const before = this.pc(target);
+    if (target === "sh4" && before === SH4_HANDLER_RTE) {
+      this.setRegisterValue(pcPath, pcRegister, this.register(pcPath, "SPC"));
+      this.setRegisterValue(pcPath, "SR", this.register(pcPath, "SSR"));
+      return { wrapped: false, returned: true };
+    }
     const after = mockNextAddress(target, before);
     this.setRegisterValue(pcPath, pcRegister, after);
     return { wrapped: after === RINGS[target].base && before !== after };
+  }
+
+  private sh4InterruptsBlocked(): boolean {
+    return ((this.register("dc.sh4.cpu", "SR") as number) & SH4_SR_BL) !== 0;
+  }
+
+  /**
+   * The SH4 accepts the interrupt of the vertical blank: `SPC` and `SSR` take the PC and `SR`,
+   * interrupts are blocked, and the PC is the interrupt entry `VBR + 0x600`. Returns what
+   * `emitEvent` returns for the event of the acceptance.
+   */
+  private acceptSh4Interrupt(): number | undefined {
+    const path = "dc.sh4.cpu";
+    const sr = this.register(path, "SR") as number;
+    this.setRegisterValue(path, "SPC", this.pc("sh4"));
+    this.setRegisterValue(path, "SSR", sr);
+    this.setRegisterValue(path, "SR", (sr | SH4_SR_BL | SH4_SR_RB) >>> 0);
+    this.setRegisterValue(path, "PC", ((this.register(path, "VBR") as number) + 0x600) >>> 0);
+    return this.emitEvent("dc.sh4.interrupt", MOCK_EVENTS["dc.sh4.interrupt"].message(this.emulationSteps));
+  }
+
+  /** The lowest id of the active code breakpoints of a target at the address its PC is at now. */
+  private codeBreakpointAtPc(target: TargetProcessor): number | undefined {
+    let hit: number | undefined;
+    for (const breakpoint of this.breakpoints.values()) {
+      if (breakpoint.kind !== "code" || CODE_BREAKPOINT_EVENTS[breakpoint.event] !== target || !this.isActive(breakpoint)) {
+        continue;
+      }
+      if (this.sameAddress(target, breakpoint.address!, this.pc(target)) && (hit === undefined || breakpoint.id < hit)) {
+        hit = breakpoint.id;
+      }
+    }
+    return hit;
   }
 
   private setCycles(cycles: bigint): void {
@@ -1011,15 +1087,22 @@ export class MockDebugger {
     this.setRegisterValue("dc.timing", "SCHED_NOW", (cycles / SH4_TIMESLICE) * SH4_TIMESLICE);
   }
 
-  /** One emulation step: every target executes one instruction, and what is due happens. */
+  /**
+   * One emulation step, which is one frame: every target executes one instruction, what is due
+   * happens, and at the vertical blank the SH4 goes through its interrupt handler.
+   */
   private emulationStep(): void {
     if (this.lifetime !== "running" || !this.running) {
       return;
     }
     this.emulationSteps++;
     const wrapped: Partial<Record<TargetProcessor, boolean>> = {};
+    let returned = false;
     for (const target of ["sh4", "arm7", "dsp"] as const) {
-      wrapped[target] = this.advance(target).wrapped;
+      // (the instruction a target was stopped in front of executes here without being tested again)
+      const executed = this.advance(target);
+      wrapped[target] = executed.wrapped;
+      returned ||= target === "sh4" && executed.returned === true;
     }
     this.setRegisterValue("dc.sh4.cpu", "PR", (((this.register("dc.sh4.cpu", "PR") as number) + 2) & 0xffffffff) >>> 0);
     this.setRegisterValue("dc.aica.sgc.0", "VOL", ((this.register("dc.aica.sgc.0", "VOL") as number) + 1) & 0xff);
@@ -1028,24 +1111,33 @@ export class MockDebugger {
 
     // event breakpoints: a hit requests a pause that is honoured at the end of the step
     let eventHit: number | undefined;
+    const raised = (hit: number | undefined) => {
+      if (hit !== undefined && (eventHit === undefined || hit < eventHit)) {
+        eventHit = hit;
+      }
+    };
     for (const [name, spec] of Object.entries(MOCK_EVENTS)) {
       if (spec.every !== undefined && this.emulationSteps % spec.every === (spec.phase ?? 0)) {
-        const hit = this.emitEvent(name, spec.message(this.emulationSteps));
-        if (hit !== undefined && (eventHit === undefined || hit < eventHit)) {
-          eventHit = hit;
-        }
+        raised(this.emitEvent(name, spec.message(this.emulationSteps)));
       }
     }
 
-    // code breakpoints: the stop is in front of the instruction the PC is at now
-    let codeHit: number | undefined;
-    for (const breakpoint of this.breakpoints.values()) {
-      if (breakpoint.kind !== "code" || !this.isActive(breakpoint)) {
-        continue;
-      }
-      const target = CODE_BREAKPOINT_EVENTS[breakpoint.event];
-      if (target && this.sameAddress(target, breakpoint.address!, this.pc(target))) {
-        codeHit = codeHit === undefined ? breakpoint.id : Math.min(codeHit, breakpoint.id);
+    // The vertical blank interrupts the SH4, unless interrupts are blocked (it was stopped in
+    // its handler and is still there). It then executes the handler up to and with its `rte`.
+    // A code breakpoint is tested at each arrival: the stop is in front of the instruction the
+    // PC is at, in the handler as well as back in the program.
+    if (!this.sh4InterruptsBlocked()) {
+      raised(this.acceptSh4Interrupt());
+    }
+    let codeHit = this.codeBreakpointAtPc("sh4");
+    for (let executed = 0; codeHit === undefined && inSh4Handler(this.pc("sh4")) && executed < MOCK_SH4_HANDLER.length; executed++) {
+      returned ||= this.advance("sh4").returned === true;
+      codeHit = this.codeBreakpointAtPc("sh4");
+    }
+    for (const target of ["arm7", "dsp"] as const) {
+      const hit = this.codeBreakpointAtPc(target);
+      if (hit !== undefined && (codeHit === undefined || hit < codeHit)) {
+        codeHit = hit;
       }
     }
 
@@ -1054,8 +1146,10 @@ export class MockDebugger {
       this.enterStop("breakpoint", codeHit);
     } else if (eventHit !== undefined) {
       this.enterStop("event", eventHit);
-    } else if (this.pendingStepOut && wrapped[this.pendingStepOut]) {
-      // the branch at the end of the loop is what the mock takes for the return
+    } else if (this.pendingStepOut && (this.pendingStepOut === "sh4" && this.stepOutOfHandler ? returned : wrapped[this.pendingStepOut])) {
+      // The return a step-out waits for: the `rte` of the handler when it was asked for in
+      // there, else the branch at the end of the loop (a handler entered after the request is
+      // skipped whole).
       this.enterStop("step");
     }
   }
@@ -1664,12 +1758,14 @@ export class MockDebugger {
       // a resume until the return: tick running now, tick paused with reason "step" later
       context.afterResponse.push(() => {
         this.pendingStepOut = targetId;
+        this.stepOutOfHandler = targetId === "sh4" && inSh4Handler(this.pc("sh4"));
         this.leaveStop();
       });
       return {};
     }
 
-    // step, and step over (the loop has no calls): one instruction, one paused tick, no running tick
+    // Step, and step over (the program has no calls): one instruction, one paused tick, no
+    // running tick. `rte` executes with its delay slot. No vertical blank falls into a step.
     context.afterResponse.push(() => {
       this.advance(targetId);
       if (targetId === "sh4") {

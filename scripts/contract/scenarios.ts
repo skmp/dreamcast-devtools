@@ -764,9 +764,10 @@ const s04: Scenario = {
       } else {
         check(context.profile === "mock", "dc.timing.SH4_CYCLES is in every paused tick");
       }
-      if (context.profile === "mock") {
+      // Mock: its program is known. A step in its loop ends at the next address of the loop (no
+      // vertical blank falls into a step); in its interrupt handler the general rule is all there is.
+      if (context.profile === "mock" && pc0 >= MOCK_SH4_RING.base && pc0 < MOCK_SH4_RING.base + MOCK_SH4_RING.length * MOCK_SH4_RING.instructionSize) {
         check(pc1 === mockNextAddress("sh4", pc0), `mock: the step from ${hex(pc0)} ended at ${hex(pc1)}, the next address of its loop is ${hex(mockNextAddress("sh4", pc0))}`);
-        check(pc0 >= MOCK_SH4_RING.base && pc0 < MOCK_SH4_RING.base + MOCK_SH4_RING.length * 2, "mock: the PC is in the loop");
       }
       return { pc0, pc1, atVector };
     };
