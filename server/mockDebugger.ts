@@ -422,7 +422,8 @@ const DEVICE_TREE: NodeSpec[] = [
             path: "dc.aica.dsp",
             label: "DSP",
             description: "DSP VLIW Core",
-            registers: [reg("STEP", 16, 0), reg("MDEC_CT", 16, 0x1fff), reg("RBP", 16, 0x0400), reg("RBL", 8, 0x03)],
+            // the widths of design 2.8: a step is 0..127
+            registers: [reg("STEP", 8, 0), reg("MDEC_CT", 16, 0x1fff), reg("RBP", 16, 0x0400), reg("RBL", 8, 0x03)],
             actions: [PANEL_IDS.DSP_DISASSEMBLY],
           },
         ],

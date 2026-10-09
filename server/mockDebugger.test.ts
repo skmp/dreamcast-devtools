@@ -245,7 +245,7 @@ describe("tick policy", () => {
     expect(arm7Pc()).toBe(mockNextAddress("arm7", before));
     expect(session.pc()).toBe(pc);
     session.ok("control.step", { target: "dsp" });
-    expect(session.lastTick().registers["dc.aica.dsp"][0]).toMatchObject({ name: "STEP", value: expect.stringMatching(/^0x[0-9A-F]{4}$/) });
+    expect(session.lastTick().registers["dc.aica.dsp"][0]).toMatchObject({ name: "STEP", value: expect.stringMatching(/^0x[0-9A-F]{2}$/) });
   });
 
   it("steps out: a running tick, then a paused tick with reason step at the start of the loop", async () => {
@@ -363,7 +363,14 @@ describe("tick policy", () => {
     session.ok("control.runUntil");
     await vi.advanceTimersByTimeAsync(128 * 16);
     expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
-    expect(session.lastTick().registers["dc.aica.dsp"][0]).toEqual({ name: "STEP", value: "0x0064", width: 16 });
+    expect(session.lastTick().registers["dc.aica.dsp"][0]).toEqual({ name: "STEP", value: "0x64", width: 8 });
+    // the widths of the DSP's registers are those of the hardware
+    expect(session.lastTick().registers["dc.aica.dsp"].map((register) => [register.name, register.width])).toEqual([
+      ["STEP", 8],
+      ["MDEC_CT", 16],
+      ["RBP", 16],
+      ["RBL", 8],
+    ]);
   });
 
   it("logs low-rate events while a client is connected, high-rate events only while a breakpoint on them exists", async () => {
@@ -937,7 +944,7 @@ describe("error table", () => {
     session.ok("state.watch", { expressions: ["dc.sh4.cpu.PC", "dc.sh4.cpu.pc", "dc.aica.dsp.STEP"] });
     expect(session.lastTick().watches).toEqual([
       { id: 1, expression: "dc.sh4.cpu.pc", value: expect.stringMatching(/^0x8C0000A[0-9A-F]$/) },
-      { id: 2, expression: "dc.aica.dsp.step", value: expect.stringMatching(/^0x00[0-9A-F]{2}$/) },
+      { id: 2, expression: "dc.aica.dsp.step", value: expect.stringMatching(/^0x[0-9A-F]{2}$/) },
     ]);
     session.ok("state.watch", { expressions: ["DC.SH4.CPU.PC"] });
     expect(session.lastTick().watches).toHaveLength(2);
