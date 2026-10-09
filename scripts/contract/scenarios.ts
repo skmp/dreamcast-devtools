@@ -1427,8 +1427,10 @@ const s10: Scenario = {
           line.bytes === "??" || /^[0-9A-F]{2}( [0-9A-F]{2})*$/.test(line.bytes),
           `${target.id}: bytes "${line.bytes}" are not space-separated upper-case hex`,
         );
-        if (target.id !== "dsp" && line.bytes !== "??") {
-          check(line.bytes.split(" ").length === target.instructionSize, `${target.id}: "${line.bytes}" are not ${target.instructionSize} bytes`);
+        if (line.bytes !== "??") {
+          // one pair for each byte of an instruction; a DSP step is its four MPRO words, each high byte first: 8 pairs
+          const pairs = target.id === "dsp" ? 8 : target.instructionSize;
+          check(line.bytes.split(" ").length === pairs, `${target.id}: "${line.bytes}" are not ${pairs} bytes`);
         }
         check((line.bytes === "??") === (line.disassembly === "<unreadable>"), `${target.id}: an unreadable word is bytes "??" and text "<unreadable>"`);
       });
@@ -1445,6 +1447,8 @@ const s10: Scenario = {
       if (target.instructionSize > 1) {
         await session.expectError("state.getDisassembly", { target: target.id, address: start + 1, count: 1 }, -32602);
       }
+      // there is no wrap-around: an address above addressMax is refused
+      await session.expectError("state.getDisassembly", { target: target.id, address: last + target.instructionSize, count: 1 }, -32602);
     }
     // an unreadable word is still a line: bytes "??", text "<unreadable>" (nothing is mapped at 0x10000000)
     const unreadable = await disassemble(context, "sh4", 0x10000000, 2);

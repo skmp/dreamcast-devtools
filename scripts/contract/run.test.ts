@@ -2174,6 +2174,27 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(summary, "S10")).toBe('sh4: the unreadable word at 0x10000000 is bytes "??" and text "???", expected "??" and "<unreadable>"');
   });
 
+  it("S10: the bytes of a DSP step are its four MPRO words as 8 pairs, and an address above addressMax is refused", async () => {
+    // a line of the DSP is one whose bytes are 8 pairs: here its words are sent as two pairs, or as 16 digits in a row
+    const dspLines = (rewrite: (bytes: string) => string): Faults => ({
+      toClient: (frame) => {
+        const lines = (frame.result as Json | undefined)?.lines as Array<Json & { bytes: string }> | undefined;
+        return lines ? { ...frame, result: { lines: lines.map((line) => (line.bytes.split(" ").length === 8 ? { ...line, bytes: rewrite(line.bytes) } : line)) } } : frame;
+      },
+    });
+    const short = await run(dspLines((bytes) => bytes.slice(0, 5)), ["S10"]);
+    expect(reportOf(short)).toEqual([expect.stringMatching(/^S10 failed dsp: "[0-9A-F]{2} [0-9A-F]{2}" are not 8 bytes$/)]);
+    const unbroken = await run(dspLines((bytes) => bytes.replaceAll(" ", "")), ["S10"]);
+    expect(reportOf(unbroken)).toEqual([expect.stringMatching(/^S10 failed dsp: bytes "[0-9A-F]{16}" are not space-separated upper-case hex$/)]);
+
+    // the address space of a target ends at addressMax: a server that wraps around to 0
+    const wraps = await run(
+      { toServer: (frame) => (frame.method === "state.getDisassembly" && paramsOf(frame).target === "arm7" && (paramsOf(frame).address as number) > 0x00ffffff ? { ...frame, params: { ...paramsOf(frame), address: 0 } } : frame) },
+      ["S10"],
+    );
+    expect(reportOf(wraps)).toEqual([expect.stringMatching(/^S10 failed state\.getDisassembly \{"target":"arm7","address":16777216,"count":1\}: expected the error -32602, got the result \{"lines":\[/)]);
+  }, 30_000);
+
   it("S14: a server that forgets, or lets go, when its last client disconnects", async () => {
     const reconnect = async (forget: (tick: Json) => Array<[string, Json]>) => {
       const { url } = await startServer(undefined, new ForgetfulMock(forget));
