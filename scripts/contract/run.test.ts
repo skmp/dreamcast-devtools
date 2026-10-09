@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger } from "../../server/mockDebugger";
 import type { MockClient, MockConnection, MockDebuggerOptions } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
-import { isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
+import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
 import { spawn } from "node:child_process";
 import { runContract } from "./run";
 import { SCENARIOS, scenariosOfMilestone, selectScenarios } from "./scenarios";
@@ -3011,6 +3011,106 @@ describe("the contract runner against a server that breaks the protocol", () => 
       required: [...scenariosOfMilestone("M1", "mock"), "S17"],
     });
   });
+
+  it("S16: an ARM7 step is its stop; where it ends is compared only on a line that is not control flow", async () => {
+    type Machine = { advance(target: string): { wrapped: boolean }; running: boolean; values: Map<string, Map<string, unknown>> };
+    const lineAt = (address: number) =>
+      (ask(new MockDebugger(), "state.getDisassembly", { target: "arm7", address, count: 1 }).result as { lines: Array<{ disassembly: string }> }).lines[0].disassembly;
+    /**
+     * The mock at its StartPaused stop with the ARM7 at `pc`. `first` is what the first step of
+     * its ARM7 does in place of executing one instruction; it gets the mock's own instruction.
+     */
+    const arm7At = (pc: number, first?: (advance: () => { wrapped: boolean }, machine: Machine) => { wrapped: boolean }): MockDebugger => {
+      const mock = new MockDebugger({ startPaused: true });
+      ask(mock, "state.setRegister", { path: "dc.aica.arm7", name: "PC", value: String(pc) });
+      const machine = mock as unknown as Machine;
+      const advance = machine.advance.bind(mock);
+      let steps = 0;
+      // (a paused machine advances only in a step)
+      machine.advance = (target) => (first && target === "arm7" && !machine.running && ++steps === 1 ? first(() => advance(target), machine) : advance(target));
+      return mock;
+    };
+    const stepPart = async (mock: MockDebugger) => {
+      const summary = await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S16"]) });
+      return summary.scenarios[0].parts?.[0];
+    };
+    const passed = { name: "arm7 step and breakpoint", status: "passed" };
+    const failed = (detail: string) => ({ name: "arm7 step and breakpoint", status: "failed", detail });
+
+    // the last line of the mock's ARM7 loop is its branch, and the first one that is not control flow is what a step is seen on
+    const branch = 0x0020002c;
+    expect(isArmControlFlow(lineAt(branch))).toBe(true);
+    const plain = [0x00200010, 0x00200014, 0x00200018, 0x0020001c].find((address) => !isArmControlFlow(lineAt(address)))!;
+    const text = lineAt(plain);
+
+    // A branch to itself, taken once more: the step is a stop of its own, and the PC is where it
+    // was. Nothing is wrong with that server.
+    expect(await stepPart(arm7At(branch, () => ({ wrapped: false })))).toEqual(passed);
+    // from a line that is not control flow the step ends at the next instruction ...
+    expect(await stepPart(arm7At(plain))).toEqual(passed);
+    // ... or at an exception vector: the instruction ran, and the interrupt that was pending is entered
+    expect(
+      await stepPart(
+        arm7At(plain, (advance, machine) => {
+          advance();
+          machine.values.get("dc.aica.arm7")!.set("PC", 0x1c);
+          return { wrapped: false };
+        }),
+      ),
+    ).toEqual(passed);
+
+    // a step that executes two instructions, and one that executes none
+    const hex = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
+    expect(
+      await stepPart(
+        arm7At(plain, (advance) => {
+          advance();
+          return advance();
+        }),
+      ),
+    ).toEqual(failed(`"${text}" at ${hex(plain)} is not control flow, and the step of arm7 ended at ${hex(plain + 8)}, not at ${hex(plain + 4)} or an exception vector`));
+    expect(await stepPart(arm7At(plain, () => ({ wrapped: false })))).toEqual(
+      failed(`"${text}" at ${hex(plain)} is not control flow, and the step of arm7 ended at ${hex(plain)}, not at ${hex(plain + 4)} or an exception vector`),
+    );
+  }, 60_000);
+
+  it("S18: the icache and ocache tables have rows, or no rows and a note", async () => {
+    /**
+     * The mock as a server with the capability "tables", whose state.getTable is answered here:
+     * `cache` is what it gives for icache and for ocache, the other tables have a row.
+     */
+    const withTables = (cache: Json): Faults => ({
+      toClient: (frame) => {
+        const result = frame.result as Json | undefined;
+        return result?.deviceTree ? { ...frame, result: { ...result, capabilities: [...(result.capabilities as string[]), "tables"] } } : frame;
+      },
+      answer: (request) => {
+        if (request.method !== "state.getTable") return undefined;
+        const id = String(paramsOf(request).id);
+        if (!["tlb", "sq", "icache", "ocache", "ocram"].includes(id)) return rpcError(request, -32602, "invalid params: id");
+        return { jsonrpc: "2.0", id: request.id, result: id === "icache" || id === "ocache" ? cache : { columns: ["index", "value"], rows: [["0", "0x00000000"]] } };
+      },
+    });
+    const tablesPart = async (cache: Json) => (await run(withTables(cache), ["S18"])).scenarios[0].parts?.[0];
+    const columns = ["line", "tag", "valid"];
+
+    // a tier with a cache model: the lines of the cache
+    expect(await tablesPart({ columns, rows: [["0", "0x0C000", "1"], ["1", "0x00000", "0"]] })).toEqual({ name: "tables", status: "passed" });
+    // a tier without one: no rows, and a note that says so
+    expect(await tablesPart({ columns, rows: [], note: "the fast tier has no cache model" })).toEqual({ name: "tables", status: "passed" });
+    // an empty table that does not say why
+    expect(await tablesPart({ columns, rows: [] })).toEqual({
+      name: "tables",
+      status: "failed",
+      detail: "state.getTable {icache}: no rows and no note; the table has rows (a tier with a cache model), or no rows and a note",
+    });
+    // rows of a cache model are rows of the table: as many cells as columns
+    expect(await tablesPart({ columns, rows: [["0", "0x0C000"]] })).toEqual({
+      name: "tables",
+      status: "failed",
+      detail: "state.getTable {icache}: row 0 has 2 cells, the table 3 columns",
+    });
+  }, 30_000);
 
   it("S17: a binary frame whose header does not belong to the result", async () => {
     const summary = await run(

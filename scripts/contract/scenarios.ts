@@ -2276,17 +2276,30 @@ const checkBinaryAfterResponse = (session: ContractSession, request: number, bin
   check(binary.seq > response.seq, `the binary frame of ${method} arrived before its JSON response; the response is sent first, the binary frame second`);
 };
 
-/** A step and a code breakpoint of a target other than the SH4. */
+/** The exception vectors of the ARM7: where a step ends when an exception, or a pending interrupt, is entered. */
+const ARM_EXCEPTION_VECTORS = [0x00, 0x04, 0x08, 0x0c, 0x10, 0x18, 0x1c];
+
+/**
+ * A step and a code breakpoint of a target other than the SH4. The step is its stop: a paused
+ * tick with a new stopId and reason "step", and no running tick in between. Where an ARM7 step
+ * ends is compared only on a line that is not control flow, as S04 does for the SH4 (a branch
+ * to itself leaves the PC where it is): there it is the next instruction, or an exception vector.
+ */
 const stepAndBreakpoint = async (context: RunContext, targetId: "arm7" | "dsp"): Promise<void> => {
   const { session } = context;
   const target = requireTarget(context, targetId);
   const before = await ensurePaused(context);
   const pc0 = pcOf(before.tick, target);
+  const line = targetId === "arm7" ? (await disassemble(context, targetId, pc0, 1)).at(0) : undefined;
   const stepped = await stepOnce(context, targetId);
+  const pc1 = pcOf(stepped.tick, target);
   if (targetId === "dsp") {
-    check(pcOf(stepped.tick, target) === (pc0 + 1) % (target.addressMax + 1), `a DSP step from ${pc0} ended at ${pcOf(stepped.tick, target)}`);
-  } else {
-    check(pcOf(stepped.tick, target) !== pc0, `a step of ${targetId} left its PC at ${hex(pc0)}`);
+    check(pc1 === (pc0 + 1) % (target.addressMax + 1), `a DSP step from ${pc0} ended at ${pc1}`);
+  } else if (line && !isArmControlFlow(line.disassembly)) {
+    check(
+      pc1 === pc0 + target.instructionSize || ARM_EXCEPTION_VECTORS.includes(pc1),
+      `"${line.disassembly}" at ${hex(pc0)} is not control flow, and the step of ${targetId} ended at ${hex(pc1)}, not at ${hex(pc0 + target.instructionSize)} or an exception vector`,
+    );
   }
 
   const pc = await findBreakpointSite(context, targetId);
@@ -2512,7 +2525,11 @@ const s18: Scenario = {
               check(row.length === table.columns.length, `state.getTable {${id}}: row ${position} has ${row.length} cells, the table ${table.columns.length} columns`),
             );
             if (id === "icache" || id === "ocache") {
-              check(table.rows.length === 0 && table.note !== undefined, `state.getTable {${id}}: no rows and a note (there is no cache model)`);
+              // a tier with a cache model has rows, the lines of the cache; one without has none, and says so
+              check(
+                table.rows.length > 0 || table.note !== undefined,
+                `state.getTable {${id}}: no rows and no note; the table has rows (a tier with a cache model), or no rows and a note`,
+              );
             }
           }
           await context.session.expectError("state.getTable", { id: "vram" }, -32602);
