@@ -1437,6 +1437,69 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(stale, "S03")).toMatch(/invariant: I6: watch 2 \(dc\.sh4\.cpu\.pc\) reads "0x8C0000A0" in a tick that says registersStale, expected "n\/a"/);
   }, 30_000);
 
+  it("S03: watches that are looked up in the registers the tick carries: one on another path reads n/a while running", async () => {
+    const summary = await run(
+      {
+        toClient: (frame) => {
+          if (!isTick(frame) || frame.params.executionState.state !== "running") return frame;
+          const watches = (frame.params.watches as Array<Json & { expression: string }>).map((watch) =>
+            watch.expression.slice(0, watch.expression.lastIndexOf(".")) in frame.params.registers ? watch : { ...watch, value: "n/a" },
+          );
+          return { ...frame, params: { ...frame.params, watches } };
+        },
+      },
+      ["S03"],
+    );
+    expect(reportOf(summary)).toEqual([
+      expect.stringMatching(
+        /^S03 failed the watch on dc\.sh4\.bsc\.bcr1 reads "n\/a" in the running tick \d+, which does not carry dc\.sh4\.bsc; it read "0x00000000" at the stop before the resume, and a watch is evaluated in every tick, whatever paths the tick carries$/,
+      ),
+    ]);
+    // no invariant says so: a watch is compared with its register where the tick carries the path
+    expect(summary.invariantViolations).toEqual([]);
+    expect(summary.cleanUpProblems).toEqual([]);
+
+    // a register that reads "n/a" always is not the one that is watched: the mock's SCIF receive register
+    const mock = new MockDebugger();
+    const tree = mock as unknown as { values: Map<string, Map<string, unknown>> };
+    for (const [path, registers] of tree.values) {
+      if (path.startsWith("dc.sh4.") && path !== "dc.sh4.cpu" && path !== "dc.sh4.scif") {
+        registers.forEach((_value, name) => registers.set(name, "n/a"));
+      }
+    }
+    tree.values.get("dc.sh4.scif")!.forEach((_value, name, registers) => name !== "SCBRR2" && registers.set(name, "n/a"));
+    const watched: string[] = [];
+    const { url, direct } = await startServer(
+      {
+        toServer: (frame) => {
+          if (frame.method === "state.watch") watched.push(...(paramsOf(frame).expressions as string[]));
+          return frame;
+        },
+      },
+      mock,
+    );
+    const picked = await runContract({ url, profile: "mock", only: new Set(["S03"]) });
+    expect(reportOf(picked)).toEqual(["S03 passed "]);
+    expect(watched).toEqual(["dc.timing.sh4_cycles", "dc.sh4.cpu.pc", "dc.sh4.scif.scbrr2"]);
+    expect((await stateOf(direct)).watches).toEqual([]);
+  }, 30_000);
+
+  it("S03, S04: a tree without dc.timing.SH4_CYCLES: the time of the SH4 is not read from somewhere else", async () => {
+    const withoutCycles = (registers: Json[]) => registers.filter((register) => register.name !== "SH4_CYCLES");
+    const summary = await run(
+      describing(
+        (result) => ({ ...result, deviceTree: mapNodes(result.deviceTree, (node) => (node.path === "dc.timing" ? { ...node, registers: withoutCycles(node.registers as Json[]) } : node)) }),
+        (registers) => (registers["dc.timing"] ? { ...registers, "dc.timing": withoutCycles(registers["dc.timing"]) } : registers),
+      ),
+      ["S03", "S04"],
+    );
+    expect(reportOf(summary)).toEqual([
+      "S03 failed the device tree has dc.timing.SH4_CYCLES: the time of the SH4 is read from it (2.8)",
+      "S04 failed dc.timing.SH4_CYCLES is in every paused tick (2.8)",
+    ]);
+    expect(summary.invariantViolations).toEqual([]);
+  }, 30_000);
+
   it("S06: a soloed category whose own breakpoints are not active either", async () => {
     const mock = new MockDebugger();
     const machine = mock as unknown as { isActive(breakpoint: Json): boolean; categories: Map<string, { soloed: boolean }> };

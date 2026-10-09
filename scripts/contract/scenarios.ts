@@ -15,6 +15,7 @@ import type {
 import { MOCK_SH4_RING, mockNextAddress } from "../../server/mockDebugger";
 import {
   ANCHOR_REGISTERS,
+  BASE_PATHS,
   M1_DEVICE_TREE,
   MILESTONES,
   SH4_CPU_REGISTERS,
@@ -419,6 +420,23 @@ const unwatchedRegister = (context: RunContext, path: string, preferred: string[
   return fail(`every register of ${path} is watched already`);
 };
 
+/**
+ * A register that has a value in `tick`, of a node outside the four base paths: one a running
+ * tick that is not full does not carry. A number if there is one, else a text.
+ */
+const registerOutsideBasePaths = (
+  session: ContractSession,
+  tick: DebuggerTick,
+): { path: string; name: string; expression: string; value: string } | undefined => {
+  const base = new Set<string>(BASE_PATHS);
+  const candidates = Array.from(session.index?.registers.keys() ?? [])
+    .filter((path) => !base.has(path))
+    .flatMap((path) => (tick.registers[path] ?? []).map((register) => ({ path, ...register })))
+    .filter((register) => register.value !== "n/a" && register.value !== "");
+  const found = candidates.find((register) => register.width > 0) ?? candidates[0];
+  return found && { path: found.path, name: found.name, expression: `${found.path}.${found.name.toLowerCase()}`, value: found.value };
+};
+
 /** `<path>.<name in lower case>` for every register of the device tree that no watch names. */
 const unwatchedExpressions = (context: RunContext): string[] => {
   const { session } = context;
@@ -747,48 +765,57 @@ const s03: Scenario = {
     const { session } = context;
     const paused = await ensurePaused(context);
     const sh4 = requireTarget(context, "sh4");
-    // Two watches for the time the target runs: watches are evaluated in every tick, whatever
+    // Three watches for the time the target runs: watches are evaluated in every tick, whatever
     // paths it carries. The invariants compare every watch of every tick with its register;
-    // one of these is on the scheduler time, which moves, and one on the SH4, whose context
-    // some backends do not have while running (the watch then reads "n/a").
+    // one of these is on the scheduler time, which moves; one on the SH4, whose context some
+    // backends do not have while running (the watch then reads "n/a"); and one on a register
+    // of a path that a running tick does not carry, which goes on reading its value.
     const keepWatch = async (expression: string): Promise<{ id: number; added: boolean }> => {
       const stored = (session.latestTick().tick.watches ?? []).find((watch) => watch.expression === expression);
       return stored ? { id: stored.id, added: false } : { id: (await addWatch(context, expression, expression)).id, added: true };
     };
-    const hasCycles = session.index?.registers.get("dc.timing")?.some((register) => register.name === "SH4_CYCLES") ?? false;
-    const cyclesWatch = hasCycles ? await keepWatch("dc.timing.sh4_cycles") : undefined;
+    check(
+      session.index?.registers.get("dc.timing")?.some((register) => register.name === "SH4_CYCLES"),
+      "the device tree has dc.timing.SH4_CYCLES: the time of the SH4 is read from it (2.8)",
+    );
+    const cyclesWatch = await keepWatch("dc.timing.sh4_cycles");
     const pcWatch = await keepWatch(`${sh4.pcPath}.${sh4.pcRegister.toLowerCase()}`);
+    // (some registers read "n/a" always: the one to watch is one that has a value at this stop)
+    const outside = registerOutsideBasePaths(session, paused.tick);
+    const outsideWatch = outside ? await keepWatch(outside.expression) : undefined;
+    if (!outside) {
+      context.note("no register outside the four base paths has a value at the stop: no watch was kept on a path that running ticks do not carry");
+    }
 
     const mark = session.mark();
     await session.call("control.runUntil", {});
     const running = await session.waitForTick(isRunning, 1000, "a running tick after control.runUntil", mark);
     check(stopIdOf(running.tick) === stopIdOf(paused.tick), "a resume does not change stopId");
     const more = await session.collectTicks(1500);
-    const runningTicks = more.filter((record) => isRunning(record.tick));
-    check(runningTicks.length >= 2, `${runningTicks.length} running tick(s) in 1.5 s after the first one; the running tick is periodic`);
+    const runningTicks = [running, ...more.filter((record) => isRunning(record.tick))];
+    check(runningTicks.length >= 3, `${runningTicks.length - 1} running tick(s) in 1.5 s after the first one; the running tick is periodic`);
 
-    const kept = [cyclesWatch, pcWatch].filter((watch) => watch !== undefined);
+    const kept = [cyclesWatch, pcWatch, outsideWatch].filter((watch) => watch !== undefined);
+    const readingsOf = (id: number) => runningTicks.map((record) => (record.tick.watches ?? []).find((entry) => entry.id === id)?.value);
     for (const watch of kept) {
-      const missing = [running, ...runningTicks].find((record) => !(record.tick.watches ?? []).some((entry) => entry.id === watch.id));
+      const missing = runningTicks.find((record) => !(record.tick.watches ?? []).some((entry) => entry.id === watch.id));
       check(!missing, `watch ${watch.id} is not listed in the running tick ${missing?.tick.tickId}; watches are evaluated in every tick`);
     }
-    if (cyclesWatch) {
-      const readings = [running, ...runningTicks].map((record) => record.tick.watches!.find((entry) => entry.id === cyclesWatch.id)!.value);
+    const moving = readingsOf(cyclesWatch.id);
+    check(new Set(moving).size > 1, `the watch on dc.timing.sh4_cycles reads ${JSON.stringify(moving[0])} in every running tick; watches are evaluated in every tick`);
+    if (outside && outsideWatch) {
+      const unread = runningTicks.find((record) => (record.tick.watches ?? []).find((entry) => entry.id === outsideWatch.id)?.value === "n/a");
       check(
-        new Set(readings).size > 1,
-        `the watch on dc.timing.sh4_cycles reads ${JSON.stringify(readings[0])} in every running tick; watches are evaluated in every tick`,
+        !unread,
+        `the watch on ${outside.expression} reads "n/a" in the running tick ${unread?.tick.tickId}${unread && outside.path in unread.tick.registers ? "" : `, which does not carry ${outside.path}`}; ` +
+          `it read ${JSON.stringify(outside.value)} at the stop before the resume, and a watch is evaluated in every tick, whatever paths the tick carries`,
       );
     }
 
-    // the machine advances between them
-    const useCycles = cyclesOf(running.tick) !== undefined;
-    if (!useCycles) {
-      check(context.profile === "mock", "dc.timing.SH4_CYCLES is in every running tick");
-    }
-    const sample = (tick: DebuggerTick): string =>
-      useCycles ? String(cyclesOf(tick)) : String(tick.executionState.registersStale ? "stale" : pcOf(tick, sh4));
-    const values = [running, ...runningTicks].map((record) => sample(record.tick));
-    check(new Set(values).size > 1, `${useCycles ? "dc.timing.SH4_CYCLES" : "the SH4 PC"} is ${values[0]} in every running tick`);
+    // the machine advances between them: the time is in every running tick, and it moves
+    const cycles = runningTicks.map((record) => cyclesOf(record.tick));
+    check(!cycles.includes(undefined), "dc.timing.SH4_CYCLES is in every running tick: dc.timing is one of the four base paths");
+    check(new Set(cycles.map(String)).size > 1, `dc.timing.SH4_CYCLES is ${cycles[0]} in every running tick`);
 
     // Every fifth periodic tick is full (1 s): registers outside the base paths refresh while
     // running. The 1.5 s above hold seven periodic ticks; 0.5 s more is allowed for a late one.
@@ -825,23 +852,19 @@ const s04: Scenario = {
     /** One step from where the target is, with what holds for every step; `atVector`: it ended at an exception vector. */
     const step = async (method: "control.step" | "control.stepOver" = "control.step"): Promise<{ pc0: number; pc1: number; atVector: boolean }> => {
       const pc0 = pcOf(record.tick, sh4);
-      const cycles0 = cyclesOf(record.tick);
+      const cycles0 = cyclesOf(record.tick) ?? fail("dc.timing.SH4_CYCLES is in every paused tick (2.8)");
       record = await stepOnce(context, "sh4", method);
       const pc1 = pcOf(record.tick, sh4);
-      const cycles1 = cyclesOf(record.tick);
+      const cycles1 = cyclesOf(record.tick) ?? fail("dc.timing.SH4_CYCLES is in every paused tick (2.8)");
 
       const vbr = registerOf(record.tick, sh4.pcPath, "VBR");
       const vectorBase = vbr !== undefined && /^0x[0-9A-F]+$/.test(vbr) ? Number.parseInt(vbr, 16) : undefined;
       const vectors = vectorBase === undefined ? [] : [0x100, 0x400, 0x600].map((offset) => (vectorBase + offset) >>> 0);
       const atVector = vectors.includes(pc1) || pc1 === 0xa0000000;
 
-      if (cycles0 !== undefined && cycles1 !== undefined) {
-        check(cycles1 >= cycles0, `dc.timing.SH4_CYCLES went back from ${cycles0} to ${cycles1} in a step`);
-        // a deferred interrupt can end the step before an instruction runs
-        check(cycles1 > cycles0 || atVector, "dc.timing.SH4_CYCLES did not increase in a step that did not end at an exception vector");
-      } else {
-        check(context.profile === "mock", "dc.timing.SH4_CYCLES is in every paused tick");
-      }
+      check(cycles1 >= cycles0, `dc.timing.SH4_CYCLES went back from ${cycles0} to ${cycles1} in a step`);
+      // a deferred interrupt can end the step before an instruction runs
+      check(cycles1 > cycles0 || atVector, "dc.timing.SH4_CYCLES did not increase in a step that did not end at an exception vector");
       // Mock: its program is known. A step in its loop ends at the next address of the loop (no
       // vertical blank falls into a step); in its interrupt handler the general rule is all there is.
       if (context.profile === "mock" && pc0 >= MOCK_SH4_RING.base && pc0 < MOCK_SH4_RING.base + MOCK_SH4_RING.length * MOCK_SH4_RING.instructionSize) {
