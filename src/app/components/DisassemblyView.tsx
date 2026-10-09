@@ -926,57 +926,57 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         </Stack>
         <Stack direction="row" spacing={1} useFlexGap alignItems="center" sx={{ flex: 1, flexWrap: "wrap", justifyContent: "flex-end" }}>
           <Stack direction="row" spacing={1} alignItems="center">
-          {stepping && (config.showMuteSolo ?? true) && (
-            <>
-              <Tooltip title={categoryState?.muted ? "Unmute category" : "Mute category"}>
-                <IconButton size="small" onClick={handleMuteToggle} color={categoryState?.muted ? "warning" : "default"}>
-                  {categoryState?.muted ? <VolumeOffIcon fontSize="small" /> : <VolumeUpIcon fontSize="small" />}
-                </IconButton>
-              </Tooltip>
-              <Tooltip title={categoryState?.soloed ? "Unsolo category" : "Solo category"}>
-                <IconButton size="small" onClick={handleSoloToggle} color={categoryState?.soloed ? "primary" : "default"}>
-                  {categoryState?.soloed ? <RadioButtonCheckedIcon fontSize="small" /> : <RadioButtonUncheckedIcon fontSize="small" />}
-                </IconButton>
-              </Tooltip>
-            </>
-          )}
-          <Tooltip title="Go to current PC">
-            <RunControlButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
-              <MyLocationIcon fontSize="small" />
-            </RunControlButton>
-          </Tooltip>
+            {stepping && (config.showMuteSolo ?? true) && (
+              <>
+                <Tooltip title={categoryState?.muted ? "Unmute category" : "Mute category"}>
+                  <IconButton size="small" onClick={handleMuteToggle} color={categoryState?.muted ? "warning" : "default"}>
+                    {categoryState?.muted ? <VolumeOffIcon fontSize="small" /> : <VolumeUpIcon fontSize="small" />}
+                  </IconButton>
+                </Tooltip>
+                <Tooltip title={categoryState?.soloed ? "Unsolo category" : "Solo category"}>
+                  <IconButton size="small" onClick={handleSoloToggle} color={categoryState?.soloed ? "primary" : "default"}>
+                    {categoryState?.soloed ? <RadioButtonCheckedIcon fontSize="small" /> : <RadioButtonUncheckedIcon fontSize="small" />}
+                  </IconButton>
+                </Tooltip>
+              </>
+            )}
+            <Tooltip title="Go to current PC">
+              <RunControlButton size="small" onClick={handleGotoPC} disabled={currentPc === undefined}>
+                <MyLocationIcon fontSize="small" />
+              </RunControlButton>
+            </Tooltip>
           </Stack>
           <Stack direction="row" spacing={1} alignItems="center">
-          <TextField
-            size="small"
-            value={unplaced ? "" : addressInput}
-            disabled={unplaced}
-            onChange={(event) => setAddressInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                handleAddressSubmit();
-              }
-            }}
-            // wide enough for an address of eight digits next to its button
-            sx={{ width: 180 }}
-            slotProps={{
-              input: {
-                endAdornment: (
-                  <InputAdornment position="end">
-                    <Button size="small" onClick={handleAddressSubmit} disabled={unplaced} sx={{ minWidth: "auto", px: 1 }}>
-                      Go
-                    </Button>
-                  </InputAdornment>
-                ),
-              },
-            }}
-          />
-          <Tooltip title="Refresh">
-            <RunControlButton size="small" onClick={handleRefresh} disabled={loading || unplaced}>
-              <RefreshIcon fontSize="small" />
-            </RunControlButton>
-          </Tooltip>
+            <TextField
+              size="small"
+              value={unplaced ? "" : addressInput}
+              disabled={unplaced}
+              onChange={(event) => setAddressInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  handleAddressSubmit();
+                }
+              }}
+              // wide enough for an address of eight digits next to its button
+              sx={{ width: 180 }}
+              slotProps={{
+                input: {
+                  endAdornment: (
+                    <InputAdornment position="end">
+                      <Button size="small" onClick={handleAddressSubmit} disabled={unplaced} sx={{ minWidth: "auto", px: 1 }}>
+                        Go
+                      </Button>
+                    </InputAdornment>
+                  ),
+                },
+              }}
+            />
+            <Tooltip title="Refresh">
+              <RunControlButton size="small" onClick={handleRefresh} disabled={loading || unplaced}>
+                <RefreshIcon fontSize="small" />
+              </RunControlButton>
+            </Tooltip>
           </Stack>
         </Stack>
       </Box>
