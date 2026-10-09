@@ -35,6 +35,19 @@ test("before the first recording the SGC panel asks for one", async ({ page, rpc
   expect(rpc.binaryFrames).toEqual([]);
 });
 
+test("without a connection the SGC panel keeps its bar, and says \"Not connected\" where a capture would be", async ({ page }) => {
+  const view = panel(page, "sgc");
+  await expect(view.getByText("Record some data to display here")).toBeVisible();
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await expect(view.getByText("Not connected")).toBeVisible();
+  await expect(view.getByText("Record some data to display here")).toHaveCount(0);
+  await expect(tooltipButton(view, RECORD)).toBeVisible();
+  await expect(view.getByRole("button", { name: "All (64)" })).toBeVisible();
+  // and asks for a recording again when a server is there
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await expect(view.getByText("Record some data to display here")).toBeVisible();
+});
+
 test("Record captures 1024 frames while the target keeps running and draws a waveform for every active channel", async ({
   page,
   rpc,
