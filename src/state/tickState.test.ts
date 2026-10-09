@@ -193,6 +193,44 @@ describe("stops of a v3 server (stopId)", () => {
   });
 });
 
+describe("a game that is started where there was none (the ticks of the emulator, design 2.3.1)", () => {
+  const cpu = (pc: string) => ({ "dc.sh4.cpu": [reg("PC", pc)] });
+
+  it("a machine that comes up parked: host-stopped, the running tick of its thread, then the start stop", () => {
+    const { state, outcomes } = run([
+      tick({ state: "running", stopId: 0 }, { registers: cpu("0x8C0000A0") }),
+      // the game is closed: no machine, and its ticks carry no registers
+      tick({ state: "paused", stopId: 1, reason: "no-game" }),
+      tick({ state: "paused", stopId: 1, reason: "no-game" }),
+      // a game is started: the machine exists, its thread starts, and it parks at its start
+      tick({ state: "paused", stopId: 2, reason: "host-stopped" }, { registers: cpu("n/a") }),
+      tick({ state: "running", stopId: 2 }),
+      tick({ state: "paused", stopId: 3, reason: "start" }, { registers: cpu("0x8C010000") }),
+    ]);
+    // nothing has a value while there is no game, however long that lasts
+    expect(outcomes[1].state.registersByPath).toEqual({});
+    expect(outcomes[2].state.registersByPath).toEqual({});
+    expect(outcomes[2].state.refresh).toBe(outcomes[1].state.refresh);
+    // The reason leaves no-game with the host-stopped tick: the views read again there (once: it
+    // is a stop as well), and again for the start stop. The running tick between them is no moment.
+    expect(outcomes.map((outcome) => outcome.state.refresh)).toEqual([0, 1, 1, 2, 2, 3]);
+    expect(outcomes.map((outcome) => outcome.newStop)).toEqual([false, true, false, true, false, true]);
+    expect(state.registersByPath).toEqual(cpu("0x8C010000"));
+    expect(state.stop).toMatchObject({ stopId: 3, reason: "start" });
+  });
+
+  it("a machine that comes up running: the views read again although no stop follows", () => {
+    const { outcomes } = run([
+      tick({ state: "paused", stopId: 1, reason: "no-game" }),
+      tick({ state: "paused", stopId: 2, reason: "host-stopped" }, { registers: cpu("n/a") }),
+      tick({ state: "running", stopId: 2 }, { registers: cpu("0x8C010000") }),
+      tick({ state: "running", stopId: 2 }, { registers: cpu("0x8C010002") }),
+    ]);
+    expect(outcomes.map((outcome) => outcome.state.refresh)).toEqual([1, 2, 2, 2]);
+    expect(outcomes[3].state.registersByPath).toEqual(cpu("0x8C010002"));
+  });
+});
+
 describe("stops of a v2 server (no stopId)", () => {
   it("a stop is the change from running to paused, and the first paused tick", () => {
     const { outcomes, state } = run([

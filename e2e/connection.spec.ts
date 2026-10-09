@@ -13,7 +13,7 @@ import {
   treeItem,
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
-import { startMockServer } from "./support/mockServer";
+import { findFreePort, startMockServer } from "./support/mockServer";
 import { defaultAnswer, serveScriptedDebugger } from "./support/scriptedDebugger";
 
 const connectButton = (page: Page) => page.getByRole("button", { name: "Connect", exact: true });
@@ -655,6 +655,43 @@ test("?ws= in front of the # selects the endpoint, and survives what the panels 
   } finally {
     await other.stop();
   }
+});
+
+test("an endpoint named by ?ws= that does not answer is tried again, and the page's own is not taken in its place", async ({
+  page,
+  mock,
+  rpc,
+  diagnostics,
+}) => {
+  // The endpoints of a page are a priority, not a chain to fall down. The server that served
+  // this page has a debugger at /ws and would answer; the page was told to use another.
+  diagnostics.allow(/^console\.error: WebSocket connection to/, "nothing listens at the endpoint the page was given");
+  const named = `ws://127.0.0.1:${await findFreePort()}/ws`;
+  await page.goto(`/?ws=${encodeURIComponent(named)}#/workspace/sh4-debugger`);
+  await expect(statusBar(page)).toContainText("Connection: reconnecting");
+  await expect(statusBar(page)).toContainText(`Endpoint: ${named}`);
+  const notice = page.getByRole("alert").filter({ hasText: "Reconnecting to" });
+  await expect(notice).toContainText(`Reconnecting to ${named}`);
+  await expect(panel(page, "device-tree")).toContainText("Not connected");
+
+  // the first attempt and the two after 1 and 2 seconds have failed: the next is for the same endpoint
+  await expect(notice).toContainText(`Reconnecting to ${named} in 5 s (attempt 3)`);
+  expect(rpc.sockets).toEqual([named, named, named]);
+  // and so is the one of Retry now
+  await notice.getByRole("button", { name: "Retry now" }).click();
+  await expect.poll(() => rpc.sockets.length).toBe(4);
+  expect(rpc.sockets).not.toContain(mock.wsURL);
+  expect(new Set(rpc.sockets)).toEqual(new Set([named]));
+  await expect(statusBar(page)).toContainText(`Endpoint: ${named}`);
+
+  // the page's own endpoint is there to be picked, by the user
+  await statusBar(page).getByText(/^Endpoint:/).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("radio", { name: /From the address bar \(\?ws=\)/ })).toBeChecked();
+  await dialog.getByRole("radio", { name: new RegExp(`nullDC @ 127\\.0\\.0\\.1:${mock.port}`) }).check();
+  await dialog.getByRole("button", { name: "Connect", exact: true }).click();
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await expect(statusBar(page)).toContainText(`Endpoint: ${mock.wsURL}`);
 });
 
 test("the tool pages do not open a debugger connection", async ({ page, rpc }) => {

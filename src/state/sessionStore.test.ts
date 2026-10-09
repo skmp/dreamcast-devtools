@@ -237,6 +237,48 @@ describe("a session whose server is gone", () => {
     store.getState().disconnect();
   });
 
+  it("an explicit endpoint is the one that is tried again, every time: it is not replaced by the next in the list", async () => {
+    // The endpoints of a page are a priority, not a chain to fall down: ?ws= names a server
+    // that is not there, and the page's own /ws, which would answer, is never tried instead.
+    vi.stubGlobal("WebSocket", RefusedSocket);
+    vi.stubEnv("VITE_WS_URL", "ws://build-default:1/ws");
+    const explicit = "ws://emulator.test:55001/ws";
+    const store = await load(`?ws=${encodeURIComponent(explicit)}`);
+    void store.getState().connect();
+    await vi.advanceTimersByTimeAsync(0);
+    // 1, 2, 5 and then every 10 seconds, each counted from the failure before it
+    const delays = [1000, 2000, 5000, 10_000, 10_000, 10_000];
+    for (const [index, delayMs] of delays.entries()) {
+      expect(store.getState()).toMatchObject({ connectionState: "reconnecting", endpoint: explicit, retry: { attempt: index + 1, delayMs } });
+      await vi.advanceTimersByTimeAsync(delayMs - 1);
+      expect(sockets).toHaveLength(index + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sockets).toHaveLength(index + 2);
+    }
+    expect(new Set(sockets)).toEqual(new Set([explicit]));
+
+    // "Retry now" and "Connect" try at once, and try that endpoint
+    void store.getState().connect({ force: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets).toHaveLength(delays.length + 2);
+    expect(sockets.at(-1)).toBe(explicit);
+    expect(store.getState()).toMatchObject({ connectionState: "reconnecting", endpoint: explicit, retry: { attempt: 1, delayMs: 1000 } });
+
+    // An endpoint the user picked is explicit too: the page's own, picked from the list although
+    // ?ws= is first in it, is the one "Retry now" and the clock go back to.
+    sockets.length = 0;
+    void store.getState().connect({ connectionId: PAGE_ENDPOINT, force: true });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    void store.getState().connect({ force: true });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1000 + 2000);
+    expect(sockets.length).toBeGreaterThanOrEqual(5);
+    expect(new Set(sockets)).toEqual(new Set([PAGE_ENDPOINT]));
+    expect(store.getState().endpoint).toBe(PAGE_ENDPOINT);
+    store.getState().disconnect();
+  });
+
   it("in a wasm build waits until an emulator has announced itself after the loss, and goes to that one", async () => {
     vi.stubEnv("VITE_TRANSPORT_MODE", "wasm");
     vi.stubGlobal("BroadcastChannel", PageChannel);
