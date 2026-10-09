@@ -119,6 +119,13 @@ export const ANCHOR_REGISTERS: ReadonlyArray<{ path: string; name: string }> = [
   { path: "dc.aica.dsp", name: "STEP" },
 ];
 
+/**
+ * The fourth anchor register, of a server that lists the target `arm7`: whether the ARM7 is
+ * clocked (1) or held in reset (0). It is in every tick of a machine (`dc.aica.arm7` is one of
+ * the base paths), and tells which callstack the ARM7 has in a paused tick (2.10).
+ */
+export const ARM7_ENABLED_REGISTER = { path: "dc.aica.arm7", name: "ENABLED", width: 1 } as const;
+
 const numbered = (prefix: string, count: number, suffix = ""): string[] => Array.from({ length: count }, (_, index) => `${prefix}${index}${suffix}`);
 
 /** The register list of `dc.sh4.cpu` (2.8): these names, in this order, all of width 32. */

@@ -5,6 +5,7 @@ import { CAPABILITIES, PROTOCOL_BOUNDS, PanelIdSchema, TABLE_IDS } from "../../s
 import type {
   BreakpointCategoryState,
   BreakpointDescriptor,
+  CallstackFrame,
   DebuggerRpcSchema,
   DebuggerShape,
   DebuggerTarget,
@@ -16,6 +17,7 @@ import type {
 import { MOCK_SH4_RING, mockNextAddress } from "../../server/mockDebugger";
 import {
   ANCHOR_REGISTERS,
+  ARM7_ENABLED_REGISTER,
   BASE_PATHS,
   M1_DEVICE_TREE,
   MILESTONES,
@@ -135,6 +137,23 @@ const pcOf = (tick: DebuggerTick, target: DebuggerTarget): number => numberOf(ti
 const cyclesOf = (tick: DebuggerTick): bigint | undefined => {
   const value = registerOf(tick, "dc.timing", "SH4_CYCLES");
   return value !== undefined && /^0x[0-9A-F]+$/.test(value) ? BigInt(value) : undefined;
+};
+
+/**
+ * Whether the ARM7 is clocked (true) or held in reset (false), as the register ENABLED of
+ * dc.aica.arm7 says in a tick: the observable of the reset (design 2.10).
+ */
+const arm7Clocked = (tick: DebuggerTick): boolean => {
+  const { path, name } = ARM7_ENABLED_REGISTER;
+  const value = registerOf(tick, path, name);
+  const read = value !== undefined && /^0x[0-9A-F]+$/.test(value) ? Number.parseInt(value, 16) : undefined;
+  if (read !== 0 && read !== 1) {
+    return fail(
+      `${path}.${name} ${value === undefined ? "is not in the paused tick" : `reads ${JSON.stringify(value)} in the paused tick`}; ` +
+        "it reads 1 while the ARM7 is clocked and 0 while it is held in reset, and the ARM7 callstack of the tick follows it (2.10)",
+    );
+  }
+  return read === 1;
 };
 
 const isPaused = (tick: DebuggerTick) => tick.executionState.state === "paused";
@@ -695,6 +714,14 @@ const s01: Scenario = {
         nodes.get(anchor.path)?.registers?.some((register) => register.name === anchor.name),
         `${anchor.path} has no register ${anchor.name}, one of the three anchor registers of 2.8`,
       );
+    }
+    // ... and a fourth one of a server that lists the ARM7: the bit that says whether the ARM7
+    // is clocked or held in reset, which S11 reads the ARM7 callstack against ...
+    if (ids.includes("arm7")) {
+      const { path, name, width } = ARM7_ENABLED_REGISTER;
+      const enabled = nodes.get(path)?.registers?.find((register) => register.name === name);
+      expectThat(enabled, `${path} has no register ${name}, the anchor register of 2.8 that says whether the ARM7 is clocked; a server that lists the target arm7 has it`);
+      expectThat(!enabled || enabled.width === width, `${path}.${name} has width ${enabled?.width}, 2.8 says ${width}`);
     }
     // ... the register list of dc.sh4.cpu: the names of 2.8 in their order, all of width 32 ...
     const cpu = nodes.get("dc.sh4.cpu")?.registers;
@@ -1518,46 +1545,48 @@ const s11: Scenario = {
       `state.getCallstack without maxFrames returned ${byDefault.frames.length} frames, with maxFrames 32 ${named.frames.length}; maxFrames defaults to 32`,
     );
 
-    // The ARM7, if the server lists it. While it runs: at least two frames, frame 0 its PC and
-    // frame 1 its link register R14, and what the stack scan finds behind them. While it is
-    // held in reset: no frames, in the tick and from state.getCallstack.
+    // The ARM7, if the server lists it. Whether it is clocked or held in reset is told by the
+    // register ENABLED of dc.aica.arm7 in the same paused tick, and its callstack follows that
+    // register in both directions (2.10). Clocked: at least two frames, frame 0 its PC and
+    // frame 1 its link register R14, and what the stack scan finds behind them. Held in reset:
+    // no frames. state.getCallstack {arm7}, asked at that stop, agrees with the register in
+    // the same way.
     const arm7 = targetOf(session.shape, "arm7");
     if (arm7) {
-      const arm7Frames = paused.tick.callstacks?.arm7 ?? [];
-      check(
-        arm7Frames.length === 0 || arm7Frames.length >= 2,
-        `the ARM7 callstack of a paused tick is [] (the ARM7 is held in reset) or has at least two frames (frame 0 the PC, frame 1 the link register); this one has ${arm7Frames.length} frame`,
-      );
-      if (arm7Frames.length > 0) {
-        check(arm7Frames[0].pc === pcOf(paused.tick, arm7), `arm7: frame 0 is at ${hex(arm7Frames[0].pc)}, the PC is ${hex(pcOf(paused.tick, arm7))}`);
-        check(arm7Frames[0].location === undefined, `arm7: frame 0 is the PC and has no location, this one has "${arm7Frames[0].location}"`);
-        check(
-          arm7Frames[1].pc === numberOf(paused.tick, arm7.pcPath, "R14"),
-          `arm7: frame 1 is at ${hex(arm7Frames[1].pc)}, R14 is ${registerOf(paused.tick, arm7.pcPath, "R14")}`,
-        );
-        check(arm7Frames[1].location === "lr", `arm7: frame 1 has location "${arm7Frames[1].location}", expected "lr"`);
-        arm7Frames.forEach((frame, position) => check(frame.index === position, `arm7: frame ${position} of the tick has index ${frame.index}`));
-        for (const frame of arm7Frames.slice(2)) {
-          check(/^stack\+0x[0-9A-Fa-f]+$/.test(frame.location ?? ""), `arm7: frame ${frame.index} has location "${frame.location}", expected "stack+0x.."`);
+      const clocked = arm7Clocked(paused.tick);
+      const says = `${ARM7_ENABLED_REGISTER.path}.${ARM7_ENABLED_REGISTER.name} reads ${clocked ? "1 (the ARM7 is clocked)" : "0 (the ARM7 is held in reset)"}`;
+      /** `frames`, of the tick or of an answer, are what the register says the ARM7 has at this stop. */
+      const followsRegister = (frames: CallstackFrame[], where: string, label: string): void => {
+        const count = `${frames.length} frame${frames.length === 1 ? "" : "s"}`;
+        if (!clocked) {
+          check(frames.length === 0, `${says}, and ${where} has ${count}; it has none then`);
+          return;
         }
-      } else {
-        context.note("the ARM7 is held in reset: its callstack is empty");
-      }
+        check(frames.length >= 2, `${says}, and ${where} has ${count}; it has at least two then (frame 0 the PC, frame 1 the link register)`);
+        check(frames[0].pc === pcOf(paused.tick, arm7), `${label}: frame 0 is at ${hex(frames[0].pc)}, the PC is ${hex(pcOf(paused.tick, arm7))}`);
+        check(frames[0].location === undefined, `${label}: frame 0 is the PC and has no location, this one has "${frames[0].location}"`);
+        check(
+          frames[1].pc === numberOf(paused.tick, arm7.pcPath, "R14"),
+          `${label}: frame 1 is at ${hex(frames[1].pc)}, R14 is ${registerOf(paused.tick, arm7.pcPath, "R14")}`,
+        );
+        check(frames[1].location === "lr", `${label}: frame 1 has location "${frames[1].location}", expected "lr"`);
+        frames.forEach((frame, position) => check(frame.index === position, `${label}: frame ${position} has index ${frame.index}`));
+        for (const frame of frames.slice(2)) {
+          check(/^stack\+0x[0-9A-Fa-f]+$/.test(frame.location ?? ""), `${label}: frame ${frame.index} has location "${frame.location}", expected "stack+0x.."`);
+        }
+      };
+      followsRegister(paused.tick.callstacks?.arm7 ?? [], "the ARM7 callstack of the same paused tick", "arm7");
       const fromArm7 = await session.call("state.getCallstack", { target: "arm7", maxFrames: 8 });
       check(fromArm7.target === "arm7", `state.getCallstack {arm7} answers for target "${fromArm7.target}"`);
       check(fromArm7.frames.length <= 8, `state.getCallstack {arm7, maxFrames: 8} returned ${fromArm7.frames.length} frames`);
-      fromArm7.frames.forEach((frame, position) => check(frame.index === position, `arm7: frame ${position} has index ${frame.index}`));
-      if (arm7Frames.length > 0) {
-        check(fromArm7.frames[0]?.pc === arm7Frames[0].pc, "arm7: frame 0 of state.getCallstack is the PC");
-      } else {
-        check(
-          fromArm7.frames.length === 0,
-          `the paused tick carries no ARM7 frames (the ARM7 is held in reset), and state.getCallstack {arm7} returns ${fromArm7.frames.length}; it answers frames: [] then`,
-        );
-      }
+      followsRegister(fromArm7.frames, "state.getCallstack {arm7, maxFrames: 8} at that stop", "state.getCallstack {arm7, maxFrames: 8}");
       // without maxFrames it works
       const whole = await session.call("state.getCallstack", { target: "arm7" });
       check(whole.frames.length <= PROTOCOL_BOUNDS.callstackMaxFrames.default, `state.getCallstack {arm7} without maxFrames returned ${whole.frames.length} frames; maxFrames defaults to 32`);
+      followsRegister(whole.frames, "state.getCallstack {arm7} at that stop", "state.getCallstack {arm7}");
+      if (!clocked) {
+        context.note("the ARM7 is held in reset: its callstack is empty");
+      }
     }
 
     // running ticks carry both arrays, empty

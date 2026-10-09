@@ -1030,7 +1030,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(noVblank.scenarios[0].details).toEqual(["no node of the device tree lists the event dc.holly.core.vblank, which every server lists (2.6)"]);
   }, 30_000);
 
-  it("S01: the register list of dc.sh4.cpu is that of 2.8, and the three anchor registers are there", async () => {
+  it("S01: the register list of dc.sh4.cpu is that of 2.8, and the anchor registers are there: the three of the targets, and ENABLED of a listed ARM7", async () => {
     /** The SH4's register list rewritten in the tree and in every tick, so that the ticks agree with the tree. */
     const cpu = (rewrite: (registers: Json[]) => Json[]): Faults =>
       describing(
@@ -1084,6 +1084,34 @@ describe("the contract runner against a server that breaks the protocol", () => 
       "dc.aica.dsp has no register STEP, one of the three anchor registers of 2.8",
     ]);
     expect(anchor.invariantViolations).toEqual([]);
+
+    // The fourth anchor, of a server that lists the ARM7: the register ENABLED of dc.aica.arm7,
+    // one bit wide. Without it, or with it as a register of 32 bits, S01 fails.
+    const arm7 = (rewrite: (registers: Json[]) => Json[]): Faults =>
+      describing(
+        (result) => ({ ...result, deviceTree: mapNodes(result.deviceTree, (node) => (node.path === "dc.aica.arm7" ? { ...node, registers: rewrite(node.registers as Json[]) } : node)) }),
+        (registers) => (registers["dc.aica.arm7"] ? { ...registers, "dc.aica.arm7": rewrite(registers["dc.aica.arm7"]) } : registers),
+      );
+    const noEnabled = await run(
+      arm7((registers) => registers.filter((register) => register.name !== "ENABLED")),
+      ["S01"],
+    );
+    expect(noEnabled.scenarios[0].details).toEqual([
+      "dc.aica.arm7 has no register ENABLED, the anchor register of 2.8 that says whether the ARM7 is clocked; a server that lists the target arm7 has it",
+    ]);
+    expect(noEnabled.invariantViolations).toEqual([]);
+    const wide = await run(
+      arm7((registers) => registers.map((register) => (register.name === "ENABLED" ? { ...register, width: 32, value: "0x00000001" } : register))),
+      ["S01"],
+    );
+    expect(wide.scenarios[0].details).toEqual(["dc.aica.arm7.ENABLED has width 32, 2.8 says 1"]);
+    expect(wide.invariantViolations).toEqual([]);
+    // where it stands in the list is the server's: only PC, the target's register, is looked up by the target table
+    const last = await run(
+      arm7((registers) => [...registers.filter((register) => register.name !== "ENABLED"), ...registers.filter((register) => register.name === "ENABLED")]),
+      ["S01", "S11"],
+    );
+    expect(reportOf(last)).toEqual(["S01 passed ", "S11 passed "]);
   }, 30_000);
 
   it("S01: a server that answers debugger.describe with nothing the client can read, or sends no tick after it, fails S01; nothing else is run", async () => {
@@ -1449,25 +1477,40 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
   }, 90_000);
 
-  it("S11: the ARM7 callstack is [] while the ARM7 is held in reset, or at least the PC and R14 with location lr", async () => {
-    /** The mock with an ARM7 callstack of its own making, in the ticks and from state.getCallstack alike. */
-    const withArm7Stack = (rewrite: (frames: Json[]) => Json[]): MockDebugger => {
+  it("S11: the ARM7 callstack follows the register ENABLED of dc.aica.arm7: [] while it reads 0, the PC and R14 with location lr and more while it reads 1", async () => {
+    /**
+     * The mock with an ARM7 callstack of its own making, in the ticks and from state.getCallstack
+     * alike, and with what its register ENABLED reads: 1, the ARM7 is clocked, unless told otherwise.
+     */
+    const withArm7Stack = (rewrite: (frames: Json[]) => Json[], enabled: 0 | 1 = 1): MockDebugger => {
       const mock = new MockDebugger();
-      const machine = mock as unknown as { callstack(target: string, maxFrames: number): Json[] };
+      const machine = mock as unknown as { callstack(target: string, maxFrames: number): Json[]; values: Map<string, Map<string, unknown>> };
+      machine.values.get("dc.aica.arm7")!.set("ENABLED", enabled);
       const callstack = machine.callstack.bind(mock);
       machine.callstack = (target, maxFrames) => (target === "arm7" ? rewrite(callstack(target, 64)).slice(0, maxFrames) : callstack(target, maxFrames));
       return mock;
     };
-    const s11 = async (mock: MockDebugger) => reportOf(await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S11"]) }));
+    const s11 = async (mock: MockDebugger, faults?: Faults) =>
+      reportOf(await runContract({ url: (await startServer(faults, mock)).url, profile: "mock", only: new Set(["S11"]) }));
+    const clocked = "dc.aica.arm7.ENABLED reads 1 (the ARM7 is clocked)";
+    const inReset = "dc.aica.arm7.ENABLED reads 0 (the ARM7 is held in reset)";
 
-    // held in reset: no frames anywhere. That is a server the design allows.
-    expect(await s11(withArm7Stack(() => []))).toEqual(["S11 passed the ARM7 is held in reset: its callstack is empty"]);
-    // running, and the unwinder finds nothing on the stack: the PC and the link register
+    // held in reset: the register reads 0, and there are no frames anywhere. That is a server the design allows.
+    expect(await s11(withArm7Stack(() => [], 0))).toEqual(["S11 passed the ARM7 is held in reset: its callstack is empty"]);
+    // clocked, and the unwinder finds nothing on the stack: the PC and the link register
     expect(await s11(withArm7Stack((frames) => frames.slice(0, 2)))).toEqual(["S11 passed "]);
+
+    // The pairing holds in both directions, inside one paused tick. A server that never unwinds
+    // its ARM7: clocked, and no frames, in the ticks and from state.getCallstack alike ...
+    expect(await s11(withArm7Stack(() => []))).toEqual([
+      `S11 failed ${clocked}, and the ARM7 callstack of the same paused tick has 0 frames; it has at least two then (frame 0 the PC, frame 1 the link register)`,
+    ]);
+    // ... and one that unwinds an ARM7 that is held in reset
+    expect(await s11(withArm7Stack((frames) => frames, 0))).toEqual([`S11 failed ${inReset}, and the ARM7 callstack of the same paused tick has 16 frames; it has none then`]);
 
     // one frame is neither
     expect(await s11(withArm7Stack((frames) => frames.slice(0, 1)))).toEqual([
-      "S11 failed the ARM7 callstack of a paused tick is [] (the ARM7 is held in reset) or has at least two frames (frame 0 the PC, frame 1 the link register); this one has 1 frame",
+      `S11 failed ${clocked}, and the ARM7 callstack of the same paused tick has 1 frame; it has at least two then (frame 0 the PC, frame 1 the link register)`,
     ]);
     // the link register is R14, and the frame says where it came from
     expect(await s11(withArm7Stack((frames) => frames.map((frame) => (frame.index === 1 ? { ...frame, location: "pr" } : frame))))).toEqual([
@@ -1480,14 +1523,50 @@ describe("the contract runner against a server that breaks the protocol", () => 
       'S11 failed arm7: frame 0 is the PC and has no location, this one has "pc"',
     ]);
 
-    // no frames in the ticks, and frames on request: the two do not say the same of a paused target
-    const ticksOnly = await run(
-      { toClient: (frame) => (isTick(frame) ? { ...frame, params: { ...frame.params, callstacks: { ...(frame.params.callstacks as Json), arm7: [] } } } : frame) },
-      ["S11"],
-    );
-    expect(detailsOf(ticksOnly, "S11").split("\n")[0]).toBe(
-      "the paused tick carries no ARM7 frames (the ARM7 is held in reset), and state.getCallstack {arm7} returns 8; it answers frames: [] then",
-    );
+    // state.getCallstack {arm7} agrees with the register in the same way as the tick does. What
+    // the tick carries is right here, and the answer is not: no frames of a clocked ARM7, ...
+    const arm7Answer = (rewrite: (frames: Json[]) => Json[]): Faults => ({
+      toClient: (frame) => {
+        const result = frame.result as { target?: string; frames?: Json[] } | undefined;
+        return result?.target === "arm7" && result.frames ? { ...frame, result: { ...result, frames: rewrite(result.frames) } } : frame;
+      },
+    });
+    expect(await s11(new MockDebugger(), arm7Answer(() => []))).toEqual([
+      `S11 failed ${clocked}, and state.getCallstack {arm7, maxFrames: 8} at that stop has 0 frames; it has at least two then (frame 0 the PC, frame 1 the link register)`,
+    ]);
+    // ... a frame 1 that is not the link register, ...
+    expect(await s11(new MockDebugger(), arm7Answer((frames) => frames.map((frame) => (frame.index === 1 ? { ...frame, location: "stack+0x0" } : frame))))).toEqual([
+      'S11 failed state.getCallstack {arm7, maxFrames: 8}: frame 1 has location "stack+0x0", expected "lr"',
+    ]);
+    // ... the frames of an ARM7 that is held in reset (the ticks have none), ...
+    const framesOnRequest = withArm7Stack((frames) => frames, 0);
+    const noFramesInTicks: Faults = {
+      toClient: (frame) => (isTick(frame) ? { ...frame, params: { ...frame.params, callstacks: { ...(frame.params.callstacks as Json), arm7: [] } } } : frame),
+    };
+    expect(await s11(framesOnRequest, noFramesInTicks)).toEqual([`S11 failed ${inReset}, and state.getCallstack {arm7, maxFrames: 8} at that stop has 8 frames; it has none then`]);
+    // ... and no frames in the ticks of a clocked ARM7, whatever the request answers
+    expect(await s11(new MockDebugger(), noFramesInTicks)).toEqual([
+      `S11 failed ${clocked}, and the ARM7 callstack of the same paused tick has 0 frames; it has at least two then (frame 0 the PC, frame 1 the link register)`,
+    ]);
+
+    // A server that lists the ARM7 and has no such register, or one that reads neither 0 nor 1:
+    // nothing tells which callstack its ARM7 has.
+    const withEnabled = (rewrite: (register: Json) => Json | undefined): Faults => {
+      const registers = (list: Json[]): Json[] =>
+        list.flatMap((register): Json[] => {
+          const rewritten = register.name === "ENABLED" ? rewrite(register) : register;
+          return rewritten ? [rewritten] : [];
+        });
+      return describing(
+        (result) => ({ ...result, deviceTree: mapNodes(result.deviceTree, (node) => (node.path === "dc.aica.arm7" ? { ...node, registers: registers(node.registers as Json[]) } : node)) }),
+        (all) => (all["dc.aica.arm7"] ? { ...all, "dc.aica.arm7": registers(all["dc.aica.arm7"]) } : all),
+      );
+    };
+    const follows = "it reads 1 while the ARM7 is clocked and 0 while it is held in reset, and the ARM7 callstack of the tick follows it (2.10)";
+    expect(await s11(new MockDebugger(), withEnabled(() => undefined))).toEqual([`S11 failed dc.aica.arm7.ENABLED is not in the paused tick; ${follows}`]);
+    expect(await s11(new MockDebugger(), withEnabled((register) => ({ ...register, value: "n/a" })))).toEqual([
+      `S11 failed dc.aica.arm7.ENABLED reads "n/a" in the paused tick; ${follows}`,
+    ]);
 
     const refused = await run(
       {
@@ -1499,10 +1578,14 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(refused, "S11")).toBe("failed");
     expect(detailsOf(refused, "S11")).toBe('state.getCallstack {"target":"arm7","maxFrames":8}: JSON-RPC error -32004 "not supported: arm7 callstack"');
 
-    // a server that does not list the ARM7 is not asked for its callstack
-    const withoutArm7 = await run(undefined, ["S11"], { supports: { targets: ["sh4", "dsp"] } });
-    expect(reportOf(withoutArm7)).toEqual(["S11 passed "]);
-  }, 60_000);
+    // a server that does not list the ARM7 is not asked for its callstack, nor for the register
+    const withoutArm7 = await run(
+      withEnabled(() => undefined),
+      ["S01", "S11"],
+      { supports: { targets: ["sh4", "dsp"] } },
+    );
+    expect(reportOf(withoutArm7)).toEqual(["S01 passed ", "S11 passed "]);
+  }, 90_000);
 
   it("S11: the SH4 callstack has the PC and PR on either server", async () => {
     const mock = new MockDebugger();
