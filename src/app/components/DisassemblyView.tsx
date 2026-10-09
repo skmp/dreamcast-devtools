@@ -484,6 +484,11 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
 
   const handleWheel = useCallback(
     (event: WheelEvent) => {
+      // A turn to the side is not a move through the addresses: it is left to the box around
+      // the listing, which scrolls to the rest of the lines in a panel narrower than they are.
+      if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+        return;
+      }
       event.preventDefault();
       wheelRemainder.current += event.deltaY;
 
@@ -814,6 +819,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     }
   }, [callbacks]);
 
+  // the view shows lines (or that the server returned none), not something in place of them
+  const listed = initialized && !error && !(lines.length === 0 && loading);
   const stepDisabled = executionState !== "paused" || !canStep;
   const stepping = config.steppingNotice === undefined;
   const StepIcon = config.stepIcon;
@@ -833,21 +840,25 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
         height: "100%",
       }}
     >
-      {/* In a panel too narrow for it in one line the toolbar takes a second one, for the
-          address box and Refresh: nothing of it is cut off. */}
+      {/* Three groups: what runs and steps the target, what the view is told about it, and
+          where the view is. In a panel too narrow for them in one line the toolbar takes a
+          second and a third: a group that does not fit beside the one before it goes below
+          it, to the right, and nothing of the toolbar is cut off. */}
       <Box
         sx={{
           px: 2,
           py: 1,
           display: "flex",
-          // the step buttons stay on the first line when the other half takes two
-          alignItems: "flex-start",
+          flexWrap: "wrap",
+          alignItems: "center",
+          justifyContent: "flex-end",
           gap: 1,
           borderBottom: "1px solid",
           borderColor: "divider",
         }}
       >
-        <Stack direction="row" spacing={0.5} alignItems="center">
+        {/* on the left of its line, whatever else is on it */}
+        <Stack direction="row" spacing={0.5} alignItems="center" sx={{ mr: "auto" }}>
           {callbacks.onRunPauseToggle && (
             <Tooltip title={executionState === "paused" ? runPausedLabel : runRunningLabel}>
               <span>
@@ -924,7 +935,6 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             );
           })}
         </Stack>
-        <Stack direction="row" spacing={1} useFlexGap alignItems="center" sx={{ flex: 1, flexWrap: "wrap", justifyContent: "flex-end" }}>
           <Stack direction="row" spacing={1} alignItems="center">
             {stepping && (config.showMuteSolo ?? true) && (
               <>
@@ -978,8 +988,20 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
               </RunControlButton>
             </Tooltip>
           </Stack>
-        </Stack>
       </Box>
+      {/* The frame of the listing. What is said about the lines (that they are being read
+          again, that the server repeated some) is said here, and stays where it is when the
+          lines are scrolled to the side. */}
+      <Box sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}>
+        {listed && repeated > 0 && (
+          <Typography variant="caption" color="warning.main" role="note" sx={{ display: "block", px: 1.5, pt: 1.5 }}>
+            {repeated === 1
+              ? "The server listed an address twice; it is shown once."
+              : `The server listed ${repeated} lines for addresses it had already listed; each address is shown once.`}
+          </Typography>
+        )}
+        {/* This box scrolls to the side when the panel is narrower than a line of the listing.
+            Its scroll bar is below the listing, not over the last of its lines. */}
       <Box sx={{ flex: 1, overflow: "auto" }}>
         {!initialized ? (
           <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
@@ -1004,6 +1026,10 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             sx={{
               flex: 1,
               height: "100%",
+                // Never narrower than its lines are at their narrowest (`gridColumns`, with the
+                // minimum of the instruction column): what the panel has no room for is scrolled
+                // to, and no column is squeezed or cut off for it.
+                minWidth: "min-content",
               overflow: "hidden",
               fontFamily: "monospace",
               fontSize: "13px",
@@ -1012,21 +1038,6 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
               cursor: "default",
             }}
           >
-            {loading && (
-              <Stack direction="row" spacing={1} alignItems="center" sx={{ position: "absolute", top: 8, right: 16 }}>
-                <CircularProgress size={12} thickness={5} />
-                <Typography variant="caption" color="text.secondary">
-                  Updating
-                </Typography>
-              </Stack>
-            )}
-            {repeated > 0 && (
-              <Typography variant="caption" color="warning.main" role="note" sx={{ display: "block", mb: 0.5 }}>
-                {repeated === 1
-                  ? "The server listed an address twice; it is shown once."
-                  : `The server listed ${repeated} lines for addresses it had already listed; each address is shown once.`}
-              </Typography>
-            )}
             {lines.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
                 No disassembly returned.
@@ -1076,6 +1087,15 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
               </Stack>
             )}
           </Box>
+        )}
+      </Box>
+        {listed && loading && (
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ position: "absolute", top: 8, right: 16 }}>
+            <CircularProgress size={12} thickness={5} />
+            <Typography variant="caption" color="text.secondary">
+              Updating
+            </Typography>
+          </Stack>
         )}
       </Box>
     </Paper>

@@ -1,5 +1,18 @@
-import { test, expect, dockTab, openWorkspace, panel, saveScreenshot, KNOWN, WORKSPACES, type WorkspaceId } from "./support/fixtures";
+import {
+  test,
+  expect,
+  disassemblyRows,
+  dockTab,
+  gotoRoute,
+  openWorkspace,
+  panel,
+  saveScreenshot,
+  KNOWN,
+  WORKSPACES,
+  type WorkspaceId,
+} from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
+import { defaultAnswer, serveScriptedDebugger } from "./support/scriptedDebugger";
 
 // The default layouts in the window of a laptop. With both side docks open such a window
 // leaves the centre dock 540 to 700 px, and the default layouts put two views side by side in
@@ -68,6 +81,22 @@ const expectViewReadable = async (page: Page, id: string, steps: string[]) => {
     await expectUsable(view.getByRole("button", { name, exact: true }), `${id}: ${name}`);
   }
   await expectUsable(view.getByRole("textbox"), `${id}: address box`);
+  // what is beside the step buttons is on their line: centred on them, whatever its height
+  const centre = async (control: Locator) => {
+    const box = (await control.boundingBox())!;
+    return box.y + box.height / 2;
+  };
+  const stepLine = await centre(view.getByRole("button", { name: steps[0], exact: true }));
+  for (const [name, control] of [
+    ["Go to current PC", view.getByRole("button", { name: "Go to current PC", exact: true })],
+    ["address box", view.getByRole("textbox")],
+  ] as const) {
+    const offset = Math.abs((await centre(control)) - stepLine);
+    // (a control a line further down is 38 px or more below)
+    if (offset < 20) {
+      expect(offset, `${id}: ${name} beside ${steps[0]}`).toBeLessThanOrEqual(1);
+    }
+  }
   // the address in the box is not cut off by the box
   const box = await view.getByRole("textbox").evaluate((element) => ({ scrollWidth: element.scrollWidth, clientWidth: element.clientWidth }));
   expect(box.scrollWidth, `${id}: the address fits its box`).toBeLessThanOrEqual(box.clientWidth + 1);
@@ -173,4 +202,170 @@ test.describe("in a window of 1600x1000, where the views are side by side", () =
       }
     });
   }
+});
+
+test.describe("in a window that got narrower under views that are side by side", () => {
+  // A layout is made for the window the page opens in, and is kept after that. A window of
+  // 1600 px that goes to the screen of a laptop (or a layout that was arranged or saved that
+  // way) has its two views side by side in a centre dock of 630 px or less, and a listing in
+  // half of that has less room than its columns need at their narrowest: the twelve characters
+  // of the instruction column are kept, and are scrolled to instead of being cut off.
+
+  /** Whether all of an element is inside the panel, and none of it clipped away by anything in the panel. */
+  const whole = async (view: Locator, element: Locator): Promise<boolean> => {
+    const [outer, inner] = [await view.boundingBox(), await element.boundingBox()];
+    const inside =
+      outer !== null &&
+      inner !== null &&
+      inner.x >= outer.x - 0.5 &&
+      inner.x + inner.width <= outer.x + outer.width + 0.5 &&
+      inner.y >= outer.y - 0.5 &&
+      inner.y + inner.height <= outer.y + outer.height + 0.5;
+    // what a scrolling box inside the panel clips is not on screen either
+    const shown = await element.evaluate(
+      (node) =>
+        new Promise<number>((resolve) => {
+          const observer = new IntersectionObserver((entries) => {
+            observer.disconnect();
+            resolve(entries[0].intersectionRatio);
+          });
+          observer.observe(node);
+        }),
+    );
+    return inside && shown >= 1;
+  };
+
+  for (const size of [
+    { width: 1366, height: 768 },
+    { width: 1280, height: 720 },
+  ]) {
+    test(`${size.width}x${size.height}: a listing narrower than its columns keeps the instruction column and scrolls to it, and its toolbar is whole`, async ({
+      page,
+      rpc,
+    }) => {
+      await openWorkspace(page, "sh4-debugger");
+      const view = panel(page, "sh4-disassembly");
+      const line = view.locator(".current-instruction");
+      await expect(line).toHaveCount(1);
+
+      await page.setViewportSize(size);
+      // still side by side, in a narrower dock: the listing has less than its columns need
+      await expect.poll(async () => (await view.boundingBox())!.width).toBeLessThan(340);
+      const box = (await view.boundingBox())!;
+      expect((await panel(page, "sh4-memory").boundingBox())!.x).toBeGreaterThanOrEqual(box.x + box.width);
+
+      // every control of the toolbar is inside the panel
+      for (const name of ["Step Over", "Step In", "Step Out", "Mute category", "Solo category", "Go to current PC", "Go", "Refresh"]) {
+        const control = view.getByRole("button", { name, exact: true });
+        await expectUsable(control, name);
+        expect(await whole(view, control), `${name} is inside the panel`).toBe(true);
+      }
+      await expectUsable(view.getByRole("textbox"), "address box");
+      expect(await whole(view, view.getByRole("textbox")), "the address box is inside the panel").toBe(true);
+      // The toolbar has taken a second line for the address box. The step buttons start it at
+      // the left, and what does not fit beside them ends at the right, on either line.
+      const placed = async (control: Locator) => {
+        const at = (await control.boundingBox())!;
+        return { left: at.x - box.x, right: box.x + box.width - (at.x + at.width), top: at.y, bottom: at.y + at.height };
+      };
+      const stepOver = await placed(view.getByRole("button", { name: "Step Over", exact: true }));
+      expect(stepOver.left, "Step Over, from the left edge").toBeLessThanOrEqual(24);
+      expect((await placed(view.getByRole("button", { name: "Go to current PC", exact: true }))).right, "Go to current PC, from the right edge").toBeLessThanOrEqual(24);
+      expect((await placed(view.getByRole("button", { name: "Refresh", exact: true }))).right, "Refresh, from the right edge").toBeLessThanOrEqual(24);
+      expect((await placed(view.getByRole("textbox"))).top, "the address box is below the step buttons").toBeGreaterThanOrEqual(stepOver.bottom);
+
+      // the instruction of the program counter's line has its twelve characters, and its text in one line
+      const address = line.locator("span").first();
+      const instruction = line.locator("span").last();
+      await expect(instruction).toHaveText(/\S/);
+      const cell = await instruction.evaluate((element) => {
+        const text = document.createRange();
+        text.selectNodeContents(element);
+        return {
+          width: element.getBoundingClientRect().width,
+          character: Number.parseFloat(getComputedStyle(element).fontSize) * 0.6,
+          lines: text.getClientRects().length,
+        };
+      });
+      expect(cell.width, "width of the instruction column").toBeGreaterThanOrEqual(12 * cell.character);
+      expect(cell.lines, "lines of the instruction text").toBe(1);
+
+      // The listing shows the start of its lines, and the rest of them when it is scrolled to
+      // the side: with the wheel, which moves the listing through its addresses only when it
+      // is turned up or down.
+      expect(await whole(view, address), "the address is shown").toBe(true);
+      expect(await whole(view, instruction), "the instruction column does not fit beside it").toBe(false);
+      const first = await disassemblyRows(view).first().getAttribute("data-address");
+      const listings = rpc.requests("state.getDisassembly").length;
+      await address.hover();
+      await page.mouse.wheel(400, 0);
+      await expect.poll(() => whole(view, instruction), { message: "the instruction is scrolled to" }).toBe(true);
+      // to the side only: the listing is where it was
+      await expect(disassemblyRows(view).first()).toHaveAttribute("data-address", first!);
+      expect(rpc.requests("state.getDisassembly").length).toBe(listings);
+      // and back
+      await page.mouse.wheel(-400, 0);
+      await expect.poll(() => whole(view, address)).toBe(true);
+    });
+  }
+
+  test("what such a listing says about its lines is in the panel, and is not scrolled away with them", async ({ page }) => {
+    // a server that takes its time over a listing when told to, and that can list an address twice
+    const server = await serveScriptedDebugger(page);
+    let repeating = false;
+    let held: Array<() => void> | undefined = [];
+    server.answer("state.getDisassembly", (params) => {
+      const listing = defaultAnswer("state.getDisassembly", params) as { lines: unknown[] };
+      const answer = repeating ? { lines: [...listing.lines, listing.lines[0]] } : listing;
+      return held ? new Promise((resolve) => held!.push(() => resolve(answer))) : answer;
+    });
+    await gotoRoute(page, "/workspace/sh4-debugger");
+    await server.described();
+    const view = panel(page, "sh4-disassembly");
+    const updating = view.getByText("Updating");
+    const note = view.getByRole("note");
+    // The first listing is late. There are no lines yet to say anything about: that they are
+    // being read is said in their place.
+    await expect(view).toContainText("Loading disassembly.");
+    await expect(updating).toHaveCount(0);
+    held.splice(0).forEach((answer) => answer());
+    held = undefined;
+    const line = view.locator(".current-instruction");
+    await expect(line).toHaveCount(1);
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await expect.poll(async () => (await view.boundingBox())!.width).toBeLessThan(340);
+
+    // the lines are read again, and the answer is late: the view says that it is reading, over the lines
+    repeating = true;
+    held = [];
+    await view.getByRole("button", { name: "Refresh", exact: true }).click();
+    await expect(updating).toBeVisible();
+    expect(await whole(view, updating), '"Updating" is inside the panel').toBe(true);
+    const toolbar = (await view.getByRole("textbox").boundingBox())!;
+    expect((await updating.boundingBox())!.y, '"Updating" is below the toolbar').toBeGreaterThanOrEqual(toolbar.y + toolbar.height);
+    // also when the lines are scrolled to the side
+    await line.locator("span").first().hover();
+    await page.mouse.wheel(400, 0);
+    await expect.poll(() => whole(view, line.locator("span").last())).toBe(true);
+    expect(await whole(view, updating), '"Updating" is inside the panel, with the lines scrolled to the side').toBe(true);
+
+    // the answer lists an address twice, and the view says so
+    held.splice(0).forEach((answer) => answer());
+    held = undefined;
+    await expect(note).toHaveText("The server listed an address twice; it is shown once.");
+    await expect(updating).toBeHidden();
+    expect(await whole(view, note), "the note is inside the panel, with the lines scrolled to the side").toBe(true);
+    await page.mouse.wheel(-400, 0);
+    await expect.poll(() => whole(view, line.locator("span").first())).toBe(true);
+    expect(await whole(view, note), "the note is inside the panel").toBe(true);
+
+    // Without a connection there are no lines, and nothing is said about lines. (The server
+    // does not describe itself on the next connection: the view stays without them.)
+    server.answer("debugger.describe", () => new Promise(() => {}));
+    server.drop();
+    await expect(view).toContainText(/Not connected|No Data/);
+    await expect(view.locator("[data-address]")).toHaveCount(0);
+    await expect(note).toHaveCount(0);
+    await expect(updating).toHaveCount(0);
+  });
 });
