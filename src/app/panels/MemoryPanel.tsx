@@ -8,7 +8,7 @@ import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { useNoDataText, useTarget } from "../../state/debuggerSelectors";
 import { formatAddress, parseAddress } from "../../state/targets";
 import { MemoryView, type MemoryViewConfig, type MemoryViewCallbacks } from "../components/MemoryView";
-import { NoData, PanelNotice } from "../components/PanelNotice";
+import { PanelNotice } from "../components/PanelNotice";
 
 const BYTES_PER_ROW = 16;
 const VISIBLE_ROWS = 60;
@@ -108,10 +108,12 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
       </Panel>
     );
   }
+  // Until a server has said where the view opens, the panel shows the frame of one, with a
+  // toolbar that cannot be used yet. The view that has a place is another one.
   if (!described) {
     return (
       <Panel>
-        <NoData />
+        <MemoryView key="unplaced" unplaced config={config} callbacks={callbacks} defaultAddress={0} initialized={false} noDataText={noDataText} />
       </Panel>
     );
   }
@@ -119,6 +121,7 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
   return (
     <Panel>
       <MemoryView
+        key="placed"
         config={config}
         callbacks={callbacks}
         defaultAddress={info.defaultMemoryAddress ?? 0}

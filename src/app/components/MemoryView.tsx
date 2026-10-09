@@ -70,6 +70,12 @@ export interface MemoryViewProps {
   refreshSignal?: unknown;
   /** What is said in place of the bytes while the view is not `initialized` (default: "No Data"). */
   noDataText?: string;
+  /**
+   * The view has no place yet: no server has said where the memory of its target is read. It
+   * is the frame of the view and nothing else: the toolbar, with a box that is empty and
+   * controls that cannot be used, and `noDataText` where the bytes will be.
+   */
+  unplaced?: boolean;
 }
 
 const clampAddress = (value: number, max: number, alignment = 1) => {
@@ -92,6 +98,7 @@ export const MemoryView = ({
   initialUrlAddress,
   refreshSignal,
   noDataText = "No Data",
+  unplaced = false,
 }: MemoryViewProps) => {
   const addressMax = config.addressMax ?? 0xffffffff;
   /** the first address of the last row */
@@ -367,7 +374,8 @@ export const MemoryView = ({
         <Stack direction="row" spacing={1} alignItems="center" sx={{ flex: 1 }}>
           <TextField
             size="small"
-            value={addressInput}
+            value={unplaced ? "" : addressInput}
+            disabled={unplaced}
             onChange={(event) => setAddressInput(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
@@ -380,7 +388,7 @@ export const MemoryView = ({
               input: {
                 endAdornment: (
                   <InputAdornment position="end">
-                    <Button size="small" onClick={handleAddressSubmit} sx={{ minWidth: "auto", px: 1 }}>
+                    <Button size="small" onClick={handleAddressSubmit} disabled={unplaced} sx={{ minWidth: "auto", px: 1 }}>
                       Go
                     </Button>
                   </InputAdornment>
@@ -389,7 +397,7 @@ export const MemoryView = ({
             }}
           />
           <Tooltip title="Refresh">
-            <RunControlButton size="small" onClick={handleRefresh} disabled={loading}>
+            <RunControlButton size="small" onClick={handleRefresh} disabled={loading || unplaced}>
               <RefreshIcon fontSize="small" />
             </RunControlButton>
           </Tooltip>

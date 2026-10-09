@@ -194,7 +194,9 @@ the watches or of a breakpoint panel is not sent and not thrown away), the toolb
 so do the notices of what the server cannot do: what a server said about itself is kept until
 the next server has described itself. The keyboard focus is where it was when the connection
 is back, also in a row of the breakpoint or the watch list. The disassembly and memory views
-are where they were, unless the new connection starts in a stop.
+are where they were, unless the new connection starts in a stop. A page that has not had a
+server yet shows the same frames; a disassembly or memory view then has its toolbar with an
+empty box, because where it opens is the server's to say.
 
 ## What the UI does with a session
 

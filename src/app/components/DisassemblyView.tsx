@@ -139,6 +139,12 @@ export interface DisassemblyViewProps {
   canStep?: boolean;
   /** What is said in place of the lines while the view is not `initialized` (default: "No Data"). */
   noDataText?: string;
+  /**
+   * The view has no place yet: no server has said where its target is. It is the frame of the
+   * view and nothing else: the toolbar, with a box that is empty and controls that cannot be
+   * used, and `noDataText` where the lines will be.
+   */
+  unplaced?: boolean;
 }
 
 export interface DisassemblyViewRef {
@@ -275,6 +281,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   refetchAfterBreakpointEdit = false,
   canStep = true,
   noDataText = "No Data",
+  unplaced = false,
 }, ref) => {
   const [lines, setLines] = useState<DisassemblyLine[]>([]);
   // how many lines of the answer on screen repeated an address, and were left out
@@ -942,7 +949,8 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
           <Stack direction="row" spacing={1} alignItems="center">
           <TextField
             size="small"
-            value={addressInput}
+            value={unplaced ? "" : addressInput}
+            disabled={unplaced}
             onChange={(event) => setAddressInput(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
@@ -956,7 +964,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
               input: {
                 endAdornment: (
                   <InputAdornment position="end">
-                    <Button size="small" onClick={handleAddressSubmit} sx={{ minWidth: "auto", px: 1 }}>
+                    <Button size="small" onClick={handleAddressSubmit} disabled={unplaced} sx={{ minWidth: "auto", px: 1 }}>
                       Go
                     </Button>
                   </InputAdornment>
@@ -965,7 +973,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             }}
           />
           <Tooltip title="Refresh">
-            <RunControlButton size="small" onClick={handleRefresh} disabled={loading}>
+            <RunControlButton size="small" onClick={handleRefresh} disabled={loading || unplaced}>
               <RefreshIcon fontSize="small" />
             </RunControlButton>
           </Tooltip>

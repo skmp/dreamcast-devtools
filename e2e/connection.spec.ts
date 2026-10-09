@@ -674,6 +674,25 @@ test("an endpoint named by ?ws= that does not answer is tried again, and the pag
   await expect(notice).toContainText(`Reconnecting to ${named}`);
   await expect(panel(page, "device-tree")).toContainText("Not connected");
 
+  // No server has been there yet, and every panel has its frame all the same. The views have
+  // their toolbars: nothing in the box, since no server has said where they open, and nothing
+  // that can be used yet.
+  const disassembly = panel(page, "sh4-disassembly");
+  const memory = panel(page, "sh4-memory");
+  for (const view of [disassembly, memory]) {
+    await expect(view).toContainText("Not connected");
+    await expect(view.getByRole("textbox")).toBeDisabled();
+    await expect(view.getByRole("textbox")).toHaveValue("");
+    await expect(view.getByRole("button", { name: "Go", exact: true })).toBeDisabled();
+    await expect(view.getByRole("button", { name: "Refresh", exact: true })).toHaveAttribute("aria-disabled", "true");
+  }
+  for (const name of ["Step Over", "Step In", "Step Out", "Go to current PC"]) {
+    await expect(disassembly.getByRole("button", { name, exact: true }), name).toHaveAttribute("aria-disabled", "true");
+  }
+  await expect(panel(page, "device-tree").getByPlaceholder("Search components...")).toBeVisible();
+  await expect(panel(page, "watches").getByPlaceholder("Enter expression")).toBeVisible();
+  await expect(panel(page, "sh4-breakpoints").getByPlaceholder("Address (e.g., 0x8C0000A0)")).toBeVisible();
+
   // the first attempt and the two after 1 and 2 seconds have failed: the next is for the same endpoint
   await expect(notice).toContainText(`Reconnecting to ${named} in 5 s (attempt 3)`);
   expect(rpc.sockets).toEqual([named, named, named]);
@@ -692,6 +711,16 @@ test("an endpoint named by ?ws= that does not answer is tried again, and the pag
   await dialog.getByRole("button", { name: "Connect", exact: true }).click();
   await expect(statusBar(page)).toContainText("Connection: connected");
   await expect(statusBar(page)).toContainText(`Endpoint: ${mock.wsURL}`);
+
+  // with a server the views open where it says, and their toolbars are there to be used
+  await expect(disassemblyRows(disassembly)).toHaveCount(64);
+  await expect(disassembly.getByRole("textbox")).toHaveValue(/^0x8C0000[0-9A-F]{2}$/);
+  await expect(memory.getByRole("textbox")).toHaveValue("0x8C0100A0");
+  await expect(memory).toContainText(/0x8C010000\s*([0-9A-F]{2} ){15}/);
+  for (const view of [disassembly, memory]) {
+    await expect(view.getByRole("textbox")).toBeEnabled();
+    await expect(view.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+  }
 });
 
 test("the tool pages do not open a debugger connection", async ({ page, rpc }) => {

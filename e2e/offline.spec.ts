@@ -236,9 +236,11 @@ test.describe("served as plain files from a sub-path (python3 -m http.server)", 
       await expect(page.getByRole("alert").filter({ hasText: "Could not connect to ws://127.0.0.1" })).toBeVisible();
       await expect(panel(page, "sh4-disassembly")).toContainText("Not connected");
       await expect(panel(page, "device-tree")).toContainText("Not connected");
-      // the boxes are there all the same, for when a server is
+      // the boxes and the toolbars are there all the same, for when a server is
       await expect(panel(page, "device-tree").getByPlaceholder("Search components...")).toBeVisible();
       await expect(panel(page, "watches").getByPlaceholder("Enter expression")).toBeVisible();
+      await expect(panel(page, "sh4-disassembly").getByRole("button", { name: "Step In", exact: true })).toBeVisible();
+      await expect(panel(page, "sh4-memory").getByRole("button", { name: "Refresh", exact: true })).toBeVisible();
       await page.waitForLoadState("networkidle");
     } finally {
       await server.stop();

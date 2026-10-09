@@ -7,7 +7,7 @@ import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { useNoDataText, useProgramCounter, useRunState, useTarget } from "../../state/debuggerSelectors";
 import { formatAddress, formatAddressInput, parseAddress, programCounter, withContextAbove } from "../../state/targets";
 import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks, type DisassemblyViewRef } from "../components/DisassemblyView";
-import { NoData, PanelNotice } from "../components/PanelNotice";
+import { PanelNotice } from "../components/PanelNotice";
 import { canResume } from "../../state/stopReasons";
 import { Panel } from "../layout/Panel";
 import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
@@ -16,6 +16,8 @@ import { generateUUID } from "../../lib/uuid";
 interface DisassemblyPanelProps {
   target: TargetProcessor;
 }
+
+const NO_BREAKPOINTS = new Map<number, { id: number; enabled: boolean }>();
 
 const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
   // instruction size, address format, where the program counter is: what debugger.describe said
@@ -210,18 +212,31 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
       </Panel>
     );
   }
-  // A view has no place before a server has said where its target is. Once it has one it
-  // stays, with its toolbar and where it was, through every loss of the connection.
+  // A view has no place before a server has said where its target is: until then the panel
+  // shows the frame of one, with a toolbar that cannot be used yet. The view that has a place
+  // is another one (it is mounted where it opens), and stays, with its toolbar and where it
+  // was, through every loss of the connection.
   if (firstAddress === undefined) {
     return (
-      <Panel>
-        <NoData />
-      </Panel>
+      <DisassemblyView
+        key="unplaced"
+        unplaced
+        config={config}
+        callbacks={callbacks}
+        defaultAddress={0}
+        breakpointsByAddress={NO_BREAKPOINTS}
+        initialized={false}
+        executionState="running"
+        categoryState={categoryState}
+        followOnPause={false}
+        noDataText={noDataText}
+      />
     );
   }
 
   return (
     <DisassemblyView
+      key="placed"
       ref={viewRef}
       config={config}
       callbacks={callbacks}
