@@ -104,6 +104,13 @@ export interface DisassemblyViewProps {
   callbacks: DisassemblyViewCallbacks;
   /** Default address to start at */
   defaultAddress: number;
+  /**
+   * The view opens in a stop of the target, at this program counter: like the program counter
+   * of every later stop (`followPc`), its line has to be on screen once the first lines are
+   * in. Ten instructions above it are where the view starts, and in a short panel, or one
+   * whose lines wrap, that leaves the line itself below what the panel shows.
+   */
+  openingStopPc?: number;
   /** Current program counter value */
   currentPc?: number;
   /** Map of addresses to breakpoint info */
@@ -249,6 +256,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   config,
   callbacks,
   defaultAddress,
+  openingStopPc,
   currentPc,
   breakpointsByAddress,
   initialized,
@@ -301,7 +309,10 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
    * - "moved": the view went to ten instructions above it;
    * - "adjusted": that did not show the line, and the view went to where it fits.
    */
-  const revealRef = useRef<{ pc: number; stage: "read" | "moved" | "adjusted" } | undefined>(undefined);
+  const revealRef = useRef<{ pc: number; stage: "read" | "moved" | "adjusted" } | undefined>(
+    // the stop the view opens in: the view is already where a followed stop would have moved it
+    openingStopPc !== undefined ? { pc: openingStopPc, stage: "moved" } : undefined,
+  );
 
   // Track previous execution state for detecting pauses
   const prevExecutionStateRef = useRef(executionState);

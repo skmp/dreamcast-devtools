@@ -45,22 +45,33 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
   // Decided once: after that the view moves when the user moves it and when the target stops.
   // A panel that was there before the connection sees its first tick; one that is opened
   // later sees what the latest tick said.
-  const [firstAddress, setFirstAddress] = useState<number | undefined>(undefined);
+  //
+  // When that tick is of a stop (a client that connects into one; a panel opened while the
+  // target is stopped), the stop is followed like every later one: the view has the line of
+  // its program counter on screen, which `stopPc` asks of it.
+  const [opening, setOpening] = useState<{ address: number; stopPc?: number } | undefined>(undefined);
+  const firstAddress = opening?.address;
   const [waitedForConnection] = useState(() => useDebuggerDataStore.getState().ticks === 0);
   /** what the view was last brought up to date with: connection and `refresh` */
   const followed = useRef<string | undefined>(undefined);
   const ready = initialized && hasTick && info.supported;
   useEffect(() => {
-    if (!ready || firstAddress !== undefined) {
+    if (!ready || opening !== undefined) {
       return;
     }
     const state = useDebuggerDataStore.getState();
     const first = waitedForConnection ? state.first : undefined;
     const pc = programCounter(first ? first.registers : state.registersByPath, info);
     followed.current = `${state.epoch}:${first ? first.refresh : state.refresh}`;
+    // the first tick of a connection counts a stop when it is one, and nothing else
+    const stopped = first ? first.refresh > 0 : state.executionState?.state === "paused";
     const fallback = Math.min(info.defaultDisassemblyAddress, info.addressMax);
-    setFirstAddress(pc !== undefined ? withContextAbove(info, pc) : fallback - (fallback % info.instructionSize));
-  }, [ready, firstAddress, info, waitedForConnection]);
+    setOpening(
+      pc !== undefined
+        ? { address: withContextAbove(info, pc), stopPc: stopped ? pc : undefined }
+        : { address: fallback - (fallback % info.instructionSize) },
+    );
+  }, [ready, opening, info, waitedForConnection]);
 
   // A stop the client has not acted on yet (stopId changed), or a game that was just loaded:
   // fetch again, and scroll to the program counter if its line is not on screen. Ticks that are
@@ -200,6 +211,7 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
       config={config}
       callbacks={callbacks}
       defaultAddress={firstAddress}
+      openingStopPc={opening?.stopPc}
       currentPc={currentPc}
       breakpointsByAddress={breakpointsByAddress}
       initialized={initialized}

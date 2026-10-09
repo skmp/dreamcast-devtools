@@ -1,6 +1,8 @@
+import type { Locator } from "@playwright/test";
 import {
   test,
   expect,
+  addPanelFromSelector,
   currentInstructionAddress,
   disassemblyRows,
   openWorkspace,
@@ -17,6 +19,19 @@ import {
 // the test's process, so the test is that window (`machine.setLifetime`).
 
 test.use({ mockOptions: {} });
+
+/** Whether a line of a disassembly view lies entirely inside its panel: what the panel cuts off is not on screen. */
+const shownInPanel = async (view: Locator, line: Locator): Promise<boolean> => {
+  const [outer, inner] = [await view.boundingBox(), await line.boundingBox()];
+  return outer !== null && inner !== null && inner.y >= outer.y && inner.y + inner.height <= outer.y + outer.height;
+};
+
+/** How many lines of a disassembly view the panel has no room for: they are rendered below its lower edge. */
+const rowsBelowThePanel = (view: Locator): Promise<number> =>
+  view.evaluate((element) => {
+    const bottom = element.getBoundingClientRect().bottom;
+    return Array.from(element.querySelectorAll("[data-address]")).filter((row) => row.getBoundingClientRect().top >= bottom).length;
+  });
 
 test("a machine stopped in the emulator's window is shown as that, with run control put away", async ({ page, machine, rpc }, testInfo) => {
   await openWorkspace(page, "sh4-debugger");
@@ -119,5 +134,39 @@ test.describe("a server that starts paused", () => {
 
     await tooltipButton(page, "Run").click();
     await expect(page.getByRole("status", { name: "Execution state" })).toHaveText("Running");
+  });
+
+  test("the stop it connects into is followed: its line is on screen, also where ten instructions do not fit above it", async ({
+    page,
+    rpc,
+  }) => {
+    // A window so low that the listing has room for a few lines only. A view opens ten
+    // instructions above the program counter, which here is below what the panel shows.
+    await page.setViewportSize({ width: 1600, height: 480 });
+    await openWorkspace(page, "sh4-debugger");
+    const view = panel(page, "sh4-disassembly");
+    const line = view.locator(".current-instruction");
+    const pc = 0x8c0000a0;
+    await expect(line).toHaveAttribute("data-address", String(pc));
+    await expect(line).toBeInViewport({ ratio: 1 });
+    expect(await rowsBelowThePanel(view)).toBeGreaterThan(0);
+    expect(await shownInPanel(view, line)).toBe(true);
+    // with as many instructions above it as fit, which is fewer than ten and more than none
+    const first = Number(await disassemblyRows(view).first().getAttribute("data-address"));
+    expect(first).toBeGreaterThan(pc - 20);
+    expect(first).toBeLessThan(pc);
+    // it took the listing the view opened with and one more, and the view is done: nothing follows
+    await page.waitForTimeout(500);
+    expect(rpc.requests("state.getDisassembly").map((request) => (request.params as { address: number }).address)).toEqual([pc - 20, first]);
+    await expect(view.getByRole("textbox")).toHaveValue(`0x${(first + 20).toString(16).toUpperCase()}`);
+
+    // a view that is opened while the target is stopped shows where it is stopped as well
+    await addPanelFromSelector(page, 1, "ARM7: Disassembly");
+    const arm7 = panel(page, "arm7-disassembly");
+    const arm7Line = arm7.locator(".current-instruction");
+    await expect(arm7Line).toHaveAttribute("data-address", String(0x00200010));
+    await expect(arm7Line).toBeInViewport({ ratio: 1 });
+    expect(await rowsBelowThePanel(arm7)).toBeGreaterThan(0);
+    expect(await shownInPanel(arm7, arm7Line)).toBe(true);
   });
 });
