@@ -3291,6 +3291,18 @@ describe("a server that stops answering", () => {
     // the last tick is what the run knows of the server
     expect(summary.finalState).toMatch(/running/);
     expect((await stateOf(direct)).executionState.state).toBe("running");
+
+    // Nothing more is sent inside a scenario either. S16 goes on with its next part when one
+    // has failed: the part behind the third timeout fails at once, with a request that was not sent.
+    lost.length = 0;
+    const parts = await runContract({ url, profile: "mock", timeoutFactor, only: new Set(["S02", "S16"]) });
+    expect(parts.scenarios[1].parts).toEqual([
+      { name: "arm7 step and breakpoint", status: "failed", detail: "control.pause {}: Request timed out: control.pause" },
+      { name: "writeMemory", status: "not-applicable", detail: 'no capability "memory-write"' },
+      { name: "setRegister", status: "failed", detail: `control.pause {}: not sent: ${stopped("control.pause")}` },
+      { name: "reset", status: "not-applicable", detail: 'no capability "reset"' },
+    ]);
+    expect(lost).toEqual(["control.pause", "breakpoints.setCategoryStates", "control.pause"]);
   }, 60_000);
 
   it("request timeouts that are not in a row do not end the run: the scenarios behind them are run", async () => {
