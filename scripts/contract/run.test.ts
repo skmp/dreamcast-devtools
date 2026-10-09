@@ -491,19 +491,65 @@ describe("the contract runner against the mock", () => {
     expect(mock.reconnects).toBe(1);
   });
 
-  it("S07: a program that does not come back to the breakpoint that was enabled again", async () => {
-    // outside of its loop the mock's SH4 walks straight on
+  it("S07: a program that never comes back to where it was is no obstacle: a breakpoint is enabled again at the interrupt entry", async () => {
+    // outside of its loop the mock's SH4 walks straight on, and takes the interrupt of every vertical blank as ever
     const mock = new MockDebugger({ startPaused: true });
     ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C00FFE0" });
     const { url } = await startServer(undefined, mock);
     const summary = await runContract({ url, profile: "mock", only: new Set(["S07"]) });
-    expect(reportOf(summary)).toEqual([
-      expect.stringMatching(
-        /^S07 passed the program did not come back to 0x8C0[0-9A-F]{5} within 2000 ms of the breakpoint there being enabled again; a breakpoint on the next instruction that was disabled and enabled again was hit$/,
-      ),
-    ]);
+    expect(reportOf(summary)).toEqual(["S07 passed "]);
     expect(summary.ok).toBe(true);
   }, 90_000);
+
+  it("S07: VBR is read at a stop the target has run up to, not where the run found it", async () => {
+    // a program that installs its vector base when it starts: at the StartPaused stop VBR is still 0
+    const mock = new MockDebugger({ startPaused: true });
+    const machine = mock as unknown as { values: Map<string, Map<string, unknown>>; emulationStep(): void };
+    machine.values.get("dc.sh4.cpu")!.set("VBR", 0);
+    const step = machine.emulationStep.bind(mock);
+    machine.emulationStep = () => {
+      machine.values.get("dc.sh4.cpu")!.set("VBR", 0x8c000000);
+      step();
+    };
+    const added: number[] = [];
+    const { url } = await startServer(
+      {
+        toServer: (frame) => {
+          if (frame.method === "breakpoints.add" && paramsOf(frame).kind === "code") added.push(paramsOf(frame).address as number);
+          return frame;
+        },
+      },
+      mock,
+    );
+    const found = (await stateOf(url)).registers as Record<string, Array<{ name: string; value: string }>>;
+    expect(found["dc.sh4.cpu"].find((register) => register.name === "VBR")!.value).toBe("0x00000000");
+    const summary = await runContract({ url, profile: "mock", only: new Set(["S07"]) });
+    expect(reportOf(summary)).toEqual(["S07 passed "]);
+    expect(added).toEqual([0x8c000600]);
+  }, 90_000);
+
+  it("S07: a program that takes no interrupt makes the scenario partial, which fails a gate and is no failure otherwise", async () => {
+    // interrupts blocked (SR.BL): the breakpoint at the interrupt entry is never reached
+    const blocked = () => {
+      const mock = new MockDebugger();
+      ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "SR", value: "0x50000000" });
+      return mock;
+    };
+    const lines: string[] = [];
+    const looked = await runContract({ url: (await startServer(undefined, blocked())).url, profile: "mock", only: new Set(["S02", "S07"]), say: (line) => lines.push(line) });
+    expect(reportOf(looked)).toEqual([
+      "S02 passed ",
+      "S07 partial the target took no interrupt within 2000 ms: the breakpoint at its interrupt entry 0x8C000600 (VBR + 0x600) was not hit, " +
+        "so it was not shown that a breakpoint that is enabled again is hit",
+    ]);
+    expect(looked).toMatchObject({ ok: true, partial: 1, failed: 0, cleanUpProblems: [] });
+    expect(lines.find((line) => line.startsWith("S07 "))).toMatch(/^S07 toggle, remove, events\.* partial \(/);
+    // the rest of the scenario was run all the same: the event breakpoints, the table of 1024
+
+    const gate = await runContract({ url: (await startServer(undefined, blocked())).url, profile: "mock", milestone: "M1", only: new Set(["S02", "S07"]) });
+    expect(gate).toMatchObject({ ok: false, requiredNotPassed: [{ id: "S07", status: "partial" }] });
+  }, 90_000);
+
 });
 
 describe("the contract runner against a server that breaks the protocol", () => {
@@ -1285,7 +1331,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     // the server answers {} to {enabled: true} and leaves the breakpoint disabled
     const ignored = await run({ toServer: (frame) => (frame.method === "breakpoints.toggle" ? { ...frame, params: { ...paramsOf(frame), enabled: false } } : frame) }, ["S07"]);
     expect(statusOf(ignored, "S07")).toBe("failed");
-    expect(detailsOf(ignored, "S07")).toMatch(/^breakpoints\.toggle: breakpoint 1 is not listed as enabled \(1 tick within 1000 ms of the request/);
+    expect(detailsOf(ignored, "S07")).toMatch(/^breakpoints\.toggle: breakpoint 3 is not listed as enabled \(\d+ ticks? within 1000 ms of the request/);
 
     // the server lists it as enabled, and has not armed it
     const listedOnly = await run(() => {
@@ -1306,9 +1352,75 @@ describe("the contract runner against a server that breaks the protocol", () => 
       };
     }, ["S07"]);
     expect(statusOf(listedOnly, "S07")).toBe("failed");
-    // the mock's loop comes back to the breakpoint within 130 ms; the runner then shows it once more, on the next instruction
-    expect(detailsOf(listedOnly, "S07")).toMatch(/^a paused tick at the breakpoint 0x8C0000[0-9A-F]{2}: not seen within 2000 ms/);
+    expect(detailsOf(listedOnly, "S07")).toMatch(/^a paused tick at the breakpoint 0x8C000600 after it was enabled again: not seen within 2000 ms; ticks since then: \d+ \(#\d+ running /);
     expect(listedOnly.cleanUpProblems).toEqual([]);
+  }, 90_000);
+
+  it("S07: a breakpoint that is enabled again after the target ran while it was disabled, and is never hit", async () => {
+    // What a server does that discards its compiled code when a breakpoint is disabled, and not
+    // when it is enabled: toggled off and on without a run in between the breakpoint works, and
+    // after a run with the breakpoint disabled it is dead. (The mock comes back to every address
+    // of its loop within 130 ms, and never to one the program has left for good.)
+    const stale = (options?: MockDebuggerOptions, pc?: string) => {
+      const mock = new MockDebugger(options);
+      const machine = mock as unknown as {
+        toggleBreakpoint(params: { id: number; enabled: boolean }, context: Json): unknown;
+        leaveStop(): void;
+        isActive(breakpoint: { id: number; kind: string }): boolean;
+      };
+      const disabled = new Set<number>();
+      const dead = new Set<number>();
+      const toggle = machine.toggleBreakpoint.bind(mock);
+      machine.toggleBreakpoint = (params, context) => {
+        disabled[params.enabled ? "delete" : "add"](params.id);
+        return toggle(params, context);
+      };
+      const leave = machine.leaveStop.bind(mock);
+      machine.leaveStop = () => {
+        disabled.forEach((id) => dead.add(id));
+        leave();
+      };
+      const isActive = machine.isActive.bind(mock);
+      machine.isActive = (breakpoint) => !(breakpoint.kind === "code" && dead.has(breakpoint.id)) && isActive(breakpoint);
+      if (pc) ask(mock, "state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: pc });
+      return mock;
+    };
+    const expected = /^a paused tick at the breakpoint 0x8C000600 after it was enabled again: not seen within 2000 ms; ticks since then: \d+ \(#\d+ running /;
+    const loop = await runContract({ url: (await startServer(undefined, stale())).url, profile: "mock", only: new Set(["S07"]) });
+    expect(statusOf(loop, "S07")).toBe("failed");
+    expect(detailsOf(loop, "S07")).toMatch(expected);
+    expect(loop.cleanUpProblems).toEqual([]);
+    // the same on a program that never comes back to where it was
+    const straight = await runContract({ url: (await startServer(undefined, stale({ startPaused: true }, "0x8C00FFE0"))).url, profile: "mock", only: new Set(["S07"]) });
+    expect(statusOf(straight, "S07")).toBe("failed");
+    expect(detailsOf(straight, "S07")).toMatch(expected);
+  }, 90_000);
+
+  it("S07: a disabled breakpoint at the interrupt entry that stops the target, and vertical blanks that are not in the event log", async () => {
+    // disabled at the interrupt entry, the breakpoint goes on stopping (in the loop it does not)
+    const mock = new MockDebugger();
+    const machine = mock as unknown as { isActive(breakpoint: { address?: number; enabled: boolean }): boolean };
+    const isActive = machine.isActive.bind(mock);
+    machine.isActive = (breakpoint) => isActive(breakpoint.address === 0x8c000600 ? { ...breakpoint, enabled: true } : breakpoint);
+    const armed = await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S07"]) });
+    expect(statusOf(armed, "S07")).toBe("failed");
+    expect(detailsOf(armed, "S07")).toMatch(/^a disabled breakpoint at the interrupt entry 0x8C000600: the target stopped \(#\d+ paused stop \d+ breakpoint bp 3\)$/m);
+
+    // a disabled event breakpoint on the vertical blank has to put its events into the log (2.6)
+    const quiet = new MockDebugger();
+    const events = quiet as unknown as { emitEvent(name: string, message: string): number | undefined; eventLog: Json[] };
+    const emit = events.emitEvent.bind(quiet);
+    events.emitEvent = (name, message) => {
+      const logged = events.eventLog.length;
+      const hit = emit(name, message);
+      if (name === "dc.holly.core.vblank") events.eventLog.length = logged;
+      return hit;
+    };
+    const unlogged = await runContract({ url: (await startServer(undefined, quiet)).url, profile: "mock", only: new Set(["S07"]) });
+    expect(statusOf(unlogged, "S07")).toBe("failed");
+    expect(detailsOf(unlogged, "S07")).toMatch(
+      /^two further entries of dc\.holly\.core\.vblank in the event log of the running target \(a disabled event breakpoint on it puts them there\): not seen within 2000 ms/,
+    );
   }, 90_000);
 
   it("S11: a server without the ARM7 callstack: no frames in the tick, or state.getCallstack {arm7} refused", async () => {
@@ -1763,7 +1875,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       ["S07"],
     );
     expect(statusOf(refused, "S07")).toBe("failed");
-    expect(detailsOf(refused, "S07")).toBe('breakpoints.add {"event":"dc.system.reset","kind":"event","enabled":false}: in-band error -32004 "not supported: event dc.no.such.event"');
+    expect(detailsOf(refused, "S07")).toBe('breakpoints.add {"event":"dc.holly.core.vblank","kind":"event","enabled":false}: in-band error -32004 "not supported: event dc.no.such.event"');
 
     const notAdvertised = await run(
       {

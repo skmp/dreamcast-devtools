@@ -1049,63 +1049,94 @@ const s06: Scenario = {
   },
 };
 
+/**
+ * The interrupt entry of the SH4, `VBR + 0x600`, as a paused tick has it: where every program
+ * with interrupts enabled arrives at each vertical blank.
+ */
+const interruptEntryOf = (tick: DebuggerTick, sh4: DebuggerTarget): number => (numberOf(tick, sh4.pcPath, "VBR") + 0x600) >>> 0;
+
+const eventIdOf = (entry: { eventId: string }): bigint => (/^\d+$/.test(entry.eventId) ? BigInt(entry.eventId) : -1n);
+
+/** The newest eventId in the log of a tick; -1 for an empty log. */
+const newestEventId = (tick: DebuggerTick): bigint => tick.eventLog.reduce((newest, entry) => (eventIdOf(entry) > newest ? eventIdOf(entry) : newest), -1n);
+
+/** How many entries of the vertical blank the log of a tick has that are newer than `after`. */
+const vblanksSince = (tick: DebuggerTick, after: bigint): number =>
+  tick.eventLog.filter((entry) => (entry.metadata as { event?: unknown } | undefined)?.event === VBLANK_EVENT && eventIdOf(entry) > after).length;
+
+/** A paused tick that reports the stop of a breakpoint at the interrupt entry (the PC can be a mirror of it). */
+const checkEntryStop = (tick: DebuggerTick, sh4: DebuggerTarget, id: number, entry: number): void => {
+  check(tick.executionState.breakpointId === id, `the stop reports breakpointId ${tick.executionState.breakpointId}, expected ${id}`);
+  check(tick.executionState.reason === "breakpoint", `the stop has reason "${tick.executionState.reason}", expected "breakpoint"`);
+  check(((pcOf(tick, sh4) ^ entry) & SH4_CODE_ADDRESS_MASK) === 0, `the stop is at ${hex(pcOf(tick, sh4))}, the breakpoint at the interrupt entry ${hex(entry)}`);
+};
+
+/** What a scenario says when the breakpoint at the interrupt entry is not hit: the program takes no interrupt, and the scenario is partial. */
+const noInterrupt = (session: ContractSession, entry: number, notShown: string): string =>
+  `the target took no interrupt within ${session.scale(2000)} ms: the breakpoint at its interrupt entry ${hex(entry)} (VBR + 0x600) was not hit, so ${notShown}`;
+
+/**
+ * Re-enabling a breakpoint, shown where the program is certain to come again: at the interrupt
+ * entry `VBR + 0x600`. From a stop that the target has run up to (not the anchor of S00,
+ * where the program has not installed its vector base): a breakpoint there is hit; disabled,
+ * the target runs through at least two further vertical blanks; enabled again while it runs,
+ * it is hit within 2 s. Returns why this could not be shown, when the target takes no interrupt.
+ */
+const reenableAtInterruptEntry = async (context: RunContext, sh4: DebuggerTarget): Promise<string | undefined> => {
+  const { session } = context;
+  const stop = (await ensurePaused(context)).tick;
+  const entry = interruptEntryOf(stop, sh4);
+  // a disabled event breakpoint on the vertical blank puts its events into the event log
+  const counter = await addBreakpoint(context, { event: VBLANK_EVENT, kind: "event", enabled: false });
+  const atEntry = await addBreakpoint(context, { event: sh4.breakpointEvent, address: entry, kind: "code", enabled: true });
+  let partial: string | undefined;
+
+  const mark = session.mark();
+  await session.call("control.runUntil", {});
+  const first = await session
+    .waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(stop), 2000, `a paused tick at the interrupt entry ${hex(entry)}`, mark)
+    .catch(() => undefined);
+  if (!first) {
+    partial = noInterrupt(session, entry, "it was not shown that a breakpoint that is enabled again is hit");
+    await ensurePaused(context);
+  } else {
+    checkEntryStop(first.tick, sh4, atEntry.id, entry);
+
+    // disabled, it is passed: the target runs through its vertical blanks
+    await toggleBreakpoint(context, atEntry.id, false);
+    const newest = newestEventId(session.latestTick().tick);
+    const resumed = session.mark();
+    await session.call("control.runUntil", {});
+    const stopped = (tick: DebuggerTick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(first.tick);
+    const ran = await session.waitForTick(
+      (tick) => stopped(tick) || (isRunning(tick) && vblanksSince(tick, newest) >= 2),
+      2000,
+      `two further entries of ${VBLANK_EVENT} in the event log of the running target (a disabled event breakpoint on it puts them there)`,
+      resumed,
+    );
+    check(isRunning(ran.tick), `a disabled breakpoint at the interrupt entry ${hex(entry)}: the target stopped (${describeState(ran.tick)})`);
+
+    // enabled again while the target runs, it is hit at the next vertical blank
+    const enabling = session.mark();
+    await session.call("breakpoints.toggle", { id: atEntry.id, enabled: true });
+    await tickShowing(session, enabling, "breakpoints.toggle", (tick) =>
+      tick.breakpoints[String(atEntry.id)]?.enabled === true ? undefined : `breakpoint ${atEntry.id} is not listed as enabled`,
+    );
+    const again = await session.waitForTick(stopped, 2000, `a paused tick at the breakpoint ${hex(entry)} after it was enabled again`, enabling);
+    checkEntryStop(again.tick, sh4, atEntry.id, entry);
+  }
+  await removeBreakpoint(context, atEntry.id);
+  await removeBreakpoint(context, counter.id);
+  return partial;
+};
+
 const s07: Scenario = {
   id: "S07",
-  title: "toggle and remove",
+  title: "toggle, remove, events",
   async run(context) {
     const { session } = context;
     const sh4 = requireTarget(context, "sh4");
-    const pc = await findBreakpointSite(context);
-    const address = pc + sh4.instructionSize;
-    // (without kind and enabled: a breakpoint with an address is a code breakpoint, and enabled)
-    const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address });
-
-    await toggleBreakpoint(context, breakpoint.id, false);
-    await expectToKeepRunning(context, "a disabled breakpoint on the next instruction");
-
-    // Enabled again, it is listed as enabled, and it is hit when the program comes to it.
-    await toggleBreakpoint(context, breakpoint.id, true);
-    const armed = session.latestTick().tick;
-    const mark = session.mark();
-    await session.call("control.runUntil", {});
-    const back = await session
-      .waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(armed), 2000, `a paused tick at the breakpoint ${hex(address)}`, mark)
-      .catch(() => undefined);
-    if (back) {
-      const { breakpointId, reason } = back.tick.executionState;
-      check(breakpointId === breakpoint.id, `the stop after the breakpoint was enabled again reports breakpointId ${breakpointId}, expected ${breakpoint.id}`);
-      check(reason === "breakpoint", `the stop after the breakpoint was enabled again has reason "${reason}", expected "breakpoint"`);
-      // (the program can come back to that code through another mirror of it)
-      check(
-        ((pcOf(back.tick, sh4) ^ address) & SH4_CODE_ADDRESS_MASK) === 0,
-        `the stop after the breakpoint was enabled again is at ${hex(pcOf(back.tick, sh4))}, the breakpoint at ${hex(address)}`,
-      );
-      await removeBreakpoint(context, breakpoint.id);
-    } else {
-      // The program has run for 600 ms since it was in front of that address, and whether it
-      // comes back there is its business. The same is then shown where the arrival is certain,
-      // as in S05: with a breakpoint on the next instruction that is disabled and enabled again.
-      await ensurePaused(context);
-      await removeBreakpoint(context, breakpoint.id);
-      const site = (await findBreakpointSite(context)) + sh4.instructionSize;
-      const again = await addBreakpoint(context, { event: sh4.breakpointEvent, address: site });
-      await toggleBreakpoint(context, again.id, false);
-      await toggleBreakpoint(context, again.id, true);
-      await resumeToBreakpoint(context, sh4, again.id, site);
-      await removeBreakpoint(context, again.id);
-      context.note(
-        `the program did not come back to ${hex(address)} within ${session.scale(2000)} ms of the breakpoint there being enabled again; ` +
-          "a breakpoint on the next instruction that was disabled and enabled again was hit",
-      );
-    }
-
-    // removing again and toggling an unknown id: in-band -32602
-    await session.expectError("breakpoints.remove", { id: breakpoint.id }, -32602);
-    await session.expectError("breakpoints.toggle", { id: breakpoint.id, enabled: true }, -32602);
-
-    // Event breakpoints. Every event the device tree lists is in the server's table: a
-    // breakpoint on each, added disabled (an enabled one stops the target when its event
-    // comes) with the request the UI sends, i.e. with the kind.
+    // S07 needs what milestone M1 has: without event breakpoints it fails, it is not skipped
     check(hasCapability(context, CAPABILITIES.EVENT_BREAKPOINTS), 'the capability "event-breakpoints" is part of milestone M1');
     const events: string[] = [];
     const visit = (nodes: DeviceNodeDescriptor[]) =>
@@ -1116,6 +1147,26 @@ const s07: Scenario = {
     visit(session.shape.deviceTree);
     check(events.length > 0, "the device tree lists no events");
     check(events.includes(VBLANK_EVENT), `the device tree lists the event ${VBLANK_EVENT}, which every running program raises`);
+
+    // A disabled breakpoint is not hit (as S06) ...
+    const pc = await findBreakpointSite(context);
+    const address = pc + sh4.instructionSize;
+    // (without kind and enabled: a breakpoint with an address is a code breakpoint, and enabled)
+    const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address });
+    await toggleBreakpoint(context, breakpoint.id, false);
+    await expectToKeepRunning(context, "a disabled breakpoint on the next instruction");
+    // ... and Remove deletes it: removing again and toggling an unknown id are in-band -32602
+    await removeBreakpoint(context, breakpoint.id);
+    await session.expectError("breakpoints.remove", { id: breakpoint.id }, -32602);
+    await session.expectError("breakpoints.toggle", { id: breakpoint.id, enabled: true }, -32602);
+
+    // Enabled again, a breakpoint is hit again: at the interrupt entry, from the stop the first
+    // part ended in, which the target has run up to.
+    const partial = await reenableAtInterruptEntry(context, sh4);
+
+    // Event breakpoints. Every event the device tree lists is in the server's table: a
+    // breakpoint on each, added disabled (an enabled one stops the target when its event
+    // comes) with the request the UI sends, i.e. with the kind.
     await ensurePaused(context);
     const disabled: BreakpointDescriptor[] = [];
     const others = events.filter((name) => name !== VBLANK_EVENT);
@@ -1150,6 +1201,8 @@ const s07: Scenario = {
     // At most 1024 breakpoints. Those that fill the table are event breakpoints, disabled:
     // nothing is armed by them, and nothing is compiled again.
     await fillBreakpointTable(context, events.includes("dc.system.reset") ? "dc.system.reset" : events[0]);
+
+    return partial === undefined ? undefined : { partial };
   },
 };
 
