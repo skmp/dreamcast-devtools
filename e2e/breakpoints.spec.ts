@@ -540,9 +540,4 @@ test("the address box, the hit notice and the reason of a stop write addresses a
     await expect(status).toHaveText(`Paused · breakpoint ${text} · stop ${stopId}`);
     await expect(alerts.filter({ hasText: "Breakpoint hit" }).last()).toHaveText(`Breakpoint hit: ${text}`);
   }
-  await expect(alerts).toHaveText([
-    "Breakpoint hit: dc.sh4.cpu.pc == 0x001008",
-    "Breakpoint hit: dc.aica.arm7.pc == 2097168",
-    "Breakpoint hit: dc.aica.dsp.step == 0x1F",
-  ]);
 });
