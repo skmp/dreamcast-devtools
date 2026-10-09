@@ -173,15 +173,19 @@ export const MemoryView = ({
     [callbacks, config.length, addressMax],
   );
 
-  // The box follows the view when the view moves (a submit, the wheel) and is rewritten for
-  // no other reason: what is being typed has to survive a render in which only the callbacks
-  // changed identity, which they do whenever the URL changes.
+  // What the box says where the view is: the address 10 rows down (the intended target), not
+  // the fetch start, as the target writes its addresses.
+  const shownAddress = config.formatAddress(Math.min(lastRow, clampAddress(address, config.maxAddress, BYTES_PER_ROW) + BYTES_PER_ROW * 10));
+
+  // The box follows the view when the view moves (a submit, the wheel: a view that has moved
+  // says another address), and the target when it writes its addresses in another way, and
+  // is rewritten for no other reason. What is being typed has to survive a render in which
+  // only the callbacks changed identity, which they do whenever the URL changes, and one in
+  // which `config` did, which is made again from every debugger.describe: a connection that
+  // is back does not move the view.
   useEffect(() => {
-    const normalized = clampAddress(address, config.maxAddress, BYTES_PER_ROW);
-    // Display the address 10 rows down (the intended target), not the fetch start
-    const displayAddress = Math.min(lastRow, normalized + BYTES_PER_ROW * 10);
-    setAddressInput(config.formatAddress(displayAddress));
-  }, [address, config, lastRow]);
+    setAddressInput(shownAddress);
+  }, [shownAddress]);
 
   useEffect(() => {
     if (initialized) {

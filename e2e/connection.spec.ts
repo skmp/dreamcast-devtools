@@ -107,11 +107,18 @@ test("killing the server mid-session: nothing stays on screen as if it were live
   await tooltipButton(page, "Pause").click();
   await expect(panel(page, "sh4-callstack")).toContainText("_main_loop+0x");
   expect(rpc.requests("debugger.describe")).toHaveLength(1);
-  // something typed and not sent yet, in the boxes of two panels
+  // something typed and not sent yet, in the boxes of four panels
   const watchBox = panel(page, "watches").getByPlaceholder("Enter expression");
   const breakpointBox = panel(page, "sh4-breakpoints").getByPlaceholder("Address (e.g., 0x8C0000A0)");
+  const disassemblyBox = panel(page, "sh4-disassembly").getByRole("textbox");
+  const memoryBox = panel(page, "sh4-memory").getByRole("textbox");
   await watchBox.fill("dc.sh4.cpu.pr");
   await breakpointBox.fill("0x8C0000A8");
+  // the address boxes say where their views are until somebody types into them
+  await expect(disassemblyBox).toHaveValue(/^0x8C0000[0-9A-F]{2}$/);
+  await expect(memoryBox).toHaveValue("0x8C0100A0");
+  await disassemblyBox.fill("0x8C00");
+  await memoryBox.fill("0x8C01");
 
   // --- the emulator dies ---
   diagnostics.allow(
@@ -144,6 +151,9 @@ test("killing the server mid-session: nothing stays on screen as if it were live
   // trying leaves the text where it is.
   await expect(watchBox).toHaveValue("dc.sh4.cpu.pr");
   await expect(breakpointBox).toHaveValue("0x8C0000A8");
+  // the views have not moved: their boxes are not written over with where they are
+  await expect(disassemblyBox).toHaveValue("0x8C00");
+  await expect(memoryBox).toHaveValue("0x8C01");
   await watchBox.press("Enter");
   await breakpointBox.press("Enter");
   for (const button of [
@@ -155,6 +165,8 @@ test("killing the server mid-session: nothing stays on screen as if it were live
   }
   await expect(watchBox).toHaveValue("dc.sh4.cpu.pr");
   await expect(breakpointBox).toHaveValue("0x8C0000A8");
+  await expect(disassemblyBox).toHaveValue("0x8C00");
+  await expect(memoryBox).toHaveValue("0x8C01");
   await saveScreenshot(page, testInfo, "session-reconnecting");
 
   // with the server still down the attempts fail, and say so in words
@@ -175,6 +187,13 @@ test("killing the server mid-session: nothing stays on screen as if it were live
     await expect.poll(() => rpc.requests("debugger.describe").length).toBe(2);
     await expect(tree.getByText("SYSCLK = 200MHz")).toBeVisible();
     await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
+    // The views kept their place and read the new server's lines and bytes there. Their boxes
+    // still say what was being typed: a server that is described again (the same addresses, in
+    // the same format) is no reason to write over it.
+    await expect(disassemblyRows(panel(page, "sh4-disassembly"))).toHaveCount(64);
+    await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+    await expect(disassemblyBox).toHaveValue("0x8C00");
+    await expect(memoryBox).toHaveValue("0x8C01");
     await tooltipButton(page, "Pause").click();
     await expect(tooltipButton(page, "Run")).toBeEnabled();
     await expect(panel(page, "sh4-callstack")).toContainText("_main_loop+0x");
@@ -314,6 +333,50 @@ test("when a lost connection is back the disassembly is where it was, unless the
   await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(pc));
   await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
   await expect(rows.first()).toHaveAttribute("data-address", String(pc - 20));
+});
+
+test("an address box keeps what is typed into it when the connection is back, and follows a server that writes its addresses in another way", async ({
+  page,
+}) => {
+  const server = await serveScriptedDebugger(page);
+  // running: a new connection has no stop to follow, and the views stay where they are
+  server.state.execution = { state: "running", stopId: 0 };
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  const view = panel(page, "sh4-disassembly");
+  const memory = panel(page, "sh4-memory");
+  const disassemblyBox = view.getByRole("textbox");
+  const memoryBox = memory.getByRole("textbox");
+  // the boxes say where the views are
+  await expect(disassemblyBox).toHaveValue("0x8C001000");
+  await expect(memoryBox).toHaveValue("0x8C0100A0");
+  // typed, and not sent: the user is still typing in the second
+  await disassemblyBox.fill("0x8C00");
+  await memoryBox.fill("0x8C01");
+
+  // --- the page's connection ends, and the same server describes itself again ---
+  server.drop();
+  await expect.poll(() => server.connections()).toBe(2);
+  await server.described();
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await expect(disassemblyRows(view)).toHaveCount(64);
+  await expect(memory).toContainText("0x8C010000");
+  // nothing has moved: the boxes are not written over with where the views are
+  await expect(disassemblyBox).toHaveValue("0x8C00");
+  await expect(memoryBox).toHaveValue("0x8C01");
+  await expect(memoryBox).toBeFocused();
+
+  // --- the next server writes the addresses of the SH4 with ten digits ---
+  (server.shape.targets as Array<Record<string, unknown>>)[0].addressDigits = 10;
+  server.drop();
+  await expect.poll(() => server.connections()).toBe(3);
+  await server.described();
+  // what was typed is an address as the last server wrote them: the boxes say where the
+  // views are, as this one does
+  await expect(disassemblyBox).toHaveValue("0x008C001000");
+  await expect(memoryBox).toHaveValue("0x008C0100A0");
+  await expect(disassemblyRows(view).first()).toContainText("0x008C000FEC");
 });
 
 test("the keyboard focus is where it was when a lost connection is back", async ({ page }) => {

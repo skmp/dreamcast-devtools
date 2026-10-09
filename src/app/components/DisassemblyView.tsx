@@ -454,14 +454,25 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     [callbacks, config.maxAddress, config.instructionSize],
   );
 
-  useEffect(() => {
-    const normalized = normalizeAddress(address, config.maxAddress, config.instructionSize);
-    // Display the address 10 instructions down (the intended target), not the fetch start
-    const displayAddress = Math.min(config.maxAddress, normalized + config.instructionSize * 10);
-    setAddressInput(config.formatAddressInput(displayAddress));
+  // What the box says where the view is: the address 10 instructions down (the intended
+  // target), not the fetch start, as the target writes its addresses.
+  const shownAddress = config.formatAddressInput(
+    Math.min(config.maxAddress, normalizeAddress(address, config.maxAddress, config.instructionSize) + config.instructionSize * 10),
+  );
 
+  // The box follows the view when the view moves (`address`: also to a place that is written
+  // like the last one, as every place near the end of the address space is), and the target
+  // when it writes its addresses in another way, and is rewritten for no other reason. What is
+  // being typed into it has to survive a connection that is lost and one that is back: neither
+  // moves the view, and both change `initialized` and `config` (which is made again from every
+  // debugger.describe).
+  useEffect(() => {
+    setAddressInput(shownAddress);
+  }, [address, shownAddress]);
+
+  useEffect(() => {
     if (initialized) {
-      void fetchDisassembly(normalized);
+      void fetchDisassembly(normalizeAddress(address, config.maxAddress, config.instructionSize));
     }
   }, [address, fetchDisassembly, config, initialized]);
 
