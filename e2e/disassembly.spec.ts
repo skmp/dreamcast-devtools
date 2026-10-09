@@ -621,6 +621,52 @@ test.describe("a breakpoint request that is answered late", () => {
     await expect(breakpointGutter(disassemblyRow(view, away + 8))).toHaveAttribute("data-breakpoint", "enabled");
   });
 
+  test("a second click on the gutter while the first is unanswered sends nothing: one breakpoint, not two", async ({ page }) => {
+    // The server makes a breakpoint for every breakpoints.add, two for two on one address: it is
+    // the client that keeps a double click from leaving two behind one mark.
+    const connection = await holdResponses(page, /^breakpoints\.(add|remove)$/);
+    await openWorkspace(page, "sh4-debugger");
+    const view = panel(page, "sh4-disassembly");
+    const list = panel(page, "sh4-breakpoints").getByRole("listitem");
+    const address = 0x8c0000a8;
+    const row = disassemblyRow(view, address);
+    const gutter = breakpointGutter(row);
+    await row.hover();
+
+    await gutter.dblclick();
+    await expect.poll(connection.held).toBe(1);
+    await gutter.click();
+    // nothing more is on its way: the answer to the listing the page asks for next comes after them
+    await tooltipButton(view, "Refresh").click();
+    await linesRead(view, connection);
+    expect(connection.requests("breakpoints.add").map((request) => request.params)).toEqual([
+      { event: "dc.sh4.cpu.pc", address, kind: "code", enabled: true },
+    ]);
+
+    connection.release();
+    await expect(gutter).toHaveAttribute("data-breakpoint", "enabled");
+    await expect(list).toHaveCount(1);
+
+    // the same for taking it away: one request, and the breakpoint is gone with it
+    await gutter.dblclick();
+    await expect.poll(connection.held).toBe(1);
+    await tooltipButton(view, "Refresh").click();
+    await linesRead(view, connection);
+    expect(connection.requests("breakpoints.remove")).toHaveLength(1);
+    connection.release();
+    await expect(gutter).toHaveAttribute("data-breakpoint", "none");
+    await expect(list).toHaveCount(0);
+    expect(connection.requests("breakpoints.add")).toHaveLength(1);
+
+    // answered, the gutter takes clicks again
+    await gutter.click();
+    await expect.poll(connection.held).toBe(1);
+    connection.release();
+    await expect(gutter).toHaveAttribute("data-breakpoint", "enabled");
+    expect(connection.requests("breakpoints.add")).toHaveLength(2);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+
   test.describe("with the view scrolled in the meantime", () => {
     test.use({ mockOptions: { startPaused: true } });
 

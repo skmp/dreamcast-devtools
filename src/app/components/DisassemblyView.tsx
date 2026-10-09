@@ -669,33 +669,48 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
     getTarget: () => target ?? "unknown",
   }), [config.instructionSize, config.maxAddress, target, applyHighlight, followPc, moveTo]);
 
-  const handleBreakpointClick = useCallback(
-    async (lineAddress: number) => {
-      const existing = breakpointsByAddress.get(lineAddress);
-      if (existing) {
-        await callbacks.onBreakpointRemove(existing.id);
-      } else {
-        await callbacks.onBreakpointAdd(lineAddress);
+  // The addresses whose breakpoint request is out. A click on the gutter of one of them does
+  // nothing: the server makes a breakpoint for every add it is sent, two for two on one
+  // address, so the second click of a double click, made before the first is answered, would
+  // leave two breakpoints behind one mark. A busy emulator answers late enough for that.
+  const breakpointRequests = useRef(new Set<number>());
+  const editBreakpoint = useCallback(
+    async (lineAddress: number, request: () => Promise<void>) => {
+      if (breakpointRequests.current.has(lineAddress)) {
+        return;
+      }
+      breakpointRequests.current.add(lineAddress);
+      try {
+        await request();
+      } finally {
+        breakpointRequests.current.delete(lineAddress);
       }
       if (refetchAfterBreakpointEdit) {
         handleRefresh();
       }
     },
-    [breakpointsByAddress, callbacks, refetchAfterBreakpointEdit, handleRefresh],
+    [refetchAfterBreakpointEdit, handleRefresh],
+  );
+
+  const handleBreakpointClick = useCallback(
+    (lineAddress: number) => {
+      const existing = breakpointsByAddress.get(lineAddress);
+      void editBreakpoint(lineAddress, () =>
+        existing ? callbacks.onBreakpointRemove(existing.id) : callbacks.onBreakpointAdd(lineAddress),
+      );
+    },
+    [breakpointsByAddress, callbacks, editBreakpoint],
   );
 
   const handleBreakpointToggle = useCallback(
-    async (lineAddress: number, event: React.MouseEvent) => {
+    (lineAddress: number, event: React.MouseEvent) => {
       event.stopPropagation();
       const existing = breakpointsByAddress.get(lineAddress);
       if (existing) {
-        await callbacks.onBreakpointToggle(existing.id, !existing.enabled);
-        if (refetchAfterBreakpointEdit) {
-          handleRefresh();
-        }
+        void editBreakpoint(lineAddress, () => callbacks.onBreakpointToggle(existing.id, !existing.enabled));
       }
     },
-    [breakpointsByAddress, callbacks, refetchAfterBreakpointEdit, handleRefresh],
+    [breakpointsByAddress, callbacks, editBreakpoint],
   );
 
   // Stable: a line element is marked from what the view knew when the element mounted, and
