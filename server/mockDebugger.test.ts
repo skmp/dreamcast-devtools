@@ -534,6 +534,38 @@ describe("tick policy", () => {
     ]);
   });
 
+  it("dc.aica.arm7 has the register ENABLED behind PC: width 1, and 1 in every tick while the mock's ARM7 runs", async () => {
+    const mock = createMock();
+    const session = connect(mock);
+    const shape = session.describe();
+    const arm7 = shape.deviceTree[0].children!.find((node) => node.path === "dc.aica")!.children!.find((node) => node.path === "dc.aica.arm7")!;
+    expect(arm7.registers!.slice(0, 2)).toEqual([
+      { name: "PC", value: "0x00200010", width: 32 },
+      { name: "ENABLED", value: "0x1", width: 1 },
+    ]);
+    const enabled = () => session.lastTick().registers["dc.aica.arm7"][1];
+
+    // a running tick that is not full carries it: dc.aica.arm7 is one of the four base paths
+    await vi.advanceTimersByTimeAsync(200);
+    expect(Object.keys(session.lastTick().registers).sort()).toEqual(BASE_PATHS);
+    expect(enabled()).toEqual({ name: "ENABLED", value: "0x1", width: 1 });
+    expect(session.lastTick().callstacks!.arm7).toEqual([]);
+
+    // a paused tick: the ARM7 is clocked, and its callstack has the PC and the link register
+    session.ok("control.pause");
+    expect(enabled()).toEqual({ name: "ENABLED", value: "0x1", width: 1 });
+    expect(session.lastTick().callstacks!.arm7.length).toBeGreaterThanOrEqual(2);
+    expect((session.ok("state.getCallstack", { target: "arm7" }) as { frames: unknown[] }).frames.length).toBeGreaterThanOrEqual(2);
+
+    // The guest holds or releases the ARM7, the debugger does not: the register is not written,
+    // by its name or through a watch on it, and that is "not supported", not "not writable".
+    session.fail("state.setRegister", { path: "dc.aica.arm7", name: "ENABLED", value: "0" }, -32004);
+    session.ok("state.watch", { expressions: ["dc.aica.arm7.enabled"] });
+    expect(session.lastTick().watches).toEqual([{ id: 1, expression: "dc.aica.arm7.enabled", value: "0x1" }]);
+    session.fail("state.editWatch", { watchId: 1, value: "0" }, -32004);
+    expect(enabled().value).toBe("0x1");
+  });
+
   it("lists in the device tree exactly the events it can raise, and accepts a breakpoint on each of them", () => {
     const mock = createMock();
     const session = connect(mock);

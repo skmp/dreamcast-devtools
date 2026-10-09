@@ -250,6 +250,11 @@ interface RegisterSpec {
   initial: RegisterContent;
   /** false: state.setRegister refuses it with -32013 */
   writable?: boolean;
+  /**
+   * The register shows something that is not the debugger's to change: state.setRegister
+   * refuses it with -32004, in every milestone (design 2.8).
+   */
+  observable?: boolean;
 }
 
 interface NodeSpec {
@@ -424,6 +429,10 @@ const DEVICE_TREE: NodeSpec[] = [
             description: "ARM7DI CPU Core",
             registers: [
               reg("PC", 32, MOCK_ARM7_RING.base),
+              // Whether the ARM7 is clocked (1) or held in reset (0): what a client can see of the
+              // reset, behind PC, which stays the first register of the node (design 2.8, 2.10).
+              // The mock's ARM7 always runs. The guest holds or releases it, not the debugger.
+              { ...reg("ENABLED", 1, 1), observable: true },
               ...numbered("R", 15, 32, "", (index) => (index === 13 ? 0x00280000 : index === 14 ? 0x0020000c : index * 0x101)),
               reg("CPSR", 32, 0x000000d3),
               reg("SPSR", 32, 0x00000010),
@@ -1687,6 +1696,9 @@ export class MockDebugger {
   }
 
   private writeRegister(path: string, register: RegisterSpec, text: string): void {
+    if (register.observable) {
+      throw notSupported(`writing ${path}.${register.name}`);
+    }
     if (register.width === 0 || register.writable === false) {
       throw new MockRpcError(DebuggerErrorCode.NOT_WRITABLE, `not writable: ${path}.${register.name}`);
     }
