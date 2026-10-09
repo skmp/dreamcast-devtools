@@ -94,6 +94,9 @@ not run it. After changing the crate, run it and commit the regenerated files.
 - Loading the page with `?crashTest` (before the `#route`) enables a hook that makes an error
   boundary's child throw on a `nulldc:crash-test` window event; `e2e/error-boundary.spec.ts`
   uses it. Without the flag the hook does not exist (`src/app/components/CrashProbe.tsx`).
+- The window of the suite is 1600x1000, where the default layouts have their views side by
+  side. `e2e/layout.spec.ts` opens every workspace in the window of a laptop (1366x768,
+  1280x720, 1440x900) and holds the default layouts to being readable there.
 
 Install the browser once with `npx playwright install chromium` (add `--with-deps` on a fresh
 Linux machine). Useful variations:
@@ -177,12 +180,21 @@ the list puts a remembered manual entry away, so that the next load of the page 
 endpoint again.
 
 When a connection is lost, or cannot be made, the state is `reconnecting`: the page says why,
-shows `No Data` instead of the last values, and tries again 1, 2, 5 and then every 10 seconds
-after each failure. `Stop` ends that, `Connect` and `Retry now` try at once. A `wasm` build
-waits for an announcement instead of a clock, because an emulator tab that was reloaded has a
-new id. Every connection that opens is described again (`debugger.describe`). A browser tells
-a page nothing about why a WebSocket did not open, so the text lists what it can be; a refusal
-by the emulator's Host/Origin check is one of them.
+drops the data of the connection, and tries again 1, 2, 5 and then every 10 seconds after each
+failure. It tries the endpoint of the session: the list above is a priority, and an endpoint
+that does not answer is not replaced by the next one. `Stop` ends that, `Connect` and
+`Retry now` try at once. A `wasm` build waits for an announcement instead of a clock, because
+an emulator tab that was reloaded has a new id. Every connection that opens is described again
+(`debugger.describe`). A browser tells a page nothing about why a WebSocket did not open, so
+the text lists what it can be; a refusal by the emulator's Host/Origin check is one of them.
+
+Without a connection the panels keep their frame. Only the data goes: where it was, every
+panel says `Not connected`. The boxes stay with what is in them (what is typed into the box of
+the watches or of a breakpoint panel is not sent and not thrown away), the toolbars stay, and
+so do the notices of what the server cannot do: what a server said about itself is kept until
+the next server has described itself. The keyboard focus is where it was when the connection
+is back, also in a row of the breakpoint or the watch list. The disassembly and memory views
+are where they were, unless the new connection starts in a stop.
 
 ## What the UI does with a session
 
@@ -194,14 +206,17 @@ by the emulator's Host/Origin check is one of them.
   buttons are off, because the server refuses them there. A run control that is off (also
   while the target runs, and without a connection) keeps the keyboard focus, so that stepping
   with the keyboard goes on from the same button; so do `Refresh` of a view while the view
-  reads and `Go to current PC` without a connection. The answer of every `control.*` request is
-  checked, and a refusal is shown; one that is repeated while its notice is on screen is
-  counted in that notice (`×n`) instead of shown again.
+  reads and `Go to current PC` without a connection. Each of these buttons is named by what
+  its tooltip says (`Run`, `Step In`, `Go to current PC`, ...). The answer of every `control.*`
+  request is checked, and a refusal is shown; one that is repeated while its notice is on
+  screen is counted in that notice (`×n`) instead of shown again.
 - **Stops.** A stop is a paused tick whose `stopId` the client has not acted on (for a v2
   server: the change from running to paused). On a stop the disassembly views scroll to the
   program counter if its line is not on screen, the disassembly and memory views read again,
   and a breakpoint that caused it is announced. No other tick does any of that. The views
   also read again after their own actions, and when a game is loaded where there was none.
+  The stop a page connects into, or a view is opened in, is followed like any other: the line
+  of the program counter is on screen, with ten instructions above it or as many as fit.
   A disassembly view that is a dock tab behind another has no lines on screen to look at: it
   scrolls to the program counter of the last stop, if need be, when its tab is shown.
   When stops arrive faster than the page renders them (a script stepping through another
@@ -215,6 +230,19 @@ by the emulator's Host/Origin check is one of them.
   `register-write`, `sgc-capture`) are said in the panel concerned, in place of its controls.
   A memory view opens at `defaultMemoryAddress` of the first server that reads that memory,
   also when servers before it only had such a notice to show.
+- **Listings.** A disassembly view shows each address of an answer once; when a server lists
+  an address twice it says so. A click on the gutter is one request: while it is unanswered
+  the gutter of that address takes no further click (the server makes a breakpoint for every
+  `breakpoints.add`).
+- **Window size.** The default layout of a workspace is made for the room its centre dock has
+  when it is made. From a window of 1600 px on, the views are side by side. Below that (a
+  laptop, with both side docks open) the first view is over the whole width and the others
+  are tabs of one group below it; the mixed-mode workspace has its two listings one above the
+  other. In a listing the instruction column keeps at least twelve characters, the toolbar
+  takes a second line where one is not enough, and the font of the memory listing follows the
+  width of its panel (down to 10 px) so that a row of sixteen bytes and their text fits from
+  520 px on. A saved layout is not touched; `Reset layout` makes the default for the window as
+  it is then.
 - **Problems.** A server of another protocol version, a `debugger.describe` that failed and
   every message that was dropped because it does not match the schema (with the path of what
   is wrong) are shown in a bar under the toolbar. A `debugger.describe` that failed (the

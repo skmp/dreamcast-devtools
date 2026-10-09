@@ -56,7 +56,8 @@ export const documentationSections: DocumentationSection[] = [
           "Native builds open one WebSocket. Its endpoint is the first of: `?ws=ws://host:port/ws` in the address bar (in front of the `#`), the last endpoint entered by hand, `VITE_WS_URL` of the build, and `/ws` on the host that served the page. Served by the emulator, there is nothing to configure.",
           "WASM builds use BroadcastChannel: the UI listens for emulator announcements and connects to the announced instance; with several it shows a connection picker.",
           "The status bar of a workspace shows the connection state and the endpoint. The endpoint is a button: click it, or press Enter on it, to pick another one, or to enter any `ws://` or `wss://` URL by hand; that URL is remembered and used first from then on.",
-          "When the connection is lost the UI says so, shows no data as if it were live, and tries again after 1, 2, 5 and then every 10 seconds. `Stop` ends that; `Connect` and `Retry now` try at once. Every new connection is described again.",
+          "When the connection is lost the UI says so and tries the same endpoint again after 1, 2, 5 and then every 10 seconds. `Stop` ends that; `Connect` and `Retry now` try at once. Every new connection is described again.",
+          "Without a connection the panels keep their boxes, their toolbars and the keyboard focus, and say `Not connected` where their data was. What is typed into a box meanwhile stays there, to be sent when the connection is back.",
           "When the emulator could not describe itself (it was busy, or did not answer) the UI says so and asks again on the same connection after 1, 2, 5 and then every 10 seconds; `Retry now` asks at once.",
           "Next to the run controls the UI shows whether the target runs and why it is stopped. What a server cannot do (`targets` and `capabilities` of `debugger.describe`) is said in the panel concerned, in place of its controls.",
         ],
@@ -78,6 +79,7 @@ export const documentationSections: DocumentationSection[] = [
         items: [
           "SH4 Debugger, ARM7 Debugger, Audio Debugger and Mixed Mode Debugger are dockable panel layouts.",
           "Each workspace stores its panel layout in the browser's localStorage. `Reset layout` in the top bar restores the default.",
+          "The default is made for the window: side by side from 1600 px on; in a narrower window with both side docks open, the first view over the whole width and the others as tabs below it.",
           "The `+` button in a panel group's header adds another panel to that group.",
           "Device Tree shows the tree returned by `debugger.describe` with the register values of the latest tick. Its search box narrows the tree word by word (node, then register) and shows at most 200 matching rows. Watches lists the watched expressions, and Events: Log shows the event log of the latest tick.",
         ],
