@@ -7,7 +7,7 @@ import { isArmControlFlow } from "./disasm";
 import { runContract } from "./run";
 import type { ContractOptions, ContractSummary } from "./run";
 import { ARM7_NOTES, SCENARIOS, scenariosOfMilestone, selectScenarios } from "./scenarios";
-import { ask, closeServers, describing, inBand, isTick, mapNodes, noTickAfter, paramsOf, reportOf, rpcError, startServer } from "./testSupport";
+import { ask, closeServers, describing, inBand, isTick, mapNodes, noTickAfter, paramsOf, reportOf, rpcError, startServer, tickBeforeResponse } from "./testSupport";
 import type { FaultSource, Faults, Json } from "./testSupport";
 
 /**
@@ -569,6 +569,21 @@ describe("S16, part writeMemory", () => {
     expect((mock as unknown as Machine).values.get("dc.sh4.cpu")!.get("PC")).toBe(0x8c0000a0);
     expect((mock as unknown as Machine).values.get("dc.sh4.cpu")!.get("R0")).toBe(0);
   }, 60_000);
+
+  it("the tick of a write may come in front of its response: the emulator's order passes, in every part that writes and on the second connection of S13", async () => {
+    // (the mock sends the tick behind the response, the emulator builds it inside the call and answers behind it)
+    for (const key of ["writeMemory", "setRegister", "reset", "arm7"]) {
+      const count = { reordered: 0 };
+      const { result, notes } = await part(key, { startPaused: true }, () => tickBeforeResponse(count));
+      expect(result, key).toEqual(passed(key));
+      expect(notes.filter((note) => !note.startsWith("arm7: ")), key).toEqual([]);
+      expect(count.reordered, key).toBeGreaterThan(5);
+    }
+    const count = { reordered: 0 };
+    const { url } = await startServer(() => tickBeforeResponse(count));
+    expect(reportOf(await runContract({ url, profile: "mock", only: new Set(["S13"]) }))).toEqual(["S13 passed "]);
+    expect(count.reordered).toBeGreaterThan(5);
+  }, 120_000);
 
   it("a write without a tick behind it, and a write whose tick is a new stop", async () => {
     const noTick = await part("writeMemory", undefined, () => noTickAfter((request) => request.method === "state.writeMemory"));
@@ -1170,6 +1185,17 @@ describe("the gate of M2, and the options that came with it", () => {
       );
       expect(lines.at(-1)).toBe("contract: OK");
     }
+  }, 240_000);
+
+  it("the gate of M2 passes a server that sends the tick of a request in front of the response to it, as the emulator does", async () => {
+    // The mock answers first and sends the tick behind: no run against it has the other order,
+    // which is the emulator's for every request that changes a table or writes (design 2.9).
+    const count = { reordered: 0 };
+    const { url } = await startServer(() => tickBeforeResponse(count));
+    const summary = await gate({ url });
+    expect(reportOf(summary).filter((line) => !/^S\d\d passed /.test(line))).toEqual([]);
+    expect(summary).toMatchObject({ ok: true, milestone: "M2", passed: 17, failed: 0, partial: 0, notApplicable: 0, requiredNotPassed: [], requiredNotesMissing: [], invariantViolations: [], cleanUpProblems: [] });
+    expect(count.reordered).toBeGreaterThan(1000);
   }, 240_000);
 
   it("the mock as an M1 server fails the gate of M2, and passes that of M1", async () => {

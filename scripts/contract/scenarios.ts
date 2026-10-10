@@ -2805,8 +2805,12 @@ const readBytes = async (context: RunContext, target: "sh4" | "arm7", address: n
 };
 
 /**
- * A write of memory that is accepted: `{}`, and a tick behind the answer that is paused, of the
- * stop the write was made in (a write is not a new stop, and it is followed by its tick).
+ * A write of memory that is accepted: `{}`, and the tick of the write, which is paused and of
+ * the stop the write was made in (a write is not a new stop). The tick is the first one since
+ * the request was sent: a server may send it in front of the response or behind it (design 2.9,
+ * "Order"; the emulator builds it inside the call and answers when the call has returned), and
+ * a paused target sends no tick of its own accord. The part reads memory in front of every
+ * such write, so no tick of an earlier request is still under way when this one is sent.
  */
 const writeBytes = async (context: RunContext, target: "sh4" | "arm7", address: number, data: number[]): Promise<void> => {
   const { session } = context;
@@ -2814,8 +2818,7 @@ const writeBytes = async (context: RunContext, target: "sh4" | "arm7", address: 
   const what = `state.writeMemory {${target}, ${hex(address)}, ${data.length} byte${data.length === 1 ? "" : "s"}}`;
   const mark = session.mark();
   await session.call("state.writeMemory", { target, address, data });
-  const answered = session.responseSince(mark) ?? fail(`the ${what} response was not recorded`);
-  const next = await session.waitForTick(() => true, 1000, `a tick behind ${what}; every accepted write is followed by its tick`, answered.seq + 1);
+  const next = await session.waitForTick(() => true, 1000, `a tick behind ${what}; every accepted write is followed by its tick`, mark);
   check(
     isPaused(next.tick) && stopIdOf(next.tick) === stopIdOf(stop),
     `the tick behind ${what} is ${describeState(next.tick)}; the target was ${describeState(stop)}, and a write is not a new stop`,

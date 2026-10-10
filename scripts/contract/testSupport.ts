@@ -112,8 +112,10 @@ export const startServer = async (
         }
         faults.beforeRequest?.(request).forEach((frame) => client.send(JSON.stringify(frame)));
         answered = faults.answer?.(request);
-        if (faults.toServer) {
-          text = JSON.stringify(faults.toServer(request));
+        // (a request the fault leaves as it is goes on as it arrived: its size is part of what some rules send)
+        const rewritten = faults.toServer ? faults.toServer(request) : request;
+        if (rewritten !== request) {
+          text = JSON.stringify(rewritten);
         }
       } catch {
         // not JSON: the runner's malformed frame goes through as it is
@@ -260,6 +262,63 @@ export const noTickAfter = (matches: (request: Json) => boolean): Faults => {
   };
 };
 
+/**
+ * The requests whose success the mock follows with a tick: the tables and the writes (a tick to
+ * every client, design 2.9), and the run control that changes the state. (Not control.pause: a
+ * target that is paused already answers it with no tick behind.)
+ */
+const TICKED_METHODS = new Set([
+  "breakpoints.add",
+  "breakpoints.remove",
+  "breakpoints.toggle",
+  "breakpoints.setCategoryStates",
+  "state.watch",
+  "state.unwatch",
+  "state.modifyWatchExpression",
+  "state.editWatch",
+  "state.setRegister",
+  "state.writeMemory",
+  "control.runUntil",
+  "control.step",
+  "control.stepOver",
+  "control.stepOut",
+  "control.reset",
+]);
+
+/**
+ * A server that sends the tick of such a request in front of the response to it, where the
+ * mock sends it behind: the emulator's order for the tables (it builds the tick inside the
+ * call and answers when the call has returned), and as legal as the mock's for every request
+ * (design 2.9, "Order"). The response waits for the next tick, which for a request that
+ * changed nothing in a running target is the periodic one. One per connection;
+ * `count.reordered` is how many responses went behind a tick.
+ */
+export const tickBeforeResponse = (count: { reordered: number } = { reordered: 0 }): Faults => {
+  const ids = new Set<unknown>();
+  let held: Json | undefined;
+  return {
+    toServer: (frame) => {
+      if (TICKED_METHODS.has(String(frame.method))) ids.add(frame.id);
+      return frame;
+    },
+    toClient: (frame) => {
+      if (held) {
+        const response = held;
+        held = undefined;
+        // (the mock sends the tick directly behind the response; anything else keeps its order)
+        if (!isTick(frame)) return [response, frame];
+        count.reordered++;
+        return [frame, response];
+      }
+      const succeeded = !isTick(frame) && frame.error === undefined && (frame.result as Json | undefined)?.error === undefined;
+      if (ids.delete(frame.id) && succeeded) {
+        held = frame;
+        return undefined;
+      }
+      return frame;
+    },
+  };
+};
 
 /** A server whose debugger.describe result is rewritten, and whose ticks are (for a tree that lists other registers). */
 export const describing = (
