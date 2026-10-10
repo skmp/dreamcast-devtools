@@ -38,10 +38,11 @@ import type { MockSgcCapture } from "./mockSgc";
  * a test or the contract runner; `server/mockWebSocket.ts` puts it on a socket and
  * `server/mockServer.ts` adds the page.
  *
- * What it implements is milestone M1 of the protocol, plus what the mock could do before
- * protocol v3: ARM7 and DSP stepping and code breakpoints, the SGC capture, and register
- * writes (state.setRegister and state.editWatch). Everything else answers -32004. The option
- * `supports` takes away from that, down to what a server of milestone M1 implements.
+ * What it implements is milestone M2 of the protocol (ARM7 run control, memory and register
+ * writes, reset, the M2 rows of the device tree), plus what the mock could do before protocol
+ * v3: DSP stepping and code breakpoints, the SGC capture, and register writes on every node.
+ * Everything else answers -32004. The option `supports` takes away from that: down to what
+ * the emulator implements in milestone M2 (`MOCK_M2_SUPPORT`), or in M1 (`MOCK_M1_SUPPORT`).
  *
  * The machine: each target walks a ring of instructions, one instruction per emulation
  * step (16 ms). The last instruction of the SH4 and ARM7 rings is the branch back to the
@@ -49,7 +50,15 @@ import type { MockSgcCapture } from "./mockSgc";
  * vertical blank the SH4 takes an interrupt, as a program with interrupts enabled does: its
  * PC leaves the loop for the handler at VBR + 0x600, which ends in `rte`, and comes back to
  * where it was. So between two steps the PC is in the loop, and a breakpoint in the handler
- * stops the SH4 there. Memory content is a hash of the address.
+ * stops the SH4 there. The ring of the ARM7 has a call: one of its instructions is `bl` to a
+ * leaf behind the ring, two instructions and the return, and R14 is the link register of it.
+ *
+ * Memory is three stores, each seen through every address that maps it: main memory (16 MiB,
+ * area 3 of the SH4 through P0, P1 and P2), wave memory (8 MiB, the SH4's 0x00800000 + X and
+ * the ARM7's X), and video memory (8 MiB in each of its two views, 0x04.. with 0x06.. and
+ * 0x05.. with 0x07..). A byte is a hash of where it is in its store until state.writeMemory
+ * writes it. Everything else the debugger can read (ROM, flash, register windows) is a hash
+ * of its address and cannot be written.
  */
 
 export interface MockDebuggerOptions {
@@ -85,9 +94,14 @@ export interface MockDebuggerOptions {
   protocol?: number;
   /**
    * What the server implements; without it, everything the mock can do. For a mock of a server
-   * of an earlier milestone, or of one without a target. See `MOCK_M1_SUPPORT`.
+   * of a milestone, or of one without a target. See `MOCK_M1_SUPPORT` and `MOCK_M2_SUPPORT`.
    */
   supports?: MockSupport;
+  /**
+   * The ARM7 is held in reset when the machine starts, as behind a reset: `ENABLED` reads 0,
+   * and it is released when the machine has run for 8 emulation steps (as a guest releases it).
+   */
+  arm7Held?: boolean;
   /** called with one line per connection event and per request the mock refuses to parse */
   log?: (line: string) => void;
 }
@@ -104,11 +118,21 @@ export interface MockSupport {
    */
   stepping?: TargetProcessor[];
   /**
-   * The capabilities of optional methods (default: all four the mock has): "event-breakpoints",
-   * "callstack", "register-write", "sgc-capture". The methods behind a missing one answer
-   * -32004, and without "callstack" the ticks carry no frames.
+   * The capabilities of optional methods (default: all six the mock has): "event-breakpoints",
+   * "callstack", "memory-write", "register-write", "reset", "sgc-capture". The methods behind a
+   * missing one answer -32004, and without "callstack" the ticks carry no frames.
    */
   capabilities?: string[];
+  /**
+   * The nodes whose registers state.setRegister writes (default: every node). A register of
+   * another node has no writer: no `flags.writable` in debugger.describe, and -32013.
+   */
+  writableNodes?: string[];
+  /**
+   * The rows of the device tree: "m2" (the default) has the nodes and registers of milestone
+   * M2 and the actions `sh4-registers` and `arm7-registers`; "m1" is the tree without them.
+   */
+  deviceTree?: "m1" | "m2";
 }
 
 /** What the emulator implements in milestone M1: SH4 debugging, event breakpoints, callstack. */
@@ -116,6 +140,27 @@ export const MOCK_M1_SUPPORT: Readonly<Required<MockSupport>> = {
   targets: ["sh4", "arm7", "dsp"],
   stepping: ["sh4"],
   capabilities: [CAPABILITIES.EVENT_BREAKPOINTS, CAPABILITIES.CALLSTACK],
+  writableNodes: [],
+  deviceTree: "m1",
+};
+
+/**
+ * What the emulator implements in milestone M2, and no more: the SH4 and the ARM7 step, the
+ * DSP does not; memory writes, a reset, and register writes of the two processors alone (the
+ * registers of `dc.sh4.cpu`, and those of `dc.aica.arm7` but `ENABLED`); no SGC capture.
+ */
+export const MOCK_M2_SUPPORT: Readonly<Required<MockSupport>> = {
+  targets: ["sh4", "arm7", "dsp"],
+  stepping: ["sh4", "arm7"],
+  capabilities: [
+    CAPABILITIES.EVENT_BREAKPOINTS,
+    CAPABILITIES.CALLSTACK,
+    CAPABILITIES.MEMORY_WRITE,
+    CAPABILITIES.REGISTER_WRITE,
+    CAPABILITIES.RESET,
+  ],
+  writableNodes: ["dc.sh4.cpu", "dc.aica.arm7"],
+  deviceTree: "m2",
 };
 
 /** One client connection, as the host gives it to the mock. */
@@ -163,6 +208,17 @@ const SH4_SR_BL = 0x10000000;
 /** `SR.RB`: the other register bank, selected when an interrupt is accepted. */
 const SH4_SR_RB = 0x20000000;
 export const MOCK_ARM7_RING: Readonly<Ring> = { base: 0x00200010, length: 8, instructionSize: 4 };
+/** The call of the ARM7's program: the sixth instruction of its ring is `bl` to the leaf, with R14 the address behind it. */
+export const MOCK_ARM7_CALL = MOCK_ARM7_RING.base + 5 * MOCK_ARM7_RING.instructionSize;
+/** The leaf, behind the ring: two instructions and the return to R14 (`mov pc, lr`). */
+export const MOCK_ARM7_LEAF: Readonly<Ring> = { base: 0x00200030, length: 3, instructionSize: 4 };
+const ARM7_LEAF_TEXT = ["add r0, r0, #1", "str r0, [r1]", "mov pc, lr"];
+const ARM7_LEAF_RETURN = MOCK_ARM7_LEAF.base + 2 * MOCK_ARM7_LEAF.instructionSize;
+const ARM7_LEAF_END = MOCK_ARM7_LEAF.base + MOCK_ARM7_LEAF.length * MOCK_ARM7_LEAF.instructionSize;
+/** After this many emulation steps of a running machine an ARM7 that is held in reset is released. */
+export const MOCK_ARM7_RELEASE_STEPS = 8;
+/** The mode bits of an ARM7 CPSR that name a mode: user, FIQ, IRQ, supervisor, abort, undefined, system. */
+const ARM7_MODES = [0x10, 0x11, 0x12, 0x13, 0x17, 0x1b, 0x1f];
 /** The DSP executes its 128 steps once per sample. */
 export const MOCK_DSP_RING: Readonly<Ring> = { base: 0, length: 128, instructionSize: 1 };
 
@@ -170,10 +226,14 @@ const RINGS: Record<TargetProcessor, Readonly<Ring>> = { sh4: MOCK_SH4_RING, arm
 
 /**
  * The address after `address` as the target executes: around the ring, or straight on outside
- * of it. (The `rte` of the SH4's handler goes to `SPC`, which only the machine knows: this
- * answers for it as for any other address outside the ring.)
+ * of it; from the call of the ARM7's ring into its leaf. (The `rte` of the SH4's handler goes
+ * to `SPC` and the return of the ARM7's leaf to `R14`, which only the machine knows: this
+ * answers for them as for any other address outside the ring.)
  */
 export const mockNextAddress = (target: TargetProcessor, address: number): number => {
+  if (target === "arm7" && address === MOCK_ARM7_CALL) {
+    return MOCK_ARM7_LEAF.base;
+  }
   const ring = RINGS[target];
   const end = ring.base + ring.length * ring.instructionSize;
   if (address >= ring.base && address < end) {
@@ -183,6 +243,14 @@ export const mockNextAddress = (target: TargetProcessor, address: number): numbe
 };
 
 const SH4_ADDRESS_MASK = 0x1fffffff;
+/** ARM7 code addresses are compared under this mask: that of the mock's wave memory (8 MiB), bits 0 and 1 dropped. */
+const ARM7_CODE_ADDRESS_MASK = 0x007ffffc;
+/** What the SH4 stores of a written `SR`, and of a written `FPSCR`; and the ARM7 of a written `CPSR`. */
+const SH4_SR_MASK = 0x700083f3;
+const SH4_FPSCR_MASK = 0x003fffff;
+const ARM7_CPSR_MASK = 0xf00000df;
+/** `SR.MD`: privileged mode, in which `SR.RB` selects the register bank. */
+const SH4_SR_MD = 0x40000000;
 /** scheduler cycles of one emulation step (16 ms at 200 MHz, a multiple of the 448-cycle slice) */
 const CYCLES_PER_EMULATION_STEP = 448n * 7143n;
 const SH4_TIMESLICE = 448n;
@@ -237,8 +305,11 @@ const CODE_BREAKPOINT_EVENTS: Record<string, TargetProcessor> = {
 };
 
 // ---------------------------------------------------------------------------------------
-// Device tree (design 2.8, the M1 rows; the registers of dc.holly.dmac, .ta, .core and of the
-// two SGC channels are the mock's own and stand in for the M2 tables).
+// Device tree (design 2.8). The M1 rows, and the M2 rows: the nodes of the system bus, the
+// SPG, the AICA's common block and its clock, the 64 channels of the sound generator, and
+// registers on dc.gdrom and dc.maple. What is normative of them is their paths, their parents,
+// the two actions, and that a node has registers at all: the lists are the mock's own, and
+// short (the emulator has some three thousand rows there).
 // ---------------------------------------------------------------------------------------
 
 type RegisterContent = number | bigint | string;
@@ -248,13 +319,8 @@ interface RegisterSpec {
   /** bits; 0 for free text */
   width: number;
   initial: RegisterContent;
-  /** false: state.setRegister refuses it with -32013 */
+  /** false: the register has no writer, and state.setRegister refuses it with -32013 */
   writable?: boolean;
-  /**
-   * The register shows something that is not the debugger's to change: state.setRegister
-   * refuses it with -32004, in every milestone (design 2.8).
-   */
-  observable?: boolean;
 }
 
 interface NodeSpec {
@@ -333,7 +399,11 @@ const sgcChannelRegisters = (volume: number): RegisterSpec[] => [
   reg("TL", 8, 0x20),
 ];
 
-const DEVICE_TREE: NodeSpec[] = [
+/** A register that cannot be read without a side effect, or that is write-only: it reads "n/a" and has no writer. */
+const unread = (name: string, width: number): RegisterSpec => reg(name, width, "n/a", false);
+
+/** The tree of a server: with the rows of milestone M2, or the M1 rows alone. */
+const deviceTree = (m2: boolean): NodeSpec[] => [
   {
     path: "dc",
     label: "Dreamcast",
@@ -353,7 +423,7 @@ const DEVICE_TREE: NodeSpec[] = [
             label: "Core",
             description: "SuperH4 CPU Core",
             registers: SH4_CPU_REGISTERS,
-            actions: [PANEL_IDS.SH4_DISASSEMBLY, PANEL_IDS.SH4_MEMORY],
+            actions: [PANEL_IDS.SH4_DISASSEMBLY, PANEL_IDS.SH4_MEMORY, ...(m2 ? [PANEL_IDS.SH4_REGISTERS] : [])],
           },
           {
             path: "dc.sh4.pbus",
@@ -415,6 +485,28 @@ const DEVICE_TREE: NodeSpec[] = [
             events: ["dc.holly.core.render_start", "dc.holly.core.render_end", "dc.holly.core.vblank"],
             actions: [PANEL_IDS.CLX2_CORE],
           },
+          ...(m2
+            ? [
+                {
+                  path: "dc.holly.sb",
+                  label: "System Bus",
+                  description: "System bus registers",
+                  children: [
+                    // the wait registers of the G1 bus are write-only: "n/a"
+                    { path: "dc.holly.sb.g1", label: "G1", description: "G1 bus", registers: [unread("SB_G1RRC", 32), unread("SB_G1RWC", 32), reg("SB_G1SYSM", 32, 0x00000001, false), unread("SB_GDAPRO", 32)] },
+                    { path: "dc.holly.sb.g2", label: "G2", description: "G2 bus", registers: [reg("SB_G2ID", 32, 0x00000012), reg("SB_G2DSTO", 32, 0x000003ff), reg("SB_G2TRTO", 32, 0x000003ff)] },
+                    { path: "dc.holly.sb.pvr", label: "PVR", description: "PVR interface", registers: [reg("SB_PDSTAP", 32, 0x0c000000), reg("SB_PDSTAR", 32, 0x0c100000), ...regs(32, "SB_PDLEN SB_PDST")] },
+                    { path: "dc.holly.sb.misc", label: "Misc", description: "Other system bus registers", registers: [reg("SB_SBREV", 32, 0x0000000b, false), reg("SB_FFST", 32), ...regs(32, "SB_LMMODE0 SB_LMMODE1")] },
+                  ],
+                },
+                {
+                  path: "dc.holly.spg",
+                  label: "SPG",
+                  description: "Sync Pulse Generator",
+                  registers: [reg("SPG_HBLANK_INT", 32, 0x031d0000), reg("SPG_VBLANK_INT", 32, 0x01500104), reg("SPG_CONTROL", 32, 0x00000140), reg("SPG_STATUS", 32, 0, false)],
+                },
+              ]
+            : []),
         ],
       },
       {
@@ -431,16 +523,17 @@ const DEVICE_TREE: NodeSpec[] = [
               reg("PC", 32, MOCK_ARM7_RING.base),
               // Whether the ARM7 is clocked (1) or held in reset (0): what a client can see of the
               // reset, behind PC, which stays the first register of the node (design 2.8, 2.10).
-              // The mock's ARM7 always runs. The guest holds or releases it, not the debugger.
-              { ...reg("ENABLED", 1, 1), observable: true },
-              ...numbered("R", 15, 32, "", (index) => (index === 13 ? 0x00280000 : index === 14 ? 0x0020000c : index * 0x101)),
+              // A reset holds it and the running machine releases it, not the debugger: no writer.
+              reg("ENABLED", 1, 1, false),
+              // R14 is the link register of the call of the ring: the program has been through its loop
+              ...numbered("R", 15, 32, "", (index) => (index === 13 ? 0x00280000 : index === 14 ? MOCK_ARM7_CALL + 4 : index * 0x101)),
               reg("CPSR", 32, 0x000000d3),
               reg("SPSR", 32, 0x00000010),
               // the banked registers of the other modes
               ...regs(32, "R8_FIQ R9_FIQ R10_FIQ R11_FIQ R12_FIQ R13_FIQ R14_FIQ SPSR_FIQ"),
               ...["IRQ", "SVC", "ABT", "UND"].flatMap((mode) => regs(32, `R13_${mode} R14_${mode} SPSR_${mode}`)),
             ],
-            actions: [PANEL_IDS.ARM7_DISASSEMBLY, PANEL_IDS.ARM7_MEMORY],
+            actions: [PANEL_IDS.ARM7_DISASSEMBLY, PANEL_IDS.ARM7_MEMORY, ...(m2 ? [PANEL_IDS.ARM7_REGISTERS] : [])],
           },
           {
             path: "dc.aica.sgc",
@@ -451,6 +544,14 @@ const DEVICE_TREE: NodeSpec[] = [
             children: [
               { path: "dc.aica.sgc.0", label: "Channel 0", description: "SGC Channel 0", registers: sgcChannelRegisters(0x7f) },
               { path: "dc.aica.sgc.1", label: "Channel 1", description: "SGC Channel 1", registers: sgcChannelRegisters(0x6a) },
+              ...(m2
+                ? Array.from({ length: 62 }, (_, index) => ({
+                    path: `dc.aica.sgc.${index + 2}`,
+                    label: `Channel ${index + 2}`,
+                    description: `SGC Channel ${index + 2}`,
+                    registers: sgcChannelRegisters(0),
+                  }))
+                : []),
             ],
           },
           {
@@ -461,6 +562,18 @@ const DEVICE_TREE: NodeSpec[] = [
             registers: [reg("STEP", 8, 0), reg("MDEC_CT", 16, 0x1fff), reg("RBP", 16, 0x0400), reg("RBL", 8, 0x03)],
             actions: [PANEL_IDS.DSP_DISASSEMBLY],
           },
+          ...(m2
+            ? [
+                {
+                  path: "dc.aica.common",
+                  label: "Common",
+                  description: "Common registers",
+                  // fields of the common block; the interrupt levels are write-only on the console
+                  registers: [reg("MVOL", 4, 0xf), reg("VER", 4, 0x1, false), reg("DMEA", 23, 0), reg("SCIEB", 11, 0x040), reg("SCIPD", 11, 0, false), unread("SCILV0", 8), reg("L", 3, 0, false), reg("M", 3, 0, false)],
+                },
+                { path: "dc.aica.rtc", label: "RTC", description: "Real Time Clock", registers: [reg("SECONDS", 32, 0x5bfc8900), reg("WRITE_ENABLE", 1, 0)] },
+              ]
+            : []),
         ],
       },
       {
@@ -468,8 +581,20 @@ const DEVICE_TREE: NodeSpec[] = [
         label: "System",
         description: "Peripherals and timing",
         children: [
-          { path: "dc.gdrom", label: "GD-ROM", description: "GD-ROM drive", events: ["dc.gdrom.command"] },
-          { path: "dc.maple", label: "Maple", description: "Maple bus", events: ["dc.maple.dma"] },
+          {
+            path: "dc.gdrom",
+            label: "GD-ROM",
+            description: "GD-ROM drive",
+            ...(m2 ? { registers: [reg("STATUS", 8, 0x50, false), reg("SECTOR_NUMBER", 32, 0x000000b0, false), reg("BYTE_COUNT", 16, 0, false), reg("PACKET_0_3", 32, 0, false)] } : {}),
+            events: ["dc.gdrom.command"],
+          },
+          {
+            path: "dc.maple",
+            label: "Maple",
+            description: "Maple bus",
+            ...(m2 ? { registers: [reg("SB_MDSTAR", 32, 0x0c700000), ...regs(32, "SB_MDTSEL SB_MDEN SB_MDST")] } : {}),
+            events: ["dc.maple.dma"],
+          },
           {
             path: "dc.timing",
             label: "Timing",
@@ -542,11 +667,13 @@ const TARGETS: DebuggerTarget[] = [
 
 const targetById = (id: TargetProcessor): DebuggerTarget => TARGETS.find((target) => target.id === id)!;
 
-/** The capabilities of optional methods the mock has: M1's, and what it could do before protocol v3. */
+/** The capabilities of optional methods the mock has: those of M1 and of M2, and the SGC capture, which it could do before protocol v3. */
 const OPTIONAL_CAPABILITIES: string[] = [
   CAPABILITIES.EVENT_BREAKPOINTS,
   CAPABILITIES.CALLSTACK,
+  CAPABILITIES.MEMORY_WRITE,
   CAPABILITIES.REGISTER_WRITE,
+  CAPABILITIES.RESET,
   CAPABILITIES.SGC_CAPTURE,
 ];
 
@@ -590,8 +717,60 @@ export const mockSh4Readable = (address: number): boolean => {
 export const mockArm7Readable = (address: number): boolean =>
   address < 0x00800000 || (address >= 0x00800000 && address <= 0x00807fff) || (address >= 0x00810000 && address <= 0x0081000b);
 
-const memoryByte = (target: "sh4" | "arm7", address: number): number =>
-  sha256Byte(`${target === "sh4" ? "SH4" : "ARM7"}:${address.toString(16)}`);
+/**
+ * The memories state.writeMemory writes. Each is one store, whatever address it is reached by:
+ * main memory through P0, P1 and P2 and mirrored by its size; wave memory through the SH4's
+ * 0x00800000 + X and the ARM7's X; video memory in two views, each mirrored once, and the mock
+ * does not show a byte of one view in the other (the emulator's interleaving is its own).
+ */
+export type MockStore = "main" | "wave" | "video64" | "video32";
+const STORES: readonly MockStore[] = ["main", "wave", "video64", "video32"];
+const MAIN_BYTES = 0x01000000;
+const WAVE_BYTES = 0x00800000;
+const VIDEO_BYTES = 0x00800000;
+
+/** The store and the offset in it that an address of a target is; undefined for what is no such memory. */
+export const mockStoreOf = (target: "sh4" | "arm7", address: number): { store: MockStore; offset: number } | undefined => {
+  if (target === "arm7") {
+    return address < WAVE_BYTES ? { store: "wave", offset: address } : undefined;
+  }
+  if (address >= 0xe0000000) {
+    return undefined;
+  }
+  const masked = address & SH4_ADDRESS_MASK;
+  switch (masked >>> 26) {
+    case 0: {
+      const offset = masked & 0x01ffffff;
+      return offset >= 0x00800000 && offset <= 0x00ffffff ? { store: "wave", offset: offset - 0x00800000 } : undefined;
+    }
+    case 1:
+      return { store: masked & 0x01000000 ? "video32" : "video64", offset: masked & (VIDEO_BYTES - 1) };
+    case 3:
+      return { store: "main", offset: masked & (MAIN_BYTES - 1) };
+    default:
+      return undefined;
+  }
+};
+
+/** What a byte reads before anything wrote it: a hash of where it is in its store, or of its address. */
+const fabricatedByte = (target: "sh4" | "arm7", address: number): number => {
+  const at = mockStoreOf(target, address);
+  switch (at?.store) {
+    case "main":
+      return sha256Byte(`SH4:${(0x8c000000 + at.offset).toString(16)}`);
+    case "wave":
+      return sha256Byte(`ARM7:${at.offset.toString(16)}`);
+    case "video64":
+      return sha256Byte(`SH4:${(0x04000000 + at.offset).toString(16)}`);
+    case "video32":
+      return sha256Byte(`SH4:${(0x05000000 + at.offset).toString(16)}`);
+    default:
+      return sha256Byte(`${target === "sh4" ? "SH4" : "ARM7"}:${address.toString(16)}`);
+  }
+};
+
+/** A byte of a target's memory as the machine has it now: what was written, else what is fabricated. */
+type ReadByte = (target: "sh4" | "arm7", address: number) => number;
 
 const isReadable = (target: "sh4" | "arm7", address: number): boolean =>
   address <= targetById(target).addressMax && (target === "sh4" ? mockSh4Readable(address) : mockArm7Readable(address));
@@ -680,7 +859,7 @@ const dspSampleProgram = [
 const hexByte = (value: number) => value.toString(16).toUpperCase().padStart(2, "0");
 const hex8 = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
 
-const disassembleLine = (target: TargetProcessor, address: number): DisassemblyLine => {
+const disassembleLine = (target: TargetProcessor, address: number, memoryByte: ReadByte, written?: string): DisassemblyLine => {
   if (target === "dsp") {
     const bytes = Array.from({ length: 8 }, (_, index) => hexByte(sha256Byte(`dsp:${address}:${index}`))).join(" ");
     return { address, bytes, disassembly: dspSampleProgram[address % dspSampleProgram.length] };
@@ -696,9 +875,20 @@ const disassembleLine = (target: TargetProcessor, address: number): DisassemblyL
   // the bytes of an instruction are the bytes state.getMemorySlice returns for its address
   const bytes = Array.from({ length: size }, (_, offset) => hexByte(memoryByte(target, address + offset))).join(" ");
 
+  if (written !== undefined) {
+    // an instruction state.writeMemory put there, which the mock's SH4 executes
+    return { address, bytes, disassembly: written };
+  }
   if (target === "sh4" && inSh4Handler(address)) {
     // the interrupt handler: what the SH4 executes at every vertical blank
     return { address, bytes, disassembly: SH4_HANDLER_TEXT[(address - MOCK_SH4_HANDLER.base) / size] };
+  }
+  if (target === "arm7" && address === MOCK_ARM7_CALL) {
+    // the call of the ARM7's loop, and behind the loop the leaf it calls
+    return { address, bytes, disassembly: `bl ${hex8(MOCK_ARM7_LEAF.base)}` };
+  }
+  if (target === "arm7" && address >= MOCK_ARM7_LEAF.base && address < ARM7_LEAF_END) {
+    return { address, bytes, disassembly: ARM7_LEAF_TEXT[(address - MOCK_ARM7_LEAF.base) / size] };
   }
 
   const instructions = target === "sh4" ? sh4Instructions : arm7Instructions;
@@ -765,6 +955,8 @@ type CallClass = "describe" | "read" | "table" | "write" | "exec";
  */
 const METHOD_CAPABILITY: Readonly<Record<string, string>> = {
   [RpcMethod.STATE_GET_CALLSTACK]: CAPABILITIES.CALLSTACK,
+  [RpcMethod.STATE_WRITE_MEMORY]: CAPABILITIES.MEMORY_WRITE,
+  [RpcMethod.CONTROL_RESET]: CAPABILITIES.RESET,
   [RpcMethod.STATE_SET_REGISTER]: CAPABILITIES.REGISTER_WRITE,
   [RpcMethod.STATE_EDIT_WATCH]: CAPABILITIES.REGISTER_WRITE,
   [RpcMethod.STATE_RECORD_SGC_FRAMES]: CAPABILITIES.SGC_CAPTURE,
@@ -818,6 +1010,9 @@ export class MockDebugger {
   private readonly targets: DebuggerTarget[];
   /** the capabilities of optional methods this server has */
   private readonly optionalCapabilities: string[];
+  /** the nodes whose registers this server writes; undefined: every node */
+  private readonly writableNodes: ReadonlySet<string> | undefined;
+  private readonly deviceTree: NodeSpec[];
   private readonly nodes = new Map<string, NodeSpec>();
   private readonly values = new Map<string, Map<string, RegisterContent>>();
   private readonly clients = new Map<number, ClientState>();
@@ -833,6 +1028,18 @@ export class MockDebugger {
   private pendingStepOut: TargetProcessor | undefined;
   /** the pending step-out of the SH4 was asked for in its interrupt handler: its return is the handler's `rte` */
   private stepOutOfHandler = false;
+  /**
+   * The temporary breakpoint of the ARM7: where its step-over of a call, or its step-out,
+   * stops. One at a time; it goes at the stop it makes and at any other stop.
+   */
+  private arm7Temporary: number | undefined;
+  /**
+   * The ARM7 is held in reset, and this many emulation steps of the running machine are left
+   * until it is released; undefined while it is clocked.
+   */
+  private arm7HeldFor: number | undefined;
+  /** what state.writeMemory wrote: store and offset -> byte */
+  private readonly written = new Map<number, number>();
   private emulationSteps = 0;
   private cycles = 0n;
 
@@ -871,6 +1078,7 @@ export class MockDebugger {
       sliceContext: options.sliceContext ?? true,
       ui: options.ui ?? "none",
       protocol: options.protocol ?? PROTOCOL_VERSION,
+      arm7Held: options.arm7Held ?? false,
       log: options.log,
     };
     const listed = options.supports?.targets;
@@ -883,6 +1091,9 @@ export class MockDebugger {
       (capability) => !options.supports?.capabilities || options.supports.capabilities.includes(capability),
     );
 
+    this.writableNodes = options.supports?.writableNodes ? new Set(options.supports.writableNodes) : undefined;
+    this.deviceTree = deviceTree(options.supports?.deviceTree !== "m1");
+
     const visit = (node: NodeSpec) => {
       this.nodes.set(node.path, node);
       if (node.registers) {
@@ -890,9 +1101,12 @@ export class MockDebugger {
       }
       node.children?.forEach(visit);
     };
-    DEVICE_TREE.forEach(visit);
+    this.deviceTree.forEach(visit);
     if (this.options.forceFallback) {
       this.values.get("dc.timing")!.set("SH4_DEBUG_ENGINE", "interpreter-fallback");
+    }
+    if (this.options.arm7Held) {
+      this.holdArm7();
     }
     if (this.options.startPaused) {
       this.running = false;
@@ -921,10 +1135,10 @@ export class MockDebugger {
       [RpcMethod.BREAKPOINTS_SET_CATEGORY_STATES]: { cls: "table", run: (params, context) => this.setCategoryStates(params, context) },
       [RpcMethod.STATE_RECORD_SGC_FRAMES]: { cls: "exec", run: (params, context) => this.recordSgcFrames(params, context) },
       [RpcMethod.STATE_GET_SGC_FRAME_DATA]: { cls: "read", run: (_params, context) => this.getSgcFrameData(context) },
+      [RpcMethod.STATE_WRITE_MEMORY]: { cls: "write", run: (params, context) => this.writeMemory(params, context) },
+      [RpcMethod.CONTROL_RESET]: { cls: "write", run: (_params, context) => this.reset(context) },
       // later milestones, not implemented by the mock
       [RpcMethod.STATE_GET_MEMORY_BINARY]: undefined,
-      [RpcMethod.STATE_WRITE_MEMORY]: undefined,
-      [RpcMethod.CONTROL_RESET]: undefined,
       [RpcMethod.STATE_GET_TABLE]: undefined,
       [RpcMethod.STATE_CAPTURE_HOLLY]: undefined,
     };
@@ -1022,9 +1236,60 @@ export class MockDebugger {
     this.broadcastTick();
   }
 
+  /**
+   * What a guest does to its sound CPU: the ARM7 is held in reset. `ENABLED` reads 0, the ARM7
+   * executes nothing and has no callstack, and its steps are refused with -32012. The running
+   * machine releases it `MOCK_ARM7_RELEASE_STEPS` emulation steps later, at the start of its
+   * program. No tick is sent for it: the next one shows it.
+   */
+  holdArm7(): void {
+    this.arm7HeldFor = MOCK_ARM7_RELEASE_STEPS;
+    this.arm7Temporary = undefined;
+    const arm7 = this.nodes.get("dc.aica.arm7")!;
+    // the registers a reset of the ARM7 leaves: those of its start
+    this.values.set("dc.aica.arm7", new Map(arm7.registers!.map((register) => [register.name, register.initial])));
+    this.setRegisterValue("dc.aica.arm7", "ENABLED", 0);
+  }
+
   // -------------------------------------------------------------------------------------
   // The machine
   // -------------------------------------------------------------------------------------
+
+  private get arm7Held(): boolean {
+    return this.arm7HeldFor !== undefined;
+  }
+
+  /** The key of a byte of a store in `written`. */
+  private static storeKey(at: { store: MockStore; offset: number }): number {
+    return STORES.indexOf(at.store) * 0x01000000 + at.offset;
+  }
+
+  private readonly memoryByte: ReadByte = (target, address) => {
+    const at = mockStoreOf(target, address);
+    const stored = at && this.written.size > 0 ? this.written.get(MockDebugger.storeKey(at)) : undefined;
+    return stored ?? fabricatedByte(target, address);
+  };
+
+  /**
+   * The instruction state.writeMemory put at an address of the SH4, if it is one the mock's SH4
+   * executes: `mov #imm, Rn` (0xEnii, both bytes written).
+   */
+  private writtenSh4Instruction(address: number): { register: string; value: number; text: string } | undefined {
+    const low = mockStoreOf("sh4", address);
+    const high = mockStoreOf("sh4", (address + 1) >>> 0);
+    if (!low || !high || this.written.size === 0) {
+      return undefined;
+    }
+    const first = this.written.get(MockDebugger.storeKey(low));
+    const second = this.written.get(MockDebugger.storeKey(high));
+    if (first === undefined || second === undefined || second >>> 4 !== 0xe) {
+      return undefined;
+    }
+    // the immediate is sign-extended
+    const value = (first & 0x80 ? 0xffffff00 | first : first) >>> 0;
+    const signed = first & 0x80 ? first - 256 : first;
+    return { register: `R${second & 0xf}`, value, text: `mov #${signed}, r${second & 0xf}` };
+  }
 
   private register(path: string, name: string): RegisterContent {
     return this.values.get(path)!.get(name)!;
@@ -1049,8 +1314,24 @@ export class MockDebugger {
     const before = this.pc(target);
     if (target === "sh4" && before === SH4_HANDLER_RTE) {
       this.setRegisterValue(pcPath, pcRegister, this.register(pcPath, "SPC"));
-      this.setRegisterValue(pcPath, "SR", this.register(pcPath, "SSR"));
+      this.setSh4Sr(this.register(pcPath, "SSR") as number);
       return { wrapped: false, returned: true };
+    }
+    if (target === "sh4") {
+      // what state.writeMemory put at the PC is what executes, if it is the instruction the mock knows
+      const instruction = this.writtenSh4Instruction(before);
+      if (instruction) {
+        this.setRegisterValue(pcPath, instruction.register, instruction.value);
+      }
+    }
+    if (target === "arm7" && before === MOCK_ARM7_CALL) {
+      // the call: R14 is the address behind it
+      this.setRegisterValue(pcPath, "R14", before + MOCK_ARM7_RING.instructionSize);
+    }
+    if (target === "arm7" && before === ARM7_LEAF_RETURN) {
+      // the return of the leaf goes to R14, whatever it is by now
+      this.setRegisterValue(pcPath, pcRegister, ((this.register(pcPath, "R14") as number) & ~3) >>> 0);
+      return { wrapped: false };
     }
     const after = mockNextAddress(target, before);
     this.setRegisterValue(pcPath, pcRegister, after);
@@ -1071,9 +1352,31 @@ export class MockDebugger {
     const sr = this.register(path, "SR") as number;
     this.setRegisterValue(path, "SPC", this.pc("sh4"));
     this.setRegisterValue(path, "SSR", sr);
-    this.setRegisterValue(path, "SR", (sr | SH4_SR_BL | SH4_SR_RB) >>> 0);
+    this.setSh4Sr((sr | SH4_SR_MD | SH4_SR_BL | SH4_SR_RB) >>> 0);
     this.setRegisterValue(path, "PC", ((this.register(path, "VBR") as number) + 0x600) >>> 0);
     return this.emitEvent("dc.sh4.interrupt", MOCK_EVENTS["dc.sh4.interrupt"].message(this.emulationSteps));
+  }
+
+  /**
+   * `SR` of the SH4 takes a value: what the register stores of it (its defined bits, and `RB`
+   * only in privileged mode), and when that changes the register bank, R0..R7 and
+   * R0_BANK..R7_BANK are exchanged, as the SH4 does it.
+   */
+  private setSh4Sr(value: number): void {
+    const path = "dc.sh4.cpu";
+    let stored = (value & SH4_SR_MASK) >>> 0;
+    if ((stored & SH4_SR_MD) === 0) {
+      stored = (stored & ~SH4_SR_RB) >>> 0;
+    }
+    const before = this.register(path, "SR") as number;
+    if (((before ^ stored) & SH4_SR_RB) !== 0) {
+      for (let index = 0; index < 8; index++) {
+        const live = this.register(path, `R${index}`);
+        this.setRegisterValue(path, `R${index}`, this.register(path, `R${index}_BANK`));
+        this.setRegisterValue(path, `R${index}_BANK`, live);
+      }
+    }
+    this.setRegisterValue(path, "SR", stored);
   }
 
   /** The lowest id of the active code breakpoints of a target at the address its PC is at now. */
@@ -1107,7 +1410,18 @@ export class MockDebugger {
     this.emulationSteps++;
     const wrapped: Partial<Record<TargetProcessor, boolean>> = {};
     let returned = false;
+    // An ARM7 that is held in reset executes nothing. The machine releases it when it has run
+    // for some steps, as a guest does: the step that releases it leaves it in front of its
+    // first instruction, where a breakpoint stops it.
+    const held = this.arm7Held;
+    if (this.arm7HeldFor !== undefined && --this.arm7HeldFor <= 0) {
+      this.arm7HeldFor = undefined;
+      this.setRegisterValue("dc.aica.arm7", "ENABLED", 1);
+    }
     for (const target of ["sh4", "arm7", "dsp"] as const) {
+      if (target === "arm7" && held) {
+        continue;
+      }
       // (the instruction a target was stopped in front of executes here without being tested again)
       const executed = this.advance(target);
       wrapped[target] = executed.wrapped;
@@ -1144,7 +1458,8 @@ export class MockDebugger {
       codeHit = this.codeBreakpointAtPc("sh4");
     }
     for (const target of ["arm7", "dsp"] as const) {
-      const hit = this.codeBreakpointAtPc(target);
+      // (the ARM7 is not where a breakpoint could stop it while it is held)
+      const hit = target === "arm7" && this.arm7Held ? undefined : this.codeBreakpointAtPc(target);
       if (hit !== undefined && (codeHit === undefined || hit < codeHit)) {
         codeHit = hit;
       }
@@ -1160,12 +1475,19 @@ export class MockDebugger {
       // there, else the branch at the end of the loop (a handler entered after the request is
       // skipped whole).
       this.enterStop("step");
+    } else if (this.arm7Temporary !== undefined && !this.arm7Held && this.sameAddress("arm7", this.arm7Temporary, this.pc("arm7"))) {
+      // the temporary breakpoint of a step-over or a step-out of the ARM7
+      this.enterStop("step");
     }
   }
 
   private sameAddress(target: TargetProcessor, a: number, b: number): boolean {
-    // the same SH4 code is reachable at 0x0C.., 0x8C.. and 0xAC..
-    return target === "sh4" ? (a & SH4_ADDRESS_MASK) === (b & SH4_ADDRESS_MASK) : a === b;
+    // the same SH4 code is reachable at 0x0C.., 0x8C.. and 0xAC..; ARM7 code is compared under
+    // the mask of the wave memory, with bits 0 and 1 dropped
+    if (target === "sh4") {
+      return (a & SH4_ADDRESS_MASK) === (b & SH4_ADDRESS_MASK);
+    }
+    return target === "arm7" ? (a & ARM7_CODE_ADDRESS_MASK) === (b & ARM7_CODE_ADDRESS_MASK) : a === b;
   }
 
   private isActive(breakpoint: BreakpointDescriptor): boolean {
@@ -1187,6 +1509,8 @@ export class MockDebugger {
     this.reason = reason;
     this.stopBreakpointId = breakpointId;
     this.pendingStepOut = undefined;
+    // the temporary breakpoint goes at the stop it makes, and at any other stop
+    this.arm7Temporary = undefined;
     this.fallbackStep = fallbackStep;
     this.updateFallback();
     this.broadcastTick();
@@ -1263,8 +1587,26 @@ export class MockDebugger {
     return this.nodes.get(path)!.registers!.map((register) => this.formatRegister(path, register));
   }
 
+  /** Whether state.setRegister writes a register of this server: it has a width and a writer, and its node is one the server writes. */
+  private hasWriter(path: string, register: RegisterSpec): boolean {
+    return register.width > 0 && register.writable !== false && (!this.writableNodes || this.writableNodes.has(path));
+  }
+
+  /** The registers of a node as debugger.describe lists them: a register this server writes says so, which a tick never does. */
+  private describedRegistersOf(path: string): RegisterValue[] {
+    const flagged = this.has(CAPABILITIES.REGISTER_WRITE);
+    return this.nodes.get(path)!.registers!.map((register) => ({
+      ...this.formatRegister(path, register),
+      ...(flagged && this.hasWriter(path, register) ? { flags: { writable: true } } : {}),
+    }));
+  }
+
   private callstack(target: "sh4" | "arm7", maxFrames: number): CallstackFrame[] {
     const sh4 = target === "sh4";
+    if (!sh4 && this.arm7Held) {
+      // an ARM7 that is held in reset has no frames (design 2.10)
+      return [];
+    }
     const path = sh4 ? "dc.sh4.cpu" : "dc.aica.arm7";
     const sp = this.register(path, sh4 ? "R15" : "R13") as number;
     const linkRegister = this.register(path, sh4 ? "PR" : "R14") as number;
@@ -1540,7 +1882,7 @@ export class MockDebugger {
       label: node.label,
       description: node.description,
       // empty arrays are omitted
-      ...(node.registers?.length ? { registers: this.registersOf(node.path) } : {}),
+      ...(node.registers?.length ? { registers: this.describedRegistersOf(node.path) } : {}),
       ...(node.events?.length ? { events: node.events.slice() } : {}),
       ...(node.actions?.length ? { actions: node.actions.slice() } : {}),
       ...(node.children?.length ? { children: node.children.map(build) } : {}),
@@ -1557,7 +1899,7 @@ export class MockDebugger {
       ui: this.options.ui,
       capabilities: this.capabilities,
       targets: this.targets.map((target) => ({ ...target })),
-      deviceTree: DEVICE_TREE.map(build),
+      deviceTree: this.deviceTree.map(build),
     };
   }
 
@@ -1578,7 +1920,7 @@ export class MockDebugger {
     const unreadable: Array<[number, number]> = [];
     for (let offset = 0; offset < length; offset++) {
       const readable = isReadable(target, address + offset);
-      data[offset] = readable ? memoryByte(target, address + offset) : 0;
+      data[offset] = readable ? this.memoryByte(target, address + offset) : 0;
       if (!readable) {
         const last = unreadable.at(-1);
         if (last && last[0] + last[1] === offset) {
@@ -1612,7 +1954,7 @@ export class MockDebugger {
       if (lineAddress + target.instructionSize - 1 > target.addressMax) {
         break;
       }
-      lines.push(disassembleLine(targetId, lineAddress));
+      lines.push(disassembleLine(targetId, lineAddress, this.memoryByte, targetId === "sh4" ? this.writtenSh4Instruction(lineAddress)?.text : undefined));
     }
     return { lines };
   }
@@ -1684,31 +2026,133 @@ export class MockDebugger {
   }
 
   private setRegister(params: Record<string, unknown>, context: RequestContext): Record<string, never> {
-    const path = params.path as string;
-    const name = params.name as string;
-    const register = this.nodes.get(path)?.registers?.find((candidate) => candidate.name === name);
+    // the path and the name are matched without regard to case, as a watch expression is
+    const path = (params.path as string).toLowerCase();
+    const name = (params.name as string).toLowerCase();
+    const register = this.nodes.get(path)?.registers?.find((candidate) => candidate.name.toLowerCase() === name);
     if (!register) {
-      throw invalidParams(`${path} has no register ${name}`);
+      throw invalidParams(`${params.path as string} has no register ${params.name as string}`);
     }
     this.writeRegister(path, register, params.value as string);
     this.tickAfter(context);
     return {};
   }
 
+  /**
+   * state.setRegister behind the look-up of its register, and state.editWatch behind that of
+   * its watch. In this order: a register of width 0 or without a writer, -32013; a value that
+   * is no number, -32602; a value the device refuses, -32013.
+   */
   private writeRegister(path: string, register: RegisterSpec, text: string): void {
-    if (register.observable) {
-      throw notSupported(`writing ${path}.${register.name}`);
+    const notWritable = (what: string) => new MockRpcError(DebuggerErrorCode.NOT_WRITABLE, `not writable: ${what}`);
+    if (!this.hasWriter(path, register)) {
+      throw notWritable(`${path}.${register.name}`);
     }
-    if (register.width === 0 || register.writable === false) {
-      throw new MockRpcError(DebuggerErrorCode.NOT_WRITABLE, `not writable: ${path}.${register.name}`);
-    }
-    const trimmed = text.trim();
-    if (!/^(0x[0-9a-f]+|\d+)$/i.test(trimmed)) {
+    // ASCII blanks around it are dropped; then 0x or 0X and hex digits, or decimal digits, and nothing else
+    const trimmed = text.replace(/^[ \t]+|[ \t]+$/g, "");
+    if (!/^(0[xX][0-9a-fA-F]+|[0-9]+)$/.test(trimmed)) {
       throw invalidParams(`value: "${text}" is neither 0x hex nor decimal`);
     }
-    // truncated to the register's width
-    const value = BigInt(trimmed) & ((1n << BigInt(register.width)) - 1n);
-    this.setRegisterValue(path, register.name, register.width > 32 ? value : Number(value));
+    // any length, of which the low `width` bits count
+    const truncated = BigInt(trimmed) & ((1n << BigInt(register.width)) - 1n);
+    if (register.width > 32) {
+      this.setRegisterValue(path, register.name, truncated);
+      return;
+    }
+    const value = Number(truncated);
+    if (path === "dc.sh4.cpu") {
+      switch (register.name) {
+        case "PC":
+          // nothing executes at an odd address
+          if (value & 1) {
+            throw notWritable(`${path}.PC = ${hex8(value)}: the address is odd`);
+          }
+          break;
+        case "SR":
+          // (the register stores its defined bits, and a change of RB exchanges the register banks)
+          this.setSh4Sr(value);
+          return;
+        case "FPSCR":
+          this.setRegisterValue(path, register.name, (value & SH4_FPSCR_MASK) >>> 0);
+          return;
+      }
+    }
+    if (path === "dc.aica.arm7") {
+      switch (register.name) {
+        case "PC":
+          // stored aligned: every write of R15 by the ARM7 clears bits 0 and 1
+          this.setRegisterValue(path, register.name, (value & ~3) >>> 0);
+          return;
+        case "CPSR":
+          if (!ARM7_MODES.includes(value & 0x1f)) {
+            throw notWritable(`${path}.CPSR = ${hex8(value)}: its mode bits are no mode`);
+          }
+          this.setRegisterValue(path, register.name, (value & ARM7_CPSR_MASK) >>> 0);
+          return;
+      }
+    }
+    this.setRegisterValue(path, register.name, value);
+  }
+
+  /**
+   * state.writeMemory: all of the range or nothing of it. Main memory, video memory and wave
+   * memory are written, through any address that maps them; everything else is not writable.
+   */
+  private writeMemory(params: Record<string, unknown>, context: RequestContext): Record<string, never> {
+    // (a target without memory is the method's own "not supported", behind the lifetime)
+    const target = this.memoryTarget(params);
+    const address = params.address as number;
+    const data = params.data as number[];
+    const last = address + data.length - 1;
+    // the range is checked as a whole before the first byte is stored; a write does not wrap
+    const places: number[] = new Array<number>(data.length);
+    for (let offset = 0; offset < data.length; offset++) {
+      const at = address + offset <= targetById(target).addressMax ? mockStoreOf(target, address + offset) : undefined;
+      if (!at) {
+        throw new MockRpcError(DebuggerErrorCode.NOT_WRITABLE, `not writable: ${target} ${hex8(address)}..${hex8(last >>> 0)}`);
+      }
+      places[offset] = MockDebugger.storeKey(at);
+    }
+    for (let offset = 0; offset < data.length; offset++) {
+      // (a byte that is written as what it is fabricated to be is not kept)
+      if (data[offset] === fabricatedByte(target, address + offset)) {
+        this.written.delete(places[offset]);
+      } else {
+        this.written.set(places[offset], data[offset]);
+      }
+    }
+    this.tickAfter(context);
+    return {};
+  }
+
+  /**
+   * control.reset: the machine is reset. Its registers are those of its start and its ARM7 is
+   * held in reset; breakpoints, watches and categories are what they were, and so is memory.
+   * A paused machine stays paused, in a new stop with reason "reset" and with no running tick.
+   * A running one runs on: an entry in the event log, and nothing is published.
+   */
+  private reset(context: RequestContext): Record<string, never> {
+    context.afterResponse.push(() => {
+      if (this.lifetime !== "running") {
+        return;
+      }
+      for (const [path, node] of this.nodes) {
+        // (time is not the machine's to reset: the scheduler counts on)
+        if (node.registers && path !== "dc.timing") {
+          this.values.set(path, new Map(node.registers.map((register) => [register.name, register.initial])));
+        }
+      }
+      this.holdArm7();
+      this.pendingStepOut = undefined;
+      const hit = this.emitEvent("dc.system.reset", MOCK_EVENTS["dc.system.reset"].message(this.emulationSteps));
+      if (!this.running) {
+        // the reason of the stop is the reset, whatever it was before, and it names no breakpoint
+        this.enterStop("reset");
+      } else if (hit !== undefined) {
+        this.enterStop("event", hit);
+      }
+    });
+    return {};
   }
 
   private pause(context: RequestContext): Record<string, never> {
@@ -1755,6 +2199,9 @@ export class MockDebugger {
     if (targetId === "dsp" && kind !== "step") {
       throw notSupported(`control.${kind} for target dsp`);
     }
+    if (targetId === "arm7" && this.arm7Held) {
+      throw new MockRpcError(DebuggerErrorCode.NOT_CLOCKED, "arm7 held in reset");
+    }
     if (targetId === "sh4") {
       // preconditions, checked before anything executes
       const pc = this.pc("sh4");
@@ -1766,6 +2213,17 @@ export class MockDebugger {
       }
     }
 
+    if (targetId === "arm7" && (kind === "stepOut" || (kind === "stepOver" && this.pc("arm7") === MOCK_ARM7_CALL))) {
+      // Step-out of the ARM7, and its step-over of a call: a temporary breakpoint (at the link
+      // register R14; behind the call) and a resume. Tick running now, tick paused with reason
+      // "step" when the ARM7 arrives there.
+      context.afterResponse.push(() => {
+        const address = kind === "stepOut" ? (this.register("dc.aica.arm7", "R14") as number) : this.pc("arm7") + MOCK_ARM7_RING.instructionSize;
+        this.leaveStop();
+        this.arm7Temporary = address >>> 0;
+      });
+      return {};
+    }
     if (kind === "stepOut") {
       // a resume until the return: tick running now, tick paused with reason "step" later
       context.afterResponse.push(() => {
@@ -1776,8 +2234,9 @@ export class MockDebugger {
       return {};
     }
 
-    // Step, and step over (the program has no calls): one instruction, one paused tick, no
-    // running tick. `rte` executes with its delay slot. No vertical blank falls into a step.
+    // Step, and step over on a line that is no call: one instruction, one paused tick, no
+    // running tick. `rte` executes with its delay slot. No vertical blank falls into a step,
+    // and a step of one target moves nothing of another.
     context.afterResponse.push(() => {
       this.advance(targetId);
       if (targetId === "sh4") {
@@ -1831,8 +2290,8 @@ export class MockDebugger {
       if (address % target.instructionSize !== 0) {
         throw invalidParams(`address: ${hex8(address)} is not a multiple of ${target.instructionSize}`);
       }
-      if (targetId === "dsp" && address > target.addressMax) {
-        throw invalidParams(`address: DSP steps are 0..${target.addressMax}`);
+      if (address > target.addressMax) {
+        throw invalidParams(`address: above the last address of ${targetId}, ${targetId === "dsp" ? target.addressMax : hex8(target.addressMax)}`);
       }
       breakpoint = { event, address, kind, enabled };
     }

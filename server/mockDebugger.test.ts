@@ -2,7 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseBinaryFrame } from "../src/lib/binaryFrame";
 import { IN_BAND_ERROR_METHODS, StrictDebuggerRpcMethodSchemas } from "../src/lib/debuggerSchema";
 import type { DebuggerShape, DebuggerTick } from "../src/lib/debuggerSchema";
-import { MOCK_EVENTS, MOCK_M1_SUPPORT, MOCK_SH4_HANDLER, MOCK_SH4_RING, MOCK_SH4_VBR, MockDebugger, mockNextAddress } from "./mockDebugger";
+import {
+  MOCK_ARM7_CALL,
+  MOCK_ARM7_LEAF,
+  MOCK_ARM7_RELEASE_STEPS,
+  MOCK_ARM7_RING,
+  MOCK_EVENTS,
+  MOCK_M1_SUPPORT,
+  MOCK_M2_SUPPORT,
+  MOCK_SH4_HANDLER,
+  MOCK_SH4_RING,
+  MOCK_SH4_VBR,
+  MockDebugger,
+  mockNextAddress,
+  mockStoreOf,
+} from "./mockDebugger";
 import type { MockDebuggerOptions } from "./mockDebugger";
 
 interface Frame {
@@ -132,7 +146,7 @@ describe("tick policy", () => {
     expect(StrictDebuggerRpcMethodSchemas["debugger.describe"].result.safeParse(shape).success).toBe(true);
     expect(shape.protocol).toBe(3);
     expect(shape.ui).toBe("none");
-    expect(shape.capabilities).toEqual(["event-breakpoints", "callstack", "register-write", "sgc-capture", "sh4-debug-native"]);
+    expect(shape.capabilities).toEqual(["event-breakpoints", "callstack", "memory-write", "register-write", "reset", "sgc-capture", "sh4-debug-native"]);
     expect(shape.targets!.map((target) => target.id)).toEqual(["sh4", "arm7", "dsp"]);
 
     const tick = first.lastTick();
@@ -539,8 +553,9 @@ describe("tick policy", () => {
     const session = connect(mock);
     const shape = session.describe();
     const arm7 = shape.deviceTree[0].children!.find((node) => node.path === "dc.aica")!.children!.find((node) => node.path === "dc.aica.arm7")!;
+    // (PC has a writer and says so in debugger.describe; ENABLED has none)
     expect(arm7.registers!.slice(0, 2)).toEqual([
-      { name: "PC", value: "0x00200010", width: 32 },
+      { name: "PC", value: "0x00200010", width: 32, flags: { writable: true } },
       { name: "ENABLED", value: "0x1", width: 1 },
     ]);
     const enabled = () => session.lastTick().registers["dc.aica.arm7"][1];
@@ -557,12 +572,14 @@ describe("tick policy", () => {
     expect(session.lastTick().callstacks!.arm7.length).toBeGreaterThanOrEqual(2);
     expect((session.ok("state.getCallstack", { target: "arm7" }) as { frames: unknown[] }).frames.length).toBeGreaterThanOrEqual(2);
 
-    // The guest holds or releases the ARM7, the debugger does not: the register is not written,
-    // by its name or through a watch on it, and that is "not supported", not "not writable".
-    session.fail("state.setRegister", { path: "dc.aica.arm7", name: "ENABLED", value: "0" }, -32004);
+    // The guest holds or releases the ARM7, the debugger does not: the register has no writer,
+    // by its name or through a watch on it, and answers -32013 as every such register does,
+    // before its value is looked at.
+    session.fail("state.setRegister", { path: "dc.aica.arm7", name: "ENABLED", value: "0" }, -32013);
+    session.fail("state.setRegister", { path: "dc.aica.arm7", name: "ENABLED", value: "twelve" }, -32013);
     session.ok("state.watch", { expressions: ["dc.aica.arm7.enabled"] });
     expect(session.lastTick().watches).toEqual([{ id: 1, expression: "dc.aica.arm7.enabled", value: "0x1" }]);
-    session.fail("state.editWatch", { watchId: 1, value: "0" }, -32004);
+    session.fail("state.editWatch", { watchId: 1, value: "0" }, -32013);
     expect(enabled().value).toBe("0x1");
   });
 
@@ -1031,6 +1048,724 @@ describe("a server that implements less (the option `supports`)", () => {
   });
 });
 
+describe("milestone M2", () => {
+  const STEP_MS = 16;
+  /** A mock with a client that has described it; `paused`: at a pause the client asked for. */
+  const setup = (options: MockDebuggerOptions = {}, paused = true) => {
+    const mock = createMock(options);
+    const session = connect(mock);
+    const shape = session.describe();
+    if (paused) {
+      session.ok("control.pause");
+    }
+    const registerOf = (path: string, name: string, tick: DebuggerTick = session.lastTick()) => tick.registers[path].find((register) => register.name === name)!.value;
+    const read = (target: string, address: number, length: number) =>
+      (session.ok("state.getMemorySlice", { target, address, length }) as { data: number[] }).data;
+    const lines = (target: string, address: number, count: number) =>
+      (session.ok("state.getDisassembly", { target, address, count }) as { lines: Array<{ address: number; bytes: string; disassembly: string }> }).lines;
+    const arm7Pc = () => Number.parseInt(registerOf("dc.aica.arm7", "PC"), 16);
+    return { mock, session, shape, registerOf, read, lines, arm7Pc };
+  };
+  const nodesOf = (shape: DebuggerShape) => {
+    const nodes = new Map<string, { parent?: string; node: DebuggerShape["deviceTree"][number] }>();
+    const visit = (list: DebuggerShape["deviceTree"], parent?: string) =>
+      list.forEach((node) => {
+        nodes.set(node.path, { parent, node });
+        visit(node.children ?? [], node.path);
+      });
+    visit(shape.deviceTree);
+    return nodes;
+  };
+
+  describe("state.writeMemory", () => {
+    it("writes main memory, wave memory and video memory, each one store through every address that maps it", () => {
+      const { session, read } = setup();
+      // main memory: 16 MiB, area 3 through P0, P1 and P2, and mirrored by its size
+      const before = read("sh4", 0x8c010000, 4);
+      expect(read("sh4", 0x0c010000, 4)).toEqual(before);
+      expect(read("sh4", 0xac010000, 4)).toEqual(before);
+      expect(read("sh4", 0x8d010000, 4)).toEqual(before);
+      session.ok("state.writeMemory", { target: "sh4", address: 0x8c010000, data: [1, 2, 3, 4] });
+      for (const address of [0x8c010000, 0x0c010000, 0xac010000, 0x8d010000, 0x0f010000]) {
+        expect(read("sh4", address, 4), address.toString(16)).toEqual([1, 2, 3, 4]);
+      }
+      expect(read("sh4", 0x8c010004, 4)).not.toEqual([1, 2, 3, 4]);
+
+      // wave memory: 8 MiB, the SH4's 0x00800000 + X and the ARM7's X, written through either target
+      expect(read("sh4", 0x00a00010, 4)).toEqual(read("arm7", 0x00200010, 4));
+      session.ok("state.writeMemory", { target: "arm7", address: 0x00000100, data: [0xaa, 0xbb] });
+      expect(read("sh4", 0x00800100, 2)).toEqual([0xaa, 0xbb]);
+      expect(read("sh4", 0xa0800100, 2)).toEqual([0xaa, 0xbb]);
+      session.ok("state.writeMemory", { target: "sh4", address: 0x80800200, data: [0xcc] });
+      expect(read("arm7", 0x00000200, 1)).toEqual([0xcc]);
+      // (the ARM7's ring at 0x00200010 is no mirror of anything: the store is as large as what the ARM7 reads)
+      expect(mockStoreOf("arm7", 0x00200010)).toEqual({ store: "wave", offset: 0x00200010 });
+      expect(mockStoreOf("arm7", 0x00800000)).toBeUndefined();
+
+      // video memory: 8 MiB in each of two views; the mirrors of a view agree, and the views are not aliased
+      const other = read("sh4", 0x04000000, 4);
+      session.ok("state.writeMemory", { target: "sh4", address: 0xa5000000, data: [9, 8, 7, 6] });
+      for (const address of [0x05000000, 0x07000000, 0x85000000, 0xa7000000, 0x05800000]) {
+        expect(read("sh4", address, 4), address.toString(16)).toEqual([9, 8, 7, 6]);
+      }
+      expect(read("sh4", 0x04000000, 4)).toEqual(other);
+      expect(read("sh4", 0x06000000, 4)).toEqual(other);
+      session.ok("state.writeMemory", { target: "sh4", address: 0x06000000, data: [5] });
+      expect(read("sh4", 0x04000000, 1)).toEqual([5]);
+      expect(read("sh4", 0x05000000, 1)).toEqual([9]);
+
+      // the bytes of a disassembly line are the bytes of memory, also when they were written
+      session.ok("state.writeMemory", { target: "arm7", address: 0x00200010, data: [0x11, 0x22, 0x33, 0x44] });
+      const [line] = (session.ok("state.getDisassembly", { target: "arm7", address: 0x00200010, count: 1 }) as { lines: Array<{ bytes: string }> }).lines;
+      expect(line.bytes).toBe("11 22 33 44");
+    });
+
+    it("refuses everything else with -32013, and a range as a whole: nothing of it is stored", () => {
+      const { session, read } = setup();
+      const refused = (target: string, address: number, data: number[] = [0]) => session.fail("state.writeMemory", { target, address, data }, -32013);
+      // the boot ROM, the flash, a register window, the modem, P4 and a store queue
+      for (const address of [0x00000000, 0x00200000, 0x005f6900, 0x005f8000, 0x00700000, 0x00710000, 0x00600000, 0xff000000, 0xe0000000, 0x10000000]) {
+        refused("sh4", address);
+      }
+      // the registers and the clock of the AICA as the ARM7 sees them, and what is above its address space
+      for (const address of [0x00800000, 0x00810000, 0x00900000, 0x00ffffff]) {
+        refused("arm7", address);
+      }
+      // a range that starts in main memory and ends above it: its first half is unchanged
+      const first = read("sh4", 0x0ffffff8, 8);
+      refused("sh4", 0x0ffffff8, new Array<number>(16).fill(0x5a));
+      expect(read("sh4", 0x0ffffff8, 8)).toEqual(first);
+      const wave = read("arm7", 0x007ffff8, 8);
+      refused("arm7", 0x007ffff8, new Array<number>(16).fill(0x5a));
+      expect(read("arm7", 0x007ffff8, 8)).toEqual(wave);
+      // a write does not wrap around the end of the address space
+      refused("sh4", 0xfffffffc, [1, 2, 3, 4, 5, 6, 7, 8]);
+      refused("arm7", 0x00fffffc, [1, 2, 3, 4, 5, 6, 7, 8]);
+    });
+
+    it("takes 1 to 65536 bytes of 0 to 255, needs a target, and answers -32004 for the DSP behind the lifetime", () => {
+      const { mock, session, read } = setup();
+      const address = 0x8c010000;
+      const original = read("sh4", address, 65536);
+      session.frames.length = 0;
+      // 65536 bytes, written as what they read: accepted, and the tick behind it is of the same stop
+      expect(session.call("state.writeMemory", { target: "sh4", address, data: original }).result).toEqual({});
+      expect(session.ticks()).toHaveLength(1);
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "pause" });
+      expect(read("sh4", address, 65536)).toEqual(original);
+
+      session.fail("state.writeMemory", { target: "sh4", address, data: new Array<number>(65537).fill(0) }, -32602);
+      session.fail("state.writeMemory", { target: "sh4", address, data: [] }, -32602);
+      session.fail("state.writeMemory", { target: "sh4", address, data: [256] }, -32602);
+      session.fail("state.writeMemory", { target: "sh4", address, data: [-1] }, -32602);
+      session.fail("state.writeMemory", { address, data: [0] }, -32602);
+      session.fail("state.writeMemory", { target: "gpu", address, data: [0] }, -32602);
+      expect(read("sh4", address, 16)).toEqual(original.slice(0, 16));
+
+      // the DSP has no memory: the method's own -32004, in-band, and decided behind the lifetime
+      session.fail("state.writeMemory", { target: "dsp", address: 0, data: [0] }, -32004);
+      mock.setLifetime("stopped");
+      session.fail("state.writeMemory", { target: "dsp", address: 0, data: [0] }, -32001);
+      session.fail("state.writeMemory", { target: "sh4", address, data: [0] }, -32001);
+      mock.setLifetime("no-machine");
+      session.fail("state.writeMemory", { target: "dsp", address: 0, data: [0] }, -32002);
+      // a parameter that is wrong is said before the lifetime, as for every method
+      session.fail("state.writeMemory", { target: "sh4", address, data: [256] }, -32602);
+    });
+
+    it("is served while the target runs, and a tick follows every accepted write and no refused one", () => {
+      const { mock, session, read } = setup({}, false);
+      session.frames.length = 0;
+      session.ok("state.writeMemory", { target: "sh4", address: 0x8c010000, data: [0x12] });
+      expect(session.ticks()).toHaveLength(1);
+      expect(session.lastTick().executionState).toEqual({ state: "running", stopId: 0 });
+      expect(read("sh4", 0x8c010000, 1)).toEqual([0x12]);
+      // a write that is refused is refused as not writable, not as "not paused"
+      session.frames.length = 0;
+      session.fail("state.writeMemory", { target: "sh4", address: 0x00000000, data: [0] }, -32013);
+      expect(session.ticks()).toHaveLength(0);
+      // ... and every client gets the tick of a write
+      const other = connect(mock);
+      session.ok("state.writeMemory", { target: "sh4", address: 0x8c010001, data: [0x34] });
+      expect(other.ticks()).toHaveLength(1);
+    });
+  });
+
+  describe("control.reset", () => {
+    it("paused: a new stop with reason reset and no running tick; the tables are kept, the ARM7 is held and the registers are those of the start", async () => {
+      const { session, registerOf } = setup({}, false);
+      await vi.advanceTimersByTimeAsync(5 * STEP_MS);
+      session.ok("control.pause");
+      session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: 0x8c010000, enabled: false });
+      session.ok("breakpoints.add", { event: "dc.aica.arm7.pc", address: MOCK_ARM7_RING.base });
+      session.ok("breakpoints.toggle", { id: 2, enabled: false });
+      session.ok("state.watch", { expressions: ["dc.sh4.cpu.r3"] });
+      session.ok("breakpoints.setCategoryStates", { categories: { dsp: { muted: true, soloed: false } } });
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R3", value: "0x1234" });
+      session.ok("state.writeMemory", { target: "sh4", address: 0x8c010000, data: [0x77] });
+      const before = session.lastTick();
+      expect(registerOf("dc.sh4.cpu", "PC")).not.toBe("0x8C0000A0");
+      session.frames.length = 0;
+
+      expect(session.call("control.reset", {}).result).toEqual({});
+      expect(session.ticks().map((tick) => tick.executionState)).toEqual([{ state: "paused", stopId: before.executionState.stopId! + 1, reason: "reset" }]);
+      const after = session.lastTick();
+      expect(after.breakpoints).toEqual(before.breakpoints);
+      expect(after.watches).toEqual([{ id: 1, expression: "dc.sh4.cpu.r3", value: "0x00003333" }]);
+      expect(after.categories).toEqual(before.categories);
+      expect(registerOf("dc.sh4.cpu", "PC")).toBe("0x8C0000A0");
+      expect(registerOf("dc.sh4.cpu", "R3")).toBe("0x00003333");
+      expect(registerOf("dc.aica.arm7", "ENABLED")).toBe("0x0");
+      expect(after.callstacks!.arm7).toEqual([]);
+      expect(after.callstacks!.sh4.length).toBeGreaterThan(0);
+      expect((session.ok("state.getCallstack", { target: "arm7" }) as { frames: unknown[] }).frames).toEqual([]);
+      // time is not reset, and memory is not the reset's to change
+      expect(BigInt(registerOf("dc.timing", "SH4_CYCLES"))).toBe(BigInt(registerOf("dc.timing", "SH4_CYCLES", before)));
+      expect((session.ok("state.getMemorySlice", { address: 0x8c010000, length: 1 }) as { data: number[] }).data).toEqual([0x77]);
+      // the event log has the reset
+      expect(after.eventLog.at(-1)).toMatchObject({ subsystem: "system", message: "machine reset", metadata: { event: "dc.system.reset" } });
+
+      // a resume behind the reset runs
+      session.ok("control.runUntil");
+      expect(session.lastTick().executionState).toEqual({ state: "running", stopId: after.executionState.stopId });
+      await vi.advanceTimersByTimeAsync(3 * STEP_MS);
+      session.ok("control.pause");
+      expect(registerOf("dc.sh4.cpu", "PC")).toBe("0x8C0000A6");
+    });
+
+    it("running: {} and an event-log entry, and nothing is published: the target runs on in the same stop", async () => {
+      const { session, registerOf } = setup({}, false);
+      await vi.advanceTimersByTimeAsync(3 * STEP_MS);
+      session.frames.length = 0;
+      expect(session.call("control.reset", {}).result).toEqual({});
+      expect(session.ticks()).toEqual([]);
+      await vi.advanceTimersByTimeAsync(200);
+      const tick = session.lastTick();
+      expect(tick.executionState).toEqual({ state: "running", stopId: 0 });
+      expect(tick.eventLog.filter((entry) => entry.metadata?.event === "dc.system.reset")).toHaveLength(1);
+      expect(session.ticks().every((entry) => entry.executionState.state === "running")).toBe(true);
+      // the machine was reset: its ARM7 was held, and is released by now
+      expect(registerOf("dc.aica.arm7", "ENABLED")).toBe("0x1");
+    });
+
+    it("is refused without a machine and for a machine the host stopped, and a reset at a breakpoint stop names no breakpoint", async () => {
+      const { mock, session } = setup({}, false);
+      session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: MOCK_SH4_RING.base + 6 });
+      await vi.advanceTimersByTimeAsync(8 * STEP_MS);
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
+      const stopId = session.lastTick().executionState.stopId!;
+      session.ok("control.reset");
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 1, reason: "reset" });
+      expect(Object.keys(session.lastTick().breakpoints)).toEqual(["1"]);
+
+      mock.setLifetime("stopped");
+      session.fail("control.reset", {}, -32001);
+      mock.setLifetime("no-machine");
+      session.fail("control.reset", {}, -32002);
+    });
+  });
+
+  describe("an ARM7 that is held in reset", () => {
+    it("behind a reset, by the option and by the machine: ENABLED 0, no callstack, no instruction, and a release when the machine has run for 8 steps", async () => {
+      expect(MOCK_ARM7_RELEASE_STEPS).toBe(8);
+      const { mock, session, registerOf, arm7Pc } = setup({ arm7Held: true }, false);
+      expect(registerOf("dc.aica.arm7", "ENABLED")).toBe("0x0");
+      const cycles = () => BigInt(registerOf("dc.timing", "SH4_CYCLES"));
+      const start = cycles();
+      await vi.advanceTimersByTimeAsync(7 * STEP_MS);
+      session.ok("control.pause");
+      // seven steps: the SH4 has run, the ARM7 has not, and has no frames
+      expect(cycles()).toBeGreaterThan(start);
+      expect(registerOf("dc.aica.arm7", "ENABLED")).toBe("0x0");
+      expect(arm7Pc()).toBe(MOCK_ARM7_RING.base);
+      expect(session.lastTick().callstacks!.arm7).toEqual([]);
+      // a paused machine releases nothing
+      await vi.advanceTimersByTimeAsync(20 * STEP_MS);
+      session.ok("state.watch", { expressions: ["dc.aica.arm7.enabled"] });
+      expect(session.lastTick().watches).toEqual([{ id: 1, expression: "dc.aica.arm7.enabled", value: "0x0" }]);
+
+      // the eighth step releases it, in front of its first instruction; from the ninth on it executes
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(STEP_MS);
+      session.ok("control.pause");
+      expect(registerOf("dc.aica.arm7", "ENABLED")).toBe("0x1");
+      expect(arm7Pc()).toBe(MOCK_ARM7_RING.base);
+      expect(session.lastTick().callstacks!.arm7.length).toBeGreaterThanOrEqual(2);
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(2 * STEP_MS);
+      session.ok("control.pause");
+      expect(arm7Pc()).toBe(MOCK_ARM7_RING.base + 8);
+
+      // the machine holds it again (a guest does that), and releases it again
+      mock.holdArm7();
+      session.ok("state.unwatch", { watchIds: [1] });
+      expect(registerOf("dc.aica.arm7", "ENABLED")).toBe("0x0");
+      expect(arm7Pc()).toBe(MOCK_ARM7_RING.base);
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(8 * STEP_MS);
+      session.ok("control.pause");
+      expect(registerOf("dc.aica.arm7", "ENABLED")).toBe("0x1");
+    });
+
+    it("its three steps answer -32012, behind -32003 while running; code breakpoints are accepted, and one on its first instruction stops it when it is released", async () => {
+      const { session, registerOf, arm7Pc } = setup({ arm7Held: true }, false);
+      for (const method of ["control.step", "control.stepOver", "control.stepOut"]) {
+        session.fail(method, { target: "arm7" }, -32003);
+      }
+      session.ok("control.pause");
+      const stopId = session.lastTick().executionState.stopId!;
+      for (const method of ["control.step", "control.stepOver", "control.stepOut"]) {
+        session.fail(method, { target: "arm7" }, -32012);
+      }
+      expect(session.lastTick().executionState.stopId).toBe(stopId);
+      // the SH4 steps as ever
+      session.ok("control.step", { target: "sh4" });
+
+      // breakpoints.add never answers -32012: a breakpoint on the first instruction is what stops there
+      session.ok("breakpoints.add", { event: "dc.aica.arm7.pc", address: MOCK_ARM7_RING.base });
+      session.ok("breakpoints.toggle", { id: 1, enabled: false });
+      session.ok("breakpoints.toggle", { id: 1, enabled: true });
+      // registers of a held ARM7 are written
+      session.ok("state.setRegister", { path: "dc.aica.arm7", name: "R1", value: "0xCAFE" });
+      expect(registerOf("dc.aica.arm7", "R1")).toBe("0x0000CAFE");
+
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(7 * STEP_MS);
+      // held: the breakpoint on the address the PC stands at does not stop anything
+      expect(session.lastTick().executionState.state).toBe("running");
+      await vi.advanceTimersByTimeAsync(STEP_MS);
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
+      expect(registerOf("dc.aica.arm7", "ENABLED")).toBe("0x1");
+      expect(arm7Pc()).toBe(MOCK_ARM7_RING.base);
+      // and from there it steps
+      session.ok("control.step", { target: "arm7" });
+      expect(arm7Pc()).toBe(MOCK_ARM7_RING.base + 4);
+    });
+  });
+
+  describe("state.setRegister and state.editWatch", () => {
+    it("match the path and the name without regard to case, and take a value in the grammar of the protocol", () => {
+      const { session, registerOf } = setup();
+      const r0 = () => registerOf("dc.sh4.cpu", "R0");
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "r0", value: "1" });
+      expect(r0()).toBe("0x00000001");
+      session.ok("state.setRegister", { path: "DC.SH4.CPU", name: "R0", value: " 0x1f " });
+      expect(r0()).toBe("0x0000001F");
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "\t0X2A" });
+      expect(r0()).toBe("0x0000002A");
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "007" });
+      expect(r0()).toBe("0x00000007");
+      // any length, of which the low bits count
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "0x123456789ABCDEF0123456789" });
+      expect(r0()).toBe("0x23456789");
+      for (const value of ["-1", "", "  ", "1.5", "0x", "0x1g", "1e3", "+1", "0b11", "1 2", "\n1"]) {
+        session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value }, -32602);
+      }
+      expect(r0()).toBe("0x23456789");
+    });
+
+    it("answer in this order: unknown path or name -32602, no writer -32013, a value that is no number -32602, a value the device refuses -32013", () => {
+      const { session, registerOf } = setup();
+      session.fail("state.setRegister", { path: "dc.no.such.node", name: "R0", value: "twelve" }, -32602);
+      session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "NO_SUCH", value: "twelve" }, -32602);
+      // no writer comes before the value: a text that is no number, written to such a register, is -32013
+      for (const [path, name] of [["dc", "SYSCLK"], ["dc.timing", "SH4_CYCLES"], ["dc.aica.arm7", "ENABLED"], ["dc.sh4.scif", "SCFRDR2"], ["dc.holly.sb.g1", "SB_G1RRC"]]) {
+        session.fail("state.setRegister", { path, name, value: "twelve" }, -32013);
+        session.fail("state.setRegister", { path, name, value: "1" }, -32013);
+      }
+      // a value the device refuses: a PC of the SH4 with bit 0 set, and it is unchanged
+      const pc = registerOf("dc.sh4.cpu", "PC");
+      session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C0000A1" }, -32013);
+      session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "zero" }, -32602);
+      expect(registerOf("dc.sh4.cpu", "PC")).toBe(pc);
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: pc });
+
+      // state.editWatch is the same from "no writer" on, behind its own look-up
+      session.ok("state.watch", { expressions: ["dc.aica.arm7.enabled", "dc.sh4.cpu.pc", "dc.sh4.cpu.r1"] });
+      session.fail("state.editWatch", { watchId: 99, value: "1" }, -32602);
+      session.fail("state.editWatch", { watchId: 99, value: "twelve" }, -32602);
+      session.fail("state.editWatch", { watchId: 1, value: "twelve" }, -32013);
+      session.fail("state.editWatch", { watchId: 2, value: "0x8C0000A1" }, -32013);
+      session.fail("state.editWatch", { watchId: 3, value: "twelve" }, -32602);
+      session.ok("state.editWatch", { watchId: 3, value: " 0x1f " });
+      expect(registerOf("dc.sh4.cpu", "R1")).toBe("0x0000001F");
+    });
+
+    it("the registers read back what was stored: the ARM7's PC aligned, its CPSR and the SH4's SR and FPSCR under their masks", () => {
+      const { session, registerOf } = setup();
+      const write = (path: string, name: string, value: string) => session.ok("state.setRegister", { path, name, value });
+      write("dc.aica.arm7", "PC", "0x00200017");
+      expect(registerOf("dc.aica.arm7", "PC")).toBe("0x00200014");
+      // a CPSR whose mode bits are no mode is refused; one that names a mode is stored under its mask
+      for (const mode of [0x00, 0x01, 0x0f, 0x14, 0x16, 0x18, 0x1a, 0x1e]) {
+        session.fail("state.setRegister", { path: "dc.aica.arm7", name: "CPSR", value: String(0x000000c0 | mode) }, -32013);
+      }
+      expect(registerOf("dc.aica.arm7", "CPSR")).toBe("0x000000D3");
+      for (const mode of [0x10, 0x11, 0x12, 0x13, 0x17, 0x1b, 0x1f]) {
+        write("dc.aica.arm7", "CPSR", `0x${((0xffffff00 | 0xc0 | mode) >>> 0).toString(16)}`);
+        expect(Number.parseInt(registerOf("dc.aica.arm7", "CPSR"), 16)).toBe((0xf00000c0 | mode) >>> 0);
+      }
+      write("dc.aica.arm7", "CPSR", "0xD3");
+      write("dc.sh4.cpu", "FPSCR", "0xFFFFFFFF");
+      expect(registerOf("dc.sh4.cpu", "FPSCR")).toBe("0x003FFFFF");
+      write("dc.sh4.cpu", "SR", "0xFFFFFFFF");
+      expect(registerOf("dc.sh4.cpu", "SR")).toBe("0x700083F3");
+      // RB is stored in privileged mode only
+      write("dc.sh4.cpu", "SR", "0x30000000");
+      expect(registerOf("dc.sh4.cpu", "SR")).toBe("0x10000000");
+      write("dc.sh4.cpu", "SR", "0x40000000");
+    });
+
+    it("debugger.describe says which registers have a writer, and a tick never does", () => {
+      const { session, shape } = setup();
+      const nodes = nodesOf(shape);
+      const flagged = (path: string) => nodes.get(path)!.node.registers!.filter((register) => register.flags?.writable === true).map((register) => register.name);
+      const unflagged = (path: string) => nodes.get(path)!.node.registers!.filter((register) => register.flags === undefined).map((register) => register.name);
+      expect(flagged("dc.sh4.cpu")).toHaveLength(69);
+      expect(unflagged("dc.aica.arm7")).toEqual(["ENABLED"]);
+      expect(flagged("dc.aica.arm7")).toHaveLength(38);
+      expect(unflagged("dc.timing")).toEqual(["MODE", "SH4_CYCLES", "SCHED_NOW", "SH4_BACKEND", "SH4_DEBUG_ENGINE"]);
+      expect(unflagged("dc")).toEqual(["SYSCLK", "BUILD"]);
+      expect(unflagged("dc.sh4.scif")).toEqual(["SCFRDR2"]);
+      // a flag is true or absent, on a register that has a width
+      for (const { node } of nodes.values()) {
+        for (const register of node.registers ?? []) {
+          expect(register.flags === undefined || (register.width > 0 && JSON.stringify(register.flags) === '{"writable":true}'), `${node.path}.${register.name}`).toBe(true);
+        }
+      }
+      // every flagged register takes the value it reads, and every other one is refused
+      for (const [path, { node }] of nodes) {
+        const writable = node.registers?.find((register) => register.flags?.writable && register.value !== "n/a");
+        const readOnly = node.registers?.find((register) => !register.flags?.writable);
+        if (writable) session.ok("state.setRegister", { path, name: writable.name, value: writable.value });
+        if (readOnly) session.fail("state.setRegister", { path, name: readOnly.name, value: "0" }, -32013);
+      }
+      for (const tick of session.ticks()) {
+        for (const registers of Object.values(tick.registers)) {
+          expect(registers.every((register) => !("flags" in register))).toBe(true);
+        }
+      }
+    });
+  });
+
+  describe("the ARM7's program has a call", () => {
+    const LOOP = [0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x30, 0x34, 0x38, 0x28, 0x2c].map((offset) => 0x00200000 + offset);
+
+    it("its ring calls a leaf behind it: bl, two plain instructions and the return to R14", async () => {
+      const { session, lines, registerOf, arm7Pc } = setup({ startPaused: true }, false);
+      expect(MOCK_ARM7_CALL).toBe(0x00200024);
+      expect(MOCK_ARM7_LEAF).toEqual({ base: 0x00200030, length: 3, instructionSize: 4 });
+      const text = lines("arm7", MOCK_ARM7_RING.base, 11).map((line) => line.disassembly);
+      expect(text[5]).toBe("bl 0x00200030");
+      expect(text[7]).toBe("b 0x00200010");
+      expect(text.slice(8)).toEqual(["add r0, r0, #1", "str r0, [r1]", "mov pc, lr"]);
+      for (const index of [0, 1, 2, 3, 4, 6]) {
+        expect(text[index], `line ${index}`).toMatch(/^(mov|ldr|str|add|sub|nop)\b/);
+        expect(text[index]).not.toMatch(/\b(pc|r15)\b/);
+      }
+
+      // step by step around the loop, twice: through the leaf and back behind the call
+      const walked: number[] = [];
+      for (let index = 0; index < 2 * LOOP.length; index++) {
+        walked.push(arm7Pc());
+        session.ok("control.step", { target: "arm7" });
+      }
+      expect(walked).toEqual([...LOOP, ...LOOP]);
+      expect(registerOf("dc.aica.arm7", "R14")).toBe("0x00200028");
+      // the return goes to R14, whatever it is: written while the ARM7 is in the leaf, it is where the leaf returns to
+      while (arm7Pc() !== MOCK_ARM7_LEAF.base) session.ok("control.step", { target: "arm7" });
+      session.ok("state.setRegister", { path: "dc.aica.arm7", name: "R14", value: "0x00200018" });
+      for (let index = 0; index < 3; index++) session.ok("control.step", { target: "arm7" });
+      expect(arm7Pc()).toBe(0x00200018);
+      // running, it goes the same way: eleven instructions a lap
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(11 * STEP_MS);
+      session.ok("control.pause");
+      expect(arm7Pc()).toBe(0x00200018);
+    });
+
+    it("a step of the ARM7 moves nothing of the SH4, and the callstack follows the call", () => {
+      const { session, registerOf, arm7Pc } = setup({ startPaused: true }, false);
+      const sh4 = () => [registerOf("dc.sh4.cpu", "PC"), registerOf("dc.timing", "SH4_CYCLES"), registerOf("dc.timing", "SCHED_NOW")];
+      const before = sh4();
+      while (arm7Pc() !== MOCK_ARM7_LEAF.base) session.ok("control.step", { target: "arm7" });
+      expect(sh4()).toEqual(before);
+      const frames = session.lastTick().callstacks!.arm7;
+      expect(frames[0]).toMatchObject({ index: 0, pc: MOCK_ARM7_LEAF.base });
+      expect(frames[1]).toMatchObject({ index: 1, pc: MOCK_ARM7_CALL + 4, location: "lr" });
+    });
+
+    it("step over on the call is a temporary breakpoint behind it and a resume; elsewhere it is a step", async () => {
+      const { session, arm7Pc } = setup({ startPaused: true }, false);
+      // not on the call: one paused tick with reason step, no running tick
+      session.frames.length = 0;
+      session.ok("control.stepOver", { target: "arm7" });
+      expect(session.ticks().map((tick) => tick.executionState.state)).toEqual(["paused"]);
+      expect(arm7Pc()).toBe(MOCK_ARM7_RING.base + 4);
+      while (arm7Pc() !== MOCK_ARM7_CALL) session.ok("control.step", { target: "arm7" });
+
+      const stopId = session.lastTick().executionState.stopId!;
+      session.frames.length = 0;
+      expect(session.call("control.stepOver", { target: "arm7" }).result).toEqual({});
+      expect(session.lastTick().executionState).toEqual({ state: "running", stopId });
+      // the leaf is three instructions: the fourth emulation step arrives behind the call
+      await vi.advanceTimersByTimeAsync(3 * STEP_MS);
+      expect(session.lastTick().executionState.state).toBe("running");
+      await vi.advanceTimersByTimeAsync(STEP_MS);
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 1, reason: "step" });
+      expect(arm7Pc()).toBe(MOCK_ARM7_CALL + 4);
+
+      // the temporary breakpoint went at its stop: the target runs on through that address
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(40 * STEP_MS);
+      expect(session.lastTick().executionState.state).toBe("running");
+    });
+
+    it("step out is a temporary breakpoint at R14 and a resume, from the leaf and from the ring", async () => {
+      const { session, arm7Pc, registerOf } = setup({ startPaused: true }, false);
+      while (arm7Pc() !== MOCK_ARM7_LEAF.base) session.ok("control.step", { target: "arm7" });
+      const stopId = session.lastTick().executionState.stopId!;
+      expect(registerOf("dc.aica.arm7", "R14")).toBe("0x00200028");
+      session.frames.length = 0;
+      expect(session.call("control.stepOut", { target: "arm7" }).result).toEqual({});
+      expect(session.lastTick().executionState).toEqual({ state: "running", stopId });
+      await vi.advanceTimersByTimeAsync(3 * STEP_MS);
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId + 1, reason: "step" });
+      expect(arm7Pc()).toBe(0x00200028);
+      expect(session.ticks().map((tick) => tick.executionState.state)).toEqual(["running", "paused"]);
+
+      // from the ring: R14 is where the last call returned to, and the loop passes it at every turn
+      session.ok("control.step", { target: "arm7" });
+      session.ok("control.stepOut", { target: "arm7" });
+      await vi.advanceTimersByTimeAsync(9 * STEP_MS);
+      expect(session.lastTick().executionState.state).toBe("running");
+      await vi.advanceTimersByTimeAsync(STEP_MS);
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "step" });
+      expect(arm7Pc()).toBe(0x00200028);
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(40 * STEP_MS);
+      expect(session.lastTick().executionState.state).toBe("running");
+    });
+
+    it("the temporary breakpoint goes at any other stop as well: a breakpoint, a pause", async () => {
+      const { session, arm7Pc } = setup({ startPaused: true }, false);
+      while (arm7Pc() !== MOCK_ARM7_CALL) session.ok("control.step", { target: "arm7" });
+      // a listed breakpoint in the leaf stops the step-over first, with its own reason
+      session.ok("breakpoints.add", { event: "dc.aica.arm7.pc", address: MOCK_ARM7_LEAF.base + 4 });
+      session.ok("control.stepOver", { target: "arm7" });
+      await vi.advanceTimersByTimeAsync(2 * STEP_MS);
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
+      session.ok("breakpoints.remove", { id: 1 });
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(40 * STEP_MS);
+      expect(session.lastTick().executionState.state).toBe("running");
+
+      // ... and so does a pause
+      session.ok("control.pause");
+      session.ok("control.stepOut", { target: "arm7" });
+      session.ok("control.pause");
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "pause" });
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(40 * STEP_MS);
+      expect(session.lastTick().executionState.state).toBe("running");
+    });
+
+    it("compares ARM7 breakpoint addresses under the mask of its wave memory, and reports the PC as it is", async () => {
+      const { session, arm7Pc } = setup({ startPaused: true }, false);
+      const site = MOCK_ARM7_RING.base + 8;
+      // a multiple of 4 up to 0x00FFFFFF, else -32602; never -32012
+      session.fail("breakpoints.add", { event: "dc.aica.arm7.pc", address: 2 }, -32602);
+      session.fail("breakpoints.add", { event: "dc.aica.arm7.pc", address: 0x01000000 }, -32602);
+      session.fail("breakpoints.add", { event: "dc.aica.arm7.pc", address: 0x80200018 }, -32602);
+      session.ok("breakpoints.add", { event: "dc.aica.arm7.pc", address: site + 0x00800000 });
+      expect(session.lastTick().breakpoints["1"]).toMatchObject({ address: site + 0x00800000 });
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(2 * STEP_MS);
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
+      expect(arm7Pc()).toBe(site);
+    });
+  });
+
+  describe("the effects of the SH4 that a client can provoke", () => {
+    it("a write of SR that changes RB in privileged mode exchanges R0..R7 with R0_BANK..R7_BANK", () => {
+      const { session, registerOf } = setup();
+      const bank = (suffix: string) => Array.from({ length: 8 }, (_, index) => registerOf("dc.sh4.cpu", `R${index}${suffix}`));
+      const live = bank("");
+      const other = bank("_BANK");
+      expect(live).not.toEqual(other);
+      expect(registerOf("dc.sh4.cpu", "SR")).toBe("0x40000000");
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "SR", value: "0x60000000" });
+      expect(bank("")).toEqual(other);
+      expect(bank("_BANK")).toEqual(live);
+      expect(registerOf("dc.sh4.cpu", "R8")).toBe("0x00008888");
+      // the same value again changes nothing; RB back exchanges them back
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "SR", value: "0x60000000" });
+      expect(bank("")).toEqual(other);
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "SR", value: "0x40000000" });
+      expect(bank("")).toEqual(live);
+      // without MD there is no other bank: RB is not stored, and nothing is exchanged
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "SR", value: "0x00000000" });
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "SR", value: "0x20000000" });
+      expect(registerOf("dc.sh4.cpu", "SR")).toBe("0x00000000");
+      expect(bank("")).toEqual(live);
+    });
+
+    it("the interrupt handler runs in the other bank and comes back to the first", async () => {
+      const { session, registerOf } = setup({}, false);
+      session.ok("breakpoints.add", { event: "dc.sh4.cpu.pc", address: MOCK_SH4_HANDLER.base });
+      await vi.advanceTimersByTimeAsync(STEP_MS);
+      expect(session.lastTick().executionState).toMatchObject({ reason: "breakpoint" });
+      expect(registerOf("dc.sh4.cpu", "SR")).toBe("0x70000000");
+      expect(registerOf("dc.sh4.cpu", "R1")).toBe("0x00000000");
+      expect(registerOf("dc.sh4.cpu", "R1_BANK")).toBe("0x00001111");
+      session.ok("breakpoints.remove", { id: 1 });
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(STEP_MS);
+      session.ok("control.pause");
+      expect(registerOf("dc.sh4.cpu", "SR")).toBe("0x40000000");
+      expect(registerOf("dc.sh4.cpu", "R1")).toBe("0x00001111");
+    });
+
+    it("a step from a PC outside the ring and the handler ends at PC + 2, and executes a written mov #imm, Rn", () => {
+      const { session, registerOf, lines } = setup();
+      const address = 0x8cffef00;
+      session.ok("state.writeMemory", { target: "sh4", address, data: [0x5a, 0xe0, 0x80, 0xe3] });
+      expect(lines("sh4", address, 2)).toEqual([
+        { address, bytes: "5A E0", disassembly: "mov #90, r0" },
+        { address: address + 2, bytes: "80 E3", disassembly: "mov #-128, r3" },
+      ]);
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: String(address) });
+      session.ok("control.step", { target: "sh4" });
+      expect(registerOf("dc.sh4.cpu", "PC")).toBe("0x8CFFEF02");
+      expect(registerOf("dc.sh4.cpu", "R0")).toBe("0x0000005A");
+      session.ok("control.step", { target: "sh4" });
+      expect(registerOf("dc.sh4.cpu", "PC")).toBe("0x8CFFEF04");
+      expect(registerOf("dc.sh4.cpu", "R3")).toBe("0xFFFFFF80");
+      // through another address of the same memory it is the same instruction
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "0" });
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x0CFFEF00" });
+      session.ok("control.step", { target: "sh4" });
+      expect(registerOf("dc.sh4.cpu", "R0")).toBe("0x0000005A");
+      // the bytes written back, the line is what it was and executes nothing
+      const original = lines("sh4", address + 4, 1)[0];
+      session.ok("state.writeMemory", { target: "sh4", address: address + 4, data: [0x11, 0xe1] });
+      session.ok("state.writeMemory", { target: "sh4", address: address + 4, data: original.bytes.split(" ").map((byte) => Number.parseInt(byte, 16)) });
+      expect(lines("sh4", address + 4, 1)[0]).toEqual(original);
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: String(address + 4) });
+      session.ok("control.step", { target: "sh4" });
+      expect(registerOf("dc.sh4.cpu", "R1")).toBe("0x00001111");
+      expect(registerOf("dc.sh4.cpu", "PC")).toBe("0x8CFFEF06");
+    });
+  });
+
+  describe("the device tree", () => {
+    it("has the M2 rows: 104 nodes under their parents, the two actions, registers where milestone M2 has them, and fewer than 1000 rows", () => {
+      const { shape } = setup();
+      const nodes = nodesOf(shape);
+      expect(nodes.size).toBe(104);
+      const parents: Record<string, string> = {
+        "dc.holly.sb": "dc.holly",
+        "dc.holly.sb.g1": "dc.holly.sb",
+        "dc.holly.sb.g2": "dc.holly.sb",
+        "dc.holly.sb.pvr": "dc.holly.sb",
+        "dc.holly.sb.misc": "dc.holly.sb",
+        "dc.holly.spg": "dc.holly",
+        "dc.aica.common": "dc.aica",
+        "dc.aica.rtc": "dc.aica",
+        ...Object.fromEntries(Array.from({ length: 64 }, (_, index) => [`dc.aica.sgc.${index}`, "dc.aica.sgc"])),
+      };
+      for (const [path, parent] of Object.entries(parents)) {
+        expect(nodes.get(path)?.parent, path).toBe(parent);
+      }
+      expect(nodes.get("dc.holly.sb")!.node.registers).toBeUndefined();
+      for (const path of [
+        ...["dmac", "sb.g1", "sb.g2", "sb.pvr", "sb.misc", "ta", "core", "spg"].map((name) => `dc.holly.${name}`),
+        "dc.aica.common",
+        "dc.aica.rtc",
+        ...Array.from({ length: 64 }, (_, index) => `dc.aica.sgc.${index}`),
+        "dc.gdrom",
+        "dc.maple",
+      ]) {
+        expect(nodes.get(path)!.node.registers!.length, path).toBeGreaterThan(0);
+        expect(nodes.get(path)!.node.registers!.length, path).toBeLessThanOrEqual(8);
+      }
+      expect(nodes.get("dc.sh4.cpu")!.node.actions).toEqual(["sh4-disassembly", "sh4-memory", "sh4-registers"]);
+      expect(nodes.get("dc.aica.arm7")!.node.actions).toEqual(["arm7-disassembly", "arm7-memory", "arm7-registers"]);
+      // each of the twelve register panels is the action of one node
+      const offered = Array.from(nodes.values()).flatMap(({ node }) => node.actions ?? []).filter((action) => action.endsWith("-registers"));
+      expect(offered).toHaveLength(12);
+      expect(new Set(offered).size).toBe(12);
+      // the registers of the M1 nodes are what they were
+      expect(nodes.get("dc.holly.dmac")!.node.registers!.map((register) => register.name)).toEqual(["DMAOR", "CHCR0"]);
+      expect(nodes.get("dc.aica.sgc.1")!.node.registers!.map((register) => register.name)).toEqual(["VOL", "KYONB", "SA", "LSA", "LEA", "FNS", "OCT", "TL"]);
+      // a write-only register reads "n/a"
+      expect(nodes.get("dc.holly.sb.g1")!.node.registers![0]).toEqual({ name: "SB_G1RRC", value: "n/a", width: 32 });
+      expect(nodes.get("dc.aica.common")!.node.registers!.find((register) => register.name === "SCILV0")).toEqual({ name: "SCILV0", value: "n/a", width: 8 });
+      const rows = nodes.size + Array.from(nodes.values()).reduce((sum, { node }) => sum + (node.registers?.length ?? 0), 0);
+      expect(rows).toBeGreaterThanOrEqual(100);
+      expect(rows).toBeLessThan(1000);
+    });
+  });
+
+  describe("the profiles", () => {
+    it("MOCK_M1_SUPPORT also hides the memory write, the reset, the M2 rows and the two actions", () => {
+      const { session, shape } = setup({ supports: MOCK_M1_SUPPORT });
+      const nodes = nodesOf(shape);
+      expect(shape.capabilities).toEqual(["event-breakpoints", "callstack", "sh4-debug-native"]);
+      expect(nodes.size).toBe(34);
+      for (const path of ["dc.holly.sb", "dc.holly.spg", "dc.aica.common", "dc.aica.rtc", "dc.aica.sgc.2", "dc.aica.sgc.63"]) {
+        expect(nodes.has(path), path).toBe(false);
+      }
+      expect(nodes.get("dc.gdrom")!.node.registers).toBeUndefined();
+      expect(nodes.get("dc.maple")!.node.registers).toBeUndefined();
+      expect(nodes.get("dc.sh4.cpu")!.node.actions).toEqual(["sh4-disassembly", "sh4-memory"]);
+      expect(nodes.get("dc.aica.arm7")!.node.actions).toEqual(["arm7-disassembly", "arm7-memory"]);
+      // no register says it has a writer: the server writes none
+      expect(Array.from(nodes.values()).flatMap(({ node }) => node.registers ?? []).some((register) => register.flags !== undefined)).toBe(false);
+      session.fail("state.writeMemory", { target: "sh4", address: 0x8c010000, data: [0] }, -32004);
+      session.fail("state.writeMemory", {}, -32004);
+      session.fail("control.reset", {}, -32004);
+      session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "1" }, -32004);
+    });
+
+    it("MOCK_M2_SUPPORT is what the emulator of M2 can do, and no more", () => {
+      const { session, shape, registerOf } = setup({ supports: MOCK_M2_SUPPORT });
+      const nodes = nodesOf(shape);
+      expect(shape.capabilities).toEqual(["event-breakpoints", "callstack", "memory-write", "register-write", "reset", "sh4-debug-native"]);
+      expect(shape.targets!.map(({ id, stepping }) => [id, stepping])).toEqual([["sh4", true], ["arm7", true], ["dsp", false]]);
+      expect(nodes.size).toBe(104);
+      // the writable registers are those of the two processors, but ENABLED: 69 and 38 on the mock
+      const flagged = new Map<string, string[]>();
+      for (const [path, { node }] of nodes) {
+        const names = (node.registers ?? []).filter((register) => register.flags?.writable).map((register) => register.name);
+        if (names.length) flagged.set(path, names);
+      }
+      expect(Array.from(flagged.keys())).toEqual(["dc.sh4.cpu", "dc.aica.arm7"]);
+      expect(flagged.get("dc.sh4.cpu")).toHaveLength(69);
+      expect(flagged.get("dc.aica.arm7")).toHaveLength(38);
+      expect(flagged.get("dc.aica.arm7")).not.toContain("ENABLED");
+
+      session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "0x55" });
+      session.ok("state.setRegister", { path: "dc.aica.arm7", name: "R1", value: "0x66" });
+      expect(registerOf("dc.aica.arm7", "R1")).toBe("0x00000066");
+      for (const [path, name] of [["dc.sh4.bsc", "BCR1"], ["dc.holly.dmac", "DMAOR"], ["dc.aica.sgc.0", "VOL"], ["dc.aica.dsp", "STEP"], ["dc.aica.rtc", "SECONDS"], ["dc.aica.arm7", "ENABLED"]]) {
+        session.fail("state.setRegister", { path, name, value: "1" }, -32013);
+      }
+      session.ok("state.watch", { expressions: ["dc.aica.sgc.0.vol"] });
+      session.fail("state.editWatch", { watchId: 1, value: "1" }, -32013);
+
+      // the ARM7 steps and has breakpoints, the DSP does not; memory is written and the machine reset
+      session.ok("control.step", { target: "arm7" });
+      session.ok("breakpoints.add", { event: "dc.aica.arm7.pc", address: 0x00200010, enabled: false });
+      session.fail("control.step", { target: "dsp" }, -32004);
+      session.fail("breakpoints.add", { event: "dc.aica.dsp.step", address: 5 }, -32004);
+      session.ok("state.writeMemory", { target: "arm7", address: 0, data: [1] });
+      session.ok("control.reset");
+      session.fail("state.recordSgcFrames", {}, -32004);
+    });
+  });
+});
+
 describe("error table", () => {
   const setup = () => {
     const mock = createMock();
@@ -1148,10 +1883,7 @@ describe("error table", () => {
     for (const method of ["control.step", "control.stepOver", "control.stepOut"]) {
       session.fail(method, { target: "sh4" }, -32003);
     }
-    // later milestones: in-band for the RpcError methods ...
-    session.fail("control.reset", {}, -32004);
-    session.fail("state.writeMemory", { target: "sh4", address: 0x8c010000, data: [0] }, -32004);
-    // ... a JSON-RPC error for the others, whatever the params
+    // later milestones: a JSON-RPC error for the methods that report failures that way, whatever the params
     session.fail("state.getMemoryBinary", { address: 0x8c010000, length: 16 }, -32004);
     session.fail("state.getTable", { id: "sq" }, -32004);
     session.fail("state.captureHolly", {}, -32004);
@@ -1183,11 +1915,13 @@ describe("error table", () => {
   it("refuses a step whose precondition fails with -32005, and makes no stop", () => {
     const { session } = setup();
     session.ok("control.pause");
-    session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C0000A1" });
-    const stopId = session.lastTick().executionState.stopId;
-    session.fail("control.step", { target: "sh4" }, -32005);
+    // (an odd PC is refused when it is written: the precondition that is left to fail is a PC that cannot be read)
+    session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C0000A1" }, -32013);
     session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x10000000" });
-    session.fail("control.step", { target: "sh4" }, -32005);
+    const stopId = session.lastTick().executionState.stopId;
+    for (const method of ["control.step", "control.stepOver", "control.stepOut"]) {
+      session.fail(method, { target: "sh4" }, -32005);
+    }
     expect(session.lastTick().executionState.stopId).toBe(stopId);
     // outside of the loop the mock goes straight on
     session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: "0x8C010000" });
@@ -1251,7 +1985,7 @@ describe("error table", () => {
     expect(session.lastTick().registers["dc.aica.sgc.1"][5]).toEqual({ name: "FNS", value: "0x3FF", width: 10 });
 
     session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "twelve" }, -32602);
-    session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "r0", value: "1" }, -32602);
+    session.fail("state.setRegister", { path: "dc.sh4.cpu", name: "R99", value: "1" }, -32602);
     session.fail("state.setRegister", { path: "dc.sh4.nope", name: "R0", value: "1" }, -32602);
     session.fail("state.setRegister", { path: "dc", name: "SYSCLK", value: "1" }, -32013);
     session.fail("state.setRegister", { path: "dc.timing", name: "SH4_CYCLES", value: "1" }, -32013);

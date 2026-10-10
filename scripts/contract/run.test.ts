@@ -243,7 +243,7 @@ const MOCK_STATUSES = {
   S19: "passed",
   S20: "passed",
   S15: "not-applicable", // emulator only
-  S16: "partial", // the mock steps the ARM7 and writes registers; it has no memory write and no reset
+  S16: "passed", // the mock is an M2 server
   S17: "passed",
   S18: "not-applicable", // no tables, no Holly capture
   S21: "not-applicable", // the run with the DSP test program only
@@ -352,15 +352,15 @@ describe("the contract runner against the mock", () => {
     expect(summary.cleanUpProblems).toEqual([]);
     expect(statusesOf(summary)).toEqual(MOCK_STATUSES);
     expect(summary.ok).toBe(true);
-    expect(summary).toMatchObject({ passed: 17, failed: 0, partial: 1, notApplicable: 4, profile: "mock", timeoutFactor: 1 });
+    expect(summary).toMatchObject({ passed: 18, failed: 0, partial: 0, notApplicable: 4, profile: "mock", timeoutFactor: 1 });
     // nothing was asked to pass: the runner looked at a server
     expect(summary).toMatchObject({ required: [], requiredNotPassed: [], nothingVerified: false, dspProgram: false });
     expect(summary.selected).toEqual(SCENARIOS.map((scenario) => scenario.id));
     expect(summary.scenarios.find((scenario) => scenario.id === "S16")?.parts).toEqual([
       { name: "arm7 step and breakpoint", status: "passed" },
-      { name: "writeMemory", status: "not-applicable", detail: 'no capability "memory-write"' },
+      { name: "writeMemory", status: "passed" },
       { name: "setRegister", status: "passed" },
-      { name: "reset", status: "not-applicable", detail: 'no capability "reset"' },
+      { name: "reset", status: "passed" },
     ]);
     expect(summary.ticksChecked).toBeGreaterThan(50);
     expect(summary.server).toMatchObject({ protocol: 3, emulator: { name: "nullDC (mock)" } });
@@ -1591,7 +1591,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       'S11 failed arm7: frame 1 has location "pr", expected "lr"',
     ]);
     expect(await s11(withArm7Stack((frames) => frames.map((frame) => (frame.index === 1 ? { ...frame, pc: 0x00200000 } : frame))))).toEqual([
-      "S11 failed arm7: frame 1 is at 0x00200000, R14 is 0x0020000C",
+      "S11 failed arm7: frame 1 is at 0x00200000, R14 is 0x00200028",
     ]);
     expect(await s11(withArm7Stack((frames) => frames.map((frame) => (frame.index === 0 ? { ...frame, location: "pc" } : frame))))).toEqual([
       'S11 failed arm7: frame 0 is the PC and has no location, this one has "pc"',
@@ -2065,15 +2065,14 @@ describe("the contract runner against a server that breaks the protocol", () => 
   });
 
   it("S04: control.stepOver or control.stepOut of the SH4 that is not supported", async () => {
-    // control.reset is what the mock answers with the in-band -32004
     const without = (method: string) =>
-      run({ toServer: (frame) => (frame.method === method ? { ...frame, method: "control.reset", params: {} } : frame) }, ["S04"]);
+      run({ answer: (request) => (request.method === method ? inBand(request, -32004, `not supported: ${method}`) : undefined) }, ["S04"]);
     const noStepOver = await without("control.stepOver");
     expect(statusOf(noStepOver, "S04")).toBe("failed");
-    expect(detailsOf(noStepOver, "S04")).toBe('control.stepOver {"target":"sh4"}: in-band error -32004 "not supported: control.reset"');
+    expect(detailsOf(noStepOver, "S04")).toBe('control.stepOver {"target":"sh4"}: in-band error -32004 "not supported: control.stepOver"');
     const noStepOut = await without("control.stepOut");
     expect(statusOf(noStepOut, "S04")).toBe("failed");
-    expect(detailsOf(noStepOut, "S04")).toBe('control.stepOut {"target":"sh4"}: in-band error -32004 "not supported: control.reset"');
+    expect(detailsOf(noStepOut, "S04")).toBe('control.stepOut {"target":"sh4"}: in-band error -32004 "not supported: control.stepOut"');
 
     // a step-over that runs on instead of stepping
     const resumes = await run({ toServer: (frame) => (frame.method === "control.stepOver" ? { ...frame, method: "control.stepOut" } : frame) }, ["S04"]);
@@ -2914,10 +2913,12 @@ describe("the contract runner against a server that breaks the protocol", () => 
     const further = await runContract({ url, profile: "mock", milestone: "M1", only: new Set(["S01", "S17"]), require: new Set(["S17"]) });
     expect(further).toMatchObject({ ok: false, selected: ["S01", "S17"], required: ["S01", "S17"], requiredNotPassed: [{ id: "S17", status: "not-applicable" }] });
 
-    // the mock, which has two of the four parts of S16: partial fails the gate of M2, and S17 passes that of M3
-    const full = (await startServer()).url;
-    const partial = await runContract({ url: full, profile: "mock", milestone: "M2", only: new Set(["S16"]) });
+    // a server that has some of the parts of S16 (no memory write, no reset): partial fails the gate of M2 ...
+    const some = (await startServer(undefined, { supports: { capabilities: ["event-breakpoints", "callstack", "register-write", "sgc-capture"] } })).url;
+    const partial = await runContract({ url: some, profile: "mock", milestone: "M2", only: new Set(["S16"]) });
     expect(partial).toMatchObject({ ok: false, nothingVerified: true, partial: 1, requiredNotPassed: [{ id: "S16", status: "partial" }] });
+    // ... and the mock passes S17 at that of M3
+    const full = (await startServer()).url;
     const m3only = await runContract({ url: full, profile: "mock", milestone: "M3", only: new Set(["S17"]) });
     expect(m3only).toMatchObject({ ok: true, required: ["S17"], requiredNotPassed: [] });
 
@@ -3298,9 +3299,9 @@ describe("a server that stops answering", () => {
     const parts = await runContract({ url, profile: "mock", timeoutFactor, only: new Set(["S02", "S16"]) });
     expect(parts.scenarios[1].parts).toEqual([
       { name: "arm7 step and breakpoint", status: "failed", detail: "control.pause {}: Request timed out: control.pause" },
-      { name: "writeMemory", status: "not-applicable", detail: 'no capability "memory-write"' },
+      { name: "writeMemory", status: "failed", detail: `control.pause {}: not sent: ${stopped("control.pause")}` },
       { name: "setRegister", status: "failed", detail: `control.pause {}: not sent: ${stopped("control.pause")}` },
-      { name: "reset", status: "not-applicable", detail: 'no capability "reset"' },
+      { name: "reset", status: "failed", detail: `control.pause {}: not sent: ${stopped("control.pause")}` },
     ]);
     expect(lost).toEqual(["control.pause", "breakpoints.setCategoryStates", "control.pause"]);
   }, 60_000);
@@ -3610,7 +3611,7 @@ describe("the emulator profile", () => {
 
     // a server that selects its backend with the first Run(): neither capability at the StartPaused stop
     const { summary: late, lines } = await anchor((listed, hasRun) => (hasRun ? listed : withoutEngine(listed)));
-    expect(lines.find((line) => line.startsWith("server: "))).toMatch(/capabilities: event-breakpoints, callstack, register-write, sgc-capture; targets: /);
+    expect(lines.find((line) => line.startsWith("server: "))).toMatch(/capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture; targets: /);
     expect(reportOf(late)).toEqual(["S00 passed SH4 debug engine: native"]);
     expect(late.ok).toBe(true);
     // (the summary names what the server said last)
@@ -3638,9 +3639,9 @@ describe("the emulator profile", () => {
 
     const summary = await running;
     expect(lines.filter((line) => /^server: |^waiting /.test(line)).map((line) => line.replace(/; targets: .*/, ""))).toEqual([
-      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, register-write, sgc-capture",
+      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture",
       expect.stringMatching(/^waiting for the StartPaused stop \(the server is #\d+ paused stop 2 no-game\)$/),
-      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, register-write, sgc-capture, sh4-debug-native",
+      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, sh4-debug-native",
     ]);
     expect(reportOf(summary)).toEqual(["S00 passed SH4 debug engine: native"]);
     expect(summary.server.capabilities).toContain("sh4-debug-native");

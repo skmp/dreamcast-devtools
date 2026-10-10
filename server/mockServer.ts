@@ -3,7 +3,7 @@ import { createServer as createHttpServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createServer as createViteServer } from "vite";
-import { MOCK_M1_SUPPORT, MockDebugger } from "./mockDebugger";
+import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT, MockDebugger } from "./mockDebugger";
 import { attachMockDebugger } from "./mockWebSocket";
 
 /**
@@ -16,6 +16,8 @@ import { attachMockDebugger } from "./mockWebSocket";
  *   --force-fallback   behave like an SH4 backend without native breakpoints (notice, capability)
  *   --stale-registers  behave like a backend whose running ticks cannot carry dc.sh4.cpu
  *   --m1               implement what the emulator does in milestone M1, and nothing more
+ *   --m2               implement what the emulator does in milestone M2, and nothing more
+ *   --arm7-held        start with the ARM7 held in reset, as behind a reset; the running machine releases it
  */
 
 const PORT = Number(process.env.PORT ?? 5173);
@@ -84,7 +86,8 @@ const start = async () => {
     startPaused: FLAGS.has("--start-paused"),
     forceFallback: FLAGS.has("--force-fallback"),
     sliceContext: !FLAGS.has("--stale-registers"),
-    supports: FLAGS.has("--m1") ? MOCK_M1_SUPPORT : undefined,
+    supports: FLAGS.has("--m1") ? MOCK_M1_SUPPORT : FLAGS.has("--m2") ? MOCK_M2_SUPPORT : undefined,
+    arm7Held: FLAGS.has("--arm7-held"),
   });
   const server = createHttpServer(app);
   const endpoint = attachMockDebugger(mock, server, WS_PATH);
