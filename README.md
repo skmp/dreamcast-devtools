@@ -33,7 +33,7 @@ Run `npm ci` once, then:
 | `npm run test:ui` | Vitest with its browser UI. |
 | `npm run test:e2e` | Playwright smoke suite in headless Chromium (see [End-to-end tests](#end-to-end-tests)). Not part of `check`. |
 | `npm run contract` | The contract runner: holds a debugger server to the protocol (see [Contract runner](#contract-runner)). Without arguments it tests the mock, in-process. |
-| `npm run check` | `lint`, `typecheck`, `test:run`, the contract gate of milestone M1 on the mock (`contract -- --milestone M1`), `build:native`, `build:wasm`; stops at the first failure. CI runs this. |
+| `npm run check` | `lint`, `typecheck`, `test:run`, the contract gate of milestone M2 on the mock, twice (`contract -- --milestone M2 --require-note "arm7: bl stepped over and out"`, on the mock as it is and with `--mock-support m2`), `build:native`, `build:wasm`; stops at the first failure. CI runs this. |
 
 ## Serving the build
 
@@ -150,7 +150,9 @@ Mock server, on the command line (`npm run mock:serve -- --start-paused`):
 | `--start-paused` | Start in the `StartPaused` stop (`reason: "start"`) instead of running. |
 | `--force-fallback` | Behave like an SH4 backend without native breakpoints: `notice` in the ticks while SH4 breakpoints are active, `dc.timing.SH4_DEBUG_ENGINE` reads `interpreter-fallback`, capability `sh4-debug-fallback`. |
 | `--stale-registers` | Behave like a backend whose running ticks cannot carry `dc.sh4.cpu`: they omit it and say `registersStale`, and watches on `dc.sh4.cpu.*` read `n/a` until the target is paused. |
-| `--m1` | Implement what the emulator does in milestone M1 and nothing more: no ARM7 or DSP stepping and code breakpoints, no register writes, no SGC capture (`targets[].stepping`, `capabilities`; the requests answer -32004). |
+| `--m1` | Implement what the emulator does in milestone M1 and nothing more: no ARM7 or DSP stepping and code breakpoints, no memory or register writes, no reset, no SGC capture (`targets[].stepping`, `capabilities`; the requests answer -32004), and the device tree without the rows and the two register panels of M2. |
+| `--m2` | Implement what the emulator does in milestone M2 and nothing more: the SH4 and the ARM7 step, the DSP does not; memory writes and reset; register writes of `dc.sh4.cpu` and of `dc.aica.arm7` (but `ENABLED`) alone, every other register answers -32013 and carries no `flags.writable`; no SGC capture. |
+| `--arm7-held` | Start with the ARM7 held in reset, as behind a reset: `ENABLED` reads 0, and the machine releases it when it has run for 8 emulation steps. |
 
 The version shown in the status bar and the About dialog is the `package.json` version, followed by
 `+<git describe --tags --always --dirty>` when the build runs inside a git checkout.
@@ -291,6 +293,35 @@ reference for every parameter, result, error code and bound; what follows is the
     `state.writeMemory` (`memory-write`), `control.reset` (`reset`), `state.recordSgcFrames`,
     `state.getSgcFrameData` (`sgc-capture`), `state.getMemoryBinary` (`memory-binary`),
     `state.getTable` (`tables`), `state.captureHolly` (`holly-capture`)
+- Milestone M2 (writes, reset, the ARM7 as a target that steps):
+  - `state.writeMemory {target, address, data}` writes 1 to 65536 bytes of main memory, video
+    memory or wave memory, all of the range or nothing: a range with a byte that is not such
+    memory, or that would pass the end of the address space, is refused with -32013. `target`
+    is required and is `sh4`, `arm7` or `dsp`; `dsp` has no memory, which is the method's own
+    -32004 (in-band, decided behind the lifetime), not an invalid parameter.
+  - `state.setRegister {path, name, value}` matches `path` and `name` without regard to case.
+    Its answers, in this order: unknown path or name -32602; a register of width 0 or without a
+    writer -32013; a value that is no number -32602; a value the device refuses -32013 (a PC of
+    the SH4 with bit 0 set, a CPSR of the ARM7 whose mode bits are no mode). The value is `0x`
+    or `0X` and hex digits, or decimal digits, with ASCII blanks around it dropped and nothing
+    else (no sign, no empty text), of any length: the low `width` bits count. A register reads
+    back what was stored (the ARM7's PC aligned; SR, FPSCR and CPSR under their masks).
+    `state.editWatch` is the same on the watched register; an unknown `watchId` is -32602.
+  - A register that `state.setRegister` can write says so in `debugger.describe`:
+    `flags: { "writable": true }`. A tick never carries `flags`.
+  - `control.reset {}`: a paused target stays paused, in a new stop with `reason: "reset"` and no
+    running tick in between; a running one runs on, with an entry `dc.system.reset` in the event
+    log and nothing published. Breakpoints, watches and categories are kept. The machine comes
+    out of a reset with its ARM7 held: `ENABLED` 0, no ARM7 callstack.
+  - Writes and a reset are served while the target runs; none of them answers -32003.
+  - `control.step`, `control.stepOver` and `control.stepOut` for `arm7` answer -32012 while the
+    ARM7 is held in reset. A code breakpoint on `dc.aica.arm7.pc` is accepted in every state; its
+    address is a multiple of 4 up to `0x00FFFFFF` and is compared under the mask of the wave
+    memory, and a stop reports the PC as it is.
+  - The device tree has the nodes of the system bus (`dc.holly.sb` with `.g1`, `.g2`, `.pvr`,
+    `.misc`), `dc.holly.spg`, `dc.aica.common`, `dc.aica.rtc` and the 64 channels
+    `dc.aica.sgc.0` to `.63`, registers on `dc.gdrom` and `dc.maple`, and the panels
+    `sh4-registers` on `dc.sh4.cpu` and `arm7-registers` on `dc.aica.arm7`.
 - Errors: the methods whose result is `{}` (`control.*`, `breakpoints.*`, the watch methods,
   the writes, `state.recordSgcFrames`) report a failure in-band, as the result
   `{ "error": { "code", "message" } }`. Every other method answers with a JSON-RPC error.
@@ -300,14 +331,35 @@ reference for every parameter, result, error code and bound; what follows is the
   payload (`src/lib/binaryFrame.ts`).
 
 The mock (`server/mockDebugger.ts`, hosted with the page by `server/mockServer.ts`) implements
-the first milestone of this protocol around a fabricated machine, keeps one state for all
-clients, and also steps the ARM7 and the DSP, records SGC frames and writes registers. Its SH4
-walks a loop of eight instructions at `0x8C0000A0` and, like a program with interrupts enabled,
-takes an interrupt at every vertical blank: the PC leaves the loop for the handler at
-`VBR + 0x600` (`0x8C000600`: two instructions, `rte` and its delay slot) and comes back, so
-between two frames it is in the loop, and a breakpoint in the handler stops it there. Its ARM7
-always runs: the register `ENABLED` of `dc.aica.arm7` (one bit: 1, the ARM7 is clocked; 0, it is
-held in reset) reads 1 in every tick, and it is not the debugger's to write (`-32004`).
+milestone M2 of this protocol around a fabricated machine, keeps one state for all clients, and
+also steps the DSP, records SGC frames and writes the registers of every node (`--m2` takes
+that away: what the emulator of M2 does, and no more). What its machine is:
+
+- Its SH4 walks a loop of eight instructions at `0x8C0000A0` and, like a program with
+  interrupts enabled, takes an interrupt at every vertical blank: the PC leaves the loop for
+  the handler at `VBR + 0x600` (`0x8C000600`: two instructions, `rte` and its delay slot) and
+  comes back, so between two frames it is in the loop, and a breakpoint in the handler stops it
+  there. The handler runs in the other register bank: a change of `SR.RB` in privileged mode,
+  by the entry, by `rte` or by a write of `SR`, exchanges `R0..R7` with `R0_BANK..R7_BANK`.
+  From a PC outside the loop and the handler a step goes two bytes on, and when
+  `state.writeMemory` has put `mov #imm, Rn` at the PC, that is what the step executes.
+- Its ARM7 walks a loop of eight instructions at `0x00200010` whose sixth is a call: `bl` at
+  `0x00200024` to a leaf of two instructions and the return (`mov pc, lr`) at `0x00200030`,
+  with `R14` the link register. `control.stepOver` on the call and `control.stepOut` are a
+  temporary breakpoint (behind the call; at `R14`) and a resume, anywhere else step over is a
+  step. A step of the ARM7 moves nothing of the SH4.
+- The ARM7 is held in reset behind a reset, with the option `arm7Held` (`--arm7-held`) and when
+  the machine is told to (`holdArm7()`, as a guest does it): `ENABLED` of `dc.aica.arm7` (one
+  bit: 1, the ARM7 is clocked; 0, it is held) reads 0, the ARM7 has no callstack and executes
+  nothing, and its steps answer -32012. The machine releases it when it has run for 8 emulation
+  steps. `ENABLED` is not the debugger's to write: it has no writer (-32013).
+- Memory is three stores, each seen through every address that maps it: main memory (16 MiB:
+  area 3 through P0, P1 and P2), wave memory (8 MiB: the SH4's `0x00800000 + X` is the ARM7's
+  `X`) and video memory (8 MiB in each of its two views, `0x04..` with `0x06..` and `0x05..`
+  with `0x07..`; the mock does not alias one view onto the other). A byte is a hash of where
+  it is until it is written. ARM7 breakpoints are compared under `0x007FFFFC`.
+- The rows of milestone M2 are short lists of the mock's own (at most eight registers a node:
+  104 nodes, about 900 rows). Under `--m1` the tree is that of M1.
 
 ## Contract runner
 
@@ -318,7 +370,11 @@ and every tick with the strict copy of the schema (unknown keys fail, the v3 fie
 required, `null` is an error), checks the tick invariants I1 to I8 on every tick of every
 connection, and runs the scenarios S00 to S21 (`scripts/contract/scenarios.ts`; `--list` names
 them). An error is its code and a message that is not empty: the wording of a message is the
-server's, and nothing is matched against it.
+server's, and nothing is matched against it. Beside I1 to I8 two things are held in every tick:
+no register of a tick carries `flags` (they are `debugger.describe`'s), and the ARM7 callstack
+of a paused tick follows `ENABLED` of `dc.aica.arm7` in that tick (no frames while it reads 0;
+frame 0 at the PC and frame 1 at `R14` with location `lr` while it reads 1), for a server that
+lists the ARM7 and has the capability `callstack`, in every stop that is not the host's.
 
 It leaves the server with the breakpoints, watches, breakpoint categories and run state it
 found: after a failed scenario and at the end of the run it removes every breakpoint and watch
@@ -332,8 +388,10 @@ are left are failed as "not run", and the clean-up reports that nothing could be
 
 ```
 npm run contract                                  # look at the mock, started in the same process
-npm run contract -- --milestone M1                # the gate of milestone M1 on the mock (part of `npm run check`)
+npm run contract -- --milestone M2                # the gate of milestone M2 on the mock (part of `npm run check`)
+npm run contract -- --milestone M2 --mock-support m2   # the same on the mock as what the emulator of M2 does
 npm run contract -- --url ws://127.0.0.1:<port>/ws --profile emulator --elf <path> --milestone M1   # the gate of M1 on an emulator
+npm run contract -- --only S16 --parts S16:arm7+tree   # two parts of S16 by themselves
 npm run contract -- --url ws://127.0.0.1:5173/ws --profile mock      # a mock server that is already running
 npm run contract -- --only S05,S06 --verbose      # some scenarios, with every frame
 npm run contract -- --json                        # the summary as JSON on stdout
@@ -349,7 +407,64 @@ with interrupts enabled comes at each vertical blank: at the interrupt entry `VB
 `VBR` read at a stop the target has run up to. The mock passes them the way a program does,
 through its interrupt handler. S11 reads the ARM7 callstack against the register `ENABLED` of
 `dc.aica.arm7` in the same paused tick: no frames while it reads 0, the PC and `R14` (and what
-the stack scan finds) while it reads 1, and `state.getCallstack` agrees.
+the stack scan finds) while it reads 1, and `state.getCallstack` agrees. S09 also reads across
+the last address of the SH4: the bytes behind it are unreadable and 0, or nothing is readable
+there (-32010); a read does not wrap. S13 also writes a register (with the value it reads) on
+one connection and wants the tick of that on the other.
+
+**S16, the scenario of milestone M2,** has five parts, each for what the server says it has:
+
+- `arm7` (`targets[arm7].stepping`). The start: when `ENABLED` reads 0 the three ARM7 steps are
+  probed for -32012, a breakpoint is added and removed, and the part settles: it resumes and
+  waits until `ENABLED` has read 1 in every running tick of one second, at least two of them
+  (it has to read 1 within 5 s), pauses, and wants `ENABLED` 1 and a PC of the ARM7 no higher
+  than `addressMax` in that tick, else once more, five times at most. (A guest may hold and
+  release its ARM7 more than once while it starts, and run it through the top of the address
+  space in between.) Until its first breakpoint is added the part starts over from a settling,
+  once, when a step answers -32012 or a stop shows the ARM7 held or out of reach. Then: a step
+  is its stop, ends at the next instruction or at a vector from a line that is no control flow,
+  never lets `dc.timing.SH4_CYCLES` go back and lets it grow by two periods of the AICA callback
+  (2 x 145124 cycles) at most; a breakpoint behind two plain lines is hit; a step from that
+  stop executes its instruction, is no breakpoint stop again, and leaves `SH4_CYCLES` and the
+  PC of the SH4 as they were; the breakpoint disabled is not hit, enabled again it is, with the
+  category `arm7` muted it is not; a twin on its address: the lower id is reported; a breakpoint
+  at its address + `0x00800000` is hit, with the PC as it is; removed and added again while the
+  target runs, it is hit within 2 s; an ARM7 step while running is -32003; `control.stepOver` on
+  a line that is no call is a step; `control.stepOut` is followed by a running tick or by its
+  stop. A call: two arrivals at a `bl` line are looked for by single steps, each with 96 steps
+  of its own; at the first the call is stepped over (the stop is behind it), at the second it
+  is stepped into and, from its first line, out of (the stop is where `R14` pointed), and behind
+  that stop the target keeps running. A step on the call that ends at a vector is not the step
+  into the callee.
+- `writeMemory` (`memory-write`): 16 bytes below the stack pointer written, read back through
+  the other two regions that map main memory, and restored; a range across the end of main
+  memory refused whole; 65536 bytes read at the SH4's `defaultMemoryAddress` and written back as
+  they are, one more and a byte of 256 refused; a missing target -32602 and `dsp` -32004; a byte
+  of wave memory through both targets; 16 bytes of video memory through three addresses of one
+  view; the boot ROM, the flash, a register window, P4 and a store queue refused; a refusal while
+  the target runs that is -32013 and not -32003; a tick behind every accepted write, of the stop
+  it was made in. With `register-write`: `mov #0x5A, r0` written at that scratch address, the PC
+  put there, one step, the PC two further and R0 `0x5A`, and everything put back. (A step that
+  ends at an exception vector with `SPC` at the scratch address executed nothing: the probe is
+  made once more from the vector.) Nothing of the part writes over memory it did not save, and
+  the PC is never moved onto a line of the program.
+- `setRegister` (`register-write`): the round trip of `R0`, the case of `path` and `name`, the
+  grammar of the value, `flags.writable` (on `R0`, not on `ENABLED`, on no register of width 0),
+  in every node a write of the first writable register with the value it reads and a refusal of
+  the first that is not; `R1` and the aligned PC of the ARM7, the odd PC of the SH4, a CPSR that
+  names no mode; the exchange of the register banks by a write of `SR.RB`; `state.editWatch`.
+- `reset` (`reset`): while running (`{}`, no stop, the entry in the event log); while paused,
+  with a disabled breakpoint, a watch and a flipped category of its own that the tick of the
+  reset stop still lists; `ENABLED` 0 and no ARM7 frames there, and `R1` of the held ARM7
+  written; then a resume and a pause behind the reset.
+- `tree` (`dc.sh4.cpu` offers the action `sh4-registers`: a server claims the M2 tree by
+  offering the M2 panel): the nodes of M2 under their parents, the two actions, at least one
+  register where M2 has tables, and each of the twelve register panels offered by one node.
+
+The part `arm7` says in notes what it met: `arm7: held at the start` or
+`arm7: clocked at the start`, and `arm7: bl stepped over and out` when it stepped over a call
+and out of one. These three texts are an interface: the emulator's contract targets require
+them with `--require-note`, so they do not change.
 
 **What a gate is.** A gate is a run that names a milestone.
 
@@ -365,6 +480,16 @@ the stack scan finds) while it reads 1, and `state.getCallstack` agrees.
 - `--only <ids>` narrows the selection, also inside a gate, and never turns an empty result into
   a success: a selection that leaves nothing to pass is a failed run. `--require <ids>` names
   further scenarios that are run and have to pass.
+- `--parts <scenario>:<part>[+<part>...]` runs only the named parts of a scenario that has
+  parts (S16: `arm7`, `writeMemory`, `setRegister`, `reset`, `tree`; `--list` names them). The
+  scenario has to pass, and it passes when each named part passed: a named part that is not
+  applicable fails. It is for a server that has a part of a milestone, where the scenario as a
+  whole would be `partial`; with `--milestone` it is an error, a gate is whole.
+- `--require-note <text>` (may be repeated, also with `--milestone`): the run is no pass unless
+  a selected scenario noted exactly that text. A gate asks with it for what it has to show and
+  a run could pass without: `--require-note "arm7: bl stepped over and out"`.
+- `--mock-support m1|m2`: the mock the runner starts itself is the mock as a server of that
+  milestone (`--m1`, `--m2` of the mock server). Not with `--url`.
 - Exit codes: 0, every selected scenario that had to pass passed, no invariant was violated and
   the server was put back; 1, anything else that is a result; 2, there was no run (a wrong
   option, or a server that could not be connected to).
@@ -383,10 +508,16 @@ that stop, runs S00 (the anchor at the entry point of `--elf`) and S15 as well, 
 every timeout by 5. The gate of M3 is two runs: that one with the test program of M1, which
 selects everything of M3 but S21, and a second one against an emulator started with the DSP
 test program, `--elf <dsptest.elf> --milestone M3 --dsp-program`, which selects S00 and S21
-alone. The mock's gate is `npm run contract -- --milestone M1` (in-process, profile mock), which
-`npm run check` runs; the mock is "M1 plus", so without `--milestone` its S16 is partial and its
-S17 passes. The gates are run against a server with the default tick period (200 ms, every
-fifth periodic tick full): the time bounds of the scenarios are written for it.
+alone. The gate of M2 on an emulator is two runs as well: the one with the test program of M1,
+and `--elf <dsptest.elf> --milestone M2 --only S00,S16` against an emulator started with the
+sounding guest, which requires the notes `arm7: held at the start` and
+`arm7: bl stepped over and out` (the first program has no call in the loop its ARM7 waits in,
+and its ARM7 takes no interrupt). The mock's gate is `npm run contract -- --milestone M2`
+(in-process, profile mock): 17 scenarios, S16 with its five parts. `npm run check` runs it
+twice, on the mock as it is and with `--mock-support m2` on the mock as what the emulator of
+M2 does, both with `--require-note "arm7: bl stepped over and out"`. The gates are run against
+a server with the default tick period (200 ms, every fifth periodic tick full): the time bounds
+of the scenarios are written for it.
 
 `--idle-breakpoint <address|symbol>` is not a test run: it mutes the `sh4` category, adds one
 breakpoint, resumes and stays connected until the server closes the connection.
