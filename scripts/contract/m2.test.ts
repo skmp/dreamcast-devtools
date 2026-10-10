@@ -7,7 +7,7 @@ import { isArmControlFlow } from "./disasm";
 import { runContract } from "./run";
 import type { ContractOptions, ContractSummary } from "./run";
 import { ARM7_NOTES, SCENARIOS, scenariosOfMilestone, selectScenarios } from "./scenarios";
-import { ask, closeServers, describing, inBand, isTick, mapNodes, noTickAfter, paramsOf, reportOf, rpcError, startServer, tickBeforeResponse } from "./testSupport";
+import { ask, closeServers, describing, inBand, isTick, mapNodes, noTickAfter, paramsOf, reportOf, rpcError, startServer, tickBeforeResponse, wallClock } from "./testSupport";
 import type { FaultSource, Faults, Json } from "./testSupport";
 
 /**
@@ -81,6 +81,51 @@ const part = async (key: string, server?: MockDebugger | MockDebuggerOptions, fa
 };
 const passed = (key: string) => ({ name: key, status: "passed" });
 const HEX = "0x[0-9A-F]{8}";
+
+/** The mock whose periodic tick is counted from each resume: the running ticks behind a resume come at known times. */
+const tickingFromResume = (options: MockDebuggerOptions): MockDebugger =>
+  patched((machine, mock) => {
+    const leaveStop = machine.leaveStop.bind(machine);
+    machine.leaveStop = () => {
+      mock.stop();
+      mock.start();
+      leaveStop();
+    };
+  }, options);
+
+/**
+ * The first settling of the arm7 part as the wire has it: the running ticks between its
+ * control.runUntil and its control.pause, each with what ENABLED reads in it and when it was
+ * sent on, and when the pause was sent (ms on the monotonic clock); and how many times the
+ * part resumed in all. `rewrite` gives the n-th of those ticks another ENABLED.
+ */
+const settlingOf = (rewrite: (nth: number, read: string) => string = (_nth, read) => read) => {
+  const seen = { resumes: 0, ticks: [] as Array<{ at: number; enabled: string }>, pausedAt: Number.NaN };
+  let open = false;
+  const faults: Faults = {
+    toServer: (frame) => {
+      if (frame.method === "control.runUntil") {
+        open = ++seen.resumes === 1;
+      } else if (frame.method === "control.pause" && open) {
+        seen.pausedAt = performance.now();
+        open = false;
+      }
+      return frame;
+    },
+    toClient: (frame) => {
+      if (!open || !isTick(frame) || frame.params.executionState.state !== "running") return frame;
+      const arm7 = frame.params.registers["dc.aica.arm7"];
+      const read = String(arm7.find((register) => register.name === "ENABLED")?.value);
+      const enabled = rewrite(seen.ticks.length, read);
+      seen.ticks.push({ at: performance.now(), enabled });
+      const registers = { ...frame.params.registers, "dc.aica.arm7": arm7.map((register) => (register.name === "ENABLED" ? { ...register, value: enabled } : register)) };
+      return enabled === read ? frame : { ...frame, params: { ...frame.params, registers } };
+    },
+  };
+  /** the ticks behind the last one that read 0 */
+  const released = () => seen.ticks.slice(seen.ticks.map((tick) => tick.enabled).lastIndexOf("0x0") + 1);
+  return { seen, faults, released };
+};
 
 describe("S16, part arm7: the start", () => {
   it("the three notes of the part are an interface to the emulator's contract targets: verbatim", () => {
@@ -186,6 +231,46 @@ describe("S16, part arm7: the start", () => {
     expect(more.detail).toBe("control.step {arm7} answered -32012: the ARM7 is held in reset, also behind a second settling");
   }, 120_000);
 
+  it("a settling waits for ENABLED 1 in every running tick of one second, at least two of them", async () => {
+    const held = { arm7Held: true, startPaused: true };
+    const read = (ticks: Array<{ enabled: string }>) => ticks.map((tick) => tick.enabled);
+    // The running ticks of this mock come 200 ms apart from the resume on: the first has the
+    // ARM7 still held, the others have it clocked. The pause is not sent before the second is over.
+    const plain = settlingOf();
+    expect((await part("arm7", tickingFromResume(held), plain.faults)).result).toEqual(passed("arm7"));
+    expect(read(plain.seen.ticks)[0]).toBe("0x0");
+    expect(plain.released().length).toBeGreaterThanOrEqual(2);
+    expect(plain.seen.pausedAt - plain.released()[0].at).toBeGreaterThanOrEqual(1000);
+
+    // One of them reads 0 once more (the guest held its ARM7 again): the second starts over
+    // with the next tick that reads 1.
+    const again = settlingOf((nth, enabled) => (nth === 4 ? "0x0" : enabled));
+    expect((await part("arm7", tickingFromResume(held), again.faults)).result).toEqual(passed("arm7"));
+    expect(read(again.seen.ticks).slice(0, 4)).toContain("0x1");
+    expect(read(again.seen.ticks)[4]).toBe("0x0");
+    expect(read(again.seen.ticks).lastIndexOf("0x0")).toBe(4);
+    expect(again.released().length).toBeGreaterThanOrEqual(2);
+    expect(again.seen.pausedAt - again.released()[0].at).toBeGreaterThanOrEqual(1000);
+
+    // A server whose running ticks are a second and a half apart: one tick that reads 1 and a
+    // second of silence behind it are not two ticks.
+    const slow = settlingOf();
+    expect((await part("arm7", tickingFromResume({ ...held, tickMs: 1500 }), slow.faults)).result).toEqual(passed("arm7"));
+    expect(slow.released().length).toBeGreaterThanOrEqual(2);
+    expect(slow.seen.pausedAt - slow.released()[0].at).toBeGreaterThanOrEqual(1000);
+
+    // The second is one of the machine, not of the wall clock: set three seconds ahead when
+    // the second tick with ENABLED 1 comes, that clock would have the second over at once.
+    const clock = wallClock();
+    const stepped = settlingOf((nth, enabled) => {
+      if (nth === 2) clock.ahead = 3000;
+      return enabled;
+    });
+    expect((await part("arm7", tickingFromResume(held), stepped.faults)).result).toEqual(passed("arm7"));
+    expect(clock.ahead).toBe(3000);
+    expect(stepped.seen.pausedAt - stepped.released()[0].at).toBeGreaterThanOrEqual(1000);
+  }, 180_000);
+
   it("a PC of the ARM7 above its last address is no place to step from: the part settles, and fails when that does not help", async () => {
     // The ARM7 of a guest that runs through the top of its address space for a while (2ndmix
     // does): the PC reads 0xFFFFFFE8, where no line can be asked for. It comes back to its loop
@@ -205,10 +290,13 @@ describe("S16, part arm7: the start", () => {
     expect(back.result).toEqual(passed("arm7"));
     expect(back.notes).toEqual(["arm7: clocked at the start", "arm7: bl stepped over and out"]);
 
-    const stays = await part("arm7", through(Number.POSITIVE_INFINITY));
+    const five = settlingOf();
+    const stays = await part("arm7", through(Number.POSITIVE_INFINITY), five.faults);
     expect(stays.detail).toBe(
       "the ARM7 did not settle: after five settlings a paused tick still does not show it clocked at an address of its own (the PC of the ARM7 is 0xFFFFFFE8, above its last address 0x00FFFFFF)",
     );
+    // five settlings, and each of them a resume: no fewer, and none behind the fifth
+    expect(five.seen.resumes).toBe(5);
   }, 120_000);
 });
 
@@ -475,17 +563,25 @@ describe("S16, part arm7: steps and breakpoints", () => {
 
     // An interrupt that is pending when the ARM7 stands on the call is entered in front of it:
     // the step ends at the vector, the handler returns to the call, and the search goes on.
+    // It is pending from the step-over of the first arrival on, so the step that is asked for
+    // from the call at the second arrival is the one that enters it: once, and seen.
     const VECTOR = 0x1c;
-    const text = (address: number) => (ask(new MockDebugger(), "state.getDisassembly", { target: "arm7", address, count: 1 }).result as { lines: Array<{ disassembly: string }> }).lines[0].disassembly;
-    expect([text(VECTOR), text(VECTOR + 4)].map((line) => /^bl\b/.test(line))).toEqual([false, false]);
+    const entries: number[] = [];
     const interrupted = patched((machine) => {
+      let pending = false;
+      const step = machine.step.bind(machine);
+      machine.step = (kind, params, context) => {
+        pending ||= params.target === "arm7" && kind === "stepOver" && arm7Pc(machine) === MOCK_ARM7_CALL;
+        return step(kind, params, context);
+      };
       const advance = machine.advance.bind(machine);
-      let entries = 2;
       machine.advance = (target) => {
         const pc = arm7Pc(machine);
         if (target !== "arm7") return advance(target);
-        // (only in a step that is asked for from the call, and not in the step-over of the first arrival)
-        if (pc === MOCK_ARM7_CALL && !machine.running && machine.arm7Temporary === undefined && entries > 0 && entries-- === 1) {
+        // (in a step, not in the run of the step-over itself)
+        if (pc === MOCK_ARM7_CALL && !machine.running && pending) {
+          pending = false;
+          entries.push(pc);
           machine.values.get("dc.aica.arm7")!.set("PC", VECTOR);
           return { wrapped: false };
         }
@@ -496,9 +592,66 @@ describe("S16, part arm7: steps and breakpoints", () => {
         return advance(target);
       };
     });
-    const entered = await part("arm7", interrupted);
+    // the handler: a plain line at the vector, and the return to the instruction it was entered in front of
+    const handler = withLines((address, line) => (address === VECTOR ? "mov r8, #1" : address === VECTOR + 4 ? "subs pc, r14, #4" : line));
+    // where each step, and each step-out, of the part was asked from: the PC of the ARM7 in the paused tick before it
+    const asked: Array<{ method: string; pc: number }> = [];
+    let pc = Number.NaN;
+    const watching: Faults = {
+      toServer: (frame) => {
+        if (/^control\.step/.test(String(frame.method)) && paramsOf(frame).target === "arm7") asked.push({ method: String(frame.method), pc });
+        return frame;
+      },
+      toClient: (frame) => {
+        if (isTick(frame) && frame.params.executionState.state === "paused") {
+          pc = Number.parseInt(String(frame.params.registers["dc.aica.arm7"].find((register) => register.name === "PC")?.value), 16);
+        }
+        return handler.toClient!(frame);
+      },
+    };
+    const entered = await part("arm7", interrupted, watching);
     expect(entered.result).toEqual(passed("arm7"));
     expect(entered.notes).toContain(ARM7_NOTES.calls);
+    expect(entries).toEqual([MOCK_ARM7_CALL]);
+    // The step that ended at the vector was not taken for the step into the callee: the part
+    // went on through the handler, stepped from the call once more, and asked for the
+    // step-out from the first line of the callee.
+    const behind = asked.slice(asked.findIndex((request) => request.method === "control.stepOver" && request.pc === MOCK_ARM7_CALL) + 1);
+    expect(behind.filter((request) => request.pc === MOCK_ARM7_CALL)).toEqual([
+      { method: "control.step", pc: MOCK_ARM7_CALL },
+      { method: "control.step", pc: MOCK_ARM7_CALL },
+    ]);
+    expect(behind.filter((request) => request.pc === VECTOR || request.pc === VECTOR + 4).map((request) => request.pc)).toEqual([VECTOR, VECTOR + 4]);
+    expect(behind.at(-1)).toEqual({ method: "control.stepOut", pc: MOCK_ARM7_LEAF.base });
+
+    // A program in which that interrupt is pending whenever the ARM7 comes to the call: the
+    // steps on the call and through the handler are charged to the arrival, which uses its 96
+    // steps and ends. No call was stepped into, and the part says so.
+    const storm = patched((machine) => {
+      let pending = false;
+      const step = machine.step.bind(machine);
+      machine.step = (kind, params, context) => {
+        pending ||= params.target === "arm7" && kind === "stepOver" && arm7Pc(machine) === MOCK_ARM7_CALL;
+        return step(kind, params, context);
+      };
+      const advance = machine.advance.bind(machine);
+      machine.advance = (target) => {
+        const at = arm7Pc(machine);
+        if (target !== "arm7" || !((at === MOCK_ARM7_CALL && !machine.running && pending) || at === VECTOR + 4)) return advance(target);
+        machine.values.get("dc.aica.arm7")!.set("PC", at === MOCK_ARM7_CALL ? VECTOR : MOCK_ARM7_CALL);
+        return { wrapped: false };
+      };
+    });
+    asked.length = 0;
+    const never = await part("arm7", storm, watching);
+    expect(never.result).toEqual(passed("arm7"));
+    expect(never.notes).toEqual(["arm7: clocked at the start", "arm7: a bl was stepped over; no second one was reached within 96 steps, and none was stepped out of"]);
+    const stormed = asked.slice(asked.findIndex((request) => request.method === "control.stepOver" && request.pc === MOCK_ARM7_CALL) + 1);
+    expect(stormed.every((request) => request.method === "control.step")).toBe(true);
+    expect(stormed.filter((request) => request.pc === VECTOR).length).toBeGreaterThan(20);
+    // (96 steps, and at most the one that is asked for from the call when they are used up)
+    expect(stormed.length).toBeGreaterThanOrEqual(96);
+    expect(stormed.length).toBeLessThanOrEqual(97);
 
     // a step on the call that ends neither in the callee nor at a vector
     const astray = patched((machine) => {
@@ -660,6 +813,21 @@ describe("S16, part writeMemory", () => {
       (machine as { memoryByte: Machine["memoryByte"] }).memoryByte = (target, address) => (target === "sh4" && (address & 0x1fffffff) === 0x00800000 ? untouched : read(target, address));
     });
     expect((await part("writeMemory", apart)).detail).toMatch(/^a byte of wave memory written through the ARM7's 0x00000000 as \d+ reads \d+ through the SH4's 0x00800000$/);
+    // ... and the other way: the ARM7 reads what it wrote itself, and nothing of what the SH4 wrote there
+    const oneWay = patched((machine) => {
+      const read = machine.memoryByte.bind(machine);
+      const write = machine.writeMemory.bind(machine);
+      let own = read("arm7", 0);
+      machine.writeMemory = (params, context) => {
+        if (params.target === "arm7" && params.address === 0) own = params.data[0];
+        return write(params, context);
+      };
+      (machine as { memoryByte: Machine["memoryByte"] }).memoryByte = (target, address) => (target === "arm7" && address === 0 ? own : read(target, address));
+    });
+    const untouched = (new MockDebugger() as unknown as Machine).memoryByte("arm7", 0);
+    expect((await part("writeMemory", oneWay)).detail).toBe(
+      `a byte of wave memory written through the SH4's 0x00800000 as ${untouched ^ 0x5a} reads ${untouched ^ 0xff} through the ARM7's 0x00000000`,
+    );
 
     expect((await part("writeMemory", undefined, writesTo((params) => params.address === 0xa5000000, -32013))).detail).toMatch(/^state\.writeMemory \{"target":"sh4","address":2768240640,"data":\[.*\]\}: in-band error -32013 "not writable"$/);
     const oneAddress = patched((machine) => {
@@ -667,6 +835,13 @@ describe("S16, part writeMemory", () => {
       (machine as { memoryByte: Machine["memoryByte"] }).memoryByte = (target, address) => (target === "sh4" && address >>> 24 === 0x07 ? 0 : read(target, address));
     });
     expect((await part("writeMemory", oneAddress)).detail).toMatch(/^16 bytes of video memory written at 0xA5000000 as \[[0-9A-F ]+\] read \[00( 00){15}\] at 0x07000000$/);
+    // ... or at 0xA5000000 and its mirror, and not where P0 has the same view
+    const notInP0 = patched((machine) => {
+      const read = machine.memoryByte.bind(machine);
+      const fresh = (new MockDebugger() as unknown as Machine).memoryByte;
+      (machine as { memoryByte: Machine["memoryByte"] }).memoryByte = (target, address) => (target === "sh4" && address >>> 24 === 0x05 ? fresh(target, address) : read(target, address));
+    });
+    expect((await part("writeMemory", notInP0)).detail).toMatch(/^16 bytes of video memory written at 0xA5000000 as \[[0-9A-F ]+\] read \[[0-9A-F ]+\] at 0x05000000$/);
     // main memory behind its three regions
     const noMirror = patched((machine) => {
       const read = machine.memoryByte.bind(machine);
@@ -676,13 +851,21 @@ describe("S16, part writeMemory", () => {
   }, 180_000);
 
   it("what is not such memory is refused, and a write to a running target is not answered with -32003", async () => {
-    const accepting = (address: number): Faults => ({ answer: (request) => (request.method === "state.writeMemory" && paramsOf(request).address === address ? { jsonrpc: "2.0", id: request.id, result: {} } : undefined) });
-    expect((await part("writeMemory", undefined, accepting(0x00200000))).detail).toBe(
-      'the flash is not writable: state.writeMemory {"target":"sh4","address":2097152,"data":[0]}: expected the error -32013, got the result {}',
-    );
-    expect((await part("writeMemory", undefined, accepting(0xe0000000))).detail).toBe(
-      'a store queue is not writable: state.writeMemory {"target":"sh4","address":3758096384,"data":[0]}: expected the error -32013, got the result {}',
-    );
+    const accepting = (address: number): Faults => ({
+      answer: (request) =>
+        request.method === "state.writeMemory" && paramsOf(request).target === "sh4" && paramsOf(request).address === address ? { jsonrpc: "2.0", id: request.id, result: {} } : undefined,
+    });
+    for (const [what, address] of [
+      ["the boot ROM", 0x00000000],
+      ["the flash", 0x00200000],
+      ["a register window", 0x005f8000],
+      ["P4", 0xff000030],
+      ["a store queue", 0xe0000000],
+    ] as const) {
+      expect((await part("writeMemory", undefined, accepting(address))).detail, what).toBe(
+        `${what} is not writable: state.writeMemory {"target":"sh4","address":${address},"data":[0]}: expected the error -32013, got the result {}`,
+      );
+    }
     const notPaused: Faults = (() => {
       let running = false;
       return {
@@ -694,7 +877,7 @@ describe("S16, part writeMemory", () => {
       } satisfies Faults;
     })();
     expect((await part("writeMemory", undefined, notPaused)).detail).toBe('state.writeMemory {"target":"sh4","address":0,"data":[0]}: expected the error -32013, got -32003 "not paused"');
-  }, 60_000);
+  }, 120_000);
 
   it("the probe that executes what was written: an instruction that does not execute, a step that ends elsewhere, and a step that ends at a vector first", async () => {
     const stale = patched((machine) => {
@@ -1026,6 +1209,18 @@ describe("S16, part reset", () => {
       mock.holdArm7 = () => undefined;
     });
     expect((await part("reset", clocked)).detail).toBe("dc.aica.arm7.ENABLED reads 1 at the stop of a reset; a machine comes out of reset with its ARM7 held");
+    // A held ARM7 has no frames. In the ticks of a server with the capability "callstack" that is
+    // the invariant of every paused tick; the part asks it of every server that lists the ARM7:
+    // here one without the capability, whose reset stop shows the frames the ARM7 had.
+    const frames: Faults = {
+      toClient: (frame) =>
+        isTick(frame) && frame.params.executionState.reason === "reset"
+          ? { ...frame, params: { ...frame.params, callstacks: { sh4: [], arm7: [{ index: 0, pc: 0x00200010, sp: 0x00280000 }, { index: 1, pc: 0x00200028, sp: 0x00280000, location: "lr" }] } } }
+          : frame,
+    };
+    const stale = await part("reset", { supports: { capabilities: ["event-breakpoints", "memory-write", "register-write", "reset"] } }, frames);
+    expect(stale.detail).toBe("the ARM7 callstack has 2 frames at the stop of a reset; an ARM7 that is held has none");
+    expect(stale.summary.invariantViolations).toEqual([]);
 
     expect((await part("reset", resetting("paused", (machine) => machine.breakpoints.clear()))).detail).toMatch(
       /^the tick of the reset stop lists breakpoint \d+ as undefined; a reset keeps the breakpoints: it was \{.*"enabled":false.*\}$/,
