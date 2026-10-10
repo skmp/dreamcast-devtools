@@ -36,7 +36,7 @@ import {
 import type { Milestone } from "./design";
 import { branchTarget, isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch, mnemonicOf } from "./disasm";
 import { indexDescribe, registerValuePattern } from "./invariants";
-import { ContractFailure, ContractSession, check, describeState, fail } from "./session";
+import { ContractFailure, ContractSession, check, describeState, fail, monotonicNow } from "./session";
 import type { BinaryRecord, TickRecord } from "./session";
 import type { ElfSymbols } from "./elfSymbols";
 
@@ -2420,7 +2420,7 @@ const arm7Part = async (context: RunContext): Promise<void> => {
       settlings++;
       const mark = session.mark();
       await session.call("control.runUntil", {});
-      const released = Date.now() + session.scale(5000);
+      const released = monotonicNow() + session.scale(5000);
       let examined = 0;
       let reads = 0;
       let since: number | undefined;
@@ -2433,16 +2433,16 @@ const arm7Part = async (context: RunContext): Promise<void> => {
           }
           if (enabledIn(tick) === 1) {
             reads++;
-            since ??= Date.now();
+            since ??= monotonicNow();
           } else {
             reads = 0;
             since = undefined;
           }
         }
-        if (since !== undefined && reads >= 2 && Date.now() - since >= session.scale(1000)) {
+        if (since !== undefined && reads >= 2 && monotonicNow() - since >= session.scale(1000)) {
           break;
         }
-        if (Date.now() > released + (since === undefined ? 0 : session.scale(3000))) {
+        if (monotonicNow() > released + (since === undefined ? 0 : session.scale(3000))) {
           await ensurePaused(context);
           return fail(
             since === undefined
@@ -3632,7 +3632,7 @@ export const selectScenarios = (options: {
  * the session recorded an invariant violation while it ran.
  */
 export const runScenario = async (scenario: Scenario, context: RunContext): Promise<ScenarioResult> => {
-  const started = Date.now();
+  const started = monotonicNow();
   const details: string[] = [];
   const notes: string[] = [];
   const noteBefore = context.note;
@@ -3680,7 +3680,7 @@ export const runScenario = async (scenario: Scenario, context: RunContext): Prom
       details.push(`invariant: ... and ${distinct.length - 12} more`);
     }
   }
-  return { id: scenario.id, title: scenario.title, status, durationMs: Date.now() - started, details, notes, ...(parts ? { parts } : {}) };
+  return { id: scenario.id, title: scenario.title, status, durationMs: Math.round(monotonicNow() - started), details, notes, ...(parts ? { parts } : {}) };
 };
 
 /** What the run compares the server with when it cleans up: the state it found. */

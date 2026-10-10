@@ -32,6 +32,15 @@ export const check = (condition: unknown, message: string): void => {
   }
 };
 
+/**
+ * The clock of the runner's deadlines and durations: milliseconds that only go forward, at the
+ * pace of the machine. The wall clock is not that: it can be set while a run is under way (a
+ * machine whose clock follows another one is stepped by a second and more at a time), and a
+ * deadline taken from it then ends a wait before its time is over, or lets "one second" pass in
+ * no time. `Date.now()` is for what a tick says of the time (I2, I3), and for nothing else.
+ */
+export const monotonicNow = (): number => performance.now();
+
 /** One frame as it arrived, in arrival order across responses and notifications. */
 export interface RecordedFrame {
   seq: number;
@@ -126,7 +135,7 @@ export class ContractSession {
   private readonly answers: AnswerLog;
   private readonly requestTimeoutMs: number;
   private readonly waiters = new Set<() => void>();
-  private readonly openedAt = Date.now();
+  private readonly openedAt = monotonicNow();
   private seq = 0;
   private closed = false;
   private socketClosed = false;
@@ -152,7 +161,7 @@ export class ContractSession {
     this.transport.subscribe((payload) => this.onText(payload));
     this.transport.subscribeBinary((data) => {
       // binary frames are numbered with the text frames: "response first, binary frame second" is an order
-      this.binary.push({ seq: this.seq++, at: Date.now() - this.openedAt, data });
+      this.binary.push({ seq: this.seq++, at: monotonicNow() - this.openedAt, data });
       this.options.trace?.(`<- binary frame, ${data.byteLength} bytes`);
       this.wake();
     });
@@ -252,9 +261,9 @@ export class ContractSession {
    */
   async closeAndWait(timeoutMs: number): Promise<boolean> {
     this.close();
-    const deadline = Date.now() + timeoutMs;
+    const deadline = monotonicNow() + timeoutMs;
     while (!this.socketClosed) {
-      const remaining = deadline - Date.now();
+      const remaining = deadline - monotonicNow();
       if (remaining <= 0) {
         return false;
       }
@@ -426,7 +435,7 @@ export class ContractSession {
    * causes the tick: the tick can arrive in the same turn as the response.
    */
   async waitForTick(predicate: (tick: DebuggerTick) => boolean, timeoutMs: number, what: string, since: number): Promise<TickRecord> {
-    const deadline = Date.now() + this.scale(timeoutMs);
+    const deadline = monotonicNow() + this.scale(timeoutMs);
     let examined = 0;
     for (;;) {
       const candidates = this.ticksSince(since);
@@ -435,7 +444,7 @@ export class ContractSession {
           return candidates[examined];
         }
       }
-      const remaining = deadline - Date.now();
+      const remaining = deadline - monotonicNow();
       if (remaining <= 0 || this.closed) {
         const seen = candidates.map((record) => describeState(record.tick)).slice(-6).join(", ");
         return fail(
@@ -456,9 +465,9 @@ export class ContractSession {
 
   /** The next binary frame at or after index `from` of `binary`, or undefined after `timeoutMs` (not scaled). */
   async waitForBinary(from: number, timeoutMs: number): Promise<BinaryRecord | undefined> {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = monotonicNow() + timeoutMs;
     while (this.binary.length <= from) {
-      const remaining = deadline - Date.now();
+      const remaining = deadline - monotonicNow();
       if (remaining <= 0 || this.closed) {
         return undefined;
       }
@@ -487,7 +496,7 @@ export class ContractSession {
 
   private onText(payload: string): void {
     const seq = this.seq++;
-    const at = Date.now() - this.openedAt;
+    const at = monotonicNow() - this.openedAt;
     let json: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(payload);

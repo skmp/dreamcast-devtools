@@ -1,3 +1,4 @@
+import { vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 import type { AddressInfo } from "node:net";
 import { MockDebugger } from "../../server/mockDebugger";
@@ -50,6 +51,19 @@ export const closeServers = async (): Promise<void> => {
   for (const close of closers.splice(0)) {
     await close();
   }
+};
+
+/**
+ * The wall clock of this process with a hand on it, until the test is over: `ahead` is how many
+ * ms it reads more than it did. (The mock stamps its ticks with the same clock, as a server on
+ * this machine would.) The deadlines and durations of the runner are not taken from it.
+ */
+export const wallClock = (): { ahead: number } => {
+  const read = Date.now.bind(Date);
+  const clock = { ahead: 0 };
+  const spy = vi.spyOn(Date, "now").mockImplementation(() => read() + clock.ahead);
+  closers.push(() => Promise.resolve(spy.mockRestore()));
+  return clock;
 };
 
 /**
