@@ -1215,7 +1215,10 @@ export class MockDebugger {
     }
     const gameStarts = lifetime === "running" && this.lifetime === "no-machine";
     this.lifetime = lifetime;
+    // a stop of the host is a stop like any other: what a step-out, or the ARM7's step-over of a
+    // call, was waiting for is not waited for behind it
     this.pendingStepOut = undefined;
+    this.arm7Temporary = undefined;
     this.stopBreakpointId = undefined;
     this.fallbackStep = false;
     if (gameStarts && this.options.startPaused) {
@@ -1272,7 +1275,9 @@ export class MockDebugger {
 
   /**
    * The instruction state.writeMemory put at an address of the SH4, if it is one the mock's SH4
-   * executes: `mov #imm, Rn` (0xEnii, both bytes written).
+   * executes: `mov #imm, Rn` (0xEnii). It is read as memory reads there, and it is a written
+   * one when the overlay holds one of its two bytes: a byte that was written as what it is
+   * fabricated to be is not kept, and is written all the same.
    */
   private writtenSh4Instruction(address: number): { register: string; value: number; text: string } | undefined {
     const low = mockStoreOf("sh4", address);
@@ -1280,9 +1285,12 @@ export class MockDebugger {
     if (!low || !high || this.written.size === 0) {
       return undefined;
     }
-    const first = this.written.get(MockDebugger.storeKey(low));
-    const second = this.written.get(MockDebugger.storeKey(high));
-    if (first === undefined || second === undefined || second >>> 4 !== 0xe) {
+    if (!this.written.has(MockDebugger.storeKey(low)) && !this.written.has(MockDebugger.storeKey(high))) {
+      return undefined;
+    }
+    const first = this.memoryByte("sh4", address);
+    const second = this.memoryByte("sh4", (address + 1) >>> 0);
+    if (second >>> 4 !== 0xe) {
       return undefined;
     }
     // the immediate is sign-extended

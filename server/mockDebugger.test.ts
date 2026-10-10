@@ -1547,8 +1547,8 @@ describe("milestone M2", () => {
       expect(session.lastTick().executionState.state).toBe("running");
     });
 
-    it("the temporary breakpoint goes at any other stop as well: a breakpoint, a pause", async () => {
-      const { session, arm7Pc } = setup({ startPaused: true }, false);
+    it("the temporary breakpoint goes at any other stop as well: a breakpoint, a pause, a stop of the host", async () => {
+      const { mock, session, arm7Pc } = setup({ startPaused: true }, false);
       while (arm7Pc() !== MOCK_ARM7_CALL) session.ok("control.step", { target: "arm7" });
       // a listed breakpoint in the leaf stops the step-over first, with its own reason
       session.ok("breakpoints.add", { event: "dc.aica.arm7.pc", address: MOCK_ARM7_LEAF.base + 4 });
@@ -1565,6 +1565,29 @@ describe("milestone M2", () => {
       session.ok("control.stepOut", { target: "arm7" });
       session.ok("control.pause");
       expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "pause" });
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(40 * STEP_MS);
+      expect(session.lastTick().executionState.state).toBe("running");
+
+      // ... and a stop of the host, which is no stop of the debugger's making: the machine the
+      // host resumes runs on through the address a step-out was waiting at
+      session.ok("control.pause");
+      session.ok("control.stepOut", { target: "arm7" });
+      mock.setLifetime("stopped");
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "host-stopped" });
+      mock.setLifetime("running");
+      expect(session.lastTick().executionState.state).toBe("running");
+      await vi.advanceTimersByTimeAsync(40 * STEP_MS);
+      expect(session.lastTick().executionState.state).toBe("running");
+      // the same for the step-over of a call, with the game closed and started again in between
+      session.ok("control.pause");
+      while (arm7Pc() !== MOCK_ARM7_CALL) session.ok("control.step", { target: "arm7" });
+      session.ok("control.stepOver", { target: "arm7" });
+      mock.setLifetime("no-machine");
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "no-game" });
+      mock.setLifetime("running");
+      // (StartPaused parks the game that starts)
+      expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "start" });
       session.ok("control.runUntil");
       await vi.advanceTimersByTimeAsync(40 * STEP_MS);
       expect(session.lastTick().executionState.state).toBe("running");
@@ -1655,6 +1678,39 @@ describe("milestone M2", () => {
       session.ok("control.step", { target: "sh4" });
       expect(registerOf("dc.sh4.cpu", "R1")).toBe("0x00001111");
       expect(registerOf("dc.sh4.cpu", "PC")).toBe("0x8CFFEF06");
+    });
+
+    it("a written mov #imm, Rn is one also where one of its two bytes is what the mock fabricates there", () => {
+      const { session, registerOf, lines, read } = setup();
+      // before anything is written the byte at 0x8C01001E reads 0x5A, and the one at 0x8C0101C5 reads 0xE0:
+      // of `5A E0` written at 0x8C01001E, and at 0x8C0101C4, the mock keeps one byte
+      expect(read("sh4", 0x8c01001e, 1)).toEqual([0x5a]);
+      expect(read("sh4", 0x8c0101c5, 1)).toEqual([0xe0]);
+      for (const address of [0x8c01001e, 0x8c0101c4]) {
+        const where = `0x${address.toString(16).toUpperCase()}`;
+        const original = lines("sh4", address, 1)[0];
+        expect(original.disassembly, where).not.toMatch(/^mov #/);
+        session.ok("state.writeMemory", { target: "sh4", address, data: [0x5a, 0xe0] });
+        expect(lines("sh4", address, 1), where).toEqual([{ address, bytes: "5A E0", disassembly: "mov #90, r0" }]);
+        session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "0" });
+        session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: String(address) });
+        session.ok("control.step", { target: "sh4" });
+        expect(registerOf("dc.sh4.cpu", "R0"), where).toBe("0x0000005A");
+        expect(registerOf("dc.sh4.cpu", "PC"), where).toBe(`0x${(address + 2).toString(16).toUpperCase()}`);
+        // written back as they were, the bytes are the line they were, and it executes nothing:
+        // the mock's SH4 executes what was written, not what its memory happens to read
+        session.ok("state.writeMemory", { target: "sh4", address, data: original.bytes.split(" ").map((byte) => Number.parseInt(byte, 16)) });
+        expect(lines("sh4", address, 1)[0], where).toEqual(original);
+        session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "0" });
+        session.ok("state.setRegister", { path: "dc.sh4.cpu", name: "PC", value: String(address) });
+        session.ok("control.step", { target: "sh4" });
+        expect(registerOf("dc.sh4.cpu", "R0"), where).toBe("0x00000000");
+      }
+      // one byte is enough to write an instruction: `E3` behind a byte that is left as it reads
+      const [low] = read("sh4", 0x8c020000, 1);
+      session.ok("state.writeMemory", { target: "sh4", address: 0x8c020001, data: [0xe3] });
+      const signed = low & 0x80 ? low - 256 : low;
+      expect(lines("sh4", 0x8c020000, 1)[0].disassembly).toBe(`mov #${signed}, r3`);
     });
   });
 
