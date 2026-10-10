@@ -61,7 +61,8 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
 /** Frame 0 of a paused target: the program counter in the mock's loop, with its symbol. */
 const CALLSTACKS: Record<string, RegExp> = {
   "sh4-callstack": /#0\s*0x8C0000A[02468ACE]\s*_main_loop\+0x[0-9A-E]\b/,
-  "arm7-callstack": /#0\s*0x002000[12][048C]\s*arm7_main_loop\+0x[0-9A-F]+\b/,
+  // (in the loop, or in the leaf behind it that the loop calls)
+  "arm7-callstack": /#0\s*0x002000[123][048C]\s*arm7_main_loop\+0x[0-9A-F]+\b/,
 };
 
 for (const workspace of WORKSPACES) {

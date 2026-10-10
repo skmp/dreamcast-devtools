@@ -41,6 +41,12 @@ interface Target {
   stepButtons: string[];
   /** an address far away from the loop, for the address box */
   farAddress: number;
+  /**
+   * A call in the loop, for a target whose program has one: the address of the call, the
+   * routine it calls (which lies behind the loop) and the last instruction of that, which
+   * returns behind the call.
+   */
+  call?: { at: number; routine: number; last: number };
 }
 
 const hex8 = (address: number) => `0x${address.toString(16).toUpperCase().padStart(8, "0")}`;
@@ -80,6 +86,8 @@ const TARGETS: Target[] = [
     bytesPattern: /^([0-9A-F]{2} ){3}[0-9A-F]{2}$/,
     stepButtons: ["Step Over", "Step In", "Step Out"],
     farAddress: 0x00204000,
+    // the mock's ARM7 calls a leaf of three instructions from the sixth instruction of its loop
+    call: { at: 0x00200024, routine: 0x00200030, last: 0x00200038 },
   },
   {
     name: "DSP",
@@ -100,8 +108,29 @@ const TARGETS: Target[] = [
   },
 ];
 
-const nextInLoop = (target: Target, address: number) =>
-  target.loopStart + ((address - target.loopStart + target.instructionSize) % (target.loopLength * target.instructionSize));
+/** The instruction the target executes after the one at `address`: around its loop, and through the routine the loop calls. */
+const nextInLoop = (target: Target, address: number) => {
+  if (target.call && address === target.call.at) {
+    return target.call.routine;
+  }
+  if (target.call && address === target.call.last) {
+    return target.call.at + target.instructionSize;
+  }
+  if (target.call && address >= target.call.routine && address < target.call.last) {
+    return address + target.instructionSize;
+  }
+  return target.loopStart + ((address - target.loopStart + target.instructionSize) % (target.loopLength * target.instructionSize));
+};
+/** Where Step Over ends: behind a call, and at the next instruction anywhere else. */
+const afterStepOver = (target: Target, address: number) => (target.call && address === target.call.at ? address + target.instructionSize : nextInLoop(target, address));
+/**
+ * Where Step Out ends. A program without a call returns at the branch of its loop (that is
+ * what the mock makes of it); one with a call returns behind the call, where its link
+ * register points whether it is in the routine or not.
+ */
+const afterStepOut = (target: Target) => (target.call ? target.call.at + target.instructionSize : target.loopStart);
+/** The last address of the program: of its loop, or of the routine behind it. */
+const programEnd = (target: Target) => (target.call ? target.call.last + target.instructionSize : target.loopStart + target.loopLength * target.instructionSize);
 
 /** Shows `address` in the view (through the address box), wherever the view was. */
 const showAddress = async (view: Locator, target: Target, address: number) => {
@@ -162,17 +191,18 @@ for (const target of TARGETS) {
 
       let address = await currentInstructionAddress(view);
       expect(address).toBeGreaterThanOrEqual(target.loopStart);
-      expect(address).toBeLessThan(target.loopStart + target.loopLength * target.instructionSize);
+      expect(address).toBeLessThan(programEnd(target));
       await expect(view.locator(".current-instruction").locator("span").first()).toHaveText(target.format(address));
 
       for (const label of target.stepButtons) {
         await expect(tooltipButton(view, label)).toBeEnabled();
         await tooltipButton(view, label).click();
-        // Step Over and Step In execute one instruction (the mock's loop has no calls). Step Out
-        // resumes until the return, which for the mock is the branch at the end of its loop.
+        // Step Over and Step In execute one instruction; where the loop has a call (the ARM7's),
+        // Step Over runs through the routine and stops behind the call. Step Out resumes until
+        // the return: the branch at the end of the loop, or the instruction behind the call.
         // The view follows every stop: the first of the DSP's 128 steps is not among the 64
         // lines around the last one, and is shown without anything being clicked.
-        address = label === "Step Out" ? target.loopStart : nextInLoop(target, address);
+        address = label === "Step Out" ? afterStepOut(target) : label === "Step Over" ? afterStepOver(target, address) : nextInLoop(target, address);
         await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(address));
         await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
         await expect(tooltipButton(page, "Run")).toBeEnabled();
@@ -192,7 +222,7 @@ for (const target of TARGETS) {
         const before = rpc.received.filter((frame) => frame.method === "event.tick").length;
 
         await tooltipButton(view, "Step Out").click();
-        await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(target.loopStart));
+        await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(afterStepOut(target)));
         await expect(tooltipButton(page, "Run")).toBeEnabled();
         // a running tick, then the paused tick of the new stop, which says that a step ended it
         const states = rpc.received

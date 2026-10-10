@@ -120,17 +120,18 @@ test("a control request the server refuses says so; nothing is silently ignored"
   const status = page.getByRole("status", { name: "Execution state" });
   await expect(status).toHaveText("Paused · paused by the debugger · stop 1");
 
-  // an odd program counter, written through the watch
+  // A program counter where nothing can be read, written through the watch. (An odd one is
+  // refused when it is written: the server stores no PC that nothing executes at.)
   const watches = panel(page, "watches");
   await watches.getByText(/^0x8C0000A[0-9A-E]$/).dblclick();
-  await watches.getByRole("listitem").getByRole("textbox").fill("0x8C0000A1");
+  await watches.getByRole("listitem").getByRole("textbox").fill("0x10000000");
   await watches.getByRole("listitem").getByRole("textbox").press("Enter");
-  await expect(watches).toContainText("dc.sh4.cpu.pc = 0x8C0000A1");
+  await expect(watches).toContainText("dc.sh4.cpu.pc = 0x10000000");
 
   await tooltipButton(view, "Step In").click();
-  await expect(page.getByRole("alert").filter({ hasText: "Step: cannot step: pc is odd" })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "Step: cannot step: pc not readable" })).toBeVisible();
   await tooltipButton(view, "Step Over").click();
-  await expect(page.getByRole("alert").filter({ hasText: "Step over: cannot step: pc is odd" })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "Step over: cannot step: pc not readable" })).toBeVisible();
   // no stop was made
   await expect(status).toHaveText("Paused · paused by the debugger · stop 1");
 });
