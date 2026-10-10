@@ -16,12 +16,16 @@ import type {
 } from "../../src/lib/debuggerSchema";
 import { MOCK_SH4_RING, mockNextAddress } from "../../server/mockDebugger";
 import {
+  AICA_CALLBACK_CYCLES,
   ANCHOR_REGISTERS,
   ARM7_ENABLED_REGISTER,
   BASE_PATHS,
   DSP_REGISTER_WIDTHS,
   M1_DEVICE_TREE,
+  M2_DEVICE_TREE,
+  M2_TREE_ACTION,
   MILESTONES,
+  REGISTER_PANEL_IDS,
   SH4_CPU_REGISTERS,
   SH4_CPU_REGISTER_WIDTH,
   TARGET_IDS,
@@ -30,7 +34,7 @@ import {
   capabilitiesOfMilestone,
 } from "./design";
 import type { Milestone } from "./design";
-import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
+import { branchTarget, isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch, mnemonicOf } from "./disasm";
 import { indexDescribe, registerValuePattern } from "./invariants";
 import { ContractFailure, ContractSession, check, describeState, fail } from "./session";
 import type { BinaryRecord, TickRecord } from "./session";
@@ -62,6 +66,8 @@ export interface ScenarioResult {
   durationMs: number;
   /** why it failed or does not apply, and notes */
   details: string[];
+  /** what the scenario noted of what it met (also in `details`): `--require-note` asks for one of these */
+  notes: string[];
   parts?: PartResult[];
 }
 
@@ -79,6 +85,11 @@ export interface RunContext {
   milestone?: Milestone;
   /** the server runs the DSP test program (`--dsp-program`): the second run of the M3 gate */
   dspProgram?: boolean;
+  /**
+   * The parts of a scenario that are run (`--parts`), by scenario id: only these, and each of
+   * them has to pass. Without an entry every part of the scenario is run.
+   */
+  parts?: ReadonlyMap<string, ReadonlySet<string>>;
   /**
    * Every breakpoint id and watch id that any tick of the run listed, on any connection: an
    * id that is in here has been used, and the server gives it to nothing new.
@@ -100,6 +111,8 @@ type Scenario = {
   emulatorOnly?: boolean;
   /** it needs a program that loads the DSP: it belongs to the run with the DSP test program, and to no other */
   dspProgram?: boolean;
+  /** the keys of its parts, for a scenario that has parts: what `--parts` names */
+  parts?: readonly string[];
   run: (context: RunContext) => Promise<Outcome>;
 };
 
@@ -759,6 +772,13 @@ const s01: Scenario = {
       }
       for (const capability of capabilitiesOfMilestone(context.milestone)) {
         expectThat(shape.capabilities?.includes(capability), `the gate of ${context.milestone}: the capability "${capability}" is not advertised (3.1)`);
+      }
+      // from M2 on the ARM7 steps: without the flag the ARM7 part of S16 would only be "not applicable"
+      if (MILESTONES.indexOf(context.milestone) >= MILESTONES.indexOf("M2") && ids.includes("arm7")) {
+        expectThat(
+          targets.find((target) => target.id === "arm7")?.stepping === true,
+          `the gate of ${context.milestone}: targets: arm7.stepping is not true; a server of milestone M2 steps the ARM7 and takes its code breakpoints (3.1)`,
+        );
       }
     }
 
@@ -1430,6 +1450,28 @@ const s09: Scenario = {
     check(flash.data.slice(16).every((byte) => byte === 0), "unreadable bytes are 0");
     // nothing readable: JSON-RPC -32010
     await session.expectError("state.getMemorySlice", { target: "sh4", address: 0x10000000, length: 16 }, -32010);
+    // There is no wrap-around: a byte above the last address of the target is not readable
+    // (2.7). 32 bytes from 16 below the end of the SH4's address space: a server that reads
+    // something there answers with the second half unreadable and zero, one that reads
+    // nothing there with -32010. What fails is a second half that reads the start of memory.
+    const top = sh4.addressMax - 15;
+    const across = await session.outcome("state.getMemorySlice", { target: "sh4", address: top, length: 32 });
+    if ("error" in across) {
+      check(
+        across.error.code === -32010,
+        `a read of 32 bytes at ${hex(top)}, across the last address of the sh4: the error ${across.error.code} "${across.error.message}", expected data whose second half is unreadable, or -32010`,
+      );
+    } else {
+      const read = across.result as { data: number[]; unreadable?: Array<[number, number]> };
+      check(read.data.length === 32, `a read of 32 bytes at ${hex(top)} returns ${read.data.length} bytes`);
+      const unreadable = new Set((read.unreadable ?? []).flatMap(([offset, length]) => Array.from({ length }, (_, position) => offset + position)));
+      const readable = Array.from({ length: 16 }, (_, position) => 16 + position).filter((offset) => !unreadable.has(offset) || read.data[offset] !== 0);
+      check(
+        readable.length === 0,
+        `a read of 32 bytes at ${hex(top)} goes ${readable.length} byte${readable.length === 1 ? "" : "s"} past the last address of the sh4 (${hex(sh4.addressMax)}): ` +
+          `it lists unreadable ${JSON.stringify(read.unreadable)}, and the bytes behind the end are ${JSON.stringify(read.data.slice(16))}; a read does not wrap, those bytes are unreadable and 0`,
+      );
+    }
 
     // a target without memory: -32004; one with memory is read at its default address
     for (const target of session.shape.targets ?? []) {
@@ -1951,6 +1993,19 @@ const s13: Scenario = {
       await unwatch(context, watchId);
       await other.waitForTick((tick) => !lists(watchId)(tick), 1000, "a tick on the second connection without the removed watch", since);
 
+      // A write: the tick that follows it goes to every client, as that of every request that
+      // changes something. The register is written with the value it reads, so nothing changes
+      // in the guest, and the target is paused, so no periodic tick comes instead.
+      if (hasCapability(context, CAPABILITIES.REGISTER_WRITE)) {
+        const paused = await ensurePaused(context);
+        const value = registerOf(paused.tick, sh4.pcPath, "R0") ?? fail(`${sh4.pcPath} has no register R0`);
+        since = other.mark();
+        await session.call("state.setRegister", { path: sh4.pcPath, name: "R0", value });
+        await other.waitForTick(() => true, 1000, "a tick on the second connection behind the state.setRegister of the first", since);
+      } else {
+        context.note('no capability "register-write": the tick of a write was not looked for on the second connection');
+      }
+
       // a category
       const original = categoriesOf(session.latestTick().tick).events;
       for (const state of [{ muted: !original.muted, soloed: original.soloed }, original]) {
@@ -2246,12 +2301,31 @@ const s15: Scenario = {
   },
 };
 
-/** Runs the parts of a multi-capability scenario; a part whose capability is missing is not applicable. */
-const runParts = async (parts: Array<{ name: string; applicable: boolean; why: string; run: () => Promise<void> }>): Promise<Outcome> => {
+interface Part {
+  /** what `--parts` names it by */
+  key: string;
+  name: string;
+  applicable: boolean;
+  why: string;
+  run: () => Promise<void>;
+}
+
+/**
+ * Runs the parts of a multi-capability scenario; a part whose capability is missing is not
+ * applicable. With `--parts` for the scenario only the named parts are run, and each of them
+ * has to pass: one that is not applicable fails.
+ */
+const runParts = async (context: RunContext, scenario: string, all: Part[]): Promise<Outcome> => {
+  const named = context.parts?.get(scenario);
+  const parts = named ? all.filter((part) => named.has(part.key)) : all;
   const results: PartResult[] = [];
   for (const part of parts) {
     if (!part.applicable) {
-      results.push({ name: part.name, status: "not-applicable", detail: part.why });
+      results.push(
+        named
+          ? { name: part.name, status: "failed", detail: `not applicable (${part.why}); a part that --parts names has to pass` }
+          : { name: part.name, status: "not-applicable", detail: part.why },
+      );
       continue;
     }
     try {
@@ -2280,149 +2354,1017 @@ const checkBinaryAfterResponse = (session: ContractSession, request: number, bin
 const ARM_EXCEPTION_VECTORS = [0x00, 0x04, 0x08, 0x0c, 0x10, 0x18, 0x1c];
 
 /**
- * A step and a code breakpoint of a target other than the SH4. The step is its stop: a paused
- * tick with a new stopId and reason "step", and no running tick in between. Where an ARM7 step
- * ends is compared only on a line that is not control flow, as S04 does for the SH4 (a branch
- * to itself leaves the PC where it is): there it is the next instruction, or an exception vector.
+ * What the `arm7` part of S16 notes of what it met. The texts are an interface: the contract
+ * targets of the emulator require them of a run with `--require-note`, so they are verbatim.
  */
-const stepAndBreakpoint = async (context: RunContext, targetId: "arm7" | "dsp"): Promise<void> => {
+export const ARM7_NOTES = {
+  /** ENABLED read 0 at the start of the part: the -32012 of the three steps was probed */
+  held: "arm7: held at the start",
+  clocked: "arm7: clocked at the start",
+  /** a call was stepped over, and a second one stepped into and out of */
+  calls: "arm7: bl stepped over and out",
+} as const;
+
+/** The three steps of a target. */
+const STEP_METHODS = ["control.step", "control.stepOver", "control.stepOut"] as const;
+
+const NOT_MUTED: BreakpointCategoryState = { muted: false, soloed: false };
+
+/** `ENABLED` of dc.aica.arm7 as a tick has it: 1, 0, or undefined when it is not there or reads neither. */
+const enabledIn = (tick: DebuggerTick): 0 | 1 | undefined => {
+  const value = registerOf(tick, ARM7_ENABLED_REGISTER.path, ARM7_ENABLED_REGISTER.name);
+  return value === "0x1" ? 1 : value === "0x0" ? 0 : undefined;
+};
+
+/** An ARM line that is a call: `bl`, in any condition (`ble`, `blt`, `bls` and `blo` are branches). */
+const isArmCall = (disassembly: string): boolean => /^bl(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?$/.test(mnemonicOf(disassembly));
+/** A call that is always taken and names where it goes: what the part steps over, into and out of. */
+const isPlainArmCall = (disassembly: string): boolean => /^bl(al)?$/.test(mnemonicOf(disassembly)) && branchTarget(disassembly) !== undefined;
+
+/**
+ * What the `arm7` part found while it may still start over: the ARM7 held in reset, or with a
+ * PC no line can be asked for. A guest may hold and release its ARM7 more than once while it
+ * starts, and the part meets that when it is run from the anchor.
+ */
+class Arm7Unsettled extends Error {}
+
+/**
+ * S16, part `arm7`: the ARM7 as a target that steps and has breakpoints (M2-ROUND 3.1 item 3).
+ * The start (an ARM7 that is held: -32012 and a settling), a step, a breakpoint that is hit,
+ * a step from that stop, the breakpoint disabled, muted, with a twin, at a mirror address and
+ * added while the target runs, step over and step out, and a call stepped over and out of.
+ */
+const arm7Part = async (context: RunContext): Promise<void> => {
   const { session } = context;
-  const target = requireTarget(context, targetId);
-  const before = await ensurePaused(context);
-  const pc0 = pcOf(before.tick, target);
-  const line = targetId === "arm7" ? (await disassemble(context, targetId, pc0, 1)).at(0) : undefined;
-  const stepped = await stepOnce(context, targetId);
-  const pc1 = pcOf(stepped.tick, target);
-  if (targetId === "dsp") {
-    check(pc1 === (pc0 + 1) % (target.addressMax + 1), `a DSP step from ${pc0} ended at ${pc1}`);
-  } else if (line && !isArmControlFlow(line.disassembly)) {
+  const arm7 = requireTarget(context, "arm7");
+  const sh4 = requireTarget(context, "sh4");
+  const size = arm7.instructionSize;
+  const event = arm7.breakpointEvent;
+  const pcIn = (tick: DebuggerTick) => pcOf(tick, arm7);
+  const latest = () => session.latestTick().tick;
+  /** the ARM7 is clocked and stands where a line can be asked for */
+  const inReach = (tick: DebuggerTick) => arm7Clocked(tick) && pcIn(tick) <= arm7.addressMax;
+  const whereItIs = (tick: DebuggerTick) => (arm7Clocked(tick) ? `the PC of the ARM7 is ${hex(pcIn(tick))}, above its last address ${hex(arm7.addressMax)}` : "ENABLED reads 0");
+
+  /**
+   * Settling: resume; wait until ENABLED has read 1 in every running tick of one second, at
+   * least two of them (it has to read 1 within 5 s); pause; the paused tick has to show
+   * ENABLED 1 and a PC no higher than addressMax, else once more. At most five in a part.
+   */
+  let settlings = 0;
+  const settle = async (): Promise<TickRecord> => {
+    for (;;) {
+      if (settlings === 5) {
+        return fail(`the ARM7 did not settle: after five settlings a paused tick still does not show it clocked at an address of its own (${whereItIs(latest())})`);
+      }
+      settlings++;
+      const mark = session.mark();
+      await session.call("control.runUntil", {});
+      const released = Date.now() + session.scale(5000);
+      let examined = 0;
+      let reads = 0;
+      let since: number | undefined;
+      for (;;) {
+        const ticks = session.ticksSince(mark);
+        for (; examined < ticks.length; examined++) {
+          const tick = ticks[examined].tick;
+          if (!isRunning(tick)) {
+            continue;
+          }
+          if (enabledIn(tick) === 1) {
+            reads++;
+            since ??= Date.now();
+          } else {
+            reads = 0;
+            since = undefined;
+          }
+        }
+        if (since !== undefined && reads >= 2 && Date.now() - since >= session.scale(1000)) {
+          break;
+        }
+        if (Date.now() > released + (since === undefined ? 0 : session.scale(3000))) {
+          await ensurePaused(context);
+          return fail(
+            since === undefined
+              ? `the ARM7 was not released: ${ARM7_ENABLED_REGISTER.path}.${ARM7_ENABLED_REGISTER.name} did not read 1 in a running tick within ${session.scale(5000)} ms of the resume`
+              : `the ARM7 was not released: ${ARM7_ENABLED_REGISTER.name} read 1 in ${reads} running tick${reads === 1 ? "" : "s"} only; it has to read 1 in every running tick of ${session.scale(1000)} ms, at least two of them`,
+          );
+        }
+        await sleep(25);
+      }
+      const paused = await ensurePaused(context);
+      if (inReach(paused.tick)) {
+        return paused;
+      }
+    }
+  };
+
+  /** until the first breakpoint of the part is added, a step that finds the ARM7 held, or out of reach, makes the part start over */
+  let mayStartOver = true;
+  /**
+   * One step of the ARM7 from where it is, with what holds for each: `{}`, one paused tick with
+   * a new stopId and reason "step", no running tick in between; the time of the SH4 does not go
+   * back, and across control.step it grows by two periods of the AICA callback at most; from a
+   * line that is not control flow the step ends at the next instruction or at a vector.
+   * `method` is control.step, or control.stepOver on a line that is not a call, which is a step.
+   */
+  const step = async (method: "control.step" | "control.stepOver" = "control.step"): Promise<{ record: TickRecord; pc0: number; pc1: number }> => {
+    const before = latest();
+    check(isPaused(before), "a step needs a paused target");
+    const pc0 = pcIn(before);
+    const line = pc0 <= arm7.addressMax ? (await disassemble(context, "arm7", pc0, 1)).at(0) : undefined;
+    const mark = session.mark();
+    const answer = await session.outcome(method, { target: "arm7" });
+    if ("error" in answer) {
+      if (answer.error.code === -32012 && mayStartOver) {
+        throw new Arm7Unsettled(`${method} {arm7} answered -32012: the ARM7 is held in reset`);
+      }
+      return fail(`${method} {"target":"arm7"}: in-band error ${answer.error.code} "${answer.error.message}"`);
+    }
+    check(Object.keys(answer.result as object).length === 0, `${method}: the success result is {}, got ${JSON.stringify(answer.result)}`);
+    const stopped = await session.waitForTick(
+      (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(before),
+      2000,
+      `a paused tick with a new stopId after ${method} {arm7}`,
+      mark,
+    );
+    const between = session.ticksSince(mark).filter((record) => record.seq <= stopped.seq);
+    check(!between.some((record) => isRunning(record.tick)), `${method} {arm7}: a running tick arrived before the paused tick of the step`);
+    check(stopped.tick.executionState.reason === "step", `${method} {arm7}: the stop has reason "${stopped.tick.executionState.reason}", expected "step"`);
+    check(stopped.tick.executionState.breakpointId === undefined, `${method} {arm7}: a step stop carries no breakpointId`);
+
+    const cycles0 = cyclesOf(before);
+    const cycles1 = cyclesOf(stopped.tick);
+    if (cycles0 !== undefined && cycles1 !== undefined) {
+      check(cycles1 >= cycles0, `dc.timing.SH4_CYCLES went back from ${cycles0} to ${cycles1} across a step of the ARM7`);
+      check(
+        method !== "control.step" || cycles1 - cycles0 <= 2n * AICA_CALLBACK_CYCLES,
+        `dc.timing.SH4_CYCLES grew by ${cycles1 - cycles0} across control.step {arm7}, more than two periods of the AICA callback (2 x ${AICA_CALLBACK_CYCLES}): ` +
+          "from a stop outside a sound burst the SH4 runs to the next burst and no further",
+      );
+    }
+    if (mayStartOver && !inReach(stopped.tick)) {
+      throw new Arm7Unsettled(`behind ${method} {arm7} ${whereItIs(stopped.tick)}`);
+    }
+    const pc1 = pcIn(stopped.tick);
+    if (line && !isArmControlFlow(line.disassembly)) {
+      check(
+        pc1 === pc0 + size || ARM_EXCEPTION_VECTORS.includes(pc1),
+        `"${line.disassembly}" at ${hex(pc0)} is not control flow, and the step of arm7 ended at ${hex(pc1)}, not at ${hex(pc0 + size)} or an exception vector`,
+      );
+    }
+    return { record: stopped, pc0, pc1 };
+  };
+
+  /** The line the ARM7 stands at, if one can be asked for. */
+  const lineAtPc = async (): Promise<DisassemblyLine | undefined> => {
+    const pc = pcIn(latest());
+    return pc <= arm7.addressMax ? (await disassemble(context, "arm7", pc, 1)).at(0) : undefined;
+  };
+
+  /**
+   * A step, as S04 makes one for the SH4, and then on to a site: a PC whose line and next line
+   * are both not control flow (at most 64 steps), so that a breakpoint behind it is the next
+   * thing the ARM7 reaches. Returns that PC.
+   */
+  const toSite = async (): Promise<number> => {
+    await step();
+    for (let steps = 0; ; steps++) {
+      const pc = pcIn(latest());
+      const lines = pc + size <= arm7.addressMax ? await disassemble(context, "arm7", pc, 2) : [];
+      if (lines.length === 2 && !isArmControlFlow(lines[0].disassembly) && !isArmControlFlow(lines[1].disassembly)) {
+        return pc;
+      }
+      if (steps === 64) {
+        return fail("no arm7 PC whose line and next line are not control flow within 64 steps");
+      }
+      await step();
+    }
+  };
+
+  // the breakpoints of the part, so that none of them outlives it when it fails
+  const mine = new Set<number>();
+  const add = async (params: { address: number; enabled?: boolean }): Promise<BreakpointDescriptor> => {
+    const breakpoint = await addBreakpoint(context, { event, kind: "code", ...params });
+    mine.add(breakpoint.id);
+    return breakpoint;
+  };
+  const remove = async (id: number): Promise<void> => {
+    await removeBreakpoint(context, id);
+    mine.delete(id);
+  };
+  let categories: Record<string, BreakpointCategoryState> | undefined;
+
+  try {
+    // The start. An ARM7 that is held in reset refuses its three steps with -32012, in-band, and
+    // takes a breakpoint all the same (that is what stops at its first instruction).
+    let startedOver = false;
+    const start = await ensurePaused(context);
+    if (!arm7Clocked(start.tick)) {
+      for (const method of STEP_METHODS) {
+        await session.expectError(method, { target: "arm7" }, -32012);
+      }
+      await remove((await add({ address: (arm7.defaultDisassemblyAddress - (arm7.defaultDisassemblyAddress % size)) >>> 0 })).id);
+      context.note(ARM7_NOTES.held);
+      await settle();
+    } else {
+      context.note(ARM7_NOTES.clocked);
+      if (!inReach(start.tick)) {
+        startedOver = true;
+        await settle();
+      }
+    }
+
+    let site: number;
+    try {
+      site = await toSite();
+    } catch (error) {
+      if (!(error instanceof Arm7Unsettled)) {
+        throw error;
+      }
+      if (startedOver) {
+        return fail(`${error.message}, and the part had started over from a settling once already`);
+      }
+      // once: the guest held its ARM7 again, or released it onto another program
+      await settle();
+      try {
+        site = await toSite();
+      } catch (again) {
+        return again instanceof Arm7Unsettled ? fail(`${again.message}, also behind a second settling`) : Promise.reject(again);
+      }
+    }
+    mayStartOver = false;
+    const address = site + size;
+
+    // a breakpoint address of the ARM7 is a multiple of 4 up to its last address
+    await session.expectError("breakpoints.add", { event, address: 2 }, -32602);
+    await session.expectError("breakpoints.add", { event, address: arm7.addressMax + 1 }, -32602);
+
+    // ARM7 breakpoints are active here: nothing soloed, the category not muted
+    const original = categoriesOf(latest());
+    const open = Object.fromEntries(Object.entries(original).map(([key, state]) => [key, key === "arm7" ? NOT_MUTED : { muted: state.muted, soloed: false }]));
+    categories = original;
+    await setCategories(context, open);
+
+    // The breakpoint behind the site is the next thing the ARM7 reaches: hit, with its id and at its address.
+    const breakpoint = await add({ address, enabled: true });
+    const hit = await resumeToBreakpoint(context, arm7, breakpoint.id, address);
+
+    // A step from that stop, with the breakpoint still enabled, executes its instruction: the
+    // stop is the step's, not the breakpoint's again. A sound burst is suspended at such a stop
+    // and the step stays inside it: the SH4 executes nothing.
+    const stepped = await step();
     check(
-      pc1 === pc0 + target.instructionSize || ARM_EXCEPTION_VECTORS.includes(pc1),
-      `"${line.disassembly}" at ${hex(pc0)} is not control flow, and the step of ${targetId} ended at ${hex(pc1)}, not at ${hex(pc0 + target.instructionSize)} or an exception vector`,
+      cyclesOf(stepped.record.tick) === cyclesOf(hit.tick),
+      `control.step {arm7} from the stop of an ARM7 breakpoint moved dc.timing.SH4_CYCLES from ${cyclesOf(hit.tick)} to ${cyclesOf(stepped.record.tick)}; the step stays inside the sound burst that is suspended there, and the SH4 does not execute`,
+    );
+    check(
+      pcOf(stepped.record.tick, sh4) === pcOf(hit.tick, sh4),
+      `control.step {arm7} from the stop of an ARM7 breakpoint moved the PC of ${sh4.pcPath} from ${hex(pcOf(hit.tick, sh4))} to ${hex(pcOf(stepped.record.tick, sh4))}; the SH4 does not execute in it`,
+    );
+
+    // disabled it is not hit, enabled again it is
+    await toggleBreakpoint(context, breakpoint.id, false);
+    await expectToKeepRunning(context, `a disabled breakpoint of the ARM7 at ${hex(address)}`);
+    await toggleBreakpoint(context, breakpoint.id, true);
+    await resumeToBreakpoint(context, arm7, breakpoint.id, address);
+    // with its category muted it is not hit, unmuted it is
+    await setCategories(context, { ...open, arm7: { muted: true, soloed: false } });
+    await expectToKeepRunning(context, `a breakpoint of the ARM7 at ${hex(address)} while the category arm7 is muted`);
+    await setCategories(context, open);
+    await resumeToBreakpoint(context, arm7, breakpoint.id, address);
+    // a twin on the same address: the stop reports the lower id
+    const twin = await add({ address, enabled: true });
+    await resumeToBreakpoint(context, arm7, Math.min(breakpoint.id, twin.id), address);
+    await remove(twin.id);
+    await remove(breakpoint.id);
+
+    // ARM7 breakpoints are compared under the mask of the wave memory, which is 2 MiB or 8 MiB:
+    // one at the address + 0x00800000 is a mirror of it on every server. It is hit, and the tick
+    // has the PC as it is.
+    if (address < 0x00800000) {
+      const mirror = await add({ address: address + 0x00800000, enabled: true });
+      const armed = latest();
+      const mark = session.mark();
+      await session.call("control.runUntil", {});
+      const stop = await session.waitForTick(
+        (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(armed),
+        2000,
+        `a paused tick at the breakpoint ${hex(address + 0x00800000)}, which is ${hex(address)} under the mask of the wave memory`,
+        mark,
+      );
+      check(stop.tick.executionState.breakpointId === mirror.id, `the stop reports breakpointId ${stop.tick.executionState.breakpointId}, expected ${mirror.id}`);
+      check(stop.tick.executionState.reason === "breakpoint", `the stop has reason "${stop.tick.executionState.reason}", expected "breakpoint"`);
+      check(
+        pcIn(stop.tick) === address,
+        `the stop of the breakpoint at ${hex(address + 0x00800000)} shows the PC ${hex(pcIn(stop.tick))}; a tick has the PC as it is, ${hex(address)}`,
+      );
+      await remove(mirror.id);
+    } else {
+      context.note(`arm7: the breakpoint site ${hex(address)} is at or above 0x00800000: a breakpoint at a mirror address was not tried`);
+    }
+
+    // added enabled while the target runs, a breakpoint is armed: hit at its next arrival
+    const running = await ensureRunning(context);
+    const adding = session.mark();
+    const late = await addBreakpointShown(context, { event, address, kind: "code", enabled: true });
+    mine.add(late.breakpoint.id);
+    const arrived = await session.waitForTick(
+      (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(running.tick),
+      2000,
+      `a paused tick at the ARM7 breakpoint ${hex(address)} that was added while the target runs`,
+      adding,
+    );
+    checkBreakpointStop(arrived.tick, arm7, late.breakpoint.id, address);
+    await remove(late.breakpoint.id);
+    await setCategories(context, original);
+    categories = undefined;
+
+    // a step while running is refused, in-band
+    await ensureRunning(context);
+    for (const method of STEP_METHODS) {
+      await session.expectError(method, { target: "arm7" }, -32003);
+    }
+    await ensurePaused(context);
+
+    // control.stepOver on a line that is not a call is a step
+    for (let steps = 0; ; steps++) {
+      const line = await lineAtPc();
+      if (line && !isArmCall(line.disassembly)) {
+        break;
+      }
+      check(steps < 64, "no arm7 line that is not a call within 64 steps");
+      await step();
+    }
+    await step("control.stepOver");
+
+    // control.stepOut is a resume with a temporary breakpoint at the link register. Whether and
+    // when the ARM7 comes there is the program's business; and when it comes there inside the
+    // sound burst the stop was in, the stop follows with no running tick at all.
+    const leaving = latest();
+    const out = session.mark();
+    await session.call("control.stepOut", { target: "arm7" });
+    const left = await session.waitForTick(
+      (tick) => isRunning(tick) || stopIdOf(tick) > stopIdOf(leaving),
+      1000,
+      "a running tick, or a paused tick with a new stopId, after control.stepOut {arm7}",
+      out,
+    );
+    const returned = isPaused(left.tick)
+      ? left
+      : await session.waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(leaving), 5000, "the stop of control.stepOut {arm7}", left.seq).catch(() => undefined);
+    if (returned) {
+      const { reason, breakpointId } = returned.tick.executionState;
+      check(reason === "step" || breakpointId !== undefined, `control.stepOut {arm7}: the stop has reason "${reason}", expected "step"`);
+    }
+    await ensurePaused(context);
+
+    // A call. Two arrivals at a `bl` line are looked for by single steps, each with 96 steps of
+    // its own (a search may walk through an interrupt handler). At the first the call is
+    // stepped over; at the second it is stepped into, and out of from its first line.
+    const arrive = async (budget: { left: number }): Promise<{ pc: number; target: number } | undefined> => {
+      for (;;) {
+        const line = await lineAtPc();
+        if (line && isPlainArmCall(line.disassembly)) {
+          return { pc: line.address, target: branchTarget(line.disassembly)! };
+        }
+        if (budget.left === 0) {
+          return undefined;
+        }
+        budget.left--;
+        await step();
+      }
+    };
+    /** The stop of a step-over or a step-out that resumed: a paused tick with a new stopId and reason "step", at `expected`. */
+    const stopOf = async (method: "control.stepOver" | "control.stepOut", expected: number, where: string): Promise<void> => {
+      const before = latest();
+      const mark = session.mark();
+      await session.call(method, { target: "arm7" });
+      const stop = await session.waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(before), 2000, `the stop of ${method} {arm7} ${where}`, mark);
+      const { reason, breakpointId } = stop.tick.executionState;
+      check(reason === "step" && breakpointId === undefined, `${method} {arm7} ${where}: the stop is ${describeState(stop.tick)}, expected reason "step" and no breakpointId`);
+      check(pcIn(stop.tick) === expected, `${method} {arm7} ${where} ended at ${hex(pcIn(stop.tick))}, not at ${hex(expected)}`);
+    };
+
+    const first = await arrive({ left: 96 });
+    if (!first) {
+      context.note("arm7: no bl was reached within 96 steps: a call was neither stepped over nor out of");
+      return;
+    }
+    await stopOf("control.stepOver", first.pc + size, `on the call at ${hex(first.pc)}`);
+
+    // (the count starts at 0 again behind the step-over)
+    const budget = { left: 96 };
+    let callee: TickRecord | undefined;
+    for (;;) {
+      const second = await arrive(budget);
+      if (!second) {
+        break;
+      }
+      const into = await step();
+      if (into.pc1 === second.target) {
+        callee = into.record;
+        break;
+      }
+      // An interrupt that was pending is entered in front of the call: that step is not the step
+      // into the callee. The search goes on through the handler, on the count of this arrival.
+      check(
+        ARM_EXCEPTION_VECTORS.includes(into.pc1),
+        `the step on the call at ${hex(second.pc)} ended at ${hex(into.pc1)}, not at its target ${hex(second.target)} or an exception vector`,
+      );
+      budget.left = Math.max(0, budget.left - 1);
+    }
+    if (!callee) {
+      context.note("arm7: a bl was stepped over; no second one was reached within 96 steps, and none was stepped out of");
+      return;
+    }
+    const linkRegister = numberOf(callee.tick, arm7.pcPath, "R14");
+    await stopOf("control.stepOut", linkRegister, `from the first line of the callee at ${hex(pcIn(callee.tick))} (R14 is ${hex(linkRegister)} there)`);
+    // The temporary breakpoint of a step-over or a step-out goes at its stop: a loop passes its
+    // address at every turn, and with no breakpoint listed the target keeps running.
+    if (Object.keys(latest().breakpoints).length === 0) {
+      await expectToKeepRunning(context, "behind the step-out of the ARM7, with no breakpoint listed (a temporary breakpoint goes at the stop it makes)");
+    }
+    context.note(ARM7_NOTES.calls);
+  } finally {
+    for (const id of mine) {
+      await session.call("breakpoints.remove", { id }).catch(() => undefined);
+    }
+    if (categories) {
+      await session.call("breakpoints.setCategoryStates", { categories }).catch(() => undefined);
+    }
+  }
+};
+
+/** `length` bytes of a target's memory that are all readable. */
+const readBytes = async (context: RunContext, target: "sh4" | "arm7", address: number, length: number): Promise<number[]> => {
+  const slice = await context.session.call("state.getMemorySlice", { target, address, length });
+  check(slice.data.length === length, `state.getMemorySlice {${target}, ${hex(address)}, ${length}} returned ${slice.data.length} bytes`);
+  check(slice.unreadable === undefined, `${length} bytes at ${hex(address)} of ${target} are readable; unreadable is ${JSON.stringify(slice.unreadable)}`);
+  return slice.data;
+};
+
+/**
+ * A write of memory that is accepted: `{}`, and a tick behind the answer that is paused, of the
+ * stop the write was made in (a write is not a new stop, and it is followed by its tick).
+ */
+const writeBytes = async (context: RunContext, target: "sh4" | "arm7", address: number, data: number[]): Promise<void> => {
+  const { session } = context;
+  const stop = session.latestTick().tick;
+  const what = `state.writeMemory {${target}, ${hex(address)}, ${data.length} byte${data.length === 1 ? "" : "s"}}`;
+  const mark = session.mark();
+  await session.call("state.writeMemory", { target, address, data });
+  const answered = session.responseSince(mark) ?? fail(`the ${what} response was not recorded`);
+  const next = await session.waitForTick(() => true, 1000, `a tick behind ${what}; every accepted write is followed by its tick`, answered.seq + 1);
+  check(
+    isPaused(next.tick) && stopIdOf(next.tick) === stopIdOf(stop),
+    `the tick behind ${what} is ${describeState(next.tick)}; the target was ${describeState(stop)}, and a write is not a new stop`,
+  );
+};
+
+const sameBytes = (a: number[], b: number[]): boolean => a.length === b.length && a.every((byte, position) => byte === b[position]);
+const listed = (bytes: number[]): string => `[${bytes.map((byte) => byte.toString(16).toUpperCase().padStart(2, "0")).join(" ")}]`;
+
+/** Writes a register and returns the tick that shows what it then reads: paused, of the same stop. */
+const writeRegister = async (context: RunContext, path: string, name: string, value: string, expected: string): Promise<TickRecord> => {
+  const { session } = context;
+  const stop = session.latestTick().tick;
+  const mark = session.mark();
+  await session.call("state.setRegister", { path, name, value });
+  const next = await tickShowing(session, mark, "state.setRegister", (tick) =>
+    registerOf(tick, path, name) === expected ? undefined : `${path}.${name} reads ${registerOf(tick, path, name)} after writing ${JSON.stringify(value)}, expected ${expected}`,
+  );
+  check(isPaused(next.tick) && stopIdOf(next.tick) === stopIdOf(stop), "a register write is not a new stop");
+  return next;
+};
+
+/** Every node of the describe tree, by path, with the node it is shown under. */
+const describedNodes = (shape: DebuggerShape): Map<string, { node: DeviceNodeDescriptor; parent?: string }> => {
+  const nodes = new Map<string, { node: DeviceNodeDescriptor; parent?: string }>();
+  const collect = (list: DeviceNodeDescriptor[], parent?: string) =>
+    list.forEach((node) => {
+      // (a path that is listed twice is S01's to report)
+      if (!nodes.has(node.path)) {
+        nodes.set(node.path, { node, parent });
+      }
+      collect(node.children ?? [], node.path);
+    });
+  collect(shape.deviceTree);
+  return nodes;
+};
+
+const isWritable = (register: { flags?: Record<string, boolean> }): boolean => register.flags?.writable === true;
+
+/** S16, part `writeMemory` (M2-ROUND 3.1 item 3). Nothing of it writes a pattern over memory it did not save. */
+const writeMemoryPart = async (context: RunContext): Promise<void> => {
+  const { session } = context;
+  const sh4 = requireTarget(context, "sh4");
+  const paused = await ensurePaused(context);
+  // The scratch address of the part, below the stack pointer: nothing lives there while the target is paused.
+  const scratch = ((numberOf(paused.tick, sh4.pcPath, "R15") - 256) & ~3) >>> 0;
+  const original = await readBytes(context, "sh4", scratch, 16);
+  const pattern = original.map((byte, position) => (byte ^ 0xa5 ^ position) & 0xff);
+  // main memory is one memory behind 0x0C.., 0x8C.. and 0xAC..: the two regions the scratch address is not in
+  const physical = scratch & 0x1fffffff;
+  const mirrors = physical >>> 26 === 3 ? [physical, (0x80000000 | physical) >>> 0, (0xa0000000 | physical) >>> 0].filter((address) => address !== scratch) : [];
+  try {
+    await writeBytes(context, "sh4", scratch, pattern);
+    const written = await readBytes(context, "sh4", scratch, 16);
+    check(sameBytes(written, pattern), `16 bytes written at ${hex(scratch)} read back as ${JSON.stringify(written)}`);
+    for (const mirror of mirrors) {
+      const seen = await readBytes(context, "sh4", mirror, 16);
+      check(sameBytes(seen, pattern), `the 16 bytes written at ${hex(scratch)} read ${listed(seen)} at ${hex(mirror)}, which maps the same main memory; they were written as ${listed(pattern)}`);
+    }
+    if (mirrors.length === 0) {
+      context.note(`writeMemory: the scratch address ${hex(scratch)} is not in main memory: its other mappings were not read`);
+    }
+  } finally {
+    await session.call("state.writeMemory", { target: "sh4", address: scratch, data: original });
+  }
+  check(sameBytes(await readBytes(context, "sh4", scratch, 16), original), "the original bytes are back");
+
+  // All of a range or nothing: one that starts in main memory and ends above it is refused, and its first half is unchanged.
+  const edge = 0x0ffffff8;
+  const below = await readBytes(context, "sh4", edge, 8);
+  await session.expectError("state.writeMemory", { target: "sh4", address: edge, data: [...below.map((byte) => byte ^ 0xff), ...new Array<number>(8).fill(0)] }, -32013);
+  check(sameBytes(await readBytes(context, "sh4", edge, 8), below), `a refused write of 16 bytes at ${hex(edge)}, across the end of main memory, changed its first half: a range is written whole or not at all`);
+
+  // The bound: 65536 bytes are accepted. They are read where the SH4's memory view opens, and
+  // written back as they are; one byte more, and a byte that is no byte, are refused and not stored.
+  const most = PROTOCOL_BOUNDS.writeMemoryLength.max;
+  const large = sh4.defaultMemoryAddress ?? fail("target sh4 has memory and no defaultMemoryAddress");
+  const block = await readBytes(context, "sh4", large, most);
+  const behind = await readBytes(context, "sh4", large + most, 1);
+  await writeBytes(context, "sh4", large, block);
+  const rewritten = await readBytes(context, "sh4", large, most);
+  const differing = rewritten.flatMap((byte, position) => (byte === block[position] ? [] : [position]));
+  if (differing.length > 0) {
+    // (what was there is put back in smaller pieces, as far as the server takes them)
+    for (let position = 0; position < most; position += 4096) {
+      await session.call("state.writeMemory", { target: "sh4", address: large + position, data: block.slice(position, position + 4096) }).catch(() => undefined);
+    }
+    fail(`${most} bytes at ${hex(large)} were written back as they read, and ${differing.length} of them read${differing.length === 1 ? "s" : ""} differently: the first one at ${hex(large + differing[0])}`);
+  }
+  await session.expectError("state.writeMemory", { target: "sh4", address: large, data: [...block, ...behind] }, -32602);
+  await session.expectError("state.writeMemory", { target: "sh4", address: large, data: [256] }, -32602);
+  await session.expectError("state.writeMemory", { target: "sh4", address: large, data: [] }, -32602);
+  const after = await readBytes(context, "sh4", large, 16);
+  if (!sameBytes(after, block.slice(0, 16))) {
+    await session.call("state.writeMemory", { target: "sh4", address: large, data: block.slice(0, 16) }).catch(() => undefined);
+    fail(`a refused state.writeMemory at ${hex(large)} was stored: the first bytes there read ${listed(after)}, they were ${listed(block.slice(0, 16))}`);
+  }
+
+  // the target is required (the reads default to sh4, a write does not), and the DSP has no
+  // memory: the method's own "not supported", in-band, not an invalid parameter
+  await session.expectError("state.writeMemory", { address: scratch, data: original }, -32602);
+  await session.expectError("state.writeMemory", { target: "dsp", address: 0, data: [0] }, -32004);
+
+  // Wave memory is one store behind the ARM7's X and the SH4's 0x00800000 + X: a byte written
+  // through either address reads back through the other. (2 MiB is the smallest wave memory.)
+  const arm7 = targetOf(session.shape, "arm7");
+  if (arm7?.memory) {
+    const x = (arm7.defaultMemoryAddress ?? 0) & 0x001fffff;
+    const fromSh4 = 0x00800000 + x;
+    const [byte] = await readBytes(context, "arm7", x, 1);
+    try {
+      check((await readBytes(context, "sh4", fromSh4, 1))[0] === byte, `wave memory: ${hex(x)} of the ARM7 and ${hex(fromSh4)} of the SH4 are one byte, and read differently`);
+      await writeBytes(context, "arm7", x, [byte ^ 0xff]);
+      const throughSh4 = (await readBytes(context, "sh4", fromSh4, 1))[0];
+      check(throughSh4 === (byte ^ 0xff), `a byte of wave memory written through the ARM7's ${hex(x)} as ${byte ^ 0xff} reads ${throughSh4} through the SH4's ${hex(fromSh4)}`);
+      await writeBytes(context, "sh4", fromSh4, [byte ^ 0x5a]);
+      const throughArm7 = (await readBytes(context, "arm7", x, 1))[0];
+      check(throughArm7 === (byte ^ 0x5a), `a byte of wave memory written through the SH4's ${hex(fromSh4)} as ${byte ^ 0x5a} reads ${throughArm7} through the ARM7's ${hex(x)}`);
+    } finally {
+      await session.call("state.writeMemory", { target: "arm7", address: x, data: [byte] });
+    }
+    check((await readBytes(context, "sh4", fromSh4, 1))[0] === byte, "the original byte of wave memory is back");
+  } else {
+    context.note("writeMemory: the server lists no arm7 with memory: wave memory was not written through both targets");
+  }
+
+  // Video memory, one view of it through three of its addresses (that the other view shows the
+  // same bytes interleaved is the emulator's own, and not asked here).
+  const video = await readBytes(context, "sh4", 0xa5000000, 16);
+  const painted = video.map((byte, position) => (byte ^ 0x3c ^ (position << 4)) & 0xff);
+  try {
+    await writeBytes(context, "sh4", 0xa5000000, painted);
+    for (const address of [0x05000000, 0x07000000]) {
+      const seen = await readBytes(context, "sh4", address, 16);
+      check(sameBytes(seen, painted), `16 bytes of video memory written at 0xA5000000 as ${listed(painted)} read ${listed(seen)} at ${hex(address)}`);
+    }
+  } finally {
+    await session.call("state.writeMemory", { target: "sh4", address: 0xa5000000, data: video });
+  }
+  check(sameBytes(await readBytes(context, "sh4", 0x05000000, 16), video), "the original bytes of video memory are back");
+
+  // What is not memory of that kind is not writable: the boot ROM, the flash, a register
+  // window, P4 and a store queue. (Addresses a write would do no harm at, were it accepted.)
+  for (const [what, address] of [
+    ["the boot ROM", 0x00000000],
+    ["the flash", 0x00200000],
+    ["a register window", 0x005f8000],
+    ["P4", 0xff000030],
+    ["a store queue", 0xe0000000],
+  ] as const) {
+    await session.expectError("state.writeMemory", { target: "sh4", address, data: [0] }, -32013).catch((error: unknown) => {
+      throw error instanceof ContractFailure ? new ContractFailure(`${what} is not writable: ${error.message}`) : error;
+    });
+  }
+  // A write is served while the target runs. That is asked with one that is refused, so that
+  // nothing is written into a running guest: "not writable", and not "not paused".
+  await ensureRunning(context);
+  await session.expectError("state.writeMemory", { target: "sh4", address: 0x00000000, data: [0] }, -32013);
+  const stop = await ensurePaused(context);
+
+  // The probe that executes what was written. One instruction, and that one the runner's: the PC
+  // is never moved onto a line of the program. `mov #0x5A, r0` at a scratch address, the PC
+  // there, one step: the PC is two further and R0 is 0x5A.
+  if (!hasCapability(context, CAPABILITIES.REGISTER_WRITE)) {
+    context.note('writeMemory: no capability "register-write": the instruction that was written was not executed');
+    return;
+  }
+  const path = sh4.pcPath;
+  // (the target has run since the scratch address above was taken: below the stack pointer of this stop, and what is there now)
+  const probe = ((numberOf(stop.tick, path, "R15") - 256) & ~3) >>> 0;
+  const saved = await readBytes(context, "sh4", probe, 2);
+  const valueOf = (tick: DebuggerTick, name: string) => registerOf(tick, path, name) ?? fail(`${path} has no register ${name}`);
+  const at = (address: number) => hex(address);
+  const undo: Array<() => Promise<unknown>> = [];
+  /** Writes a register for the probe; `back` is what puts it back when the probe is over, or fails. */
+  const set = async (name: string, value: string, back?: string): Promise<TickRecord> => {
+    const record = await writeRegister(context, path, name, value, value);
+    if (back !== undefined) {
+      undo.push(() => session.call("state.setRegister", { path, name, value: back }));
+    }
+    return record;
+  };
+  /** The step from the probe address: where it ended, and whether that is an exception vector of the program. */
+  const execute = async (): Promise<{ tick: DebuggerTick; pc: number; atVector: boolean }> => {
+    const tick = (await stepOnce(context, "sh4")).tick;
+    const pc = pcOf(tick, sh4);
+    const vbr = numberOf(tick, path, "VBR");
+    return { tick, pc, atVector: [0x100, 0x400, 0x600].some((offset) => pc === (vbr + offset) >>> 0) };
+  };
+  const executed = (tick: DebuggerTick, pc: number, where: string): void => {
+    check(pc === probe + 2, `the step from the instruction written at ${at(probe)}${where} ended at ${at(pc)}, not at ${at(probe + 2)}`);
+    check(
+      valueOf(tick, "R0") === "0x0000005A",
+      `"mov #0x5A, r0" was written at ${at(probe)} and stepped${where}, and R0 reads ${valueOf(tick, "R0")}: what executes is what was written (0x0000005A)`,
+    );
+  };
+  try {
+    await writeBytes(context, "sh4", probe, [0x5a, 0xe0]);
+    undo.push(() => session.call("state.writeMemory", { target: "sh4", address: probe, data: saved }));
+    const pc0 = valueOf(stop.tick, "PC");
+    const r0 = valueOf(stop.tick, "R0");
+    await set("PC", at(probe), pc0);
+    undo.push(() => session.call("state.setRegister", { path, name: "R0", value: r0 }));
+    const first = await execute();
+    if (!first.atVector) {
+      executed(first.tick, first.pc, "");
+    } else {
+      // An interrupt that was owed is accepted before the instruction runs: the step ends at
+      // its vector with nothing executed, which SPC says. The saved PC is put where the handler
+      // returns to, and the probe is made once more from the vector, where SR.BL is set and no
+      // interrupt is accepted.
+      check(
+        valueOf(first.tick, "SPC") === at(probe),
+        `the step from ${at(probe)} ended at the exception vector ${at(first.pc)}, and SPC reads ${valueOf(first.tick, "SPC")}; an exception that is entered in front of the instruction returns to it`,
+      );
+      // (the PC and the R0 of the interrupted program are restored through SPC, and left alone)
+      undo.length = 1;
+      await set("SPC", pc0);
+      const pcAtVector = valueOf(first.tick, "PC");
+      const r0AtVector = valueOf(first.tick, "R0");
+      await set("PC", at(probe), pcAtVector);
+      undo.push(() => session.call("state.setRegister", { path, name: "R0", value: r0AtVector }));
+      const second = await execute();
+      executed(second.tick, second.pc, ", from the exception vector the first step ended at");
+    }
+  } finally {
+    for (const action of undo.reverse()) {
+      await action().catch(() => undefined);
+    }
+  }
+  const restored = (await session.describe()).tick;
+  check(sameBytes(await readBytes(context, "sh4", probe, 2), saved), "the two bytes of the probe are restored");
+  check(isPaused(restored), "the target is paused behind the probe");
+};
+
+/** S16, part `setRegister` (M2-ROUND 3.1 item 3, M2-D18 to M2-D20). */
+const setRegisterPart = async (context: RunContext): Promise<void> => {
+  const { session } = context;
+  const sh4 = requireTarget(context, "sh4");
+  const cpu = sh4.pcPath;
+  const paused = await ensurePaused(context);
+  const original = registerOf(paused.tick, cpu, "R0") ?? fail(`${cpu} has no register R0`);
+  const nodes = describedNodes(session.shape);
+  const arm7 = targetOf(session.shape, "arm7");
+  const arm7Path = arm7?.pcPath ?? ARM7_ENABLED_REGISTER.path;
+  const described = (path: string, name: string) => nodes.get(path)?.node.registers?.find((register) => register.name === name);
+  try {
+    await writeRegister(context, cpu, "R0", "0x12345678", "0x12345678");
+    // decimal, and truncated to the register's width
+    await writeRegister(context, cpu, "R0", "255", "0x000000FF");
+    await writeRegister(context, cpu, "R0", "0x1FFFFFFFF", "0xFFFFFFFF");
+    // the path and the name are matched without regard to case; ASCII blanks around the value are dropped
+    for (const [path, name, value, expected] of [
+      [cpu, "r0", "1", "0x00000001"],
+      [cpu.toUpperCase(), "R0", " 0x1f ", "0x0000001F"],
+    ]) {
+      const mark = session.mark();
+      await session.call("state.setRegister", { path, name, value });
+      await tickShowing(session, mark, "state.setRegister", (tick) =>
+        registerOf(tick, cpu, "R0") === expected ? undefined : `R0 reads ${registerOf(tick, cpu, "R0")} after state.setRegister ${JSON.stringify({ path, name, value })}, expected ${expected}`,
+      );
+    }
+    // a text that is no number: -32602, and nothing is written
+    for (const value of ["twelve", "-1", "", "1.5", "0x"]) {
+      await session.expectError("state.setRegister", { path: cpu, name: "R0", value }, -32602);
+    }
+  } finally {
+    await writeRegister(context, cpu, "R0", original, original);
+  }
+  await session.expectError("state.setRegister", { path: cpu, name: "NO_SUCH_REGISTER", value: "0" }, -32602);
+  await session.expectError("state.setRegister", { path: "dc.no.such.node", name: "R0", value: "0" }, -32602);
+
+  // A register says in debugger.describe whether it has a writer: R0 does; a register of width
+  // 0 is free text and never has one; and ENABLED of the ARM7 is the guest's to change.
+  check(isWritable(described(cpu, "R0") ?? {}), `${cpu}.R0 carries no flags.writable in debugger.describe; a register that state.setRegister writes says so`);
+  for (const [path, { node }] of nodes) {
+    const text = node.registers?.find((register) => register.width === 0 && isWritable(register));
+    check(!text, `${path}.${text?.name} has width 0 and carries flags.writable; a register of width 0 is free text and has no writer`);
+  }
+  const enabled = described(arm7Path, ARM7_ENABLED_REGISTER.name);
+  if (arm7 && enabled) {
+    check(!isWritable(enabled), `${arm7Path}.ENABLED carries flags.writable; the guest holds and releases its ARM7, not the debugger`);
+    // (no writer comes before the value: a text that is no number is "not writable" there, too)
+    await session.expectError("state.setRegister", { path: arm7Path, name: ARM7_ENABLED_REGISTER.name, value: "0" }, -32013);
+    await session.expectError("state.setRegister", { path: arm7Path, name: ARM7_ENABLED_REGISTER.name, value: "twelve" }, -32013);
+  }
+
+  // In every node: the first register that says it has a writer takes the value it reads, and
+  // the first that does not is refused.
+  for (const [path, { node }] of nodes) {
+    const values = session.latestTick().tick.registers[path] ?? [];
+    const valueOf = (name: string) => values.find((register) => register.name === name)?.value;
+    const writable = node.registers?.find((register) => isWritable(register) && valueOf(register.name) !== undefined && valueOf(register.name) !== "n/a");
+    if (writable) {
+      const value = valueOf(writable.name)!;
+      await writeRegister(context, path, writable.name, value, value);
+    }
+    const readOnly = node.registers?.find((register) => !isWritable(register));
+    if (readOnly) {
+      await session.expectError("state.setRegister", { path, name: readOnly.name, value: "0" }, -32013);
+    }
+  }
+
+  // The registers of the ARM7, and what the two processors refuse or store differently from what they are given.
+  const now = () => session.latestTick().tick;
+  if (arm7) {
+    const r1 = registerOf(now(), arm7Path, "R1");
+    if (r1 !== undefined && /^0x[0-9A-F]{8}$/.test(r1)) {
+      check(isWritable(described(arm7Path, "R1") ?? {}), `${arm7Path}.R1 carries no flags.writable; the registers of the two processors are written in milestone M2`);
+      const other = hex((Number.parseInt(r1, 16) ^ 0x00ff00ff) >>> 0);
+      try {
+        await writeRegister(context, arm7Path, "R1", other, other);
+      } finally {
+        await writeRegister(context, arm7Path, "R1", r1, r1);
+      }
+    }
+    // the PC of the ARM7 is stored aligned
+    if (isWritable(described(arm7Path, arm7.pcRegister) ?? {})) {
+      const pc = registerOf(now(), arm7Path, arm7.pcRegister)!;
+      check((Number.parseInt(pc, 16) & 3) === 0, `the PC of the ARM7 reads ${pc}; it is a multiple of 4`);
+      await writeRegister(context, arm7Path, arm7.pcRegister, hex((Number.parseInt(pc, 16) | 3) >>> 0), pc).catch((error: unknown) => {
+        throw error instanceof ContractFailure ? new ContractFailure(`the PC of the ARM7 is stored with bits 0 and 1 clear: ${error.message}`) : error;
+      });
+    }
+    // a CPSR whose mode bits are no mode is refused
+    const cpsr = registerOf(now(), arm7Path, "CPSR");
+    if (cpsr !== undefined && isWritable(described(arm7Path, "CPSR") ?? {})) {
+      await session.expectError("state.setRegister", { path: arm7Path, name: "CPSR", value: hex((Number.parseInt(cpsr, 16) & ~0x1f) >>> 0) }, -32013);
+      const still = (await session.describe()).tick;
+      check(registerOf(still, arm7Path, "CPSR") === cpsr, `a refused write of CPSR changed it: it reads ${registerOf(still, arm7Path, "CPSR")}, it was ${cpsr}`);
+    }
+  }
+  // nothing executes at an odd address: a PC of the SH4 with bit 0 set is refused
+  const pc = registerOf(now(), cpu, sh4.pcRegister)!;
+  await session.expectError("state.setRegister", { path: cpu, name: sh4.pcRegister, value: hex((Number.parseInt(pc, 16) | 1) >>> 0) }, -32013);
+  const unchanged = (await session.describe()).tick;
+  check(registerOf(unchanged, cpu, sh4.pcRegister) === pc, `a refused write of the PC of the SH4 changed it: it reads ${registerOf(unchanged, cpu, sh4.pcRegister)}, it was ${pc}`);
+
+  // SR applies its effect: with MD set, a write that flips RB exchanges R0..R7 with R0_BANK..R7_BANK
+  const sr = numberOf(now(), cpu, "SR");
+  if ((sr & 0x40000000) !== 0) {
+    const bank = (tick: DebuggerTick, suffix: string) => Array.from({ length: 8 }, (_, index) => registerOf(tick, cpu, `R${index}${suffix}`));
+    const before = now();
+    try {
+      const flipped = (await writeRegister(context, cpu, "SR", hex((sr ^ 0x20000000) >>> 0), hex((sr ^ 0x20000000) >>> 0))).tick;
+      check(
+        JSON.stringify(bank(flipped, "")) === JSON.stringify(bank(before, "_BANK")) && JSON.stringify(bank(flipped, "_BANK")) === JSON.stringify(bank(before, "")),
+        `a write of SR that flips RB (MD is set) exchanges R0..R7 with R0_BANK..R7_BANK: R0..R7 read ${JSON.stringify(bank(flipped, ""))} and R0_BANK..R7_BANK ${JSON.stringify(bank(flipped, "_BANK"))}; ` +
+          `before it they read ${JSON.stringify(bank(before, ""))} and ${JSON.stringify(bank(before, "_BANK"))}`,
+      );
+    } finally {
+      await writeRegister(context, cpu, "SR", hex(sr), hex(sr));
+    }
+  } else {
+    context.note("setRegister: MD is clear in SR at this stop: the exchange of the register banks by a write of SR.RB was not shown");
+  }
+
+  // state.editWatch is state.setRegister on the watched register
+  await session.expectError("state.editWatch", { watchId: Math.max(0, ...context.seen.watches) + 100_000, value: "0" }, -32602);
+  const { id } = await addWatch(context, `${cpu}.r0`, `${cpu}.r0`).catch(() => ({ id: undefined }));
+  if (id !== undefined) {
+    const mark = session.mark();
+    await session.call("state.editWatch", { watchId: id, value: "0x00C0FFEE" });
+    await tickShowing(session, mark, "state.editWatch", (tick) =>
+      registerOf(tick, cpu, "R0") === "0x00C0FFEE" ? undefined : `R0 reads ${registerOf(tick, cpu, "R0")}; state.editWatch writes the watched register`,
+    );
+    await writeRegister(context, cpu, "R0", original, original);
+    await unwatch(context, id);
+  } else {
+    context.note("state.editWatch not exercised: R0 is watched by somebody else");
+  }
+  if (arm7 && enabled) {
+    const expression = `${arm7Path}.${ARM7_ENABLED_REGISTER.name.toLowerCase()}`;
+    const stored = (now().watches ?? []).find((watch) => watch.expression === expression);
+    const watchId = stored?.id ?? (await addWatch(context, expression, expression)).id;
+    await session.expectError("state.editWatch", { watchId, value: "1" }, -32013);
+    if (!stored) {
+      await unwatch(context, watchId);
+    }
+    // A write is served while the target runs. That is asked with one that is refused: "not
+    // writable", and not "not paused".
+    await ensureRunning(context);
+    await session.expectError("state.setRegister", { path: arm7Path, name: ARM7_ENABLED_REGISTER.name, value: "0" }, -32013);
+    await ensurePaused(context);
+  }
+};
+
+/** S16, part `reset` (M2-ROUND 3.1 item 3, M2-D22, M2-D23). */
+const resetPart = async (context: RunContext): Promise<void> => {
+  const { session } = context;
+  const sh4 = requireTarget(context, "sh4");
+  const arm7 = targetOf(session.shape, "arm7");
+  const RESET_EVENT = "dc.system.reset";
+
+  // While the target runs: {}, the target runs on in the same stop, nothing is published; the
+  // event log gets an entry of the reset, when the server lists that event.
+  const running = await ensureRunning(context);
+  const newest = newestEventId(session.latestTick().tick);
+  const asked = session.mark();
+  await session.call("control.reset", {});
+  await session.collectTicks(1000);
+  for (const record of session.ticksSince(asked)) {
+    check(
+      isRunning(record.tick) && stopIdOf(record.tick) === stopIdOf(running.tick),
+      `control.reset while the target runs: a tick is ${describeState(record.tick)}; the target was ${describeState(running.tick)}, it runs on in the same stop and nothing is published for the reset`,
+    );
+  }
+  if (session.index?.events.has(RESET_EVENT)) {
+    await session.waitForTick(
+      (tick) => eventsSince(tick, RESET_EVENT, newest) > 0,
+      1000,
+      `an entry of ${RESET_EVENT} in the event log behind control.reset of a running target`,
+      asked,
     );
   }
 
-  const pc = await findBreakpointSite(context, targetId);
-  const address = pc + target.instructionSize;
-  const breakpoint = await addBreakpoint(context, { event: target.breakpointEvent, address });
-  const armed = session.latestTick().tick;
-  const mark = session.mark();
+  // While paused. The tables are kept: so that there is something to keep, a disabled breakpoint
+  // of the SH4, a watch on a register no watch names, and the category dsp flipped.
+  const paused = await ensurePaused(context);
+  const categories = categoriesOf(paused.tick);
+  const flipped = { muted: !categories.dsp.muted, soloed: categories.dsp.soloed };
+  const breakpoint = await addBreakpoint(context, { event: sh4.breakpointEvent, address: (sh4.defaultDisassemblyAddress & ~1) >>> 0, kind: "code", enabled: false });
+  const register = unwatchedRegister(context, sh4.pcPath, ["GBR", "VBR", "MACH", "MACL"]);
+  const { id: watchId } = await addWatch(context, register.expression, register.expression);
+  const before = (await setCategories(context, { dsp: flipped })).tick;
+  try {
+    const mark = session.mark();
+    await session.call("control.reset", {});
+    const reset = await session.waitForTick((tick) => stopIdOf(tick) > stopIdOf(before), 5000, "a tick with a new stopId after control.reset", mark);
+    check(isPaused(reset.tick), "a reset while paused stays paused");
+    check(reset.tick.executionState.reason === "reset", `the stop has reason "${reset.tick.executionState.reason}", expected "reset"`);
+    check(!session.ticksSince(mark).some((record) => record.seq < reset.seq && isRunning(record.tick)), "no running tick between control.reset and its stop");
+    // breakpoints, watches and categories are what they were
+    const kept = reset.tick.breakpoints[String(breakpoint.id)];
+    check(
+      kept !== undefined && kept.enabled === false && kept.address === breakpoint.address,
+      `the tick of the reset stop lists breakpoint ${breakpoint.id} as ${JSON.stringify(kept)}; a reset keeps the breakpoints: it was ${JSON.stringify(breakpoint)}`,
+    );
+    const watch = (reset.tick.watches ?? []).find((entry) => entry.id === watchId);
+    check(watch?.expression === register.expression, `the tick of the reset stop lists watch ${watchId} as ${JSON.stringify(watch)}; a reset keeps the watches: it was on ${register.expression}`);
+    check(
+      JSON.stringify(sortKeys(reset.tick.categories)) === JSON.stringify(sortKeys(before.categories)),
+      `the categories are ${JSON.stringify(reset.tick.categories)} behind the reset; a reset keeps them: they were ${JSON.stringify(before.categories)}`,
+    );
+    // the machine is reset: its ARM7 is held, and has no frames
+    if (arm7) {
+      check(!arm7Clocked(reset.tick), `${ARM7_ENABLED_REGISTER.path}.${ARM7_ENABLED_REGISTER.name} reads 1 at the stop of a reset; a machine comes out of reset with its ARM7 held`);
+      check((reset.tick.callstacks?.arm7 ?? []).length === 0, `the ARM7 callstack has ${reset.tick.callstacks?.arm7?.length} frames at the stop of a reset; an ARM7 that is held has none`);
+      // the registers of a held ARM7 are written
+      const r1 = registerOf(reset.tick, arm7.pcPath, "R1");
+      if (hasCapability(context, CAPABILITIES.REGISTER_WRITE) && r1 !== undefined && /^0x[0-9A-F]{8}$/.test(r1)) {
+        const other = hex((Number.parseInt(r1, 16) ^ 0x00ff00ff) >>> 0);
+        await writeRegister(context, arm7.pcPath, "R1", other, other).catch((error: unknown) => {
+          throw error instanceof ContractFailure ? new ContractFailure(`a register of the ARM7 is written while it is held in reset: ${error.message}`) : error;
+        });
+        await writeRegister(context, arm7.pcPath, "R1", r1, r1);
+      }
+    }
+  } finally {
+    await session.call("state.unwatch", { watchIds: [watchId] }).catch(() => undefined);
+    await session.call("breakpoints.remove", { id: breakpoint.id }).catch(() => undefined);
+    await session.call("breakpoints.setCategoryStates", { categories }).catch(() => undefined);
+  }
+
+  // The machine runs behind its reset: a resume gives a running tick, and a pause a paused one.
+  const resumed = session.mark();
   await session.call("control.runUntil", {});
-  const hit = await session.waitForTick(
-    (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(armed),
-    2000,
-    `a paused tick at the ${targetId} breakpoint ${address}`,
-    mark,
-  );
-  check(hit.tick.executionState.breakpointId === breakpoint.id, `the stop reports breakpointId ${hit.tick.executionState.breakpointId}, expected ${breakpoint.id}`);
-  check(hit.tick.executionState.reason === "breakpoint", `the stop has reason "${hit.tick.executionState.reason}"`);
-  check(pcOf(hit.tick, target) === address, `the stop is at ${pcOf(hit.tick, target)}, the breakpoint at ${address}`);
-  await removeBreakpoint(context, breakpoint.id);
+  await session.waitForTick(isRunning, 1000, "a running tick after control.runUntil behind a reset", resumed);
+  const pausing = session.mark();
+  await session.call("control.pause", {});
+  await session.waitForTick(isPaused, 2000, "a paused tick after control.pause behind a reset", pausing);
+};
+
+/** S16, part `tree`: the M2 rows of the device tree (M2-ROUND 3.6.1, M2-D24). */
+const treePart = async (context: RunContext): Promise<void> => {
+  const nodes = describedNodes(context.session.shape);
+  const findings: string[] = [];
+  for (const row of M2_DEVICE_TREE) {
+    const entry = nodes.get(row.path);
+    if (!entry) {
+      findings.push(`the device tree has no node ${row.path}, which milestone M2 adds`);
+      continue;
+    }
+    if (entry.parent !== row.parent) {
+      findings.push(`${row.path} is ${entry.parent === undefined ? "a root of the device tree" : `under ${entry.parent}`}, milestone M2 has it under ${row.parent}`);
+    }
+    for (const action of row.actions ?? []) {
+      if (!entry.node.actions?.includes(action)) {
+        findings.push(`${row.path}: the action "${action}" of milestone M2 is missing`);
+      }
+    }
+    if (row.registers && !entry.node.registers?.length) {
+      findings.push(`${row.path} lists no registers; from milestone M2 on it carries at least one`);
+    }
+  }
+  // A register panel shows the node that offers its id: an id is the action of one node.
+  for (const id of REGISTER_PANEL_IDS) {
+    const offering = Array.from(nodes.values()).filter(({ node }) => node.actions?.includes(id)).map(({ node }) => node.path);
+    if (offering.length > 1) {
+      findings.push(`the action "${id}" is offered by ${offering.join(" and ")}; a register panel is the action of one node`);
+    }
+  }
+  if (findings.length > 0) {
+    fail(findings[0], findings.slice(1));
+  }
 };
 
 const s16: Scenario = {
   id: "S16",
   title: "M2: ARM7, writes, reset",
   milestone: "M2",
+  parts: ["arm7", "writeMemory", "setRegister", "reset", "tree"],
   run: (context) =>
-    runParts([
+    runParts(context, "S16", [
       {
-        name: "arm7 step and breakpoint",
+        key: "arm7",
+        name: "arm7",
         applicable: targetOf(context.session.shape, "arm7")?.stepping === true,
         why: "targets: arm7.stepping is false",
-        run: () => stepAndBreakpoint(context, "arm7"),
+        run: () => arm7Part(context),
       },
       {
+        key: "writeMemory",
         name: "writeMemory",
         applicable: hasCapability(context, CAPABILITIES.MEMORY_WRITE),
         why: 'no capability "memory-write"',
-        async run() {
-          const { session } = context;
-          const sh4 = requireTarget(context, "sh4");
-          const paused = await ensurePaused(context);
-          // below the stack pointer: nothing lives there while the target is paused
-          const address = ((numberOf(paused.tick, sh4.pcPath, "R15") - 256) & ~3) >>> 0;
-          const original = (await session.call("state.getMemorySlice", { target: "sh4", address, length: 16 })).data;
-          const pattern = original.map((byte, position) => (byte ^ 0xa5 ^ position) & 0xff);
-          try {
-            await session.call("state.writeMemory", { target: "sh4", address, data: pattern });
-            const written = (await session.call("state.getMemorySlice", { target: "sh4", address, length: 16 })).data;
-            check(JSON.stringify(written) === JSON.stringify(pattern), `16 bytes written at ${hex(address)} read back as ${JSON.stringify(written)}`);
-          } finally {
-            await session.call("state.writeMemory", { target: "sh4", address, data: original });
-          }
-          const restored = (await session.call("state.getMemorySlice", { target: "sh4", address, length: 16 })).data;
-          check(JSON.stringify(restored) === JSON.stringify(original), "the original bytes are back");
-          // the BIOS is not writable, and the range is checked as a whole
-          await session.expectError("state.writeMemory", { target: "sh4", address: 0x00000000, data: [0] }, -32013);
-          await session.expectError("state.writeMemory", { target: "sh4", address, data: [] }, -32602);
-        },
+        run: () => writeMemoryPart(context),
       },
       {
+        key: "setRegister",
         name: "setRegister",
         applicable: hasCapability(context, CAPABILITIES.REGISTER_WRITE),
         why: 'no capability "register-write"',
-        async run() {
-          const { session } = context;
-          const sh4 = requireTarget(context, "sh4");
-          const paused = await ensurePaused(context);
-          const original = registerOf(paused.tick, sh4.pcPath, "R0") ?? fail(`${sh4.pcPath} has no register R0`);
-          const write = async (value: string, expected: string) => {
-            const mark = session.mark();
-            await session.call("state.setRegister", { path: sh4.pcPath, name: "R0", value });
-            const next = await tickShowing(session, mark, "state.setRegister", (tick) =>
-              registerOf(tick, sh4.pcPath, "R0") === expected ? undefined : `R0 reads ${registerOf(tick, sh4.pcPath, "R0")} after writing ${value}, expected ${expected}`,
-            );
-            check(isPaused(next.tick) && stopIdOf(next.tick) === stopIdOf(paused.tick), "a register write is not a new stop");
-          };
-          try {
-            await write("0x12345678", "0x12345678");
-            // decimal, and truncated to the register's width
-            await write("255", "0x000000FF");
-            await write("0x1FFFFFFFF", "0xFFFFFFFF");
-          } finally {
-            await write(original, original);
-          }
-          await session.expectError("state.setRegister", { path: sh4.pcPath, name: "NO_SUCH_REGISTER", value: "0" }, -32602);
-          await session.expectError("state.setRegister", { path: "dc.no.such.node", name: "R0", value: "0" }, -32602);
-          await session.expectError("state.setRegister", { path: sh4.pcPath, name: "R0", value: "twelve" }, -32602);
-          // a register with width 0 is free text and read-only
-          for (const [path, registers] of session.index!.registers) {
-            const text = registers.find((register) => register.width === 0);
-            if (text) {
-              await session.expectError("state.setRegister", { path, name: text.name, value: "1" }, -32013);
-              break;
-            }
-          }
-          // state.editWatch is state.setRegister on the watched register
-          const { id } = await addWatch(context, `${sh4.pcPath}.r0`, `${sh4.pcPath}.r0`).catch(() => ({ id: undefined }));
-          if (id !== undefined) {
-            const mark = session.mark();
-            await session.call("state.editWatch", { watchId: id, value: "0x00C0FFEE" });
-            await tickShowing(session, mark, "state.editWatch", (tick) =>
-              registerOf(tick, sh4.pcPath, "R0") === "0x00C0FFEE" ? undefined : `R0 reads ${registerOf(tick, sh4.pcPath, "R0")}; state.editWatch writes the watched register`,
-            );
-            await write(original, original);
-            await unwatch(context, id);
-          } else {
-            context.note("state.editWatch not exercised: R0 is watched by somebody else");
-          }
-        },
+        run: () => setRegisterPart(context),
       },
       {
+        key: "reset",
         name: "reset",
         applicable: hasCapability(context, CAPABILITIES.RESET),
         why: 'no capability "reset"',
-        async run() {
-          const { session } = context;
-          const paused = await ensurePaused(context);
-          const mark = session.mark();
-          await session.call("control.reset", {});
-          const reset = await session.waitForTick((tick) => stopIdOf(tick) > stopIdOf(paused.tick), 5000, "a tick with a new stopId after control.reset", mark);
-          check(isPaused(reset.tick), "a reset while paused stays paused");
-          check(reset.tick.executionState.reason === "reset", `the stop has reason "${reset.tick.executionState.reason}", expected "reset"`);
-          check(!session.ticksSince(mark).some((record) => record.seq < reset.seq && isRunning(record.tick)), "no running tick between control.reset and its stop");
-        },
+        run: () => resetPart(context),
+      },
+      {
+        key: "tree",
+        name: "tree",
+        // a server claims the M2 tree by offering the M2 panel
+        applicable: describedNodes(context.session.shape).get(M2_TREE_ACTION.path)?.node.actions?.includes(M2_TREE_ACTION.action) === true,
+        why: `${M2_TREE_ACTION.path} does not offer the action "${M2_TREE_ACTION.action}"`,
+        run: () => treePart(context),
       },
     ]),
 };
@@ -2431,9 +3373,11 @@ const s17: Scenario = {
   id: "S17",
   title: "M3: SGC capture",
   milestone: "M3",
+  parts: ["sgcCapture"],
   run: (context) =>
-    runParts([
+    runParts(context, "S17", [
       {
+        key: "sgcCapture",
         name: "sgc capture",
         applicable: hasCapability(context, CAPABILITIES.SGC_CAPTURE),
         why: 'no capability "sgc-capture"',
@@ -2512,9 +3456,11 @@ const s18: Scenario = {
   id: "S18",
   title: "M4: tables, Holly capture",
   milestone: "M4",
+  parts: ["tables", "hollyCapture"],
   run: (context) =>
-    runParts([
+    runParts(context, "S18", [
       {
+        key: "tables",
         name: "tables",
         applicable: hasCapability(context, CAPABILITIES.TABLES),
         why: 'no capability "tables"',
@@ -2536,6 +3482,7 @@ const s18: Scenario = {
         },
       },
       {
+        key: "hollyCapture",
         name: "holly capture",
         applicable: hasCapability(context, CAPABILITIES.HOLLY_CAPTURE),
         why: 'no capability "holly-capture"',
@@ -2653,7 +3600,8 @@ export interface Selection {
  * What a run runs and what of it has to pass (design 5.5.3). `milestone` selects the gate of
  * that milestone and requires each of its scenarios to pass. Without it every scenario is
  * selected (with `dspProgram`: the anchor and the scenarios of the DSP test program), and
- * none is required. `require` names further scenarios that are run and have to pass. `only`
+ * none is required. `require` names further scenarios that are run and have to pass, and so
+ * does `parts`, for the scenarios whose parts it names. `only`
  * narrows the selection, also inside a gate: what it leaves out is not run, and a gate
  * scenario it leaves out is not asked for. It never makes an empty result a success: that is
  * the run's verdict when nothing passed.
@@ -2664,15 +3612,18 @@ export const selectScenarios = (options: {
   dspProgram?: boolean;
   only?: Set<string>;
   require?: Set<string>;
+  parts?: ReadonlyMap<string, ReadonlySet<string>>;
 }): Selection => {
-  const { profile, milestone, dspProgram = false, only, require } = options;
+  const { profile, milestone, dspProgram = false, only } = options;
+  // a scenario whose parts are named is run for them, and has to pass with them
+  const require = new Set([...(options.require ?? []), ...(options.parts?.keys() ?? [])]);
   const order = SCENARIOS.map((scenario) => scenario.id);
   const gate = milestone ? scenariosOfMilestone(milestone, profile, dspProgram) : undefined;
   const base = gate ?? (dspProgram ? SCENARIOS.filter((scenario) => scenario.dspProgram || (scenario.id === "S00" && profile === "emulator")).map((scenario) => scenario.id) : order);
   const kept = (id: string) => !only || only.has(id);
   return {
-    selected: order.filter((id) => (base.includes(id) || require?.has(id)) && kept(id)),
-    required: order.filter((id) => require?.has(id) || (gate?.includes(id) && kept(id))),
+    selected: order.filter((id) => (base.includes(id) || require.has(id)) && kept(id)),
+    required: order.filter((id) => require.has(id) || (gate?.includes(id) && kept(id))),
   };
 };
 
@@ -2683,8 +3634,12 @@ export const selectScenarios = (options: {
 export const runScenario = async (scenario: Scenario, context: RunContext): Promise<ScenarioResult> => {
   const started = Date.now();
   const details: string[] = [];
+  const notes: string[] = [];
   const noteBefore = context.note;
-  context.note = (text) => details.push(text);
+  context.note = (text) => {
+    details.push(text);
+    notes.push(text);
+  };
   const violationsBefore = context.session.violations.length;
   let status: ScenarioStatus = "passed";
   let parts: PartResult[] | undefined;
@@ -2725,7 +3680,7 @@ export const runScenario = async (scenario: Scenario, context: RunContext): Prom
       details.push(`invariant: ... and ${distinct.length - 12} more`);
     }
   }
-  return { id: scenario.id, title: scenario.title, status, durationMs: Date.now() - started, details, ...(parts ? { parts } : {}) };
+  return { id: scenario.id, title: scenario.title, status, durationMs: Date.now() - started, details, notes, ...(parts ? { parts } : {}) };
 };
 
 /** What the run compares the server with when it cleans up: the state it found. */

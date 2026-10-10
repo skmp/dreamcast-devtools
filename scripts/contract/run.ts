@@ -1,4 +1,4 @@
-import { MockDebugger } from "../../server/mockDebugger";
+import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT, MockDebugger } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
 import type { MockListener } from "../../server/mockWebSocket";
 import type { DebuggerShape, DebuggerTick } from "../../src/lib/debuggerSchema";
@@ -27,6 +27,20 @@ export interface ContractOptions {
   only?: Set<string>;
   /** further scenarios that are run and have to pass */
   require?: Set<string>;
+  /**
+   * `--parts`: for a scenario that has parts, the parts of it that are run, by their keys.
+   * Only these are run, the scenario passes when each of them passed (one that is not
+   * applicable fails), and the scenario has to pass. Not with `milestone`: a gate is whole.
+   */
+  parts?: Map<string, Set<string>>;
+  /**
+   * `--require-note`: texts that a selected scenario has to have noted, each one verbatim. The
+   * run is no pass without them: a scenario says in notes what it met (an ARM7 that was held at
+   * its start, a call that was stepped over and out of), and a gate asks for what it has to show.
+   */
+  requireNotes?: string[];
+  /** the profile of the mock that is started in this process (no `url`): everything it can do, or what the emulator of a milestone does */
+  mockSupport?: "m1" | "m2";
   /** multiplies every timeout; default 1 for the mock profile, 5 for the emulator profile */
   timeoutFactor?: number;
   verbose?: boolean;
@@ -48,9 +62,12 @@ export interface ContractSummary {
   dspProgram: boolean;
   /** the scenarios the run selected, in the order they were run */
   selected: string[];
-  /** the scenarios that had to pass (those of the gate, and `require`), and those of them that did not, with how they ended */
+  /** the scenarios that had to pass (those of the gate, `require`, and those `parts` names), and those of them that did not, with how they ended */
   required: string[];
   requiredNotPassed: Array<{ id: string; status: ScenarioResult["status"] | "not-run" }>;
+  /** the notes the run had to have (`requireNotes`), and those of them that no selected scenario noted */
+  requiredNotes: string[];
+  requiredNotesMissing: string[];
   url: string;
   profile: Profile;
   timeoutFactor: number;
@@ -105,9 +122,10 @@ const prepare = async (options: ContractOptions) => {
     if (options.profile !== "mock") {
       throw new Error("--profile emulator needs --url");
     }
-    listener = await listenMockDebugger(new MockDebugger());
+    const supports = options.mockSupport === "m1" ? MOCK_M1_SUPPORT : options.mockSupport === "m2" ? MOCK_M2_SUPPORT : undefined;
+    listener = await listenMockDebugger(new MockDebugger({ supports }));
     url = listener.url;
-    say(`mock debugger started in this process at ${url}`);
+    say(`mock debugger started in this process at ${url}${options.mockSupport ? `, as a server of milestone ${options.mockSupport.toUpperCase()}` : ""}`);
   }
   const target = url;
   const timeoutFactor = options.timeoutFactor ?? (options.profile === "emulator" ? 5 : 1);
@@ -221,6 +239,7 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
         elf: options.elf,
         milestone: options.milestone,
         dspProgram: options.dspProgram,
+        parts: options.parts,
         seen,
         note: () => undefined,
       };
@@ -231,9 +250,9 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
         // could not run; that is a result, not an aborted run.
         const stopped = context.session.stoppedAnswering;
         if (stopped) {
-          results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: [`not run: ${stopped}`] });
+          results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: [`not run: ${stopped}`], notes: [] });
         } else if (context.session.isClosed) {
-          results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: ["the connection is closed"] });
+          results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details: ["the connection is closed"], notes: [] });
         } else {
           const result = await runScenario(scenario, context);
           if (result.status === "failed") {
@@ -254,7 +273,7 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
       const found = unusable ? [unusable.message, ...unusable.more] : ["debugger.describe gave no result"];
       for (const scenario of selected) {
         const details = scenario.id === "S01" ? found : [`not run: ${found[0]}`];
-        results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details });
+        results.push({ id: scenario.id, title: scenario.title, status: "failed", durationMs: 0, details, notes: [] });
         formatScenario(results.at(-1)!).forEach(say);
       }
       final = sessions[0]?.ticks.at(-1)?.tick;
@@ -272,7 +291,17 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
     // A run in which no scenario passed has verified nothing: not applicable and partial are
     // no failures of their own, and they are no passes either.
     const nothingVerified = count("passed") === 0;
-    const ok = !nothingVerified && count("failed") === 0 && requiredNotPassed.length === 0 && violations.length === 0 && problems.length === 0;
+    // the notes a gate asks for: each is what a selected scenario noted, to the letter
+    const requiredNotes = options.requireNotes ?? [];
+    const noted = new Set(results.flatMap((result) => result.notes));
+    const requiredNotesMissing = requiredNotes.filter((text) => !noted.has(text));
+    const ok =
+      !nothingVerified &&
+      count("failed") === 0 &&
+      requiredNotPassed.length === 0 &&
+      requiredNotesMissing.length === 0 &&
+      violations.length === 0 &&
+      problems.length === 0;
     const summary: ContractSummary = {
       ok,
       nothingVerified,
@@ -281,6 +310,8 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
       selected: selection.selected,
       required,
       requiredNotPassed,
+      requiredNotes,
+      requiredNotesMissing,
       url,
       profile: options.profile,
       timeoutFactor,
@@ -313,6 +344,9 @@ export const runContract = async (options: ContractOptions): Promise<ContractSum
     }
     for (const { id, status } of requiredNotPassed.filter((entry) => entry.status !== "failed")) {
       say(`required: ${id} is ${status === "not-run" ? "not run" : STATUS_TEXT[status]}; it has to pass`);
+    }
+    for (const text of requiredNotesMissing) {
+      say(`required note: no selected scenario noted "${text}"`);
     }
     if (nothingVerified) {
       say(selected.length === 0 ? "nothing verified: the selection leaves no scenario to run" : "nothing verified: no scenario passed");

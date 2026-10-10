@@ -57,6 +57,86 @@ describe("the ticks of the mock", () => {
   });
 });
 
+describe("what milestone M2 added", () => {
+  it("I4: no register of a tick carries flags, which are debugger.describe's", () => {
+    // the describe of the mock has them, and its ticks do not
+    const described = (frames[0].result as DebuggerShape).deviceTree[0].children!.find((node) => node.path === "dc.sh4")!.children![0].registers!;
+    expect(described[0]).toEqual({ name: "PC", value: "0x8C0000A0", width: 32, flags: { writable: true } });
+    expect(violationsOf(tick())).toEqual([]);
+    const flagged = tick();
+    (flagged.registers["dc.sh4.cpu"][3] as Json).flags = { writable: true };
+    expect(violationsOf(flagged)).toEqual(["I4: dc.sh4.cpu.GBR carries flags in a tick; flags are debugger.describe's, a register of a tick has name, value and width"]);
+    // (also an empty record: the key is what a tick does not have)
+    const empty = tick();
+    (empty.registers["dc.timing"][0] as Json).flags = {};
+    expect(violationsOf(empty)).toEqual(["I4: dc.timing.MODE carries flags in a tick; flags are debugger.describe's, a register of a tick has name, value and width"]);
+  });
+
+  it("2.10: the ARM7 callstack of a paused tick follows ENABLED of dc.aica.arm7 in that tick", () => {
+    expect(index).toMatchObject({ arm7: true, callstack: true });
+    send("control.pause");
+    const paused = tick();
+    expect(paused.callstacks!.arm7.length).toBeGreaterThanOrEqual(2);
+    expect(violationsOf(paused)).toEqual([]);
+    const enabled = (candidate: DebuggerTick, value: string) => {
+      candidate.registers["dc.aica.arm7"].find((register) => register.name === "ENABLED")!.value = value;
+      return candidate;
+    };
+    const says = "dc.aica.arm7.ENABLED reads";
+
+    // held in reset, and frames; clocked, and none or one
+    expect(violationsOf(enabled(tick(), "0x0"))).toEqual([`2.10: ${says} 0 (the ARM7 is held in reset), and the ARM7 callstack of the paused tick has 16 frames; it has none then`]);
+    const none = tick();
+    none.callstacks!.arm7 = [];
+    expect(violationsOf(none)).toEqual([`2.10: ${says} 1 (the ARM7 is clocked), and the ARM7 callstack of the paused tick has 0 frames; it has at least two then (frame 0 the PC, frame 1 the link register)`]);
+    expect(violationsOf(enabled(none, "0x0"))).toEqual([]);
+    const one = tick();
+    one.callstacks!.arm7 = one.callstacks!.arm7.slice(0, 1);
+    expect(violationsOf(one)).toEqual([`2.10: ${says} 1 (the ARM7 is clocked), and the ARM7 callstack of the paused tick has 1 frame; it has at least two then (frame 0 the PC, frame 1 the link register)`]);
+    // the two frames a clocked ARM7 has: its PC, and R14 with the location "lr"
+    const two = tick();
+    two.callstacks!.arm7 = two.callstacks!.arm7.slice(0, 2);
+    expect(violationsOf(two)).toEqual([]);
+    const elsewhere = tick();
+    elsewhere.callstacks!.arm7[0].pc = 0x00200000;
+    elsewhere.callstacks!.arm7[1].pc = 0x00200004;
+    expect(violationsOf(elsewhere)).toEqual([
+      expect.stringMatching(/^2\.10: frame 0 of the ARM7 callstack is at 0x00200000, the PC of dc\.aica\.arm7 in the same paused tick is 0x002000[0-9A-F]{2}$/),
+      "2.10: frame 1 of the ARM7 callstack is at 0x00200004, R14 of dc.aica.arm7 in the same paused tick is 0x00200028",
+    ]);
+    const located = tick();
+    located.callstacks!.arm7[0].location = "pc";
+    located.callstacks!.arm7[1].location = "pr";
+    expect(violationsOf(located)).toEqual([
+      '2.10: frame 0 of the ARM7 callstack is the PC and has no location, this one has "pc"',
+      '2.10: frame 1 of the ARM7 callstack has location "pr", expected "lr"',
+    ]);
+    // a register that reads neither, or is not there
+    expect(violationsOf(enabled(tick(), "n/a"))).toEqual([`2.10: ${says} "n/a" in the paused tick; it reads 1 while the ARM7 is clocked and 0 while it is held in reset`]);
+    const without = tick();
+    without.registers["dc.aica.arm7"] = without.registers["dc.aica.arm7"].filter((register) => register.name !== "ENABLED");
+    expect(violationsOf(without).filter((line) => line.startsWith("2.10"))).toEqual(["2.10: dc.aica.arm7.ENABLED is not in the paused tick; it reads 1 while the ARM7 is clocked and 0 while it is held in reset"]);
+
+    // Not asked: of a running tick (it has no frames), in the stops of the host, and of a server
+    // that does not list the ARM7 or has no callstacks.
+    send("control.runUntil");
+    expect(violationsOf(tick())).toEqual([]);
+    for (const reason of ["host-stopped", "guest-exit"]) {
+      const host = enabled(structuredClone(paused), "0x0");
+      host.executionState.reason = reason;
+      expect(violationsOf(host), reason).toEqual([]);
+    }
+    const held = enabled(structuredClone(paused), "0x0");
+    expect(checkTick(held, { ...index, arm7: false }, {})).toEqual([]);
+    expect(checkTick(held, { ...index, callstack: false }, {})).toEqual([]);
+    expect(checkTick(held, index, {})).toHaveLength(1);
+    // the index reads both from the describe result
+    const shape = frames[0].result as DebuggerShape;
+    expect(indexDescribe({ ...shape, targets: shape.targets!.filter((target) => target.id !== "arm7") }).arm7).toBe(false);
+    expect(indexDescribe({ ...shape, capabilities: ["event-breakpoints"] }).callstack).toBe(false);
+  });
+});
+
 describe("I2 and I3: the clock", () => {
   it("the timestamp of a tick is wall-clock ms, within a day of the runner's clock", () => {
     const now = Date.now();

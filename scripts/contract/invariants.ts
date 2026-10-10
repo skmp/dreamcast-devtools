@@ -1,6 +1,6 @@
 import { ConformanceSchemas, PROTOCOL_BOUNDS } from "../../src/lib/debuggerSchema";
 import type { DebuggerShape, DebuggerTick, DeviceNodeDescriptor } from "../../src/lib/debuggerSchema";
-import { BASE_PATHS } from "./design";
+import { ARM7_ENABLED_REGISTER, BASE_PATHS, TARGET_TABLE } from "./design";
 
 /**
  * The invariants of the contract (design 5.5, I1 to I8), applied to every tick of every
@@ -10,7 +10,10 @@ import { BASE_PATHS } from "./design";
  * are the describe lists (I4); full paused ticks, four base paths while running, a stopId
  * that never goes back (I5); watches in id order that read what their registers read (I6);
  * a breakpointId that comes with its reason and names a breakpoint the tick lists (I7); ids
- * that are never used again (I8). Pure functions: the session feeds them what arrived.
+ * that are never used again (I8). And two that came with milestone M2: no register of a tick
+ * says that it has a writer (I4: `flags` is describe's), and the ARM7 callstack of a paused
+ * tick follows the register ENABLED of dc.aica.arm7 in that tick (2.10). Pure functions: the
+ * session feeds them what arrived.
  */
 
 /** The path a running tick omits, with `registersStale: true`, on a backend without a context at the slice hook. */
@@ -23,10 +26,20 @@ export interface DescribeIndex {
   paths: Set<string>;
   /** every event a node lists */
   events: Set<string>;
+  /** the describe lists the target arm7 */
+  arm7: boolean;
+  /** the describe advertises the capability "callstack": paused ticks carry frames */
+  callstack: boolean;
 }
 
 export const indexDescribe = (shape: DebuggerShape): DescribeIndex => {
-  const index: DescribeIndex = { registers: new Map(), paths: new Set(), events: new Set() };
+  const index: DescribeIndex = {
+    registers: new Map(),
+    paths: new Set(),
+    events: new Set(),
+    arm7: shape.targets?.some((target) => target.id === "arm7") ?? false,
+    callstack: shape.capabilities?.includes("callstack") ?? false,
+  };
   const visit = (nodes: DeviceNodeDescriptor[]) => {
     for (const node of nodes) {
       index.paths.add(node.path);
@@ -219,6 +232,11 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
         violations.push(`I4: registers["${path}"] carries [${names.join(" ")}], describe lists [${expected.join(" ")}]`);
         continue;
       }
+      // `flags` is what debugger.describe says of a register (that it has a writer); a tick carries values
+      const flagged = registers.find((register) => "flags" in register);
+      if (flagged) {
+        violations.push(`I4: ${path}.${flagged.name} carries flags in a tick; flags are debugger.describe's, a register of a tick has name, value and width`);
+      }
       registers.forEach((register, position) => {
         const width = described[position].width;
         if (register.width !== width) {
@@ -275,6 +293,13 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
   if (state.state === "running" && ((tick.callstacks?.sh4?.length ?? 0) > 0 || (tick.callstacks?.arm7?.length ?? 0) > 0)) {
     violations.push("I5: a running tick carries callstack frames");
   }
+  // 2.10: the ARM7 callstack of a paused tick follows the register ENABLED of dc.aica.arm7 in
+  // that tick, in every stop of the debugger: of a server that lists the ARM7 and has the
+  // capability "callstack". (The stops of the host carry what the host left: not looked at.)
+  const hostStop = state.reason === "host-stopped" || state.reason === "guest-exit" || state.reason === "no-game";
+  if (index?.arm7 && index.callstack && state.state === "paused" && !hostStop) {
+    violations.push(...checkArm7Pairing(tick));
+  }
   // I7: a breakpointId comes with the reason of a breakpoint stop, and it is a key of
   // `breakpoints` in the same tick: in every tick that carries one, not only in the first tick
   // of a stop. When the breakpoint of a stop is removed, the later ticks of that stop keep the
@@ -321,6 +346,55 @@ export const checkTick = (raw: unknown, index: DescribeIndex | undefined, tracki
   }
 
   return violations;
+};
+
+const hex8 = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
+
+/**
+ * The pairing of 2.10 in one paused tick: ENABLED of dc.aica.arm7 reads 0 or 1; with 0 the
+ * ARM7 has no frames; with 1 it has at least two, frame 0 at its PC without a location and
+ * frame 1 at R14 with location "lr".
+ */
+const checkArm7Pairing = (tick: DebuggerTick): string[] => {
+  const { path, name } = ARM7_ENABLED_REGISTER;
+  const registers = tick.registers[path];
+  if (!registers) {
+    // (a paused tick that lacks the path is I5's to report)
+    return [];
+  }
+  const valueOf = (register: string): number | undefined => {
+    const value = registers.find((candidate) => candidate.name === register)?.value;
+    return value !== undefined && /^0x[0-9A-F]+$/.test(value) ? Number.parseInt(value, 16) : undefined;
+  };
+  const enabled = valueOf(name);
+  const frames = tick.callstacks?.arm7 ?? [];
+  const count = `${frames.length} frame${frames.length === 1 ? "" : "s"}`;
+  if (enabled !== 0 && enabled !== 1) {
+    const read = registers.find((candidate) => candidate.name === name)?.value;
+    return [`2.10: ${path}.${name} ${read === undefined ? "is not in the paused tick" : `reads ${JSON.stringify(read)} in the paused tick`}; it reads 1 while the ARM7 is clocked and 0 while it is held in reset`];
+  }
+  if (enabled === 0) {
+    return frames.length === 0 ? [] : [`2.10: ${path}.${name} reads 0 (the ARM7 is held in reset), and the ARM7 callstack of the paused tick has ${count}; it has none then`];
+  }
+  if (frames.length < 2) {
+    return [`2.10: ${path}.${name} reads 1 (the ARM7 is clocked), and the ARM7 callstack of the paused tick has ${count}; it has at least two then (frame 0 the PC, frame 1 the link register)`];
+  }
+  const found: string[] = [];
+  const pc = valueOf(TARGET_TABLE.arm7.pcRegister);
+  const linkRegister = valueOf("R14");
+  if (pc !== undefined && frames[0].pc !== pc) {
+    found.push(`2.10: frame 0 of the ARM7 callstack is at ${hex8(frames[0].pc)}, the PC of ${path} in the same paused tick is ${hex8(pc)}`);
+  }
+  if (frames[0].location !== undefined) {
+    found.push(`2.10: frame 0 of the ARM7 callstack is the PC and has no location, this one has "${frames[0].location}"`);
+  }
+  if (linkRegister !== undefined && frames[1].pc !== linkRegister) {
+    found.push(`2.10: frame 1 of the ARM7 callstack is at ${hex8(frames[1].pc)}, R14 of ${path} in the same paused tick is ${hex8(linkRegister)}`);
+  }
+  if (frames[1].location !== "lr") {
+    found.push(`2.10: frame 1 of the ARM7 callstack has location "${frames[1].location}", expected "lr"`);
+  }
+  return found;
 };
 
 /**

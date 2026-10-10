@@ -355,6 +355,26 @@ export class ContractSession {
   }
 
   /**
+   * A request that may succeed or be refused: its result, or its error with the channel it came
+   * on. For a rule that has two answers (a step of an ARM7 that may be held in reset, a read
+   * that one server answers with data and another with "nothing readable"). A request that is
+   * not answered, or whose answer the schema rejects, fails as in `call`.
+   */
+  async outcome(method: string, params: unknown): Promise<{ result: unknown } | { error: { code: number; message: string }; inBand: boolean }> {
+    try {
+      const result = await this.request(method, params);
+      const inBand = IN_BAND_ERROR_METHODS.has(method) ? (result as InBandResult | undefined)?.error : undefined;
+      return inBand ? { error: inBand, inBand: true } : { result };
+    } catch (error) {
+      if (error instanceof JsonRpcException) {
+        check(!IN_BAND_ERROR_METHODS.has(method) || error.code === -32601, `${method} ${JSON.stringify(params)}: the error ${error.code} came as a JSON-RPC error, this method reports failures in-band`);
+        return { error: { code: error.code, message: error.message }, inBand: false };
+      }
+      return fail(callFailure(method, params, error));
+    }
+  }
+
+  /**
    * A request that has to fail with `code`, on the channel of its method: in-band for the
    * methods whose result type is RpcError, a JSON-RPC error for the others (and for -32601).
    * The code is the contract. The message is a line for a person: it has to be there, and

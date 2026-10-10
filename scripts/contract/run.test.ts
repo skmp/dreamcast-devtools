@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { MOCK_M1_SUPPORT, MOCK_SH4_RING, MockDebugger } from "../../server/mockDebugger";
 import type { MockClient, MockConnection, MockDebuggerOptions } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
-import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
+import { isSh4ControlFlow, isSh4DelayedBranch } from "./disasm";
 import { spawn } from "node:child_process";
 import { runContract } from "./run";
 import { SCENARIOS, scenariosOfMilestone, selectScenarios } from "./scenarios";
@@ -38,7 +38,8 @@ afterEach(closeServers);
 /**
  * The runner against the mock, and against the mock behind a proxy that breaks the
  * protocol in one way per test: a runner that passes a broken server proves nothing.
- * (The server and the proxy are in testSupport.ts.)
+ * (The server and the proxy are in testSupport.ts; the rules of milestone M2 are tested in
+ * m2.test.ts.)
  */
 
 /** What a run of every scenario against the mock reports, when the mock follows the protocol. */
@@ -150,10 +151,11 @@ describe("the contract runner against the mock", () => {
     expect(summary).toMatchObject({ required: [], requiredNotPassed: [], nothingVerified: false, dspProgram: false });
     expect(summary.selected).toEqual(SCENARIOS.map((scenario) => scenario.id));
     expect(summary.scenarios.find((scenario) => scenario.id === "S16")?.parts).toEqual([
-      { name: "arm7 step and breakpoint", status: "passed" },
+      { name: "arm7", status: "passed" },
       { name: "writeMemory", status: "passed" },
       { name: "setRegister", status: "passed" },
       { name: "reset", status: "passed" },
+      { name: "tree", status: "passed" },
     ]);
     expect(summary.ticksChecked).toBeGreaterThan(50);
     expect(summary.server).toMatchObject({ protocol: 3, emulator: { name: "nullDC (mock)" } });
@@ -1335,8 +1337,9 @@ describe("the contract runner against a server that breaks the protocol", () => 
       machine.callstack = (target, maxFrames) => (target === "arm7" ? rewrite(callstack(target, 64)).slice(0, maxFrames) : callstack(target, maxFrames));
       return mock;
     };
+    /** What S11 says. (Where the ticks are what is wrong, the invariant of 2.10 says so as well, behind it: m2.test.ts has that.) */
     const s11 = async (mock: MockDebugger, faults?: Faults) =>
-      reportOf(await runContract({ url: (await startServer(faults, mock)).url, profile: "mock", only: new Set(["S11"]) }));
+      reportOf(await runContract({ url: (await startServer(faults, mock)).url, profile: "mock", only: new Set(["S11"]) })).map((line) => line.replace(/ \| invariant: .*$/, ""));
     const clocked = "dc.aica.arm7.ENABLED reads 1 (the ARM7 is clocked)";
     const inReset = "dc.aica.arm7.ENABLED reads 0 (the ARM7 is held in reset)";
 
@@ -2635,20 +2638,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
 
   it("reports a scenario whose capability the server does not advertise as not applicable, never as passed; a run of nothing else has verified nothing", async () => {
     const lines: string[] = [];
-    const { url } = await startServer({
-      toClient: (frame) => {
-        const result = frame.result as Json | undefined;
-        if (!result?.deviceTree) return frame;
-        return {
-          ...frame,
-          result: {
-            ...result,
-            capabilities: ["event-breakpoints", "callstack", "sh4-debug-native"],
-            targets: (result.targets as Json[]).map((target) => (target.id === "sh4" ? target : { ...target, stepping: false })),
-          },
-        };
-      },
-    });
+    const { url } = await startServer(undefined, { supports: MOCK_M1_SUPPORT });
     const summary = await runContract({ url, profile: "mock", only: new Set(["S16", "S17", "S18"]), say: (line) => lines.push(line) });
     expect(summary.scenarios.map((scenario) => scenario.status)).toEqual(["not-applicable", "not-applicable", "not-applicable"]);
     expect(summary).toMatchObject({ passed: 0, failed: 0, partial: 0, notApplicable: 3 });
@@ -2726,6 +2716,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       'the gate of M2: the capability "memory-write" is not advertised (3.1)',
       'the gate of M2: the capability "register-write" is not advertised (3.1)',
       'the gate of M2: the capability "reset" is not advertised (3.1)',
+      "the gate of M2: targets: arm7.stepping is not true; a server of milestone M2 steps the ARM7 and takes its code breakpoints (3.1)",
     ]);
   }, 30_000);
 
@@ -2783,68 +2774,6 @@ describe("the contract runner against a server that breaks the protocol", () => 
       required: [...scenariosOfMilestone("M1", "mock"), "S17"],
     });
   });
-
-  it("S16: an ARM7 step is its stop; where it ends is compared only on a line that is not control flow", async () => {
-    type Machine = { advance(target: string): { wrapped: boolean }; running: boolean; values: Map<string, Map<string, unknown>> };
-    const lineAt = (address: number) =>
-      (ask(new MockDebugger(), "state.getDisassembly", { target: "arm7", address, count: 1 }).result as { lines: Array<{ disassembly: string }> }).lines[0].disassembly;
-    /**
-     * The mock at its StartPaused stop with the ARM7 at `pc`. `first` is what the first step of
-     * its ARM7 does in place of executing one instruction; it gets the mock's own instruction.
-     */
-    const arm7At = (pc: number, first?: (advance: () => { wrapped: boolean }, machine: Machine) => { wrapped: boolean }): MockDebugger => {
-      const mock = new MockDebugger({ startPaused: true });
-      ask(mock, "state.setRegister", { path: "dc.aica.arm7", name: "PC", value: String(pc) });
-      const machine = mock as unknown as Machine;
-      const advance = machine.advance.bind(mock);
-      let steps = 0;
-      // (a paused machine advances only in a step)
-      machine.advance = (target) => (first && target === "arm7" && !machine.running && ++steps === 1 ? first(() => advance(target), machine) : advance(target));
-      return mock;
-    };
-    const stepPart = async (mock: MockDebugger) => {
-      const summary = await runContract({ url: (await startServer(undefined, mock)).url, profile: "mock", only: new Set(["S16"]) });
-      return summary.scenarios[0].parts?.[0];
-    };
-    const passed = { name: "arm7 step and breakpoint", status: "passed" };
-    const failed = (detail: string) => ({ name: "arm7 step and breakpoint", status: "failed", detail });
-
-    // the last line of the mock's ARM7 loop is its branch, and the first one that is not control flow is what a step is seen on
-    const branch = 0x0020002c;
-    expect(isArmControlFlow(lineAt(branch))).toBe(true);
-    const plain = [0x00200010, 0x00200014, 0x00200018, 0x0020001c].find((address) => !isArmControlFlow(lineAt(address)))!;
-    const text = lineAt(plain);
-
-    // A branch to itself, taken once more: the step is a stop of its own, and the PC is where it
-    // was. Nothing is wrong with that server.
-    expect(await stepPart(arm7At(branch, () => ({ wrapped: false })))).toEqual(passed);
-    // from a line that is not control flow the step ends at the next instruction ...
-    expect(await stepPart(arm7At(plain))).toEqual(passed);
-    // ... or at an exception vector: the instruction ran, and the interrupt that was pending is entered
-    expect(
-      await stepPart(
-        arm7At(plain, (advance, machine) => {
-          advance();
-          machine.values.get("dc.aica.arm7")!.set("PC", 0x1c);
-          return { wrapped: false };
-        }),
-      ),
-    ).toEqual(passed);
-
-    // a step that executes two instructions, and one that executes none
-    const hex = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
-    expect(
-      await stepPart(
-        arm7At(plain, (advance) => {
-          advance();
-          return advance();
-        }),
-      ),
-    ).toEqual(failed(`"${text}" at ${hex(plain)} is not control flow, and the step of arm7 ended at ${hex(plain + 8)}, not at ${hex(plain + 4)} or an exception vector`));
-    expect(await stepPart(arm7At(plain, () => ({ wrapped: false })))).toEqual(
-      failed(`"${text}" at ${hex(plain)} is not control flow, and the step of arm7 ended at ${hex(plain)}, not at ${hex(plain + 4)} or an exception vector`),
-    );
-  }, 60_000);
 
   it("S18: the icache and ocache tables have rows, or no rows and a note", async () => {
     /**
@@ -3069,10 +2998,13 @@ describe("a server that stops answering", () => {
     lost.length = 0;
     const parts = await runContract({ url, profile: "mock", timeoutFactor, only: new Set(["S02", "S16"]) });
     expect(parts.scenarios[1].parts).toEqual([
-      { name: "arm7 step and breakpoint", status: "failed", detail: "control.pause {}: Request timed out: control.pause" },
+      { name: "arm7", status: "failed", detail: "control.pause {}: Request timed out: control.pause" },
       { name: "writeMemory", status: "failed", detail: `control.pause {}: not sent: ${stopped("control.pause")}` },
       { name: "setRegister", status: "failed", detail: `control.pause {}: not sent: ${stopped("control.pause")}` },
-      { name: "reset", status: "failed", detail: `control.pause {}: not sent: ${stopped("control.pause")}` },
+      // (the target runs: the part starts with its reset of a running target)
+      { name: "reset", status: "failed", detail: `control.reset {}: not sent: ${stopped("control.pause")}` },
+      // the tree is read from the answer the server did give
+      { name: "tree", status: "passed" },
     ]);
     expect(lost).toEqual(["control.pause", "breakpoints.setCategoryStates", "control.pause"]);
   }, 60_000);

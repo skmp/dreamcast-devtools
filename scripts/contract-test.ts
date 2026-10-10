@@ -11,7 +11,8 @@ import { ContractFailure } from "./contract/session";
  *
  *   npm run contract -- [--url ws://host:port/ws] [--profile mock|emulator] [--elf <path>]
  *                       [--milestone M1|M2|M3|M4] [--dsp-program] [--require S16,S17]
- *                       [--only S05,S06] [--json] [--json-file <path>] [--verbose]
+ *                       [--only S05,S06] [--parts S16:arm7+tree] [--require-note <text>]
+ *                       [--mock-support m1|m2] [--json] [--json-file <path>] [--verbose]
  *   npm run contract -- --url ws://host:port/ws --idle-breakpoint <address|symbol> [--elf <path>]
  *
  * Without --url it starts the mock debugger in this process (no page, no Vite) and runs
@@ -51,6 +52,16 @@ const USAGE = `usage: npm run contract -- [options]
   --require <ids>             further scenarios that are run and have to pass, e.g. --require S16
   --only <ids>                narrow the selection to these scenarios, e.g. --only S05,S06; a
                               selection that leaves nothing to pass is a failed run
+  --parts <id>:<part>[+<part>...]
+                              run only these parts of a scenario that has parts, e.g.
+                              --parts S16:arm7 (S16: arm7, writeMemory, setRegister, reset, tree).
+                              Each named part has to pass: one that is not applicable fails.
+                              Not with --milestone: a gate is whole
+  --require-note <text>       the run is no pass unless a selected scenario noted exactly this
+                              text, e.g. --require-note "arm7: bl stepped over and out"; may be
+                              given more than once, also with --milestone
+  --mock-support m1|m2        the mock that is started in this process implements what the
+                              emulator does in that milestone and no more (not with --url)
   --timeout-factor <n>        multiply every timeout by n instead of the profile's factor
   --json                      print the summary as JSON on stdout (the scenario lines go to stderr)
   --json-file <path>          also write the JSON summary to a file
@@ -71,6 +82,9 @@ interface Options {
   elf?: string;
   only?: Set<string>;
   require?: Set<string>;
+  parts?: Map<string, Set<string>>;
+  requireNotes: string[];
+  mockSupport?: "m1" | "m2";
   milestone?: Milestone;
   dspProgram: boolean;
   timeoutFactor?: number;
@@ -82,7 +96,7 @@ interface Options {
 }
 
 const parseArguments = (argv: string[]): Options => {
-  const options: Options = { profile: "mock", dspProgram: false, json: false, verbose: false, list: false };
+  const options: Options = { profile: "mock", dspProgram: false, json: false, verbose: false, list: false, requireNotes: [] };
   let profileGiven = false;
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
@@ -115,6 +129,34 @@ const parseArguments = (argv: string[]): Options => {
       case "--require":
         options.require = idsOf(value(index++, flag));
         break;
+      case "--parts": {
+        // <scenario>:<part>[+<part>...]; the keys of the parts are written as --list prints them
+        const [id, list, ...rest] = value(index++, flag).split(":");
+        const keys = (list ?? "").split("+").map((key) => key.trim()).filter(Boolean);
+        if (rest.length > 0 || keys.length === 0) {
+          throw new Error("--parts is <scenario>:<part>[+<part>...], e.g. --parts S16:arm7+tree");
+        }
+        const scenario = id.trim().toUpperCase();
+        (options.parts ??= new Map<string, Set<string>>()).set(scenario, new Set([...(options.parts.get(scenario) ?? []), ...keys]));
+        break;
+      }
+      case "--require-note": {
+        // (a note may start with anything, "--" included: the next argument is the text)
+        const text = argv[++index];
+        if (text === undefined || text === "") {
+          throw new Error("--require-note needs the text of a note");
+        }
+        options.requireNotes.push(text);
+        break;
+      }
+      case "--mock-support": {
+        const support = value(index++, flag).toLowerCase();
+        if (support !== "m1" && support !== "m2") {
+          throw new Error(`--mock-support is m1 or m2, not "${support}"`);
+        }
+        options.mockSupport = support;
+        break;
+      }
       case "--milestone": {
         const milestone = value(index++, flag).toUpperCase();
         if (!(MILESTONES as readonly string[]).includes(milestone)) {
@@ -181,6 +223,30 @@ const parseArguments = (argv: string[]): Options => {
       throw new Error(`--require ${id}: --only leaves that scenario out`);
     }
   }
+  // --parts names parts that exist, of a scenario that is run; and a gate is run whole
+  for (const [id, keys] of options.parts ?? []) {
+    const scenario = SCENARIOS.find((candidate) => candidate.id === id);
+    if (!scenario) {
+      throw new Error(`--parts: there is no scenario ${id}`);
+    }
+    if (!scenario.parts) {
+      throw new Error(`--parts ${id}: that scenario has no parts`);
+    }
+    for (const key of keys) {
+      if (!scenario.parts.includes(key)) {
+        throw new Error(`--parts ${id}: it has no part "${key}"; its parts are ${scenario.parts.join(", ")}`);
+      }
+    }
+    if (options.only && !options.only.has(id)) {
+      throw new Error(`--parts ${id}: --only leaves that scenario out`);
+    }
+  }
+  if (options.parts && options.milestone) {
+    throw new Error(`--parts with --milestone: the gate of ${options.milestone} is its scenarios whole; --only ${Array.from(options.parts.keys()).join(",")} --parts ... runs a part by itself`);
+  }
+  if (options.mockSupport && options.url) {
+    throw new Error("--mock-support is for the mock the runner starts itself: not with --url");
+  }
   if (options.dspProgram && options.milestone && MILESTONES.indexOf(options.milestone) < MILESTONES.indexOf("M3")) {
     throw new Error(`--dsp-program is the second run of the gate of M3: the gate of ${options.milestone} has no scenario for it`);
   }
@@ -202,7 +268,12 @@ const main = async (): Promise<number> => {
 
   if (options.list) {
     for (const scenario of SCENARIOS) {
-      const notes = [scenario.milestone ?? "M1", ...(scenario.emulatorOnly ? ["emulator profile"] : []), ...(scenario.dspProgram ? ["--dsp-program"] : [])];
+      const notes = [
+        scenario.milestone ?? "M1",
+        ...(scenario.emulatorOnly ? ["emulator profile"] : []),
+        ...(scenario.dspProgram ? ["--dsp-program"] : []),
+        ...(scenario.parts ? [`parts: ${scenario.parts.join(", ")}`] : []),
+      ];
       say(`${scenario.id} ${scenario.title} (${notes.join(", ")})`);
     }
     return 0;
@@ -221,6 +292,9 @@ const main = async (): Promise<number> => {
     dspProgram: options.dspProgram,
     only: options.only,
     require: options.require,
+    parts: options.parts,
+    requireNotes: options.requireNotes,
+    mockSupport: options.mockSupport,
     timeoutFactor: options.timeoutFactor,
     verbose: options.verbose,
     say,

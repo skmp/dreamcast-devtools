@@ -70,13 +70,15 @@ export const TARGET_TABLE: Readonly<Record<TargetProcessor, NormativeTarget>> = 
 };
 
 /**
- * A node the device tree has from milestone M1 on: the node it is shown under (none for the
- * root), and the panels it opens.
+ * A node the device tree has from a milestone on: the node it is shown under (none for the
+ * root), the panels it opens, and whether it has to carry registers.
  */
 export interface TreeRow {
   path: string;
   parent?: string;
   actions?: string[];
+  /** the node lists at least one register: which registers is the server's choice */
+  registers?: boolean;
 }
 
 const SH4_REGISTER_MODULES = ["bsc", "ccn", "cpg", "dmac", "intc", "rtc", "sci", "scif", "tmu", "ubc"];
@@ -111,6 +113,41 @@ export const M1_DEVICE_TREE: readonly TreeRow[] = [
   { path: "dc.maple", parent: "dc.system" },
   { path: "dc.timing", parent: "dc.system" },
 ];
+
+const withRegisters = (parent: string, paths: string[]): TreeRow[] => paths.map((path) => ({ path, parent, registers: true }));
+
+/**
+ * What milestone M2 adds to the table of 2.8 (the cut of the M2 round, 3.6.1): the nodes of the
+ * system bus, the SPG, the AICA's common block and clock, the 64 channels of the sound
+ * generator; the two register panels of the processors; and registers on the nodes whose
+ * tables are M2's. Normative are the paths, the parents, the two actions, and that such a node
+ * carries at least one register. The register lists are the server's.
+ */
+export const M2_DEVICE_TREE: readonly TreeRow[] = [
+  { path: "dc.sh4.cpu", parent: "dc.sh4", actions: ["sh4-registers"] },
+  { path: "dc.aica.arm7", parent: "dc.aica", actions: ["arm7-registers"] },
+  { path: "dc.holly.sb", parent: "dc.holly" },
+  ...withRegisters("dc.holly.sb", ["dc.holly.sb.g1", "dc.holly.sb.g2", "dc.holly.sb.pvr", "dc.holly.sb.misc"]),
+  ...withRegisters("dc.holly", ["dc.holly.dmac", "dc.holly.ta", "dc.holly.core", "dc.holly.spg"]),
+  ...withRegisters("dc.aica", ["dc.aica.common", "dc.aica.rtc"]),
+  ...withRegisters(
+    "dc.aica.sgc",
+    Array.from({ length: 64 }, (_, channel) => `dc.aica.sgc.${channel}`),
+  ),
+  ...withRegisters("dc.system", ["dc.gdrom", "dc.maple"]),
+];
+
+/** The action a server claims the M2 tree with: the register panel of the SH4, offered by `dc.sh4.cpu`. */
+export const M2_TREE_ACTION = { path: "dc.sh4.cpu", action: "sh4-registers" } as const;
+
+/**
+ * The twelve register panels: those of the two processors and of the ten on-chip modules of
+ * the SH4. A panel shows the node that offers its id, so an id is the action of one node.
+ */
+export const REGISTER_PANEL_IDS: readonly string[] = ["sh4-registers", "arm7-registers", ...SH4_REGISTER_MODULES.map((name) => `${name}-registers`)];
+
+/** One period of the AICA scheduler callback, in SH4 cycles: a sound burst of 32 samples. */
+export const AICA_CALLBACK_CYCLES = 145124n;
 
 /** The three registers the targets are anchored in: where the PC of each, or the step, is read. */
 export const ANCHOR_REGISTERS: ReadonlyArray<{ path: string; name: string }> = [
