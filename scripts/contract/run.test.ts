@@ -9,219 +9,37 @@ import { isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch } from "./disasm
 import { spawn } from "node:child_process";
 import { runContract } from "./run";
 import { SCENARIOS, scenariosOfMilestone, selectScenarios } from "./scenarios";
-import type { ContractSummary } from "./run";
 import { ContractFailure } from "./session";
+import {
+  ask,
+  closeServers,
+  closers,
+  describing,
+  detailsOf,
+  inBand,
+  isTick,
+  mapNodes,
+  noTickAfter,
+  paramsOf,
+  reportOf,
+  request,
+  rpcError,
+  run,
+  startServer,
+  stateOf,
+  statusOf,
+  statusesOf,
+  worded,
+} from "./testSupport";
+import type { FaultSource, Faults, Json } from "./testSupport";
+
+afterEach(closeServers);
 
 /**
  * The runner against the mock, and against the mock behind a proxy that breaks the
  * protocol in one way per test: a runner that passes a broken server proves nothing.
+ * (The server and the proxy are in testSupport.ts.)
  */
-
-type Json = Record<string, unknown>;
-
-interface Faults {
-  /** rewrites a frame of the server; undefined drops it; an array sends several */
-  toClient?: (frame: Json) => Json | Json[] | undefined;
-  /** rewrites a request of the client */
-  toServer?: (frame: Json) => Json;
-  /** frames the client receives after it has sent a request and before the server sees that request */
-  beforeRequest?: (request: Json) => Json[];
-  /** answers a request in the server's place: the server does not see a request this returns a frame for */
-  answer?: (request: Json) => Json | undefined;
-  /** the same for a frame as it arrived, before it is parsed: for what depends on its size, or is no JSON */
-  answerText?: (text: string) => Json | undefined;
-  /** rewrites a frame of the client as it arrived, before anything else looks at it */
-  toServerText?: (text: string) => string;
-  /** the largest message the front takes from a client (default: what the mock takes, 1 MiB); above it the connection is closed with 1009 */
-  maxPayload?: number;
-  /** the close code the client gets when the server closes the connection, in place of the server's */
-  closeCode?: (code: number) => number;
-  /** a frame of the client for which this is true is lost: the server does not see it, and nothing answers it */
-  lose?: (request: unknown) => boolean;
-  /** rewrites a binary frame of the server */
-  toClientBinary?: (frame: Buffer) => Buffer;
-  /** a frame of the server for which this is true is held back until the next binary frame has been sent */
-  afterNextBinary?: (frame: Json) => boolean;
-}
-
-/** One set of faults for every connection, or a function that makes one per connection (faults that keep state). */
-type FaultSource = Faults | (() => Faults);
-
-const closers: Array<() => Promise<void>> = [];
-
-afterEach(async () => {
-  for (const close of closers.splice(0)) {
-    await close();
-  }
-});
-
-/**
- * The mock on a WebSocket, optionally behind a proxy that applies `faults`. Returns the URL
- * to test, and `direct`, the URL of the mock itself (what a client sees that is not behind
- * the proxy).
- */
-const startServer = async (
-  source?: FaultSource,
-  options?: MockDebuggerOptions | MockDebugger,
-): Promise<{ url: string; direct: string; mock: MockDebugger }> => {
-  const mock = options instanceof MockDebugger ? options : new MockDebugger(options);
-  const listener = await listenMockDebugger(mock);
-  closers.push(() => listener.close());
-  if (!source) {
-    return { url: listener.url, direct: listener.url, mock };
-  }
-
-  // (the front takes any size, unless told otherwise: what is too large is the server's to refuse)
-  const limits = typeof source === "function" ? source() : source;
-  const proxy = new WebSocketServer({ port: 0, host: "127.0.0.1", maxPayload: limits.maxPayload ?? 64 * 1048576 });
-  await new Promise<void>((resolve) => proxy.once("listening", resolve));
-  closers.unshift(
-    () =>
-      new Promise<void>((resolve) => {
-        proxy.clients.forEach((client) => client.terminate());
-        proxy.close(() => resolve());
-      }),
-  );
-  proxy.on("connection", (client) => {
-    const faults = typeof source === "function" ? source() : source;
-    const upstream = new WebSocket(listener.url);
-    const early: string[] = [];
-    const held: Json[] = [];
-    client.on("message", (data) => {
-      let text = faults.toServerText ? faults.toServerText(data.toString()) : data.toString();
-      let answered: Json | undefined = faults.answerText?.(text);
-      if (answered) {
-        client.send(JSON.stringify(answered));
-        return;
-      }
-      try {
-        const request = JSON.parse(text) as Json;
-        if (faults.lose?.(request)) {
-          return;
-        }
-        faults.beforeRequest?.(request).forEach((frame) => client.send(JSON.stringify(frame)));
-        answered = faults.answer?.(request);
-        if (faults.toServer) {
-          text = JSON.stringify(faults.toServer(request));
-        }
-      } catch {
-        // not JSON: the runner's malformed frame goes through as it is
-      }
-      if (answered) {
-        client.send(JSON.stringify(answered));
-        return;
-      }
-      if (upstream.readyState === WebSocket.OPEN) {
-        upstream.send(text);
-      } else {
-        early.push(text);
-      }
-    });
-    upstream.on("open", () => early.splice(0).forEach((text) => upstream.send(text)));
-    upstream.on("message", (data, isBinary) => {
-      if (isBinary) {
-        const frame = Buffer.from(data as Buffer);
-        client.send(faults.toClientBinary ? faults.toClientBinary(frame) : frame, { binary: true });
-        held.splice(0).forEach((late) => client.send(JSON.stringify(late)));
-        return;
-      }
-      const frame = JSON.parse(data.toString()) as Json;
-      if (faults.afterNextBinary?.(frame)) {
-        held.push(frame);
-        return;
-      }
-      const rewritten = faults.toClient ? faults.toClient(frame) : frame;
-      for (const out of rewritten === undefined ? [] : Array.isArray(rewritten) ? rewritten : [rewritten]) {
-        client.send(JSON.stringify(out));
-      }
-    });
-    client.on("close", () => upstream.close());
-    // the client is told how the server ended the connection (1009: the message was too big)
-    upstream.on("close", (code) => {
-      const told = faults.closeCode ? faults.closeCode(code) : code;
-      client.close(told >= 1000 && told !== 1004 && told !== 1005 && told !== 1006 ? told : undefined);
-    });
-    upstream.on("error", () => undefined);
-    client.on("error", () => undefined);
-  });
-  return { url: `ws://127.0.0.1:${(proxy.address() as AddressInfo).port}/ws`, direct: listener.url, mock };
-};
-
-const run = async (faults: FaultSource | undefined, only?: string[], options?: MockDebuggerOptions): Promise<ContractSummary> => {
-  const { url } = await startServer(faults, options);
-  return runContract({ url, profile: "mock", only: only ? new Set(only) : undefined });
-};
-
-/** What a new client of the server sees: the tick that follows its debugger.describe. */
-const stateOf = async (url: string): Promise<Json & { executionState: Json; breakpoints: Record<string, Json>; watches: Json[]; categories: Record<string, Json> }> => {
-  const probe = new WebSocket(url);
-  try {
-    return await new Promise((resolve, reject) => {
-      probe.on("error", reject);
-      probe.on("open", () => probe.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "debugger.describe", params: {} })));
-      let described = false;
-      probe.on("message", (data) => {
-        const frame = JSON.parse(data.toString()) as Json;
-        if (frame.id === 1) {
-          described = true;
-        } else if (described && isTick(frame)) {
-          resolve(frame.params as never);
-        }
-      });
-    });
-  } finally {
-    probe.close();
-  }
-};
-
-/** Sends requests to the server as another client would, and resolves when the last one is answered. */
-const request = async (url: string, requests: Array<[method: string, params: Json]>): Promise<void> => {
-  const socket = new WebSocket(url);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      socket.on("error", reject);
-      socket.on("open", () => requests.forEach(([method, params], index) => socket.send(JSON.stringify({ jsonrpc: "2.0", id: index + 1, method, params }))));
-      socket.on("message", (data) => {
-        const frame = JSON.parse(data.toString()) as Json;
-        if (frame.id === requests.length) {
-          resolve();
-        }
-      });
-    });
-  } finally {
-    socket.close();
-  }
-};
-
-/** One request to the mock as a client of its own (no socket), and what it answered. */
-const ask = (mock: MockDebugger, method: string, params: Json): Json => {
-  const frames: Json[] = [];
-  const client = mock.connect({ sendText: (text) => frames.push(JSON.parse(text) as Json), sendBinary: () => undefined });
-  client.receive(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
-  client.close();
-  return frames.find((frame) => frame.id === 1)!;
-};
-
-const isTick = (frame: Json): frame is Json & { params: Json & { executionState: Json; registers: Record<string, Json[]> } } =>
-  frame.method === "event.tick";
-
-/** The answers of a server that refuses a request: on the channel of the result, or as a JSON-RPC error. */
-const inBand = (request: Json, code: number, message: string): Json => ({ jsonrpc: "2.0", id: request.id, result: { error: { code, message } } });
-const rpcError = (request: Json, code: number, message: string): Json => ({ jsonrpc: "2.0", id: request.id, error: { code, message } });
-const paramsOf = (request: Json): Json => (request.params ?? {}) as Json;
-
-/** A frame of the server with the message of every error it carries, on either channel, replaced by `text(code, message)`. */
-const worded = (frame: Json, text: (code: number, message: string) => string): Json => {
-  const reword = (error: Json) => ({ ...error, message: text(error.code as number, error.message as string) });
-  if (frame.error) {
-    return { ...frame, error: reword(frame.error as Json) };
-  }
-  const inBandError = (frame.result as Json | undefined)?.error as Json | undefined;
-  return inBandError && typeof inBandError === "object" ? { ...frame, result: { ...(frame.result as Json), error: reword(inBandError) } } : frame;
-};
-
-const statusOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.status;
-const detailsOf = (summary: ContractSummary, id: string) => summary.scenarios.find((scenario) => scenario.id === id)?.details.join("\n") ?? "";
 
 /** What a run of every scenario against the mock reports, when the mock follows the protocol. */
 const MOCK_STATUSES = {
@@ -248,10 +66,6 @@ const MOCK_STATUSES = {
   S18: "not-applicable", // no tables, no Holly capture
   S21: "not-applicable", // the run with the DSP test program only
 };
-
-const statusesOf = (summary: ContractSummary) => Object.fromEntries(summary.scenarios.map((scenario) => [scenario.id, scenario.status]));
-/** One line per scenario that did not pass as a whole, for a readable failure of a test. */
-const reportOf = (summary: ContractSummary) => summary.scenarios.map((scenario) => `${scenario.id} ${scenario.status} ${scenario.details.join(" | ")}`);
 
 /**
  * A mock that counts reconnects, and that can do what a server must not do when its last
@@ -314,27 +128,6 @@ const staleTickBeforeEveryAnswer = (): Faults => {
       return renumbered(frame);
     },
     beforeRequest: () => (last ? [renumbered(last)] : []),
-  };
-};
-
-/** Drops the one tick that follows the response to a request for which `matches` is true. One per connection. */
-const noTickAfter = (matches: (request: Json) => boolean): Faults => {
-  const ids = new Set<unknown>();
-  let drop = false;
-  return {
-    toServer: (frame) => {
-      if (matches(frame)) ids.add(frame.id);
-      return frame;
-    },
-    toClient: (frame) => {
-      if (isTick(frame)) {
-        const dropped = drop;
-        drop = false;
-        return dropped ? undefined : frame;
-      }
-      drop = ids.delete(frame.id);
-      return frame;
-    },
   };
 };
 
@@ -909,28 +702,6 @@ describe("the contract runner against a server that breaks the protocol", () => 
       "S10 passed ",
     ]);
   });
-
-  /** A server whose debugger.describe result is rewritten, and whose ticks are (for a tree that lists other registers). */
-  const describing = (
-    rewrite: (result: Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) => Json,
-    registers?: (registers: Record<string, Json[]>) => Record<string, Json[]>,
-  ): Faults => ({
-    toClient: (frame) => {
-      if (isTick(frame)) {
-        return registers ? { ...frame, params: { ...frame.params, registers: registers(frame.params.registers) } } : frame;
-      }
-      const result = frame.result as (Json & { targets: Array<Json & { id: string }>; deviceTree: Json[] }) | undefined;
-      return result?.deviceTree ? { ...frame, result: rewrite(result) } : frame;
-    },
-  });
-  /** Every node of a tree, rewritten (undefined: the node is left out). */
-  const mapNodes = (nodes: Json[], rewrite: (node: Json) => Json | undefined): Json[] =>
-    nodes.flatMap((node) => {
-      const rewritten = rewrite(node);
-      if (!rewritten) return [];
-      const children = rewritten.children as Json[] | undefined;
-      return [children ? { ...rewritten, children: mapNodes(children, rewrite) } : rewritten];
-    });
 
   it("S01: targets that do not have the normative values of the table of 3.1; labels and default addresses are the server's", async () => {
     const constants = await run(
