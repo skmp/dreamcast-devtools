@@ -22,3 +22,8 @@ export const SciRegistersPanel = () => <EmptyRegisterPanel title="Serial Communi
 export const ScifRegistersPanel = () => <EmptyRegisterPanel title="Serial Communications Interface w/ FIFO Registers" />;
 export const TmuRegistersPanel = () => <EmptyRegisterPanel title="Timer Unit Registers" />;
 export const UbcRegistersPanel = () => <EmptyRegisterPanel title="User Break Controller Registers" />;
+
+// The register panels of the two processors (protocol M2): the same placeholder until the
+// generic register panel is there.
+export const Sh4RegistersPanel = () => <EmptyRegisterPanel title="SH4 Registers" />;
+export const Arm7RegistersPanel = () => <EmptyRegisterPanel title="ARM7 Registers" />;

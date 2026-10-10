@@ -96,6 +96,7 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
   { title: "SH4: Simulator", id: "sh4-sim", content: /Hide Crosshairs/ },
   { title: "Events: Log", id: "events", content: /\d{2}:\d{2}:\d{2}\.\d{3}/ },
   { title: "Events: Breakpoints", id: "events-breakpoints", content: /No breakpoints defined\./ },
+  { title: "SH4: Registers", id: "sh4-registers", content: /SH4 Registers - Coming Soon/ },
   { title: "SH4: BSC Registers", id: "bsc-registers", content: /Bus State Controller Registers - Coming Soon/ },
   { title: "SH4: CCN Registers", id: "ccn-registers", content: /Cache Controller Registers - Coming Soon/ },
   { title: "SH4: CPG Registers", id: "cpg-registers", content: /Clock Pulse Generator Registers - Coming Soon/ },
@@ -115,6 +116,7 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
   { title: "ARM7: Disassembly", id: "arm7-disassembly", content: /0x(001FFF|002000)[0-9A-F]{2}/ },
   { title: "ARM7: Memory", id: "arm7-memory", content: /0x00000000/ },
   { title: "ARM7: Breakpoints", id: "arm7-breakpoints", content: /No breakpoints defined\./ },
+  { title: "ARM7: Registers", id: "arm7-registers", content: /ARM7 Registers - Coming Soon/ },
   { title: "CLX2: TA", id: "holly-ta", content: /This view is under consideration\./ },
   { title: "CLX2: CORE", id: "holly-core", content: /Drop your refsw2 log here/ },
   { title: "SGC", id: "sgc", content: /Record some data to display here/ },
@@ -139,7 +141,7 @@ test("the panel selector offers every panel that is not in the dock, and each on
   await openWorkspace(page, "sh4-debugger");
 
   // The mock starts running and sends a tick five times a second, and every tick renders every
-  // mounted panel again: with 35 panels in the dock a slow machine has nothing left between two
+  // mounted panel again: with 37 panels in the dock a slow machine has nothing left between two
   // ticks, and the test would measure that instead of the selector. Nothing here needs a target
   // that runs, so it is paused (a paused server sends no periodic tick), as soon as the event
   // log has an entry for "Events: Log" to show.
@@ -152,7 +154,7 @@ test("the panel selector offers every panel that is not in the dock, and each on
   const addPanel = page.getByLabel("Add Panel", { exact: true }).nth(1);
   await addPanel.click();
   const dialog = page.getByRole("dialog");
-  // the centre dock already has its three default panels; the other 32 are offered, with their ids
+  // the centre dock already has its three default panels; the other 34 are offered, with their ids
   await expect(dialog.getByRole("listitem")).toHaveCount(SELECTOR_PANELS.length);
   for (const { title, id } of SELECTOR_PANELS) {
     await expect(dialog.getByRole("button", { name: `${title} ${id}`, exact: true })).toBeVisible();

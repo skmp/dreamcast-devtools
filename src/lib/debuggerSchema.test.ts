@@ -8,6 +8,8 @@ import {
   IN_BAND_ERROR_METHODS,
   PANEL_IDS,
   PROTOCOL_VERSION,
+  PanelIdSchema,
+  RegisterValueSchema,
   RpcMethod,
   RpcMethodNameSchema,
   StrictDebuggerRpcMethodSchemas,
@@ -65,9 +67,30 @@ describe("protocol constants", () => {
     expect(DebuggerRpcMethodSchemas[RpcMethod.CONTROL_STEP].result.safeParse({ error: { code: DebuggerErrorCode.NOT_PAUSED, message: "" } }).success).toBe(true);
   });
 
-  it("recognises the panel ids", () => {
+  it("recognises the panel ids, the two register panels of milestone M2 among them", () => {
     expect(isPanelId(PANEL_IDS.SH4_DISASSEMBLY)).toBe(true);
-    expect(isPanelId("sh4-registers")).toBe(false);
+    expect(PANEL_IDS.SH4_REGISTERS).toBe("sh4-registers");
+    expect(PANEL_IDS.ARM7_REGISTERS).toBe("arm7-registers");
+    expect(isPanelId("sh4-registers")).toBe(true);
+    expect(isPanelId("arm7-registers")).toBe(true);
+    expect(isPanelId("dsp-registers")).toBe(false);
+    // 37 ids, each once, and the schema has exactly those (the emulator's tests read the list as text)
+    const ids = Object.values(PANEL_IDS);
+    expect(ids).toHaveLength(37);
+    expect(new Set(ids).size).toBe(37);
+    expect([...PanelIdSchema.options].sort()).toEqual([...ids].sort());
+    // a device node of a v3 server may name them as actions
+    const node = { path: "dc.sh4.cpu", label: "Core", description: "", actions: ["sh4-registers", "arm7-registers"] };
+    expect(ConformanceSchemas.DeviceNodeDescriptorSchema.safeParse(node).success).toBe(true);
+    expect(ConformanceSchemas.DeviceNodeDescriptorSchema.safeParse({ ...node, actions: ["dsp-registers"] }).success).toBe(false);
+  });
+
+  it("a register may say that it has a writer: flags.writable, in the client copy and in the strict copy", () => {
+    const register = { name: "R0", value: "0x00000000", width: 32, flags: { writable: true } };
+    expect(ConformanceSchemas.RegisterValueSchema.safeParse(register).success).toBe(true);
+    expect(RegisterValueSchema.parse(register).flags).toEqual({ writable: true });
+    // a flag is a boolean
+    expect(ConformanceSchemas.RegisterValueSchema.safeParse({ ...register, flags: { writable: "yes" } }).success).toBe(false);
   });
 });
 
@@ -430,7 +453,7 @@ describe("the strict copy", () => {
   it("checks the device tree: no empty arrays, no unknown actions, no unknown keys in nested nodes", () => {
     const value = shape();
     const node = value.deviceTree[0].children[0] as Record<string, unknown>;
-    node.actions = ["sh4-registers"];
+    node.actions = ["sh4-pipeline"];
     node.events = [];
     node.children = [{ path: "dc.sh4.cpu.x", label: "X", description: "", note: "unknown key" }];
     expect(issuePaths(strictShape.safeParse(value)).sort()).toEqual([
@@ -440,7 +463,7 @@ describe("the strict copy", () => {
     ]);
     // the client ignores an unknown action instead of dropping the message
     const lenient = DebuggerRpcMethodSchemas["debugger.describe"].result.parse(value);
-    expect(lenient.deviceTree[0].children?.[0].actions).toEqual(["sh4-registers"]);
+    expect(lenient.deviceTree[0].children?.[0].actions).toEqual(["sh4-pipeline"]);
   });
 
   it("ties defaultMemoryAddress to memory", () => {
@@ -502,6 +525,14 @@ describe("request parameters carry the bounds of the protocol", () => {
     expect(accepts("state.writeMemory", { target: "sh4", address: 0, data: [] })).toBe(false);
     expect(accepts("state.writeMemory", { target: "sh4", address: 0, data: [256] })).toBe(false);
     expect(accepts("state.writeMemory", { target: "arm7", address: 0, data: [255] })).toBe(true);
+    expect(accepts("state.writeMemory", { target: "sh4", address: 0, data: new Array(65536).fill(0) })).toBe(true);
+    expect(accepts("state.writeMemory", { target: "sh4", address: 0, data: new Array(65537).fill(0) })).toBe(false);
+    // the target is required and is any of the three ids, as for the reads: "dsp" is the
+    // method's own -32004, decided by the server behind the lifetime, and not an invalid parameter
+    expect(accepts("state.writeMemory", { target: "dsp", address: 0, data: [0] })).toBe(true);
+    expect(StrictDebuggerRpcMethodSchemas["state.writeMemory"].params.safeParse({ target: "dsp", address: 0, data: [0] }).success).toBe(true);
+    expect(accepts("state.writeMemory", { address: 0, data: [0] })).toBe(false);
+    expect(accepts("state.writeMemory", { target: "gpu", address: 0, data: [0] })).toBe(false);
   });
 
   it("bounds addresses to unsigned 32 bits and watch expressions to 256 characters, 64 per call", () => {

@@ -31,6 +31,7 @@ export const PANEL_IDS = {
   SH4_DISASSEMBLY: "sh4-disassembly",
   SH4_MEMORY: "sh4-memory",
   SH4_BREAKPOINTS: "sh4-breakpoints",
+  SH4_REGISTERS: "sh4-registers",
   SH4_BSC_REGISTERS: "bsc-registers",
   SH4_CCN_REGISTERS: "ccn-registers",
   SH4_CPG_REGISTERS: "cpg-registers",
@@ -49,6 +50,7 @@ export const PANEL_IDS = {
   ARM7_DISASSEMBLY: "arm7-disassembly",
   ARM7_MEMORY: "arm7-memory",
   ARM7_BREAKPOINTS: "arm7-breakpoints",
+  ARM7_REGISTERS: "arm7-registers",
   CLX2_TA: "holly-ta",
   CLX2_CORE: "holly-core",
   SGC: "sgc",
@@ -69,6 +71,7 @@ export const PanelIdSchema = z.enum([
   PANEL_IDS.SH4_DISASSEMBLY,
   PANEL_IDS.SH4_MEMORY,
   PANEL_IDS.SH4_BREAKPOINTS,
+  PANEL_IDS.SH4_REGISTERS,
   PANEL_IDS.SH4_BSC_REGISTERS,
   PANEL_IDS.SH4_CCN_REGISTERS,
   PANEL_IDS.SH4_CPG_REGISTERS,
@@ -87,6 +90,7 @@ export const PanelIdSchema = z.enum([
   PANEL_IDS.ARM7_DISASSEMBLY,
   PANEL_IDS.ARM7_MEMORY,
   PANEL_IDS.ARM7_BREAKPOINTS,
+  PANEL_IDS.ARM7_REGISTERS,
   PANEL_IDS.CLX2_TA,
   PANEL_IDS.CLX2_CORE,
   PANEL_IDS.SGC,
@@ -344,6 +348,10 @@ const defineProtocol = (conformance: boolean) => {
     value: z.string(),
     /** bits; 0 for free text */
     width: conformance ? z.number().int().min(0) : z.number(),
+    /**
+     * `{ writable: true }` on a register of `debugger.describe` that `state.setRegister` can
+     * write; absent otherwise, and never in a tick.
+     */
     flags: z.record(z.string(), z.boolean()).optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   });
@@ -698,7 +706,11 @@ const defineProtocol = (conformance: boolean) => {
     },
     [RpcMethod.STATE_WRITE_MEMORY]: {
       params: object({
-        target: z.enum(["sh4", "arm7"]),
+        /**
+         * Required, and any of the three target ids, as for the reads: `dsp` has no memory, which
+         * the method says with its own error -32004, in-band, and not with -32602.
+         */
+        target: targetParam,
         address: addressParam,
         data: z
           .array(z.number().int().min(0).max(255))

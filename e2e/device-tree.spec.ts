@@ -234,7 +234,7 @@ test("a panel the server names and this build does not have is no button, and br
   const server = await serveScriptedDebugger(page);
   const core = ((server.shape.deviceTree as Array<{ children: Array<{ children: Array<{ path: string; actions: string[] }> }> }>)[0]
     .children[0].children).find((node) => node.path === "dc.sh4.cpu")!;
-  core.actions = ["sh4-registers", "sh4-disassembly", "hologram-viewer"];
+  core.actions = ["sh4-pipeline", "sh4-disassembly", "hologram-viewer"];
   await gotoRoute(page, "/workspace/sh4-debugger");
   await expect(statusBar(page)).toContainText("Connection: connected");
 

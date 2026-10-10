@@ -36,6 +36,8 @@ import {
   ScifRegistersPanel,
   TmuRegistersPanel,
   UbcRegistersPanel,
+  Sh4RegistersPanel,
+  Arm7RegistersPanel,
 } from "../panels/Sh4RegisterPanels";
 import {
   SqContentsPanel,
@@ -115,6 +117,7 @@ const mainTabs: PanelDefinition[] = [
   { id: PANEL_IDS.SH4_DISASSEMBLY, title: "SH4: Disassembly", component: <Sh4DisassemblyPanel /> },
   { id: PANEL_IDS.SH4_MEMORY, title: "SH4: Memory", component: <Sh4MemoryPanel /> },
   { id: PANEL_IDS.SH4_BREAKPOINTS, title: "SH4: Breakpoints", component: <Sh4BreakpointsPanel /> },
+  { id: PANEL_IDS.SH4_REGISTERS, title: "SH4: Registers", component: <Sh4RegistersPanel /> },
   { id: PANEL_IDS.SH4_BSC_REGISTERS, title: "SH4: BSC Registers", component: <BscRegistersPanel /> },
   { id: PANEL_IDS.SH4_CCN_REGISTERS, title: "SH4: CCN Registers", component: <CcnRegistersPanel /> },
   { id: PANEL_IDS.SH4_CPG_REGISTERS, title: "SH4: CPG Registers", component: <CpgRegistersPanel /> },
@@ -133,6 +136,7 @@ const mainTabs: PanelDefinition[] = [
   { id: PANEL_IDS.ARM7_DISASSEMBLY, title: "ARM7: Disassembly", component: <Arm7DisassemblyPanel /> },
   { id: PANEL_IDS.ARM7_MEMORY, title: "ARM7: Memory", component: <Arm7MemoryPanel /> },
   { id: PANEL_IDS.ARM7_BREAKPOINTS, title: "ARM7: Breakpoints", component: <Arm7BreakpointsPanel /> },
+  { id: PANEL_IDS.ARM7_REGISTERS, title: "ARM7: Registers", component: <Arm7RegistersPanel /> },
   { id: PANEL_IDS.CLX2_TA, title: "CLX2: TA", component: <TaInspectorPanel /> },
   { id: PANEL_IDS.CLX2_CORE, title: "CLX2: CORE", component: <CoreInspectorPanel /> },
   { id: PANEL_IDS.SGC, title: "SGC", component: <AudioPanel /> },
