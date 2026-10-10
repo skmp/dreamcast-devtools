@@ -835,12 +835,91 @@ describe("S16, part setRegister", () => {
     expect((await part("setRegister", undefined, silent)).detail).toBe("dc.aica.arm7.R1 carries no flags.writable; the registers of the two processors are written in milestone M2");
   }, 120_000);
 
+  it("the two processors: a PC that says nothing of a writer and has none, an R1 that is refused or not stored, a refused value that is stored all the same", async () => {
+    // The PC of a processor without the flag, and refused as a register without a writer is:
+    // the refusal of its odd value, and of the first register of the node without the flag,
+    // are the same answer, and say nothing of the PC.
+    for (const node of ["dc.aica.arm7", "dc.sh4.cpu"]) {
+      const noWriter: Faults = {
+        ...describing((result) => ({
+          ...result,
+          deviceTree: mapNodes(result.deviceTree, (entry) =>
+            entry.path === node ? { ...entry, registers: (entry.registers as Json[]).map((register) => (register.name === "PC" ? { name: "PC", value: register.value, width: 32 } : register)) } : entry,
+          ),
+        })),
+        answer: (request) => (request.method === "state.setRegister" && paramsOf(request).path === node && paramsOf(request).name === "PC" ? inBand(request, -32013, "not writable") : undefined),
+      };
+      expect((await part("setRegister", { startPaused: true }, noWriter)).detail, node).toBe(`${node}.PC carries no flags.writable; the registers of the two processors are written in milestone M2`);
+    }
+
+    // R1 of the clocked ARM7 makes its round trip: refused, and accepted without being stored
+    const refused = answering((params) => params.path === "dc.aica.arm7" && params.name === "R1", (request) => inBand(request, -32013, "not writable"));
+    // (the line is that of the write that puts R1 back, which is refused as the first one was)
+    expect((await part("setRegister", { startPaused: true }, refused)).detail).toBe('state.setRegister {"path":"dc.aica.arm7","name":"R1","value":"0x00000101"}: in-band error -32013 "not writable"');
+    const dropped = patched((machine) => {
+      const write = machine.writeRegister.bind(machine);
+      machine.writeRegister = (path, register, text) => (path === "dc.aica.arm7" && register.name === "R1" ? undefined : write(path, register, text));
+    }, { startPaused: true });
+    expect((await part("setRegister", dropped)).detail).toMatch(
+      /^state\.setRegister: dc\.aica\.arm7\.R1 reads 0x00000101 after writing "0x00FF01FE", expected 0x00FF01FE \(1 tick within 1000 ms of the request, /,
+    );
+
+    // "refused" is "not stored": a server that answers -32013 for the odd PC of the SH4, or for
+    // the CPSR that names no mode, and stores the value
+    const storing = (node: string, name: string) =>
+      patched((machine) => {
+        const write = machine.writeRegister.bind(machine);
+        machine.writeRegister = (path, register, text) => {
+          try {
+            write(path, register, text);
+          } catch (error) {
+            if (path === node && register.name === name && (error as { code?: number }).code === -32013) machine.setRegisterValue(path, name, Number(text));
+            throw error;
+          }
+        };
+      }, { startPaused: true });
+    expect((await part("setRegister", storing("dc.sh4.cpu", "PC"))).detail).toBe("a refused write of the PC of the SH4 changed it: it reads 0x8C0000A1, it was 0x8C0000A0");
+    expect((await part("setRegister", storing("dc.aica.arm7", "CPSR"))).detail).toBe("a refused write of CPSR changed it: it reads 0x000000C0, it was 0x000000D3");
+  }, 120_000);
+
+  it("a write of a register is no new stop", async () => {
+    const newStop = patched((machine) => {
+      const setRegister = machine.setRegister.bind(machine);
+      machine.setRegister = (params, context) => {
+        const result = setRegister(params, context);
+        context.afterResponse.unshift(() => machine.enterStop("pause"));
+        return result;
+      };
+    }, { startPaused: true });
+    expect((await part("setRegister", newStop)).detail).toMatch(
+      /^the tick behind state\.setRegister \{dc\.sh4\.cpu, R0\} is #\d+ paused stop (\d+) pause; the target was #\d+ paused stop (?!\1 )\d+ \w+, and a register write is not a new stop$/,
+    );
+  }, 60_000);
+
   it("a write of SR.RB that does not exchange the register banks; without MD the exchange is not asked for", async () => {
     const stored = patched((machine) => {
       machine.setSh4Sr = (value) => machine.setRegisterValue("dc.sh4.cpu", "SR", (value & 0x700083f3) >>> 0);
     }, { startPaused: true });
     expect((await part("setRegister", stored)).detail).toMatch(
-      /^a write of SR that flips RB \(MD is set\) exchanges R0\.\.R7 with R0_BANK\.\.R7_BANK: R0\.\.R7 read \["0x00000000","0x00001111",.*\] and R0_BANK\.\.R7_BANK \["0x00000000","0x00000000",.*\]; before it they read /,
+      /^a write of SR that flips RB \(MD is set\) exchanges R0\.\.R7 with R0_BANK\.\.R7_BANK: R0\.\.R7 read \["0x5A5A5A5A","0x00001111",.*\] and R0_BANK\.\.R7_BANK \["0x00000000","0x00000000",.*\]; before it they read /,
+    );
+    // A machine whose two banks read the same (one that has not run yet: both are as its reset
+    // left them). The exchange is seen there all the same, in R0, which the part sets apart
+    // first; and a server that exchanges nothing does not pass because nothing would show.
+    const equal = (machine: Machine) => {
+      for (let index = 0; index < 8; index++) machine.values.get("dc.sh4.cpu")!.set(`R${index}`, 0);
+    };
+    const same = await part("setRegister", patched(equal, { startPaused: true }));
+    expect(same.result).toEqual(passed("setRegister"));
+    expect(same.notes).toEqual([]);
+    const cpu = (same.mock as unknown as Machine).values.get("dc.sh4.cpu")!;
+    expect([cpu.get("R0"), cpu.get("R0_BANK"), cpu.get("SR")]).toEqual([0, 0, 0x40000000]);
+    const nothing = patched((machine) => {
+      equal(machine);
+      machine.setSh4Sr = (value) => machine.setRegisterValue("dc.sh4.cpu", "SR", (value & 0x700083f3) >>> 0);
+    }, { startPaused: true });
+    expect((await part("setRegister", nothing)).detail).toMatch(
+      /^a write of SR that flips RB \(MD is set\) exchanges R0\.\.R7 with R0_BANK\.\.R7_BANK: R0\.\.R7 read \["0x5A5A5A5A"(,"0x00000000"){7}\] and R0_BANK\.\.R7_BANK \["0x00000000"(,"0x00000000"){7}\]; before it they read \["0x5A5A5A5A"(,"0x00000000"){7}\] and \["0x00000000"(,"0x00000000"){7}\]$/,
     );
     const user = patched((machine) => {
       machine.values.get("dc.sh4.cpu")!.set("SR", 0);

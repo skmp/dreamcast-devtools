@@ -2837,7 +2837,10 @@ const writeRegister = async (context: RunContext, path: string, name: string, va
   const next = await tickShowing(session, mark, "state.setRegister", (tick) =>
     registerOf(tick, path, name) === expected ? undefined : `${path}.${name} reads ${registerOf(tick, path, name)} after writing ${JSON.stringify(value)}, expected ${expected}`,
   );
-  check(isPaused(next.tick) && stopIdOf(next.tick) === stopIdOf(stop), "a register write is not a new stop");
+  check(
+    isPaused(next.tick) && stopIdOf(next.tick) === stopIdOf(stop),
+    `the tick behind state.setRegister {${path}, ${name}} is ${describeState(next.tick)}; the target was ${describeState(stop)}, and a register write is not a new stop`,
+  );
   return next;
 };
 
@@ -3135,14 +3138,14 @@ const setRegisterPart = async (context: RunContext): Promise<void> => {
         await writeRegister(context, arm7Path, "R1", r1, r1);
       }
     }
-    // the PC of the ARM7 is stored aligned
-    if (isWritable(described(arm7Path, arm7.pcRegister) ?? {})) {
-      const pc = registerOf(now(), arm7Path, arm7.pcRegister)!;
-      check((Number.parseInt(pc, 16) & 3) === 0, `the PC of the ARM7 reads ${pc}; it is a multiple of 4`);
-      await writeRegister(context, arm7Path, arm7.pcRegister, hex((Number.parseInt(pc, 16) | 3) >>> 0), pc).catch((error: unknown) => {
-        throw error instanceof ContractFailure ? new ContractFailure(`the PC of the ARM7 is stored with bits 0 and 1 clear: ${error.message}`) : error;
-      });
-    }
+    // The PC of the ARM7 has a writer, and is stored aligned. (That it says so is asked first:
+    // a refusal is what a register without a writer answers, too.)
+    check(isWritable(described(arm7Path, arm7.pcRegister) ?? {}), `${arm7Path}.${arm7.pcRegister} carries no flags.writable; the registers of the two processors are written in milestone M2`);
+    const armPc = registerOf(now(), arm7Path, arm7.pcRegister) ?? fail(`the tick has no ${arm7Path}.${arm7.pcRegister}`);
+    check((Number.parseInt(armPc, 16) & 3) === 0, `the PC of the ARM7 reads ${armPc}; it is a multiple of 4`);
+    await writeRegister(context, arm7Path, arm7.pcRegister, hex((Number.parseInt(armPc, 16) | 3) >>> 0), armPc).catch((error: unknown) => {
+      throw error instanceof ContractFailure ? new ContractFailure(`the PC of the ARM7 is stored with bits 0 and 1 clear: ${error.message}`) : error;
+    });
     // a CPSR whose mode bits are no mode is refused
     const cpsr = registerOf(now(), arm7Path, "CPSR");
     if (cpsr !== undefined && isWritable(described(arm7Path, "CPSR") ?? {})) {
@@ -3151,26 +3154,37 @@ const setRegisterPart = async (context: RunContext): Promise<void> => {
       check(registerOf(still, arm7Path, "CPSR") === cpsr, `a refused write of CPSR changed it: it reads ${registerOf(still, arm7Path, "CPSR")}, it was ${cpsr}`);
     }
   }
-  // nothing executes at an odd address: a PC of the SH4 with bit 0 set is refused
-  const pc = registerOf(now(), cpu, sh4.pcRegister)!;
+  // Nothing executes at an odd address: a PC of the SH4 with bit 0 set is refused, by a
+  // register that has a writer (one without would refuse it with the same code).
+  check(isWritable(described(cpu, sh4.pcRegister) ?? {}), `${cpu}.${sh4.pcRegister} carries no flags.writable; the registers of the two processors are written in milestone M2`);
+  const pc = registerOf(now(), cpu, sh4.pcRegister) ?? fail(`the tick has no ${cpu}.${sh4.pcRegister}`);
   await session.expectError("state.setRegister", { path: cpu, name: sh4.pcRegister, value: hex((Number.parseInt(pc, 16) | 1) >>> 0) }, -32013);
   const unchanged = (await session.describe()).tick;
   check(registerOf(unchanged, cpu, sh4.pcRegister) === pc, `a refused write of the PC of the SH4 changed it: it reads ${registerOf(unchanged, cpu, sh4.pcRegister)}, it was ${pc}`);
 
-  // SR applies its effect: with MD set, a write that flips RB exchanges R0..R7 with R0_BANK..R7_BANK
+  // SR applies its effect: with MD set, a write that flips RB exchanges R0..R7 with
+  // R0_BANK..R7_BANK. An exchange shows only where the two banks read differently, and they
+  // need not: a machine that has not run yet has both as its reset left them. So R0 is first
+  // given a value that R0_BANK does not have, and gets its own back behind the exchange.
   const sr = numberOf(now(), cpu, "SR");
   if ((sr & 0x40000000) !== 0) {
     const bank = (tick: DebuggerTick, suffix: string) => Array.from({ length: 8 }, (_, index) => registerOf(tick, cpu, `R${index}${suffix}`));
-    const before = now();
+    const r0 = registerOf(now(), cpu, "R0") ?? fail(`${cpu} has no register R0`);
+    const apart = hex((numberOf(now(), cpu, "R0_BANK") ^ 0x5a5a5a5a) >>> 0);
     try {
-      const flipped = (await writeRegister(context, cpu, "SR", hex((sr ^ 0x20000000) >>> 0), hex((sr ^ 0x20000000) >>> 0))).tick;
-      check(
-        JSON.stringify(bank(flipped, "")) === JSON.stringify(bank(before, "_BANK")) && JSON.stringify(bank(flipped, "_BANK")) === JSON.stringify(bank(before, "")),
-        `a write of SR that flips RB (MD is set) exchanges R0..R7 with R0_BANK..R7_BANK: R0..R7 read ${JSON.stringify(bank(flipped, ""))} and R0_BANK..R7_BANK ${JSON.stringify(bank(flipped, "_BANK"))}; ` +
-          `before it they read ${JSON.stringify(bank(before, ""))} and ${JSON.stringify(bank(before, "_BANK"))}`,
-      );
+      const before = (await writeRegister(context, cpu, "R0", apart, apart)).tick;
+      try {
+        const flipped = (await writeRegister(context, cpu, "SR", hex((sr ^ 0x20000000) >>> 0), hex((sr ^ 0x20000000) >>> 0))).tick;
+        check(
+          JSON.stringify(bank(flipped, "")) === JSON.stringify(bank(before, "_BANK")) && JSON.stringify(bank(flipped, "_BANK")) === JSON.stringify(bank(before, "")),
+          `a write of SR that flips RB (MD is set) exchanges R0..R7 with R0_BANK..R7_BANK: R0..R7 read ${JSON.stringify(bank(flipped, ""))} and R0_BANK..R7_BANK ${JSON.stringify(bank(flipped, "_BANK"))}; ` +
+            `before it they read ${JSON.stringify(bank(before, ""))} and ${JSON.stringify(bank(before, "_BANK"))}`,
+        );
+      } finally {
+        await writeRegister(context, cpu, "SR", hex(sr), hex(sr));
+      }
     } finally {
-      await writeRegister(context, cpu, "SR", hex(sr), hex(sr));
+      await writeRegister(context, cpu, "R0", r0, r0);
     }
   } else {
     context.note("setRegister: MD is clear in SR at this stop: the exchange of the register banks by a write of SR.RB was not shown");
