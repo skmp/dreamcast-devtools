@@ -347,7 +347,8 @@ that away: what the emulator of M2 does, and no more). What its machine is:
   `0x00200024` to a leaf of two instructions and the return (`mov pc, lr`) at `0x00200030`,
   with `R14` the link register. `control.stepOver` on the call and `control.stepOut` are a
   temporary breakpoint (behind the call; at `R14`) and a resume, anywhere else step over is a
-  step. A step of the ARM7 moves nothing of the SH4.
+  step. The temporary breakpoint goes at the stop it makes and at any other stop, one of the
+  host among them. A step of the ARM7 moves nothing of the SH4.
 - The ARM7 is held in reset behind a reset, with the option `arm7Held` (`--arm7-held`) and when
   the machine is told to (`holdArm7()`, as a guest does it): `ENABLED` of `dc.aica.arm7` (one
   bit: 1, the ARM7 is clocked; 0, it is held) reads 0, the ARM7 has no callstack and executes
@@ -442,17 +443,20 @@ one connection and wants the tick of that on the other.
   they are, one more and a byte of 256 refused; a missing target -32602 and `dsp` -32004; a byte
   of wave memory through both targets; 16 bytes of video memory through three addresses of one
   view; the boot ROM, the flash, a register window, P4 and a store queue refused; a refusal while
-  the target runs that is -32013 and not -32003; a tick behind every accepted write, of the stop
-  it was made in. With `register-write`: `mov #0x5A, r0` written at that scratch address, the PC
-  put there, one step, the PC two further and R0 `0x5A`, and everything put back. (A step that
-  ends at an exception vector with `SPC` at the scratch address executed nothing: the probe is
-  made once more from the vector.) Nothing of the part writes over memory it did not save, and
-  the PC is never moved onto a line of the program.
+  the target runs that is -32013 and not -32003; the tick of every accepted write, of the stop
+  it was made in (the first tick since the request was sent: a server sends it in front of the
+  response or behind it). With `register-write`: `mov #0x5A, r0` written at that scratch
+  address, the PC put there, one step, the PC two further and R0 `0x5A`, and everything put
+  back. (A step that ends at an exception vector with `SPC` at the scratch address executed
+  nothing: the probe is made once more from the vector.) Nothing of the part writes over memory
+  it did not save, and the PC is never moved onto a line of the program.
 - `setRegister` (`register-write`): the round trip of `R0`, the case of `path` and `name`, the
   grammar of the value, `flags.writable` (on `R0`, not on `ENABLED`, on no register of width 0),
   in every node a write of the first writable register with the value it reads and a refusal of
-  the first that is not; `R1` and the aligned PC of the ARM7, the odd PC of the SH4, a CPSR that
-  names no mode; the exchange of the register banks by a write of `SR.RB`; `state.editWatch`.
+  the first that is not; `R1` and the aligned PC of the ARM7, the odd PC of the SH4 (both PCs
+  with `flags.writable`), a CPSR that names no mode; the exchange of the register banks by a
+  write of `SR.RB`, with `R0` first given a value `R0_BANK` does not have (the two banks of a
+  machine that has not run yet read the same); `state.editWatch`.
 - `reset` (`reset`): while running (`{}`, no stop, the entry in the event log); while paused,
   with a disabled breakpoint, a watch and a flipped category of its own that the tick of the
   reset stop still lists; `ENABLED` 0 and no ARM7 frames there, and `R1` of the held ARM7
@@ -517,7 +521,8 @@ and its ARM7 takes no interrupt). The mock's gate is `npm run contract -- --mile
 twice, on the mock as it is and with `--mock-support m2` on the mock as what the emulator of
 M2 does, both with `--require-note "arm7: bl stepped over and out"`. The gates are run against
 a server with the default tick period (200 ms, every fifth periodic tick full): the time bounds
-of the scenarios are written for it.
+of the scenarios are written for it. The runner measures them on the monotonic clock: setting
+the wall clock while a run is under way neither ends a wait early nor makes it longer.
 
 `--idle-breakpoint <address|symbol>` is not a test run: it mutes the `sh4` category, adds one
 breakpoint, resumes and stays connected until the server closes the connection.
