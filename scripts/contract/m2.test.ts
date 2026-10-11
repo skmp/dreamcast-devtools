@@ -713,14 +713,59 @@ describe("S16, part writeMemory", () => {
       request.method === "state.writeMemory" && matches(paramsOf(request) as never) ? inBand(request, code, code === -32013 ? "not writable" : "refused") : undefined,
   });
 
+  /**
+   * The mock at its StartPaused stop, with the PC of its SH4 at each stop a control.pause made
+   * (`pausedAt`). The part lets the target run once, for the write that is refused while it
+   * runs, and makes its probe from the stop behind that: the PC it has to put back is the PC of
+   * that stop, wherever the program got to. The mock's own machine executes one instruction at
+   * each fire of a timer that runs free, every 16 ms: in the millisecond or so the part lets it
+   * run that is by chance none, or one. `steps` takes the chance out: the machine executes that
+   * many emulation steps at each resume, at once, as an emulator executes when it is resumed,
+   * and none by its timer. Without it the machine is the mock's own.
+   */
+  const pausing = (steps?: number, patch: (machine: Machine) => void = () => undefined) => {
+    const pausedAt: number[] = [];
+    const mock = patched((machine) => {
+      const enterStop = machine.enterStop.bind(machine);
+      machine.enterStop = (reason, ...rest) => {
+        if (reason === "pause") pausedAt.push(sh4Pc(machine));
+        enterStop(reason, ...rest);
+      };
+      if (steps !== undefined) {
+        const emulationStep = machine.emulationStep.bind(machine);
+        machine.emulationStep = () => undefined;
+        const leaveStop = machine.leaveStop.bind(machine);
+        machine.leaveStop = () => {
+          leaveStop();
+          for (let step = 0; step < steps; step++) emulationStep();
+        };
+      }
+      patch(machine);
+    }, { startPaused: true });
+    return { mock, pausedAt };
+  };
+  /** Which machine of `pausing` an expectation failed on. */
+  const ranOf = (steps?: number) => (steps === undefined ? "the mock's own machine" : `a machine that executes ${steps} emulation steps at each resume`);
+
   it("the mock passes, and what the part wrote is back as it was", async () => {
-    const { result, mock, notes } = await part("writeMemory", { startPaused: true });
-    expect(result).toEqual(passed("writeMemory"));
-    expect(notes).toEqual([]);
-    // nothing is left of the pattern, the instruction or the 64 KiB: every byte reads what it is fabricated to be
-    expect((mock as unknown as Machine).written.size).toBe(0);
-    expect((mock as unknown as Machine).values.get("dc.sh4.cpu")!.get("PC")).toBe(0x8c0000a0);
-    expect((mock as unknown as Machine).values.get("dc.sh4.cpu")!.get("R0")).toBe(0);
+    // the mock's own machine; one that executes nothing while the part lets it run; and one that executes three instructions
+    for (const steps of [undefined, 0, 3]) {
+      const server = pausing(steps);
+      const on = ranOf(steps);
+      const { result, mock, notes } = await part("writeMemory", server.mock);
+      expect(result, on).toEqual(passed("writeMemory"));
+      expect(notes, on).toEqual([]);
+      // nothing is left of the pattern, the instruction or the 64 KiB: every byte reads what it is fabricated to be
+      expect((mock as unknown as Machine).written.size, on).toBe(0);
+      // The PC is where the stop behind the write to the running target had it: at the first
+      // instruction of the program if nothing executed meanwhile, and three further behind three.
+      expect(server.pausedAt, on).toHaveLength(1);
+      if (steps !== undefined) {
+        expect(server.pausedAt[0], on).toBe(0x8c0000a0 + 2 * steps);
+      }
+      expect(sh4Pc(mock as unknown as Machine), on).toBe(server.pausedAt[0]);
+      expect((mock as unknown as Machine).values.get("dc.sh4.cpu")!.get("R0"), on).toBe(0);
+    }
   }, 60_000);
 
   it("the tick of a write may come in front of its response: the emulator's order passes, in every part that writes and on the second connection of S13", async () => {
@@ -892,9 +937,13 @@ describe("S16, part writeMemory", () => {
     });
     expect((await part("writeMemory", far)).detail).toBe("the step from the instruction written at 0x8CFFEF00 ended at 0x8CFFEF04, not at 0x8CFFEF02");
 
-    /** The mock whose n-th step from the scratch address accepts an interrupt instead of executing; `spc`: what the entry leaves in SPC. */
-    const interrupted = (which: (n: number) => boolean, spc?: number) =>
-      patched((machine) => {
+    /**
+     * The mock whose n-th step from the scratch address accepts an interrupt instead of executing;
+     * `spc`: what the entry leaves in SPC; `ran`: the emulation steps its machine executes at each
+     * resume (`pausing`).
+     */
+    const interrupted = (which: (n: number) => boolean, spc?: number, ran?: number) =>
+      pausing(ran, (machine) => {
         const step = machine.step.bind(machine);
         let steps = 0;
         machine.step = (kind, params, context) => {
@@ -906,24 +955,34 @@ describe("S16, part writeMemory", () => {
           });
           return {};
         };
-      }, { startPaused: true });
+      });
     // One step may: the interrupt is entered in front of the instruction, SPC says so, and the
     // probe is made once more from the vector. Everything is put back: the program goes on
-    // where it was, in its handler, with the registers it had.
-    const once = await part("writeMemory", interrupted((n) => n === 1));
-    expect(once.result).toEqual(passed("writeMemory"));
-    const machine = once.mock as unknown as Machine;
-    expect(machine.written.size).toBe(0);
-    expect(machine.values.get("dc.sh4.cpu")!.get("PC")).toBe(0x8c000600);
-    expect(machine.values.get("dc.sh4.cpu")!.get("SPC")).toBe(0x8c0000a0);
-    expect(machine.values.get("dc.sh4.cpu")!.get("R0")).toBe(0);
-    expect(machine.values.get("dc.sh4.cpu")!.get("R0_BANK")).toBe(0);
+    // where it was, in its handler, with the registers it had. Where it was is the PC of the
+    // stop the probe was made from, which is what SPC takes: on the mock's own machine, on one
+    // that executed nothing while the part let it run, and on one that executed three instructions.
+    for (const ran of [undefined, 0, 3]) {
+      const server = interrupted((n) => n === 1, undefined, ran);
+      const on = ranOf(ran);
+      const once = await part("writeMemory", server.mock);
+      expect(once.result, on).toEqual(passed("writeMemory"));
+      const machine = once.mock as unknown as Machine;
+      expect(machine.written.size, on).toBe(0);
+      expect(machine.values.get("dc.sh4.cpu")!.get("PC"), on).toBe(0x8c000600);
+      expect(server.pausedAt, on).toHaveLength(1);
+      if (ran !== undefined) {
+        expect(server.pausedAt[0], on).toBe(0x8c0000a0 + 2 * ran);
+      }
+      expect(machine.values.get("dc.sh4.cpu")!.get("SPC"), on).toBe(server.pausedAt[0]);
+      expect(machine.values.get("dc.sh4.cpu")!.get("R0"), on).toBe(0);
+      expect(machine.values.get("dc.sh4.cpu")!.get("R0_BANK"), on).toBe(0);
+    }
     // an entry that does not return to the instruction it was entered in front of
-    expect((await part("writeMemory", interrupted((n) => n === 1, 0x8cffef02))).detail).toBe(
+    expect((await part("writeMemory", interrupted((n) => n === 1, 0x8cffef02).mock)).detail).toBe(
       "the step from 0x8CFFEF00 ended at the exception vector 0x8C000600, and SPC reads 0x8CFFEF02; an exception that is entered in front of the instruction returns to it",
     );
     // from the vector no interrupt is accepted: a second step that executes nothing fails
-    expect((await part("writeMemory", interrupted(() => true))).detail).toBe(
+    expect((await part("writeMemory", interrupted(() => true).mock)).detail).toBe(
       "the step from the instruction written at 0x8CFFEF00, from the exception vector the first step ended at ended at 0x8C000600, not at 0x8CFFEF02",
     );
   }, 180_000);
