@@ -124,7 +124,7 @@ it is skipped unless `E2E_EMULATOR_URL` is the page URL the emulator prints
 `-DNULLDC_DEVTOOLS_DIST=<this checkout>/dist-native`, and its build), started headless and
 paused on the sounding guest of its tree, as the emulator's own tests start one
 (`tests/debugger/contract/contract.py`): with a home, a configuration and a data directory of
-its own, three directories that exist.
+its own, three directories made for the run.
 
 ```
 HOME=<run dir>/home XDG_CONFIG_HOME=<run dir>/cfg XDG_DATA_HOME=<run dir>/data \
@@ -141,9 +141,10 @@ kill <pid of the emulator>
 - The three variables are needed too. Without them the emulator reads the `emu.cfg` of the
   user, and takes from it what the command line does not give: an address to listen on that
   may not be the loopback one (`Debugger:Bind`, `Debugger:AllowedHosts`), a directory to serve
-  in place of the bundle it embeds (`Debugger:WebRoot`). And it opens the memory cards and
-  the flash memory in the data directory of the user, which an emulator the user has running
-  holds open.
+  in place of the bundle it embeds (`Debugger:WebRoot`). And it opens the memory cards in the
+  data directory of the user, which an emulator the user has running has open. With the
+  variables the run reads no `emu.cfg` but its own, an empty one, and its memory cards are
+  new files of its data directory.
 - The emulator is ended by its pid when Playwright has returned (`SIGTERM`; it ends within
   seconds). The spec leaves the machine paused, and that lasts as long as its page: ten
   seconds after the last client has gone the server releases the stop, and the guest runs
