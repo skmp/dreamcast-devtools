@@ -635,7 +635,7 @@ test.describe("a server of milestone M1", () => {
     await pauseFromToolbar(page);
     const view = panel(page, "sh4-memory");
     await expect(memoryRows(view)).toHaveCount(60);
-    await expect(hexCell(view, 0x8c010000)).not.toHaveAttribute("title");
+    await expect(hexCell(view, 0x8c010000)).toHaveAttribute("title", "Read-only: this server cannot write memory");
     await dblclickByte(view, 0x8c010004);
     await expect(byteEditor(view)).toHaveCount(0);
     await expect(view.getByRole("textbox")).toHaveCount(1);

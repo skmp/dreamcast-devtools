@@ -12,8 +12,10 @@ import { MemoryView, type MemoryViewConfig, type MemoryViewCallbacks } from "../
 import { PanelNotice } from "../components/PanelNotice";
 
 const VISIBLE_ROWS = 60;
+// what the bytes say of editing when the pointer rests on them: how to, or why not
 const EDIT_HINT = "Double-click a byte to write memory from there";
 const RUNNING_HINT = "Read-only while the target runs: pause it to write memory";
+const NO_WRITES_HINT = "Read-only: this server cannot write memory";
 
 interface MemoryPanelProps {
   target: "sh4" | "arm7";
@@ -151,7 +153,7 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
         // screen are read again, where the view is.
         refreshSignal={`${epoch}:${refresh}:${reread}`}
         editable={memoryWriteCapability && paused}
-        editHint={memoryWriteCapability ? (paused ? EDIT_HINT : RUNNING_HINT) : undefined}
+        editHint={memoryWriteCapability ? (paused ? EDIT_HINT : RUNNING_HINT) : NO_WRITES_HINT}
         noDataText={noDataText}
       />
     </Panel>
