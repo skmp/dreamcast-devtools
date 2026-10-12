@@ -343,7 +343,22 @@ describe("ticks", () => {
     vi.useFakeTimers();
     const hit = { state: "paused", stopId: 2, reason: "breakpoint", breakpointId: 4 };
     const breakpoints = { "4": { id: 4, event: "dc.aica.dsp.step", address: 5, kind: "code", enabled: true } };
-    const { transport } = await initialise(tickFrame({ state: "running", stopId: 1 }));
+    // the server lists the target of the breakpoint: a DSP whose steps are decimal, three digits wide
+    const dsp = {
+      id: "dsp",
+      label: "DSP",
+      pcPath: "dc.aica.dsp",
+      pcRegister: "STEP",
+      breakpointEvent: "dc.aica.dsp.step",
+      instructionSize: 1,
+      addressMax: 127,
+      addressRadix: 10,
+      addressDigits: 3,
+      defaultDisassemblyAddress: 0,
+      memory: false,
+      stepping: true,
+    };
+    const { transport } = await initialise(tickFrame({ state: "running", stopId: 1 }), describeResult({ targets: [dsp] }));
     expect(store().toasts).toEqual([]);
 
     transport.deliver(tickFrame(hit, { breakpoints }));

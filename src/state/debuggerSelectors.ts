@@ -8,8 +8,8 @@ import { hasCapability, programCounter, targetInfo, type TargetInfo } from "./ta
 // changes, so a panel that uses them does not render again for every tick.
 
 /**
- * What the server said about a target in debugger.describe (or the built-in values for a v2
- * server). While the connection is away it is what the server of the last one said: a panel
+ * What the server said about a target in debugger.describe; a target it does not list is not
+ * supported. While the connection is away it is what the server of the last one said: a panel
  * keeps the frame that server gave it. Before any server has described itself the built-in
  * values stand in, with every target supported.
  */
@@ -25,7 +25,10 @@ export const useTarget = (id: TargetProcessor): TargetInfo => {
 export const useNoDataText = (): string =>
   useSessionStore((state) => (state.connectionState === "connected" ? "No Data" : "Not connected"));
 
-/** Whether the server has an optional method (`capabilities` of debugger.describe). */
+/**
+ * Whether the server has an optional method (`capabilities` of debugger.describe); before any
+ * server has described itself every panel has its controls.
+ */
 export const useCapability = (capability: string): boolean =>
   useDebuggerDataStore((state) => hasCapability(state.shape, capability));
 

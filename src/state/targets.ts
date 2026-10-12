@@ -1,20 +1,24 @@
 import type { BreakpointCategory, BreakpointDescriptor, DebuggerShape, DebuggerTarget, RegisterValue, TargetProcessor } from "../lib/debuggerSchema";
 
 // What the panels know about a target (SH4, ARM7, DSP): where its program counter is, how its
-// addresses are written, where a view starts, and what the server can do with it. A v3
-// server says all of it in `targets` of debugger.describe. A v2 server says nothing, and the
-// panels then use the values they had built in before protocol v3.
+// addresses are written, where a view starts, and what the server can do with it. The server
+// says all of it in `targets` of debugger.describe, and what it can do beyond that in
+// `capabilities`. What a server does not list it does not have: nothing is assumed for a
+// describe result that leaves a list out, and one without `protocol` lists nothing at all.
 
 export interface TargetInfo extends DebuggerTarget {
   /**
-   * false: the server lists targets and this one is not among them. Its panels show a notice
-   * instead of controls. The other fields are then the built-in values.
+   * false: the server does not list this target. Its panels show a notice instead of
+   * controls, and the notice names the target by `label` (`unlistedTarget`).
    */
   supported: boolean;
 }
 
-/** What the panels assumed before `targets` existed; used for a server that does not send it. */
-export const V2_TARGETS: Readonly<Record<TargetProcessor, DebuggerTarget>> = {
+/**
+ * The values of a target that no server gave. They have two uses, `targetBeforeFirstServer`
+ * and `unlistedTarget`, and are never a stand-in for what a server left out.
+ */
+const BUILT_IN_TARGETS: Readonly<Record<TargetProcessor, DebuggerTarget>> = {
   sh4: {
     id: "sh4",
     label: "SH4",
@@ -61,28 +65,49 @@ export const V2_TARGETS: Readonly<Record<TargetProcessor, DebuggerTarget>> = {
   },
 };
 
-/** A server that does not report a protocol version is a v2 server. */
-export const isV2Server = (shape: DebuggerShape | undefined): boolean => shape !== undefined && shape.protocol === undefined;
+/**
+ * A target on a page that has had no server yet. Every panel shows its frame then, with its
+ * toolbar and its boxes, and a frame needs a label and a way to write an address. Nothing is
+ * requested with these values: there is nobody to ask.
+ */
+export const targetBeforeFirstServer = (id: TargetProcessor): TargetInfo => ({ ...BUILT_IN_TARGETS[id], supported: true });
+
+/**
+ * A target the server does not list. Its panels say so in place of their controls ("This
+ * server does not support the ARM7 target"), which takes the label. A panel that shows the
+ * notice asks the server for nothing, so the other fields reach no request.
+ */
+export const unlistedTarget = (id: TargetProcessor): TargetInfo => ({ ...BUILT_IN_TARGETS[id], supported: false });
+
+/**
+ * Whether the lists of a describe result are read. A result without `protocol` gets the
+ * version banner and is a server that lists no target and no capability, whatever it carries
+ * under those names.
+ */
+const listsAnything = (shape: DebuggerShape): boolean => shape.protocol !== undefined;
+
+/** The targets the server lists; none when its describe result has no `targets`. */
+const listedTargets = (shape: DebuggerShape | undefined): readonly DebuggerTarget[] =>
+  shape !== undefined && listsAnything(shape) ? (shape.targets ?? []) : [];
 
 export const targetInfo = (shape: DebuggerShape | undefined, id: TargetProcessor): TargetInfo => {
-  const listed = shape?.targets;
-  if (!listed) {
-    return { ...V2_TARGETS[id], supported: true };
+  if (shape === undefined) {
+    return targetBeforeFirstServer(id);
   }
-  const target = listed.find((candidate) => candidate.id === id);
-  return target ? { ...target, supported: true } : { ...V2_TARGETS[id], supported: false };
+  const target = listedTargets(shape).find((candidate) => candidate.id === id);
+  return target ? { ...target, supported: true } : unlistedTarget(id);
 };
 
 /**
- * Whether an optional method works. A v3 server lists what it has in `capabilities`. A v2
- * server is asked for everything, as it always was (what the v2 mock listed there are
- * names of its own).
+ * Whether an optional method works: the server lists what it has in `capabilities`, and has
+ * nothing when its describe result has no such list. A page that has had no server yet has
+ * every panel with its controls (see `targetBeforeFirstServer`).
  */
 export const hasCapability = (shape: DebuggerShape | undefined, capability: string): boolean => {
-  if (!shape || shape.protocol === undefined || !shape.capabilities) {
+  if (shape === undefined) {
     return true;
   }
-  return shape.capabilities.includes(capability);
+  return listsAnything(shape) && (shape.capabilities ?? []).includes(capability);
 };
 
 /** An address as lists, the disassembly column and notices print it: "0x8C0000A0", "005". */
@@ -142,25 +167,20 @@ export const withContextAbove = (target: Pick<DebuggerTarget, "instructionSize" 
 
 /**
  * The mute / solo category of a breakpoint: "events" for an event breakpoint, otherwise the
- * target whose code breakpoints use its event. The names of the events decide for a server
- * that lists no targets, as they always did.
+ * target whose code breakpoints use its event. A code breakpoint whose event is of no listed
+ * target has no target to belong to, and is listed with the events.
  */
 export const breakpointCategory = (shape: DebuggerShape | undefined, breakpoint: BreakpointDescriptor): BreakpointCategory => {
   if (breakpoint.kind === "event") {
     return "events";
   }
-  const target = shape?.targets?.find((candidate) => candidate.breakpointEvent === breakpoint.event);
-  if (target) {
-    return target.id;
-  }
-  const lower = breakpoint.event.toLowerCase();
-  if (lower.includes("sh4")) return "sh4";
-  if (lower.includes("arm7")) return "arm7";
-  if (lower.includes("aica") || lower.includes("dsp")) return "dsp";
-  return "events";
+  return listedTargets(shape).find((candidate) => candidate.breakpointEvent === breakpoint.event)?.id ?? "events";
 };
 
-/** A breakpoint as lists and notices print it: the event, and for a code breakpoint its address in the target's format. */
+/**
+ * A breakpoint as lists and notices print it: the event, and for a code breakpoint its address
+ * in the format of its target. No target, no format: the address is then plain hex.
+ */
 export const describeBreakpoint = (shape: DebuggerShape | undefined, breakpoint: BreakpointDescriptor): string => {
   if (breakpoint.kind === "event") {
     return breakpoint.event;
@@ -168,7 +188,7 @@ export const describeBreakpoint = (shape: DebuggerShape | undefined, breakpoint:
   if (breakpoint.address === undefined) {
     return `${breakpoint.event} == ?`;
   }
-  const category = breakpointCategory(shape, breakpoint);
-  const target = category === "events" ? V2_TARGETS.sh4 : targetInfo(shape, category);
-  return `${breakpoint.event} == ${formatAddress(target, breakpoint.address)}`;
+  const target = listedTargets(shape).find((candidate) => candidate.breakpointEvent === breakpoint.event);
+  const address = target ? formatAddress(target, breakpoint.address) : `0x${breakpoint.address.toString(16).toUpperCase()}`;
+  return `${breakpoint.event} == ${address}`;
 };
