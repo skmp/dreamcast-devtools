@@ -14,7 +14,7 @@ import {
   tooltipButton,
 } from "./support/fixtures";
 import type { Locator } from "@playwright/test";
-import { serveScriptedDebugger, type Json } from "./support/scriptedDebugger";
+import { defaultAnswer, jsonRpcError, serveScriptedDebugger, type Json } from "./support/scriptedDebugger";
 import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT } from "../server/mockDebugger";
 
 const hex8 = (address: number) => `0x${address.toString(16).toUpperCase().padStart(8, "0")}`;
@@ -322,14 +322,65 @@ const hexCell = (view: Locator, address: number): Locator => view.locator(`[data
  * Double-clicks the byte at `address`. A row is one piece of text, and the view finds the byte
  * from where in the hex column the pointer is: here the middle of the byte's second digit.
  */
-const dblclickByte = async (view: Locator, address: number) => {
+const dblclickByte = async (view: Locator, address: number, options: { force?: boolean } = {}) => {
   const cell = hexCell(view, address - (address % 16));
   const box = (await cell.boundingBox())!;
-  await cell.dblclick({ position: { x: ((address % 16) * 3 + 1.5) * (box.width / 47), y: box.height / 2 } });
+  await cell.dblclick({ position: { x: ((address % 16) * 3 + 1.5) * (box.width / 47), y: box.height / 2 }, ...options });
 };
 
 /** The open editor of a memory view (its other box is the address box). */
 const byteEditor = (view: Locator): Locator => view.getByRole("textbox", { name: /^Bytes to write from / });
+
+/**
+ * The place the keyboard has in the hex column of a memory view, on a server that writes
+ * memory: the hex column of one row, which is the one stop of the listing for the Tab key and
+ * names the byte it is on.
+ */
+const place = (view: Locator): Locator => view.getByRole("button", { name: /, write$/ });
+
+/** How far down the screen the header line of a listing is: it moves when something scrolls the listing. */
+const headerTop = async (view: Locator): Promise<number> => (await view.getByText("Address", { exact: true }).boundingBox())!.y;
+
+/** The box that scrolls a listing to the side, in a panel narrower than a row. */
+const sideScroll = (view: Locator, to?: "start" | "end"): Promise<number> =>
+  view
+    .locator("[data-memory-hex]")
+    .first()
+    .evaluate((cell, where) => {
+      let box: HTMLElement | null = cell.parentElement;
+      while (box && !/auto|scroll/.test(getComputedStyle(box).overflowX)) {
+        box = box.parentElement;
+      }
+      if (!box) {
+        throw new Error("nothing scrolls the listing to the side");
+      }
+      if (where) {
+        box.scrollLeft = where === "end" ? box.scrollWidth : 0;
+      }
+      return box.scrollLeft;
+    }, to);
+
+/** By how much the listing, or anything around it up to its panel, is scrolled up or down. */
+const scrolledDown = (view: Locator): Promise<number> =>
+  view.evaluate((root) => {
+    let total = 0;
+    for (let box = root.querySelector<HTMLElement>("[data-memory-hex]"); box && box !== root.parentElement; box = box.parentElement) {
+      total += box.scrollTop;
+    }
+    return total;
+  });
+
+/** How many rows of a listing are on screen as a whole: the listing is cut at the edge of its panel. */
+const wholeRows = (view: Locator): Promise<number> =>
+  view.evaluate((root) => {
+    const cells = Array.from(root.querySelectorAll<HTMLElement>("[data-memory-hex]"));
+    let listing = cells[0].parentElement;
+    while (listing && getComputedStyle(listing).overflowY === "visible") {
+      listing = listing.parentElement;
+    }
+    const frame = listing!.getBoundingClientRect();
+    return cells.filter((cell) => cell.parentElement!.getBoundingClientRect().bottom <= frame.bottom).length;
+  });
 
 const EDIT_HINT = "Double-click a byte to write memory from there";
 const RUNNING_HINT = "Read-only while the target runs: pause it to write memory";
@@ -436,9 +487,11 @@ test.describe("byte editing", () => {
     await openWorkspace(page, "sh4-debugger");
     const view = panel(page, "sh4-memory");
     await expect(memoryRows(view)).toHaveCount(60);
-    // running
+    // running: the bytes say that they cannot be written now, and a double click on one all the same opens nothing
     await expect(hexCell(view, 0x8c010000)).toHaveAttribute("title", RUNNING_HINT);
-    await dblclickByte(view, 0x8c010002);
+    await expect(hexCell(view, 0x8c010000)).toHaveAttribute("aria-disabled", "true");
+    await dblclickByte(view, 0x8c010002, { force: true });
+    await dblclickByte(view, 0x8c010012);
     await expect(byteEditor(view)).toHaveCount(0);
 
     await pauseFromToolbar(page);
@@ -519,6 +572,10 @@ test.describe("byte editing", () => {
   });
 
   test("a run that would pass the last address of the target is not sent", async ({ page, rpc }) => {
+    // The last sixty rows of an address space are one view, which moves no further. Its last
+    // row is on screen in a panel that has room for sixty rows: the listing is cut at the edge
+    // of its panel, and nothing scrolls it.
+    await page.setViewportSize({ width: 1600, height: 2800 });
     await openWorkspace(page, "sh4-debugger");
     await pauseFromToolbar(page);
     const view = panel(page, "sh4-memory");
@@ -527,6 +584,7 @@ test.describe("byte editing", () => {
     await box.fill("0xFFFFFFFF");
     await box.press("Enter");
     await expect(memoryRows(view).last().locator("span").first()).toHaveText("0xFFFFFFF0");
+    await expect(memoryRows(view).last().locator("span").first()).toBeInViewport({ ratio: 1 });
     await dblclickByte(view, 0xffffffff);
     const editor = byteEditor(view);
     await expect(editor).toHaveAccessibleName("Bytes to write from 0xFFFFFFFF");
@@ -599,6 +657,433 @@ test.describe("byte editing", () => {
   });
 });
 
+test.describe("byte editing: the box of an editor is in a row of the listing", () => {
+  test("a view that moves is leaving the box: the wheel puts an open editor away, and it is not back when its row is", async ({ page, rpc }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const first = memoryRows(view).first().locator("span").first();
+    await expect(memoryRows(view)).toHaveCount(60);
+
+    // an editor in one of the first six rows: a notch of the wheel takes its row out of the listing
+    await dblclickByte(view, 0x8c010004);
+    await byteEditor(view).fill("AA");
+    await memoryRows(view).nth(5).hover();
+    await expect(byteEditor(view)).toBeFocused();
+    await page.mouse.wheel(0, 60);
+    await expect(first).toHaveText(hex8(0x8c010000 + 96));
+    await expect(byteEditor(view)).toHaveCount(0);
+    // the focus the box had is on the hex column, which is no box: what is typed next goes nowhere
+    await expect(place(view)).toBeFocused();
+    await page.keyboard.type("8C020000");
+    // the row is back: the editor is not, and nothing takes the focus
+    await page.mouse.wheel(0, -60);
+    await expect(first).toHaveText(hex8(0x8c010000));
+    await expect(rowAt(view, 0x8c010000)).toBeVisible();
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(view.getByRole("textbox")).toHaveCount(1);
+    await expect(place(view)).toBeFocused();
+
+    // an editor in a row that stays in the listing when the view moves is put away as well: its
+    // row is another one then, and the box would be made again there, with what was typed selected
+    await dblclickByte(view, 0x8c0100a4);
+    await byteEditor(view).fill("BB");
+    await page.mouse.wheel(0, 60);
+    await expect(first).toHaveText(hex8(0x8c010000 + 96));
+    await expect(rowAt(view, 0x8c0100a0)).toBeVisible();
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view)).toHaveCount(0);
+    await page.keyboard.type("CC");
+    await page.keyboard.press("Escape");
+
+    expect(rpc.requests("state.writeMemory")).toEqual([]);
+    await expect(rowAt(view, 0x8c0100a0).locator("span").nth(1)).toHaveText(/^([0-9A-F]{2} ){15}[0-9A-F]{2}$/);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+
+  test("the wheel over the memory view takes the focus out of no other box: an address typed elsewhere is not written to memory", async ({ page, rpc }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const listing = panel(page, "sh4-disassembly");
+    const first = memoryRows(view).first().locator("span").first();
+    await expect(memoryRows(view)).toHaveCount(60);
+
+    await dblclickByte(view, 0x8c010004);
+    await byteEditor(view).fill("AA");
+    await memoryRows(view).nth(5).hover();
+    await page.mouse.wheel(0, 60);
+    await expect(first).toHaveText(hex8(0x8c010000 + 96));
+
+    // an address is being typed into the box of the disassembly, without "0x": a run of bytes, if it were one
+    const box = listing.getByRole("textbox");
+    await box.click();
+    await box.fill("8C02");
+    // the memory view is moved back to the row that was edited
+    await memoryRows(view).nth(5).hover();
+    await page.mouse.wheel(0, -60);
+    await expect(first).toHaveText(hex8(0x8c010000));
+    await page.waitForTimeout(300);
+    await expect(box).toBeFocused();
+    await expect(byteEditor(view)).toHaveCount(0);
+    await page.keyboard.type("0000");
+    await page.keyboard.press("Enter");
+    // the listing went there, and no memory was written
+    await expect(disassemblyRows(listing).first()).toHaveAttribute("data-address", String(0x8c020000 - 10 * 2));
+    expect(rpc.requests("state.writeMemory")).toEqual([]);
+    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+  });
+
+  test("rows that give way to an error take an open editor with them: it is not back, with the focus, when the bytes are read again", async ({ page }) => {
+    const server = await serveScriptedDebugger(page);
+    server.shape.capabilities = ["event-breakpoints", "callstack", "memory-write"];
+    let failing = false;
+    server.answer("state.getMemorySlice", (params) => (failing ? jsonRpcError(-32000, "emulator busy") : defaultAnswer("state.getMemorySlice", params)));
+    await gotoRoute(page, "/workspace/sh4-debugger");
+    await server.described();
+    const view = panel(page, "sh4-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+
+    await dblclickByte(view, 0x8c010004);
+    await byteEditor(view).fill("AA");
+    await expect(byteEditor(view)).toBeFocused();
+    // another client steps the target: a new stop, for which the bytes are read again, and the read fails
+    failing = true;
+    server.state.execution = { state: "paused", stopId: 2, reason: "pause" };
+    server.tick();
+    await expect(view.getByText("emulator busy")).toBeVisible();
+    await expect(memoryRows(view)).toHaveCount(0);
+    await expect(byteEditor(view)).toHaveCount(0);
+    // the next stop reads them: the rows are back, and the editor is not
+    failing = false;
+    server.state.execution = { state: "paused", stopId: 3, reason: "pause" };
+    server.tick();
+    await expect(memoryRows(view)).toHaveCount(60);
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(view.getByRole("textbox")).toHaveCount(1);
+    expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe("INPUT");
+    expect(server.requestsOf("state.writeMemory")).toEqual([]);
+  });
+
+  test("another client resumes the target while the focus is in the editor of a byte: the editor goes, and the next stop does not bring it back", async ({
+    page,
+  }) => {
+    // The toolbar's Run would take the focus out of the box, and leaving the box puts an editor
+    // away by itself. Here nothing is clicked: the ticks say that the target runs, and stops again.
+    const server = await serveScriptedDebugger(page);
+    server.shape.capabilities = ["event-breakpoints", "callstack", "memory-write"];
+    await gotoRoute(page, "/workspace/sh4-debugger");
+    await server.described();
+    const view = panel(page, "sh4-memory");
+    const status = page.getByRole("status", { name: "Execution state" });
+    await expect(memoryRows(view)).toHaveCount(60);
+
+    await dblclickByte(view, 0x8c010006);
+    await byteEditor(view).fill("5A");
+    await expect(byteEditor(view)).toBeFocused();
+
+    server.state.execution = { state: "running", stopId: 1 };
+    server.tick();
+    await expect(status).toContainText("Running");
+    // no box while the target runs; the byte has the focus the box had, and cannot be written
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(place(view)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName("0x8C010006 06, write");
+    await expect(place(view)).toHaveAttribute("aria-disabled", "true");
+    for (const key of ["Enter", "F2", "Space"]) {
+      await page.keyboard.press(key);
+    }
+    await expect(byteEditor(view)).toHaveCount(0);
+    // the arrows move the place all the same: that reads, and writes nothing
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowDown");
+    await expect(hexCell(view, 0x8c010010)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName("0x8C010017 17, write");
+
+    // a new stop: the box is not back, and what was typed is gone with it
+    server.state.execution = { state: "paused", stopId: 2, reason: "pause" };
+    server.tick();
+    await expect(status).toContainText("stop 2");
+    await expect.poll(() => server.requestsOf("state.getMemorySlice").length).toBe(2);
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view)).toHaveCount(0);
+    // the byte can be written again, where the focus still is
+    await expect(place(view)).toBeFocused();
+    await expect(place(view)).not.toHaveAttribute("aria-disabled");
+    await page.keyboard.press("Enter");
+    await expect(byteEditor(view)).toHaveAccessibleName("Bytes to write from 0x8C010017");
+    await expect(byteEditor(view)).toHaveValue("17");
+    await byteEditor(view).press("Escape");
+    expect(server.requestsOf("state.writeMemory")).toEqual([]);
+  });
+
+  test("the listing is cut at the edge of its panel and is not scrolled: an editor in the row that is cut there leaves the rows where they are", async ({
+    page,
+    rpc,
+  }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+
+    // The row the edge of the panel cuts: its upper part is on screen, the rest is not. (The
+    // window is given a height at which about half of that row is, whatever the layout is.)
+    type CutRow = { address: number; x: number; y: number };
+    let cut: CutRow | undefined;
+    for (let height = 1000; height <= 1040 && !cut; height += 4) {
+      await page.setViewportSize({ width: 1600, height });
+      await page.waitForTimeout(150);
+      cut = await view.evaluate((root): CutRow | undefined => {
+        const cells = Array.from(root.querySelectorAll<HTMLElement>("[data-memory-hex]"));
+        let listing = cells[0].parentElement;
+        while (listing && getComputedStyle(listing).overflowY === "visible") {
+          listing = listing.parentElement;
+        }
+        const edge = listing!.getBoundingClientRect().bottom;
+        for (const cell of cells) {
+          const box = cell.getBoundingClientRect();
+          const shown = edge - box.top;
+          if (box.top < edge && box.bottom > edge && shown >= 7 && shown <= box.height - 4) {
+            // the fourth byte of the row, in the part of it that is on screen
+            return { address: Number(cell.dataset.memoryHex) + 3, x: box.left + (3 * 3 + 1.5) * (box.width / 47), y: box.top + shown / 2 };
+          }
+        }
+        return undefined;
+      });
+    }
+    expect(cut, "a row that the edge of the panel cuts").toBeDefined();
+    const top = await headerTop(view);
+    expect(await scrolledDown(view)).toBe(0);
+
+    // The box of the editor takes the focus, and reaches below the edge. A browser brings what
+    // has the focus on screen by scrolling whatever can be scrolled; the listing cannot be.
+    await page.mouse.dblclick(cut!.x, cut!.y);
+    await expect(byteEditor(view)).toBeFocused();
+    await expect(byteEditor(view)).toHaveAccessibleName(`Bytes to write from ${hex8(cut!.address)}`);
+    await page.keyboard.type("5A");
+    expect(await scrolledDown(view)).toBe(0);
+    expect(await headerTop(view)).toBe(top);
+    await expect(memoryRows(view).first().locator("span").first()).toBeInViewport({ ratio: 1 });
+    await page.keyboard.press("Enter");
+    await expect(byteEditor(view)).toHaveCount(0);
+    expect(rpc.requests("state.writeMemory").map((frame) => frame.params)).toEqual([{ target: "sh4", address: cut!.address, data: [0x5a] }]);
+    // the focus is on the byte again, and that scrolls nothing either
+    await expect(place(view)).toBeFocused();
+    expect(await scrolledDown(view)).toBe(0);
+    expect(await headerTop(view)).toBe(top);
+
+    // nor does what a search in the page does for a row far below the edge: it is brought on screen by nothing
+    await memoryRows(view).last().evaluate((row) => row.scrollIntoView());
+    await hexCell(view, 0x8c010000 + 59 * 16).evaluate((cell) => cell.scrollIntoView({ block: "center" }));
+    expect(await scrolledDown(view)).toBe(0);
+    expect(await headerTop(view)).toBe(top);
+    await expect(memoryRows(view).first().locator("span").first()).toBeInViewport({ ratio: 1 });
+    await expect(memoryRows(view).last()).not.toBeInViewport();
+  });
+});
+
+test.describe("byte editing with the keyboard", () => {
+  test("the hex column of one row is the stop of the Tab key; the arrows move the place, Enter, the space bar and F2 open the editor at its byte, and the place has the focus again when the editor goes", async ({
+    page,
+    rpc,
+  }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+    await expect(hexCell(view, 0x8c010000)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    const mark = view.locator(".memory-cursor");
+    const editor = byteEditor(view);
+
+    // one stop in the whole listing, behind Refresh: the first byte of the first row
+    await expect(place(view)).toHaveCount(1);
+    await expect(view.locator("[data-memory-hex][tabindex]")).toHaveCount(1);
+    await expect(mark).toBeHidden();
+    await view.getByRole("button", { name: "Refresh", exact: true }).focus();
+    await page.keyboard.press("Tab");
+    await expect(hexCell(view, 0x8c010000)).toBeFocused();
+    await expect(place(view)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    await expect(place(view)).not.toHaveAttribute("aria-disabled");
+    // the byte is framed, where its digits are
+    const frameOf = async (address: number) => {
+      const cell = (await hexCell(view, address - (address % 16)).boundingBox())!;
+      const frame = (await mark.boundingBox())!;
+      const character = cell.width / 47;
+      return { left: frame.x - (cell.x + (address % 16) * 3 * character), width: frame.width - 2 * character };
+    };
+    await expect(mark).toBeVisible();
+    expect(Math.abs((await frameOf(0x8c010000)).left + 2)).toBeLessThan(1);
+    expect(Math.abs((await frameOf(0x8c010000)).width - 4)).toBeLessThan(1);
+
+    // the arrows: along the row, and from row to row
+    await page.keyboard.press("ArrowRight");
+    await expect(place(view)).toHaveAccessibleName("0x8C010001 BC, write");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowLeft");
+    await expect(place(view)).toHaveAccessibleName("0x8C010002 32, write");
+    expect(Math.abs((await frameOf(0x8c010002)).left + 2)).toBeLessThan(1);
+    await page.keyboard.press("ArrowDown");
+    await expect(hexCell(view, 0x8c010010)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName(/^0x8C010012 [0-9A-F]{2}, write$/);
+    await expect(place(view)).toHaveCount(1);
+    await expect(view.locator("[data-memory-hex][tabindex]")).toHaveCount(1);
+    expect(Math.abs((await frameOf(0x8c010012)).left + 2)).toBeLessThan(1);
+    await page.keyboard.press("ArrowUp");
+    await expect(hexCell(view, 0x8c010000)).toBeFocused();
+    // a row has sixteen bytes: the place stops at its ends
+    for (let press = 0; press < 20; press++) {
+      await page.keyboard.press("ArrowRight");
+    }
+    await expect(place(view)).toHaveAccessibleName("0x8C01000F 6B, write");
+    for (let press = 0; press < 20; press++) {
+      await page.keyboard.press("ArrowLeft");
+    }
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    // with Ctrl an arrow is not the listing's, and no other key is
+    await page.keyboard.press("Control+ArrowRight");
+    await page.keyboard.press("a");
+    await page.keyboard.press("5");
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    await expect(editor).toHaveCount(0);
+
+    // Enter: the editor at that byte, as after a double click there
+    for (let press = 0; press < 4; press++) {
+      await page.keyboard.press("ArrowRight");
+    }
+    await page.keyboard.press("Enter");
+    await expect(editor).toBeFocused();
+    await expect(editor).toHaveAccessibleName("Bytes to write from 0x8C010004");
+    await expect(editor).toHaveValue("1F");
+    await expect(mark).toBeHidden();
+    await page.keyboard.type("DE AD");
+    await page.keyboard.press("Enter");
+    await expect(editor).toHaveCount(0);
+    await expect(hexCell(view, 0x8c010000)).toHaveText("45 BC 32 04 DE AD 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    // accepted: the focus is on the byte again, which is the one that was read again
+    await expect(place(view)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName("0x8C010004 DE, write");
+    await expect(mark).toBeVisible();
+
+    // F2, and Escape: the same
+    await page.keyboard.press("F2");
+    await expect(editor).toBeFocused();
+    await page.keyboard.type("00");
+    await page.keyboard.press("Escape");
+    await expect(editor).toHaveCount(0);
+    await expect(place(view)).toBeFocused();
+    // the space bar, which is no blank in the box
+    await page.keyboard.press("Space");
+    await expect(editor).toBeFocused();
+    await expect(editor).toHaveValue("DE");
+    // Tab leaves the box: the editor is put away, and the focus is not taken back
+    await page.keyboard.press("Tab");
+    await expect(editor).toHaveCount(0);
+    await expect(place(view)).not.toBeFocused();
+
+    // a press on a byte puts the place there, and a double click does: the editor it opens gives the focus back to that byte
+    const cell = (await hexCell(view, 0x8c010020).boundingBox())!;
+    await page.mouse.click(cell.x + (7 * 3 + 1.5) * (cell.width / 47), cell.y + cell.height / 2);
+    await expect(hexCell(view, 0x8c010020)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName(/^0x8C010027 [0-9A-F]{2}, write$/);
+    await expect(mark).toBeVisible();
+    expect(Math.abs((await frameOf(0x8c010027)).left + 2)).toBeLessThan(1);
+    await dblclickByte(view, 0x8c010039);
+    await expect(editor).toHaveAccessibleName("Bytes to write from 0x8C010039");
+    await editor.press("Escape");
+    await expect(hexCell(view, 0x8c010030)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName(/^0x8C010039 [0-9A-F]{2}, write$/);
+
+    expect(rpc.requests("state.writeMemory").map((frame) => frame.params)).toEqual([{ target: "sh4", address: 0x8c010004, data: [0xde, 0xad] }]);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+
+  test("the place stays on screen: at the last row that is whole, and at the first, an arrow moves the view by a row under it", async ({ page, rpc }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const first = memoryRows(view).first().locator("span").first();
+    await expect(memoryRows(view)).toHaveCount(60);
+    const slices = () => rpc.requests("state.getMemorySlice").map((frame) => frame.params?.address);
+    const top = await headerTop(view);
+    // the panel has room for some of the sixty rows, and cuts the one behind them
+    const whole = await wholeRows(view);
+    expect(whole).toBeGreaterThan(3);
+    expect(whole).toBeLessThan(50);
+    const last = 0x8c010000 + (whole - 1) * 16;
+    await expect(hexCell(view, last)).toBeInViewport({ ratio: 1 });
+    await expect(hexCell(view, last + 16)).not.toBeInViewport({ ratio: 1 });
+    const read = slices().length;
+
+    await place(view).focus();
+    for (let row = 1; row < whole; row++) {
+      await page.keyboard.press("ArrowDown");
+    }
+    // down to the last whole row the view stays where it is
+    await expect(hexCell(view, last)).toBeFocused();
+    await expect(first).toHaveText(hex8(0x8c010000));
+    expect(slices()).toHaveLength(read);
+
+    // one more: the row behind it is not gone to; it comes to the place
+    await page.keyboard.press("ArrowDown");
+    await expect(first).toHaveText(hex8(0x8c010010));
+    expect(slices().at(-1)).toBe(0x8c010010);
+    await expect(place(view)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName(new RegExp(`^${hex8(last + 16)} [0-9A-F]{2}, write$`));
+    await expect(place(view)).toBeInViewport({ ratio: 1 });
+    await expect(view.locator(".memory-cursor")).toBeInViewport({ ratio: 1 });
+    expect(await scrolledDown(view)).toBe(0);
+    expect(await headerTop(view)).toBe(top);
+
+    // and up again: to the first row, and from there the view moves the other way
+    for (let row = 1; row < whole; row++) {
+      await page.keyboard.press("ArrowUp");
+    }
+    await expect(hexCell(view, 0x8c010010)).toBeFocused();
+    await expect(first).toHaveText(hex8(0x8c010010));
+    await page.keyboard.press("ArrowUp");
+    await expect(first).toHaveText(hex8(0x8c010000));
+    await expect(hexCell(view, 0x8c010000)).toBeFocused();
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    expect(slices().slice(read)).toEqual([0x8c010010, 0x8c010000]);
+    expect(await headerTop(view)).toBe(top);
+  });
+
+  test("in a panel narrower than its rows the listing is scrolled to the side for the place of the keyboard, and never up or down", async ({ page }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect.poll(async () => (await view.boundingBox())!.width).toBeLessThan(340);
+    const mark = view.locator(".memory-cursor");
+    const top = await headerTop(view);
+
+    await place(view).focus();
+    await sideScroll(view, "start");
+    for (let press = 0; press < 15; press++) {
+      await page.keyboard.press("ArrowRight");
+    }
+    await expect(place(view)).toHaveAccessibleName("0x8C01000F 6B, write");
+    // the last byte of a row is outside a panel this narrow, until the listing is scrolled to it
+    // (all of its frame is on screen then, but for the fraction of a pixel a scroll position is rounded by)
+    await expect(mark).toBeInViewport({ ratio: 0.9 });
+    expect(await sideScroll(view)).toBeGreaterThan(0);
+
+    await sideScroll(view, "end");
+    for (let press = 0; press < 15; press++) {
+      await page.keyboard.press("ArrowLeft");
+    }
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    await expect(mark).toBeInViewport({ ratio: 0.9 });
+    expect(await scrolledDown(view)).toBe(0);
+    expect(await headerTop(view)).toBe(top);
+  });
+});
+
 test.describe("byte editing on a server that can do what the emulator of milestone M2 can", () => {
   test.use({ mockOptions: { supports: MOCK_M2_SUPPORT } });
 
@@ -639,6 +1124,9 @@ test.describe("a server of milestone M1", () => {
     await dblclickByte(view, 0x8c010004);
     await expect(byteEditor(view)).toHaveCount(0);
     await expect(view.getByRole("textbox")).toHaveCount(1);
+    // ... and the bytes are text: no stop of the Tab key, and no control
+    await expect(place(view)).toHaveCount(0);
+    await expect(view.locator("[data-memory-hex][tabindex], [data-memory-hex][role], .memory-cursor")).toHaveCount(0);
     expect(rpc.requests("state.writeMemory")).toEqual([]);
     expect(rpc.received.filter((frame) => JSON.stringify(frame).includes("-32004"))).toEqual([]);
   });
