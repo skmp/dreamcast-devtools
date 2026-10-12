@@ -90,7 +90,10 @@ not run it. After changing the crate, run it and commit the regenerated files.
   `startPaused`, `sliceContext`, ...), and the `machine` fixture is the mock itself, for what
   the emulator's own window does (`machine.setLifetime("no-machine")`).
 - A test that needs exact ticks, a refused request, a message that breaks the schema or a
-  protocol v2 server answers the page's WebSocket itself (`e2e/support/scriptedDebugger.ts`).
+  server that leaves out what protocol v3 always sends answers the page's WebSocket itself
+  (`e2e/support/scriptedDebugger.ts`). `e2e/v2-server.spec.ts` has the one server of the suite
+  whose `debugger.describe` result has no `protocol`, and a server for each field the client
+  does without.
 - Loading the page with `?crashTest` (before the `#route`) enables a hook that makes an error
   boundary's child throw on a `nulldc:crash-test` window event; `e2e/error-boundary.spec.ts`
   uses it. Without the flag the hook does not exist (`src/app/components/CrashProbe.tsx`).
@@ -218,8 +221,8 @@ where it opens is the server's to say.
   its tooltip says (`Run`, `Step In`, `Go to current PC`, ...). The answer of every `control.*`
   request is checked, and a refusal is shown; one that is repeated while its notice is on
   screen is counted in that notice (`×n`) instead of shown again.
-- **Stops.** A stop is a paused tick whose `stopId` the client has not acted on (for a v2
-  server: the change from running to paused). On a stop the disassembly views scroll to the
+- **Stops.** A stop is a paused tick whose `stopId` the client has not acted on; a paused
+  tick without a `stopId` is no stop. On a stop the disassembly views scroll to the
   program counter if its line is not on screen, the disassembly and memory views read again,
   and a breakpoint that caused it is announced. No other tick does any of that. The views
   also read again after their own actions, and when a game is loaded where there was none.
@@ -232,10 +235,13 @@ where it opens is the server's to say.
 - **Registers.** `registers` of a tick is merged per path (`src/state/tickState.ts`); nothing
   of a connection is kept for the next. `dc.sh4.cpu` is dimmed while `registersStale` is set.
 - **Targets.** Instruction size, address format, default addresses and what works come from
-  `targets` of `debugger.describe` (`src/state/targets.ts`); for a v2 server the values that
-  were built in before protocol v3 are used. A target the server does not list, stepping or
+  `targets` of `debugger.describe` (`src/state/targets.ts`), and nothing is built in for a
+  server that leaves them out. A target the server does not list, stepping or
   memory it does not have, and a capability it lacks (`event-breakpoints`, `callstack`,
   `register-write`, `sgc-capture`) are said in the panel concerned, in place of its controls.
+  The values the UI has of its own serve two things only: the frames of a page that has had no
+  server yet, and the label in the notice of a target that is not listed ("This server does not
+  support the ARM7 target").
   A memory view opens at `defaultMemoryAddress` of the first server that reads that memory,
   also when servers before it only had such a notice to show.
 - **Listings.** A disassembly view shows each address of an answer once; when a server lists
@@ -256,6 +262,19 @@ where it opens is the server's to say.
   scroll bar or a turn of the wheel to the side: no column is squeezed or cut off for it. Its
   toolbar takes a line for each of its three groups when it has to: the step buttons at the
   left, the rest at the right.
+- **What a server leaves out.** The client does not serve protocol v2 any more, and reads
+  nothing into a field that is absent. A `debugger.describe` result without `targets` lists no
+  target, and one without `capabilities` has none: every panel concerned shows its notice and
+  asks the server for nothing; a code breakpoint whose event is of no listed target is listed
+  with the events, its address in plain hex. A result without `protocol` gets the banner of
+  another protocol version and is treated as a server that lists neither, whatever it carries
+  under those names. A paused tick without `stopId` is no stop (none is made from "running, then
+  paused"): no view is moved and no breakpoint is announced. A tick without `callstacks` has no
+  frames (none are kept from the stop before), one without `watches` no watches, and one without
+  `categories` leaves the mute and solo states as they are, as a key it does not carry does. A
+  binary frame without the header is not taken, and its request ends in the error of the frame
+  that did not arrive. An event-log entry without `metadata` is a row without the event name and
+  the cycle count.
 - **Problems.** A server of another protocol version, a `debugger.describe` that failed and
   every message that was dropped because it does not match the schema (with the path of what
   is wrong) are shown in a bar under the toolbar. A `debugger.describe` that failed (the
@@ -273,8 +292,8 @@ reference for every parameter, result, error code and bound; what follows is the
   has `emulator` (`name`, `version`, `build`), `protocol`, `ui` (the version of the UI bundle the
   server embeds, or `"none"`), `capabilities`, `targets` and `deviceTree`. A server says what it
   implements through `capabilities` and `targets`, and answers everything else with the error
-  -32004 `not supported: ...`. A result without `protocol` is a v2 server; the UI then behaves as
-  it did for protocol v2.
+  -32004 `not supported: ...`. A result without `protocol` is no server of this protocol: the
+  UI shows the version banner and treats it as a server that lists no target and no capability.
 - The server pushes one kind of notification, `event.tick`: `tickId`, `timestamp`,
   `executionState` (`state`, `stopId`, and for a stop its `reason` and `breakpointId`; `notice`,
   `registersStale`), `registers`, `breakpoints`, `eventLog`, `watches`, `callstacks`,
