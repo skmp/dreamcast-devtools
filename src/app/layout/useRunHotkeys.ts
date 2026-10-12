@@ -1,20 +1,28 @@
 import { useEffect, useRef } from "react";
 import { hotkeyControl, type RunControlId } from "../../state/runControls";
 
+/** A code editor, with everything it puts into the document for itself. */
+const MONACO = ".monaco-editor";
+
 /**
  * Whether a key press is somebody else's. Monaco has uses of its own for the function keys,
  * and what is typed into an editor is the editor's. A dialog that is open is in front of the
  * page: what is behind it is not operated while it is up (the browser's own meaning of the
  * key, F5 to reload, is the one that is left).
+ *
+ * A dialog is open when it is on screen. One that is kept in the document while it is closed
+ * is hidden, and not open. A widget of a code editor is no dialog of the page, whatever role
+ * it gives itself: Monaco's Find box is a `dialog` that stays in its editor from the first
+ * Ctrl+F on, moved out of sight when it is closed, and in front of nothing but that editor
+ * when it is open. What is typed into it is the editor's by the first rule.
  */
 const belongsElsewhere = (event: KeyboardEvent): boolean => {
   const target = event.target;
-  if (target instanceof Element && target.closest(".monaco-editor") !== null) {
+  if (target instanceof Element && target.closest(MONACO) !== null) {
     return true;
   }
-  // (a dialog that is kept in the document while it is closed is hidden, and not open)
   return Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).some(
-    (dialog) => dialog.getClientRects().length > 0 && getComputedStyle(dialog).visibility !== "hidden",
+    (dialog) => dialog.closest(MONACO) === null && dialog.getClientRects().length > 0 && getComputedStyle(dialog).visibility !== "hidden",
   );
 };
 
