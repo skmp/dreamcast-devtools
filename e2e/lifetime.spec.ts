@@ -47,7 +47,7 @@ test("a machine stopped in the emulator's window is shown as that, with run cont
   const pc = await currentInstructionAddress(view);
   await expect(panel(page, "sh4-callstack").getByRole("listitem").first()).toContainText(`0x${pc.toString(16).toUpperCase()}`);
   // nothing here can resume it: the buttons that could only be refused are off
-  for (const button of [tooltipButton(page, "Run"), tooltipButton(page, "Run to next breakpoint"), tooltipButton(page, "Pause")]) {
+  for (const button of [tooltipButton(page, "Run"), tooltipButton(page, "Pause")]) {
     await expect(button).toBeDisabled();
   }
   for (const label of ["Step Over", "Step In", "Step Out"]) {

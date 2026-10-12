@@ -63,6 +63,31 @@ const cutOff = (page: Page): Promise<string[]> =>
     return problems;
   });
 
+/**
+ * The controls of the toolbar that lie on top of one another. (The two buttons inside the box
+ * of the page list are part of that box, and the switch of the colour scheme is an input laid
+ * over its own picture.)
+ */
+const overlappingInToolbar = (page: Page): Promise<string[]> =>
+  page.evaluate(() => {
+    const controls = Array.from(document.querySelectorAll("header button, header input, header [role=status]")).filter((element) => {
+      const box = element.getBoundingClientRect();
+      return box.width > 0 && box.height > 0 && element.closest(".MuiAutocomplete-endAdornment") === null && element.getAttribute("role") !== "switch";
+    });
+    const name = (element: Element) => element.getAttribute("aria-label") ?? element.textContent ?? element.tagName;
+    const problems: string[] = [];
+    controls.forEach((first, index) => {
+      const a = first.getBoundingClientRect();
+      for (const second of controls.slice(index + 1)) {
+        const b = second.getBoundingClientRect();
+        if (a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5) {
+          problems.push(`${name(first)} / ${name(second)}`);
+        }
+      }
+    });
+    return problems;
+  });
+
 /** A control is there to be used: visible, and all of it on screen (nothing of it under the edge of its panel). */
 const expectUsable = async (control: Locator, name: string) => {
   await expect(control, name).toBeVisible();
@@ -137,10 +162,51 @@ for (const size of [
         await openWorkspace(page, workspace);
         await expect(page.getByRole("status", { name: "Execution state" })).toHaveText("Paused · waiting at the start · stop 1");
 
-        // the run controls of the toolbar
-        for (const name of ["Run", "Pause", "Run to next breakpoint"]) {
-          await expectUsable(page.locator("header").getByRole("button", { name, exact: true }), name);
+        // The run controls of the toolbar: the six of them and the name of the target they step,
+        // all of each on screen, in one line, and none of them on or under another control of
+        // the toolbar (they are four more than there were, in the same room).
+        const toolbar = page.locator("header").getByRole("group", { name: "Run controls" });
+        const controls = [
+          ...["Run", "Pause", "Step Into", "Step Over", "Step Out", "Reset"].map((name) => [name, toolbar.getByRole("button", { name, exact: true })] as const),
+          ["Focused target", toolbar.getByRole("status", { name: "Focused target" })] as const,
+        ];
+        for (const [name, control] of controls) {
+          await expectUsable(control, name);
         }
+        await expect(toolbar.getByRole("status", { name: "Focused target" })).toHaveText(
+          { "sh4-debugger": "SH4", "arm7-debugger": "ARM7", "audio-debugger": "DSP", "mixed-mode-debugger": "SH4" }[workspace],
+        );
+        const boxes = await Promise.all(controls.map(async ([name, control]) => ({ name, box: (await control.boundingBox())! })));
+        const run = boxes[0].box;
+        for (const { name, box } of boxes) {
+          // on the line of Run: centred on it
+          expect(Math.abs(box.y + box.height / 2 - (run.y + run.height / 2)), `${name} is on the line of Run`).toBeLessThanOrEqual(1);
+        }
+        expect(await overlappingInToolbar(page)).toEqual([]);
+        // and each of them is what a click at its place gets: nothing lies over it
+        for (const [name, control] of controls.slice(0, 6)) {
+          expect(
+            await control.evaluate((button) => {
+              const box = button.getBoundingClientRect();
+              const top = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+              return top !== null && button.contains(top);
+            }),
+            `${name} is what is clicked at its place`,
+          ).toBe(true);
+        }
+        // paused at the start, a machine is run, stepped and reset; it is not paused again
+        for (const [name, control] of controls.slice(0, 6)) {
+          const off = name === "Pause" || (workspace === "audio-debugger" && (name === "Step Over" || name === "Step Out"));
+          if (off) {
+            await expect(control, name).toBeDisabled();
+          } else {
+            await expect(control, name).toBeEnabled();
+          }
+        }
+        // the state of the machine is beside them or under them, and all of it can be read
+        const status = page.getByRole("status", { name: "Execution state" });
+        await expect(status).toBeInViewport({ ratio: 1 });
+        expect(await status.evaluate((element) => element.scrollWidth <= element.clientWidth + 1 && element.scrollHeight <= element.clientHeight + 1)).toBe(true);
 
         for (const { id, steps } of VIEWS[workspace]) {
           await expectViewReadable(page, id, steps);
