@@ -1,10 +1,14 @@
 import type { Page, WebSocketRoute } from "@playwright/test";
+import { V3_TARGETS } from "./scriptedDebugger";
 
 /**
  * A debugger server that lives inside the test: the page's WebSocket to /ws is answered
- * here (page.routeWebSocket) instead of by the mock. It speaks just enough of the protocol
- * for a workspace to come up, with a device tree of any size, and sends ticks on demand.
- * The static files are still served by the mock server.
+ * here (page.routeWebSocket) instead of by the mock. It is a server of protocol v3 with a
+ * device tree of any size: its describe result and its ticks carry every field such a server
+ * always sends, so the page that is measured is the page of a server the UI supports, with
+ * its three targets and without the banner of another protocol version. It answers the
+ * reads with nothing and sends ticks on demand. The static files are still served by the
+ * mock server.
  */
 export interface SyntheticTree {
   /** number of nodes under the root node "dc" */
@@ -26,6 +30,8 @@ export interface SyntheticDebugger {
   /** Resolves when the client has asked for debugger.describe and got its first tick. */
   readonly ready: Promise<void>;
   readonly requests: Array<{ method: string; params: unknown }>;
+  /** Its debugger.describe result and the tick it sent last, for a test that holds them to the schema. */
+  readonly sent: { describe?: unknown; tick?: unknown };
 }
 
 const pad = (value: number, width: number) => value.toString().padStart(width, "0");
@@ -44,6 +50,10 @@ export const serveSyntheticDebugger = async (page: Page, tree: SyntheticTree): P
 
   const describe = () => ({
     emulator: { name: "synthetic", version: "e2e", build: "native" },
+    protocol: 3,
+    ui: "none",
+    capabilities: ["event-breakpoints", "callstack"],
+    targets: V3_TARGETS.map((target) => ({ ...target })),
     deviceTree: [
       {
         path: "dc",
@@ -60,26 +70,31 @@ export const serveSyntheticDebugger = async (page: Page, tree: SyntheticTree): P
   });
 
   let tickId = 0;
+  const unmuted = { muted: false, soloed: false };
+  // paused in one stop from the first tick to the last: no tick after the first moves a view
   const buildTick = () => ({
     tickId: tickId++,
     timestamp: Date.now(),
-    executionState: { state: "paused" },
+    executionState: { state: "paused", stopId: 1, reason: "pause" },
     registers: Object.fromEntries(Array.from({ length: tree.nodes }, (_, node) => [nodePath(node), registersOf(node)])),
     breakpoints: {},
     eventLog: [],
     watches: [],
     callstacks: { sh4: [], arm7: [] },
+    categories: { events: unmuted, sh4: unmuted, arm7: unmuted, dsp: unmuted },
   });
 
   let socket: WebSocketRoute | undefined;
   const requests: SyntheticDebugger["requests"] = [];
+  const sent: SyntheticDebugger["sent"] = {};
   let markReady: () => void = () => undefined;
   const ready = new Promise<void>((resolve) => {
     markReady = resolve;
   });
 
   const sendTick = () => {
-    socket?.send(JSON.stringify({ jsonrpc: "2.0", method: "event.tick", params: buildTick() }));
+    sent.tick = buildTick();
+    socket?.send(JSON.stringify({ jsonrpc: "2.0", method: "event.tick", params: sent.tick }));
   };
 
   await page.routeWebSocket(/\/ws$/, (route) => {
@@ -90,7 +105,8 @@ export const serveSyntheticDebugger = async (page: Page, tree: SyntheticTree): P
       const respond = (result: unknown) => route.send(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
       switch (request.method) {
         case "debugger.describe":
-          respond(describe());
+          sent.describe = describe();
+          respond(sent.describe);
           sendTick();
           markReady();
           break;
@@ -113,6 +129,7 @@ export const serveSyntheticDebugger = async (page: Page, tree: SyntheticTree): P
     value,
     ready,
     requests,
+    sent,
     tick(change = []) {
       for (const node of change) {
         values[node][0] += 1;
