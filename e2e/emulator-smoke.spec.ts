@@ -1,5 +1,9 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { test, expect, type Locator, type Page } from "@playwright/test";
 import { Diagnostics, currentInstructionAddress, dockTab, panel, saveScreenshot, statusBar, type RpcFrame } from "./support/fixtures";
+import { DIST_DIR } from "./support/paths";
 
 // The UI against the emulator: the page an emulator serves (the bundle it embeds), driven
 // against the debugger server of that emulator. Every other spec of this suite meets the mock
@@ -28,6 +32,12 @@ const ENTRY = 0x8c010000;
 const SCRATCH = 0x8c200000;
 /** The length of the guest's ARM7 program, which is at 0 of the wave memory. */
 const ARM7_PROGRAM_BYTES = 352;
+
+/** What `dist-native/bundle-info.json` says of a build (scripts/bundle-info.ts). */
+interface BundleInfo {
+  version: string;
+  files: Array<{ path: string; bytes: number; sha256: string }>;
+}
 
 const hex8 = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
 
@@ -132,6 +142,25 @@ test.describe("the UI the emulator serves, against that emulator", () => {
       expect(described.protocol).toBe(3);
       expect(described.ui).not.toBe("none");
       await expect(statusBar(page)).toContainText(`nullDC Debugger ${described.ui}`);
+      // And that bundle is the build of this checkout: the one in dist-native/, which the
+      // set-up of the suite has just made the build of this tree. `ui` is its version, and
+      // what the emulator serves is its files, byte for byte (a tree with changes keeps one
+      // version for different contents). An emulator that was built before the sources
+      // changed, or that serves a directory of its configuration, is not under test here.
+      const bundle = JSON.parse(readFileSync(resolve(DIST_DIR, "bundle-info.json"), "utf8")) as BundleInfo;
+      expect(described.ui, "`ui` of the emulator is the version of this checkout's dist-native: the emulator was built with another bundle").toBe(bundle.version);
+      expect(bundle.files.map((file) => file.path)).toContain("index.html");
+      const served: string[] = [];
+      for (const file of bundle.files) {
+        // (the page is what the emulator answers for "/")
+        const response = await page.request.get(`${origin}/${file.path === "index.html" ? "" : file.path}`);
+        const body = response.ok() ? await response.body() : Buffer.alloc(0);
+        if (response.status() !== 200 || createHash("sha256").update(body).digest("hex") !== file.sha256) {
+          served.push(`${file.path}: HTTP ${response.status()}, ${body.byteLength} bytes for ${file.bytes}`);
+        }
+      }
+      expect(served, "files the emulator serves that are not the files of this checkout's dist-native: it was built with another bundle, or serves a directory").toEqual([]);
+      note(`the bundle: ${bundle.files.length} files, each served as dist-native has it`);
       // what this spec uses of milestone M2
       expect(described.capabilities).toEqual(expect.arrayContaining(["memory-write", "register-write", "reset"]));
       expect(described.targets.filter((target) => target.stepping).map((target) => target.id)).toEqual(expect.arrayContaining(["sh4", "arm7"]));
