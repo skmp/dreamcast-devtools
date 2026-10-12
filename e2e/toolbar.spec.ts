@@ -1508,10 +1508,31 @@ test.describe("Reset", () => {
     const memoryAt = Number(await memoryRow.getAttribute("data-memory-hex"));
     expect(listingAt).toBeGreaterThan(0x8c003000);
     expect(memoryAt).toBeGreaterThan(0x8c007000);
-    const before = {
+    // What the views read by themselves is over before the reset is asked for. A view that was
+    // sent somewhere reads its bytes there, and reads them once more when the page has caught
+    // up with the address it wrote into its URL: how long that takes is how busy the page is.
+    // The two counts are taken when they have stood still over a time in which the page came
+    // to rest, so that nothing a view was going to read anyway is taken for an answer to the
+    // reset.
+    const reads = () => ({
       listings: server.requestsOf("state.getDisassembly").length,
       slices: server.requestsOf("state.getMemorySlice").length,
-    };
+    });
+    /** The page has nothing left to do: what its renders and their effects ask for has been asked for. */
+    const atRest = () => page.evaluate(() => new Promise<void>((resolve) => requestIdleCallback(() => resolve(), { timeout: 10_000 })));
+    let before = reads();
+    await expect
+      .poll(
+        async () => {
+          const earlier = before;
+          await page.waitForTimeout(600);
+          await atRest();
+          before = reads();
+          return before.listings === earlier.listings && before.slices === earlier.slices;
+        },
+        { message: "the views have stopped reading by themselves", intervals: [0], timeout: 60_000 },
+      )
+      .toBe(true);
 
     await expectUsable(page, "Reset");
     await control(page, "Reset").click();
