@@ -1,4 +1,4 @@
-import { Suspense, useEffect, useRef, useCallback, useMemo, useState, type ReactElement, type FunctionComponent } from "react";
+import { Suspense, useEffect, useRef, useCallback, useMemo, useState, type ReactElement, type FunctionComponent, type SyntheticEvent } from "react";
 import {
   DockviewReact,
   type DockviewReadyEvent,
@@ -16,6 +16,7 @@ import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { PanelSelectorModal } from "./PanelSelectorModal";
 import { loadLayout, saveLayout, withKnownPanels } from "./dockingLayoutStorage";
 import { isCompactDock, type DefaultLayoutMode } from "./defaultLayout";
+import { useFocusedTargetStore } from "../../state/focusedTarget";
 import "dockview/dist/styles/dockview.css";
 
 export type PanelDefinition = {
@@ -286,6 +287,27 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
     setModalOpen(true);
   }, []);
 
+  // Which panel has the focus, for the toolbar of the page: its step buttons and the function
+  // keys act on the target of the panel of a target that had it last (`focusedTarget`). A panel
+  // has the focus when the pointer goes down in it or the keyboard focus moves into it: that
+  // panel is the one the event is in. On the header of a group, which is in no panel, it is
+  // the panel that group shows: for a click on a tab the one of that tab, which the dock has
+  // made the group's panel by now (its own listeners are on the elements below this one, and
+  // have run). An event that is in neither (a menu a panel opened elsewhere in the page) says
+  // nothing.
+  const reportFocus = useCallback((event: SyntheticEvent) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const panelId =
+      target.closest("[data-panel-id]")?.getAttribute("data-panel-id") ??
+      apiRef.current?.groups.find((group) => group.element.contains(target))?.activePanel?.id;
+    if (panelId) {
+      useFocusedTargetStore.getState().panelFocused(panelId);
+    }
+  }, []);
+
   // Custom header actions component that shows the "+" button for each group
   const RightHeaderActionsComponent: FunctionComponent<IDockviewHeaderActionsProps> = useCallback(
     ({ api }) => {
@@ -318,6 +340,8 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
     <>
       <Box
         ref={dockRef}
+        onPointerDown={reportFocus}
+        onFocus={reportFocus}
         sx={{
           height: "100%",
           width: "100%",
