@@ -989,6 +989,80 @@ test.describe("the function keys", () => {
     expect(controlRequests(rpc)).toEqual(["control.runUntil"]);
   });
 
+  // Monaco makes the Find box of an editor at the first Ctrl+F, gives it the role of a dialog,
+  // and keeps it in the document from then on: closed, it is moved out of sight above the
+  // editor, with a place on the page still. It is a part of its editor, open or closed.
+  for (const [workspace, title, id, target, label] of [
+    ["sh4-debugger", "SH4: Simulator", "sh4-sim", "sh4", "SH4"],
+    ["audio-debugger", "DSP: Playground", "dsp-playground", "dsp", "DSP"],
+  ] as const) {
+    test(`the Find box of an editor is no dialog of the page: open or closed, the keys are the toolbar's outside the editor (${title})`, async ({ page, rpc, diagnostics }) => {
+      if (workspace === "audio-debugger") {
+        diagnostics.allow(...KNOWN.sgcNoData);
+      }
+      const keys = await recordKeys(page);
+      const loads: string[] = [];
+      page.on("load", () => loads.push(page.url()));
+      await openWorkspace(page, workspace);
+      await expect(executionState(page)).toHaveText("Paused · waiting at the start · stop 1");
+      await addPanelFromSelector(page, 1, title);
+      const editor = monacoEditor(panel(page, id));
+      await expectMonacoReady(editor);
+      const find = editor.locator(".find-widget");
+      /** Whether the box has a place on the page, as far as the document says. */
+      const hasPlace = () => find.evaluate((element) => element.getClientRects().length > 0 && getComputedStyle(element).visibility !== "hidden");
+      // a box of another dock, which the editor's panel is not in front of
+      const outside = panel(page, "watches").getByPlaceholder("Enter expression");
+      await expect(focusedTarget(page)).toHaveText(label);
+      // no editor has been searched yet: there is no box
+      await expect(find).toHaveCount(0);
+
+      // Find: the focus is in the box, and what is pressed there is the editor's
+      await editor.click();
+      await page.keyboard.press("ControlOrMeta+F");
+      await expect(find).toHaveClass(/(^| )visible( |$)/);
+      await expect(find).toHaveAttribute("role", "dialog");
+      expect(await page.evaluate(() => document.activeElement?.closest(".find-widget") !== null)).toBe(true);
+      expect(await press(page, keys, "F5")).toEqual(left("F5"));
+      await page.keyboard.press("F11");
+      await page.waitForTimeout(300);
+      expect(controlRequests(rpc)).toEqual([]);
+
+      // closed: it is in the document, a dialog still, and has a place there
+      await page.keyboard.press("Escape");
+      await expect(find).not.toHaveClass(/(^| )visible( |$)/);
+      await expect(find).toHaveAttribute("aria-hidden", "true");
+      await expect(find).toHaveAttribute("role", "dialog");
+      // (it has gone where it goes: above the top of its editor)
+      await expect(find).not.toBeInViewport();
+      expect(await hasPlace()).toBe(true);
+      await outside.click();
+      await expect(outside).toBeFocused();
+      expect(await press(page, keys, "F11")).toEqual(taken("F11"));
+      await expect(executionState(page)).toHaveText("Paused · step completed · stop 2");
+      expect(controlRequests(rpc)).toEqual([`control.step ${target}`]);
+
+      // open, with the focus out of the editor: the box is in front of its editor, and of nothing else
+      await editor.click();
+      await page.keyboard.press("ControlOrMeta+F");
+      await expect(find).toHaveClass(/(^| )visible( |$)/);
+      await expect(find).toBeInViewport();
+      await outside.click();
+      await expect(outside).toBeFocused();
+      await expect(find).toHaveClass(/(^| )visible( |$)/);
+      await expect(find).not.toHaveAttribute("aria-hidden", "true");
+      expect(await press(page, keys, "F11")).toEqual(taken("F11"));
+      await expect(executionState(page)).toHaveText("Paused · step completed · stop 3");
+      // F5 runs the target, and does not load the page again
+      expect(await press(page, keys, "F5")).toEqual(taken("F5"));
+      await expect(executionState(page)).toHaveText("Running");
+      expect(await press(page, keys, "F6")).toEqual(taken("F6"));
+      await expect(executionState(page)).toHaveText("Paused · paused by the debugger · stop 4");
+      expect(controlRequests(rpc)).toEqual([`control.step ${target}`, `control.step ${target}`, "control.runUntil", `control.pause ${target}`]);
+      expect(loads).toHaveLength(1);
+    });
+  }
+
   test("while a dialog is open the keys are not the toolbar's", async ({ page, rpc }) => {
     const keys = await recordKeys(page);
     await openWorkspace(page, "sh4-debugger");
@@ -1050,6 +1124,12 @@ test.describe("the function keys", () => {
       await putDialog(role, "position: fixed; top: 0; left: 0");
       expect(await press(page, keys, "F11"), role).toEqual(left("F11"));
       expect(await press(page, keys, "F5"), role).toEqual(left("F5"));
+      // Kept from assistive technology, it is on screen all the same: that is what a dialog
+      // is while a menu that was opened from it is up (the library says so of everything
+      // behind its topmost layer).
+      await page.evaluate(() => document.getElementById("a-dialog-of-the-test")!.setAttribute("aria-hidden", "true"));
+      expect(await press(page, keys, "F11"), `${role}, aria-hidden`).toEqual(left("F11"));
+      expect(await press(page, keys, "F5"), `${role}, aria-hidden`).toEqual(left("F5"));
       await removeDialog();
     }
     await page.waitForTimeout(200);
