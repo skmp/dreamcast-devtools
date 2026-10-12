@@ -252,7 +252,9 @@ where it opens is the server's to say.
   the watches (`state.setRegister`, `state.editWatch`), and memory by a double click on a byte
   of the hex column: the run of bytes typed into the box that opens is one
   `state.writeMemory`, from that byte on (`DE AD BE EF`, `deadbeef`; hex, two digits a byte).
-  Enter sends, Escape and leaving the box put it away. The three editors are offered while the
+  Enter sends, Escape and leaving the box put it away; for the box of a byte, which is in a row
+  of the listing, a view that moves (the wheel) is leaving the box, and so are rows that give
+  way to an error. The three editors are offered while the
   target is paused, on a server with the capability (`register-write`, `memory-write`), and
   for a register only when it carries `flags.writable` in `debugger.describe` (a watch finds
   its register by its expression: `<path>.<name>` without regard to case, split at the last
@@ -263,6 +265,23 @@ where it opens is the server's to say.
   last address of the target, which is not sent. While a request is out the editor waits and
   sends nothing more; it closes when the server has accepted the write, and what is then on
   screen is what the server says: the value of the tick, the bytes that are read again.
+- **Writes with the keyboard.** The value of a register the server writes is a stop of the Tab
+  key, in a register panel and in the watches: Enter, the space bar and F2 open its editor. In
+  a memory view the hex column of one row is the stop, and names the byte the keyboard is on.
+  The arrow keys move that place from byte to byte and from row to row, a click on a byte puts
+  it there, and Enter, the space bar and F2 open the editor at its byte. At the first row, and
+  at the last one that is whole on screen, an arrow moves the view by a row instead: the place
+  is never on a row the panel cuts off. When an editor goes with the focus in its box (the
+  write was accepted, Escape, the target runs again) the focus is on the value, or the byte,
+  it was opened from; a focus that left the box by itself stays where it went. While the
+  target runs the values and the place keep the focus they have, say that they cannot be used
+  (`aria-disabled`) and open nothing. On a server without the capability, and for a register
+  without a writer, there is no such stop.
+- **The memory listing is not scrolled.** It is sixty rows, cut at the edge of its panel
+  (`overflow: clip`): the rows below the edge are reached by moving the view through its
+  addresses, and nothing the browser does for a focus or a search in the page scrolls the
+  listing, which would have no way back. In a panel narrower than a row it is scrolled to the
+  side, by its scroll bar, the wheel and the place of the keyboard.
 - **After a write.** When one of this client's writes is answered `{}`, the disassembly and
   memory views read again where they are (`reread` of the store, a counter beside `refresh`):
   a byte edit does not move a listing. No request moves a view to the program counter. That is
