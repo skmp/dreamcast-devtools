@@ -58,6 +58,16 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
   },
 };
 
+/**
+ * The panels of a default layout that are a tab behind another: the register panel of the
+ * workspace's processor, behind the breakpoints. A panel behind a tab is not in the document
+ * until its tab is shown.
+ */
+const BEHIND: Partial<Record<(typeof WORKSPACES)[number], { title: string; id: string; front: string; content: RegExp }>> = {
+  "sh4-debugger": { title: "SH4: Registers", id: "sh4-registers", front: "sh4-breakpoints", content: /Core dc\.sh4\.cpu\s*Name\s*Value\s*Bits\s*PC\s*0x8C0000A/ },
+  "arm7-debugger": { title: "ARM7: Registers", id: "arm7-registers", front: "arm7-breakpoints", content: /ARM7 dc\.aica\.arm7\s*Name\s*Value\s*Bits\s*PC\s*0x002000/ },
+};
+
 /** Frame 0 of a paused target: the program counter in the mock's loop, with its symbol. */
 const CALLSTACKS: Record<string, RegExp> = {
   "sh4-callstack": /#0\s*0x8C0000A[02468ACE]\s*_main_loop\+0x[0-9A-E]\b/,
@@ -76,11 +86,24 @@ for (const workspace of WORKSPACES) {
       await expect(panel(page, id), `panel ${id}`).toBeVisible();
       await expect(panel(page, id), `panel ${id}`).toContainText(content);
     }
-    // nothing else is open
+    // nothing else is shown
     const mounted = await page.locator("[data-panel-id]").evaluateAll((elements) =>
       elements.map((element) => element.getAttribute("data-panel-id")),
     );
     expect(mounted.sort()).toEqual(Object.keys(expected).sort());
+    // and nothing else is open: a tab for each of them, and for the panel behind the breakpoints
+    const behind = BEHIND[workspace];
+    await expect(page.locator(".dv-default-tab")).toHaveCount(Object.keys(expected).length + (behind ? 1 : 0));
+    if (behind) {
+      // the last tab of the breakpoints' group, and not the one the group shows
+      const group = page.locator(".dv-groupview").filter({ has: panel(page, behind.front) });
+      await expect(group.locator(".dv-default-tab")).toHaveText([/Breakpoints$/, behind.title]);
+      await dockTab(page, behind.title).click();
+      await expect(panel(page, behind.id), `panel ${behind.id}`).toContainText(behind.content);
+      await expect(panel(page, behind.front)).toHaveCount(0);
+      await dockTab(page, behind.title.replace("Registers", "Breakpoints")).click();
+      await expect(panel(page, behind.front)).toBeVisible();
+    }
 
     // paused: the callstack panels of the workspace show the frames of the tick
     await pauseFromToolbar(page);
@@ -91,23 +114,26 @@ for (const workspace of WORKSPACES) {
   });
 }
 
+/** What the register panel of an on-chip module shows: its node, the columns and its first register. */
+const registers = (path: string, register: string) => new RegExp(`${path.replaceAll(".", "\\.")}\\s*Name\\s*Value\\s*Bits\\s*${register}\\s*0x`);
+
 /** Every panel of the selector that is not part of the SH4 workspace's centre dock: title -> content. */
 const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((view: Locator) => Promise<void>) }> = [
   { title: "Documentation", id: "documentation", content: /Getting Started/ },
   { title: "SH4: Simulator", id: "sh4-sim", content: /Hide Crosshairs/ },
   { title: "Events: Log", id: "events", content: /\d{2}:\d{2}:\d{2}\.\d{3}/ },
   { title: "Events: Breakpoints", id: "events-breakpoints", content: /No breakpoints defined\./ },
-  { title: "SH4: Registers", id: "sh4-registers", content: /SH4 Registers - Coming Soon/ },
-  { title: "SH4: BSC Registers", id: "bsc-registers", content: /Bus State Controller Registers - Coming Soon/ },
-  { title: "SH4: CCN Registers", id: "ccn-registers", content: /Cache Controller Registers - Coming Soon/ },
-  { title: "SH4: CPG Registers", id: "cpg-registers", content: /Clock Pulse Generator Registers - Coming Soon/ },
-  { title: "SH4: DMAC Registers", id: "dmac-registers", content: /Direct Memory Access Controller Registers - Coming Soon/ },
-  { title: "SH4: INTC Registers", id: "intc-registers", content: /Interrupt Controller Registers - Coming Soon/ },
-  { title: "SH4: RTC Registers", id: "rtc-registers", content: /Real Time Clock Registers - Coming Soon/ },
-  { title: "SH4: SCI Registers", id: "sci-registers", content: /Serial Communications Interface Registers - Coming Soon/ },
-  { title: "SH4: SCIF Registers", id: "scif-registers", content: /Serial Communications Interface w\/ FIFO Registers - Coming Soon/ },
-  { title: "SH4: TMU Registers", id: "tmu-registers", content: /Timer Unit Registers - Coming Soon/ },
-  { title: "SH4: UBC Registers", id: "ubc-registers", content: /User Break Controller Registers - Coming Soon/ },
+  // the register panels of the on-chip modules: each shows the node that offers it
+  { title: "SH4: BSC Registers", id: "bsc-registers", content: registers("BSC dc.sh4.bsc", "BCR1") },
+  { title: "SH4: CCN Registers", id: "ccn-registers", content: registers("CCN dc.sh4.ccn", "PTEH") },
+  { title: "SH4: CPG Registers", id: "cpg-registers", content: registers("CPG dc.sh4.cpg", "FRQCR") },
+  { title: "SH4: DMAC Registers", id: "dmac-registers", content: registers("DMAC dc.sh4.dmac", "SAR0") },
+  { title: "SH4: INTC Registers", id: "intc-registers", content: registers("INTC dc.sh4.intc", "ICR") },
+  { title: "SH4: RTC Registers", id: "rtc-registers", content: registers("RTC dc.sh4.rtc", "R64CNT") },
+  { title: "SH4: SCI Registers", id: "sci-registers", content: registers("SCI dc.sh4.sci", "SCSMR1") },
+  { title: "SH4: SCIF Registers", id: "scif-registers", content: registers("SCIF dc.sh4.scif", "SCSMR2") },
+  { title: "SH4: TMU Registers", id: "tmu-registers", content: registers("TMU dc.sh4.tmu", "TOCR") },
+  { title: "SH4: UBC Registers", id: "ubc-registers", content: registers("UBC dc.sh4.ubc", "BARA") },
   { title: "SH4: Store Queues", id: "sq-contents", content: /Store Queues Contents\s*Memory contents \(all zeros\)/ },
   { title: "SH4: ICACHE", id: "icache-contents", content: /Instruction Cache Contents - Coming Soon/ },
   { title: "SH4: OCACHE", id: "ocache-contents", content: /Operand Cache Contents - Coming Soon/ },
@@ -117,7 +143,7 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
   { title: "ARM7: Disassembly", id: "arm7-disassembly", content: /0x(001FFF|002000)[0-9A-F]{2}/ },
   { title: "ARM7: Memory", id: "arm7-memory", content: /0x00000000/ },
   { title: "ARM7: Breakpoints", id: "arm7-breakpoints", content: /No breakpoints defined\./ },
-  { title: "ARM7: Registers", id: "arm7-registers", content: /ARM7 Registers - Coming Soon/ },
+  { title: "ARM7: Registers", id: "arm7-registers", content: registers("ARM7 dc.aica.arm7", "PC") },
   { title: "CLX2: TA", id: "holly-ta", content: /This view is under consideration\./ },
   { title: "CLX2: CORE", id: "holly-core", content: /Drop your refsw2 log here/ },
   { title: "SGC", id: "sgc", content: /Record some data to display here/ },
@@ -155,12 +181,14 @@ test("the panel selector offers every panel that is not in the dock, and each on
   const addPanel = page.getByLabel("Add Panel", { exact: true }).nth(1);
   await addPanel.click();
   const dialog = page.getByRole("dialog");
-  // the centre dock already has its three default panels; the other 34 are offered, with their ids
+  // the centre dock already has its four default panels, the one behind a tab included; the other 33 are offered, with their ids
+  expect(SELECTOR_PANELS).toHaveLength(33);
   await expect(dialog.getByRole("listitem")).toHaveCount(SELECTOR_PANELS.length);
   for (const { title, id } of SELECTOR_PANELS) {
     await expect(dialog.getByRole("button", { name: `${title} ${id}`, exact: true })).toBeVisible();
   }
   await expect(dialog.getByRole("button", { name: /^SH4: Disassembly / })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: /^SH4: Registers / })).toHaveCount(0);
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
 
@@ -227,7 +255,7 @@ test("the action buttons of a device tree node open that panel in the centre doc
   // nested node: PBUS -> BSC opens a register panel
   await treeItemRow(page, "dc.sh4.pbus").click();
   await treeItem(page, "dc.sh4.bsc").getByLabel("Open SH4: BSC Registers").click();
-  await expect(panel(page, "bsc-registers")).toContainText("Bus State Controller Registers - Coming Soon");
+  await expect(panel(page, "bsc-registers")).toContainText(registers("BSC dc.sh4.bsc", "BCR1"));
 
   // a debugger panel of another target works in this workspace too
   await treeItemRow(page, "dc.aica.arm7").getByLabel("Open ARM7: Disassembly").click();
@@ -245,6 +273,7 @@ test("the dock layout survives a reload and Reset layout restores the default", 
     "SH4: Disassembly",
     "SH4: Memory",
     "SH4: Breakpoints",
+    "SH4: Registers",
     "Watches",
     "SH4: Callstack",
   ]);
@@ -345,7 +374,7 @@ test("a panel of a saved layout that this build does not have is left out, and t
   }
   await expect(panel(page, "sh4-disassembly")).toContainText("0x8C0000A0");
   // what it does not know is not a tab, not an empty panel and not an error
-  expect(await tabTitles(page)).toEqual(["Device Tree", "SH4: Disassembly", "SH4: Memory", "SH4: Breakpoints", "Watches", "SH4: Callstack"]);
+  expect(await tabTitles(page)).toEqual(["Device Tree", "SH4: Disassembly", "SH4: Memory", "SH4: Breakpoints", "SH4: Registers", "Watches", "SH4: Callstack"]);
   await expect(page.locator("[data-error-boundary]")).toHaveCount(0);
   await expect(page.getByRole("alert")).toHaveCount(0);
   // and the panels that went missing can be opened again
