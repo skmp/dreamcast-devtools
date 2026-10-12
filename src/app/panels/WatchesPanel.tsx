@@ -1,4 +1,4 @@
-import { memo, useCallback, useId, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Panel } from "../layout/Panel";
 import {
   Autocomplete,
@@ -14,59 +14,57 @@ import {
 } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import { useCapability } from "../../state/debuggerSelectors";
+import { useCapability, useRunState } from "../../state/debuggerSelectors";
 import { ListFocusKeeper } from "../components/ListFocusKeeper";
 import { NoData } from "../components/PanelNotice";
 import { UNUSABLE_SX } from "../components/unusable";
+import { useWriteEditor } from "../components/useWriteEditor";
 import { CAPABILITIES, type DeviceNodeDescriptor } from "../../lib/debuggerSchema";
-
-const VALUE_TITLE = "Double-click to write the register";
-const READ_ONLY_TITLE = "Read-only: this server cannot write registers";
+import { EDIT_TITLES, editability, hasWriter, indexRegisters, watchedRegister, type Editability } from "./registerPanelModel";
 
 // Component for individual watch item with inline editing
-const WatchItem = ({ expression, value, writable, focusKey, onRemove, onEdit, onModifyExpression }: {
+const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModifyExpression }: {
   expression: string;
   value: unknown;
   /** names the Remove button of this watch for the keyboard focus (see ListFocusKeeper) */
   focusKey: string;
-  /** false: the server has no register writes, and the value cannot be edited */
-  writable: boolean;
+  /**
+   * Whether the value is an editor now, and why not: the server has no register writes, the
+   * register of the watch has no writer (or the watch names no described register), or the
+   * target runs.
+   */
+  mode: Editability;
   onRemove: () => void;
   onEdit: (newValue: string) => Promise<void>;
   onModifyExpression: (newExpression: string) => Promise<void>;
 }) => {
-  const [isEditingValue, setIsEditingValue] = useState(false);
   const [isEditingExpression, setIsEditingExpression] = useState(false);
-  const [editValue, setEditValue] = useState("");
   const [editExpression, setEditExpression] = useState("");
-  const [hasValueError, setHasValueError] = useState(false);
   const [hasExpressionError, setHasExpressionError] = useState(false);
+  // The editor of the value: open until the server has accepted the write, and one request at
+  // a time. Like every editor of a register it is offered while the register can be written;
+  // one that is open when the target runs again is put away.
+  const valueEditor = useWriteEditor(onEdit);
+  const writable = mode === "editable";
+  const isEditingValue = valueEditor.text !== undefined && writable;
+  const { text: valueDraft, close: closeValueEditor } = valueEditor;
+  useEffect(() => {
+    if (valueDraft !== undefined && !writable) {
+      closeValueEditor();
+    }
+  }, [valueDraft, writable, closeValueEditor]);
 
   const handleDoubleClickValue = () => {
     if (!writable) {
       return;
     }
-    setEditValue(formatWatchValue(value));
-    setIsEditingValue(true);
-    setHasValueError(false);
+    valueEditor.open(formatWatchValue(value));
   };
 
   const handleDoubleClickExpression = () => {
     setEditExpression(expression);
     setIsEditingExpression(true);
     setHasExpressionError(false);
-  };
-
-  const handleSaveValue = async () => {
-    try {
-      await onEdit(editValue);
-      setIsEditingValue(false);
-      setHasValueError(false);
-    } catch {
-      // Flash red border on error - keep edit box open
-      setHasValueError(true);
-      setTimeout(() => setHasValueError(false), 500);
-    }
   };
 
   const handleSaveExpression = async () => {
@@ -84,12 +82,10 @@ const WatchItem = ({ expression, value, writable, focusKey, onRemove, onEdit, on
   const handleKeyDownValue = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      handleSaveValue().catch((error) => {
-        console.error("handleSaveValue failed:", error);
-      });
+      // a refusal keeps the box open, marked, and the notice of the store says why
+      valueEditor.submit();
     } else if (e.key === "Escape") {
-      setIsEditingValue(false);
-      setHasValueError(false);
+      valueEditor.close();
     }
   };
 
@@ -170,15 +166,20 @@ const WatchItem = ({ expression, value, writable, focusKey, onRemove, onEdit, on
               {isEditingValue ? (
                 <TextField
                   size="small"
-                  value={editValue}
-                  onChange={(e) => setEditValue(e.target.value)}
+                  value={valueEditor.text ?? ""}
+                  onChange={(e) => valueEditor.change(e.target.value)}
                   onKeyDown={handleKeyDownValue}
-                  onBlur={() => {
-                    setIsEditingValue(false);
-                    setHasValueError(false);
-                  }}
+                  onBlur={valueEditor.close}
                   autoFocus
-                  error={hasValueError}
+                  error={valueEditor.refusal !== undefined}
+                  slotProps={{
+                    htmlInput: {
+                      "aria-label": `New value of ${expression}`,
+                      "aria-busy": valueEditor.sending || undefined,
+                      readOnly: valueEditor.sending,
+                      title: valueEditor.refusal,
+                    },
+                  }}
                   sx={{
                     flex: 1,
                     "& .MuiOutlinedInput-root": {
@@ -225,7 +226,7 @@ const WatchItem = ({ expression, value, writable, focusKey, onRemove, onEdit, on
           <Box
             component="span"
             onDoubleClick={handleDoubleClickValue}
-            title={writable ? VALUE_TITLE : READ_ONLY_TITLE}
+            title={EDIT_TITLES[mode]}
             sx={{ cursor: writable ? "text" : "default" }}
           >
             {formatWatchValue(value)}
@@ -336,8 +337,19 @@ export const WatchesPanel = () => {
   const removeWatch = useDebuggerDataStore((state) => state.removeWatch);
   const editWatch = useDebuggerDataStore((state) => state.editWatch);
   const modifyWatchExpression = useDebuggerDataStore((state) => state.modifyWatchExpression);
-  // state.editWatch is a register write: a server without them (milestone M1) refuses it
-  const writable = useCapability(CAPABILITIES.REGISTER_WRITE);
+  // state.editWatch is a register write. A server without them (milestone M1) refuses it
+  // (-32004), and so does every server for a register without a writer (-32013): neither is
+  // asked for. Which register has one is said in the describe tree and in no tick, and a watch
+  // is an expression: its register is the described one the expression names. Like the other
+  // editors, this one is offered while the target is paused.
+  const registerWrite = useCapability(CAPABILITIES.REGISTER_WRITE);
+  const paused = useRunState() === "paused";
+  const deviceTree = useDebuggerDataStore((state) => state.deviceTree);
+  const described = useMemo(() => indexRegisters(deviceTree), [deviceTree]);
+  const modeOf = (expression: string): Editability => {
+    const register = watchedRegister(described, expression);
+    return editability(register !== undefined && hasWriter(register), { registerWrite, paused });
+  };
   const scope = useId();
   const lostFocus = useRef<string | undefined>(undefined);
 
@@ -381,7 +393,7 @@ export const WatchesPanel = () => {
               key={watch.id}
               expression={watch.expression}
               value={watch.value}
-              writable={writable}
+              mode={modeOf(watch.expression)}
               // the expression, not the id: it is what the user sees, and it is the same watch after the server was restarted
               focusKey={`${scope}:${watch.expression}:remove`}
               onRemove={() => void handleRemove(watch.id)}
