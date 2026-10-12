@@ -82,6 +82,8 @@ export const documentationSections: DocumentationSection[] = [
           "The default is made for the window: side by side from 1600 px on; in a narrower window with both side docks open, the first view over the whole width and the others as tabs below it.",
           "The `+` button in a panel group's header adds another panel to that group.",
           "Device Tree shows the tree returned by `debugger.describe` with the register values of the latest tick. Its search box narrows the tree word by word (node, then register) and shows at most 200 matching rows. Watches lists the watched expressions, and Events: Log shows the event log of the latest tick.",
+          "SH4: Registers, ARM7: Registers and the register panels of the SH4's on-chip modules (BSC, CCN, CPG, DMAC, INTC, RTC, SCI, SCIF, TMU, UBC) are one table each: name, value and width of the registers of the device tree node that offers the panel, and a `+` per row that adds the register to the watches. The device tree opens a panel with the button on its node; the panels of the two processors are a tab behind the breakpoints in their workspace.",
+          "While the target is paused, a double click on a value writes a register (in a register panel and in Watches): type `0x` hex or decimal, Enter sends, Escape closes. A double click on a byte in the hex column of a memory view writes memory from that byte on: type the bytes in hex (`DE AD BE EF`), and the whole run is one write. Only registers the server can write have an editor, and what the server refuses is shown while the editor stays open. After a write the disassembly and memory views read again where they are; a written program counter moves the disassembly to it.",
         ],
       },
       {

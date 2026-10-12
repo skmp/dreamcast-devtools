@@ -224,8 +224,11 @@ where it opens is the server's to say.
 - **Stops.** A stop is a paused tick whose `stopId` the client has not acted on; a paused
   tick without a `stopId` is no stop. On a stop the disassembly views scroll to the
   program counter if its line is not on screen, the disassembly and memory views read again,
-  and a breakpoint that caused it is announced. No other tick does any of that. The views
-  also read again after their own actions, and when a game is loaded where there was none.
+  and a breakpoint that caused it is announced. The views also read again after their own
+  actions, and when a game is loaded where there was none. One more tick moves the views as a
+  stop does (and announces nothing): a paused tick of the same stop in which the program
+  counter of a listed target (`targets[].pcPath` / `pcRegister`) is another one, because
+  somebody wrote it. No other tick does any of that.
   The stop a page connects into, or a view is opened in, is followed like any other: the line
   of the program counter is on screen, with ten instructions above it or as many as fit.
   A disassembly view that is a dock tab behind another has no lines on screen to look at: it
@@ -234,11 +237,44 @@ where it opens is the server's to say.
   client), their ticks are all applied, and the views move and read for the latest only.
 - **Registers.** `registers` of a tick is merged per path (`src/state/tickState.ts`); nothing
   of a connection is kept for the next. `dc.sh4.cpu` is dimmed while `registersStale` is set.
+- **Register panels.** One table (`src/app/panels/RegisterPanel.tsx`) is bound to twelve panel
+  ids: `sh4-registers`, `arm7-registers` and the ten of the on-chip modules of the SH4
+  (`bsc-registers` ... `ubc-registers`). A panel shows the node of the device tree that offers
+  its id in `actions`: nothing in the UI says which node that is. When several nodes offer the
+  id it is the first in the order of the describe tree (a node before its children); when none
+  does, the panel says "This server has no <title>." and asks for nothing. A row is a register
+  with its name, its value, its width in bits and a `+` that adds it to the watches. Names,
+  widths and whether a register can be written are those of `debugger.describe`; only the
+  values are the ticks', which carry no `flags`. With no game loaded every value is `n/a`. The
+  panels of the two processors are part of the default layout of their workspace (SH4 Debugger,
+  ARM7 Debugger), as a tab behind the breakpoints; a saved layout gets them with `Reset layout`.
+- **Writes.** A register is written by a double click on its value, in a register panel or in
+  the watches (`state.setRegister`, `state.editWatch`), and memory by a double click on a byte
+  of the hex column: the run of bytes typed into the box that opens is one
+  `state.writeMemory`, from that byte on (`DE AD BE EF`, `deadbeef`; hex, two digits a byte).
+  Enter sends, Escape and leaving the box put it away. The three editors are offered while the
+  target is paused, on a server with the capability (`register-write`, `memory-write`), and
+  for a register only when it carries `flags.writable` in `debugger.describe` (a watch finds
+  its register by its expression: `<path>.<name>` without regard to case, split at the last
+  dot). So nothing is sent that the server refuses by rule (-32004, or -32013 for a register
+  without a writer). The value of a register is sent as it was typed (`0x` hex or decimal):
+  the server reads it. What it refuses is shown, and the editor stays open with what was
+  typed, marked, with the reason as its title; so does a run that is no bytes or would pass the
+  last address of the target, which is not sent. While a request is out the editor waits and
+  sends nothing more; it closes when the server has accepted the write, and what is then on
+  screen is what the server says: the value of the tick, the bytes that are read again.
+- **After a write.** When one of this client's writes is answered `{}`, the disassembly and
+  memory views read again where they are (`reread` of the store, a counter beside `refresh`):
+  a byte edit does not move a listing. No request moves a view to the program counter. That is
+  the tick's to say, as above, in front of the answer to the write or behind it, and the same
+  for a PC written through a watch or by another client.
 - **Targets.** Instruction size, address format, default addresses and what works come from
   `targets` of `debugger.describe` (`src/state/targets.ts`), and nothing is built in for a
   server that leaves them out. A target the server does not list, stepping or
   memory it does not have, and a capability it lacks (`event-breakpoints`, `callstack`,
-  `register-write`, `sgc-capture`) are said in the panel concerned, in place of its controls.
+  `sgc-capture`) are said in the panel concerned, in place of its controls; without
+  `register-write` or `memory-write` the values and the bytes are no editors, and say so when
+  the pointer rests on them.
   The values the UI has of its own serve two things only: the frames of a page that has had no
   server yet, and the label in the notice of a target that is not listed ("This server does not
   support the ARM7 target").
@@ -261,7 +297,9 @@ where it opens is the server's to say.
   panel is narrower than its columns (about 360 px for the SH4) is scrolled to the side, by its
   scroll bar or a turn of the wheel to the side: no column is squeezed or cut off for it. Its
   toolbar takes a line for each of its three groups when it has to: the step buttons at the
-  left, the rest at the right.
+  left, the rest at the right. The memory view has the same rule below the 520 px at which its
+  font is at its smallest: its rows keep their three columns and are scrolled to the side, and
+  what it says about them ("Updating") stays in the panel.
 - **What a server leaves out.** The client does not serve protocol v2 any more, and reads
   nothing into a field that is absent. A `debugger.describe` result without `targets` lists no
   target, and one without `capabilities` has none: every panel concerned shows its notice and
