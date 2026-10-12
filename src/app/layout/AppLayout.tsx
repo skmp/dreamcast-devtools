@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useMemo, useState, useRef } from "react";
+import { useEffect, useLayoutEffect, useCallback, useMemo, useState, useRef } from "react";
 import { AppBar, Box, Button, Divider, IconButton, Link, Stack, Switch, Typography, Alert } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
 import { lazyImport } from "../components/lazyImport";
@@ -12,6 +12,7 @@ import DarkModeIcon from "@mui/icons-material/DarkMode";
 import LightModeIcon from "@mui/icons-material/LightMode";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
+import { useFocusedTargetStore } from "../../state/focusedTarget";
 import { DeviceTreePanel } from "../panels/DeviceTreePanel";
 import { WatchesPanel } from "../panels/WatchesPanel";
 import { EventLogPanel } from "../panels/EventLogPanel";
@@ -326,6 +327,14 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const showLeftToggle = !isNarrow;
   const showRightToggle = !isNarrow;
 
+  // The focused target of a workspace page is the workspace's own until one of its panels has
+  // had the focus: what had it on the page before is not this page's. Before the page is
+  // painted, so that the toolbar never names the target of another page.
+  const workspaceOpened = useFocusedTargetStore((state) => state.workspaceOpened);
+  useLayoutEffect(() => {
+    workspaceOpened();
+  }, [workspaceId, workspaceOpened]);
+
   // Load layout preferences when workspaceId changes
   useEffect(() => {
     const prefs = loadLayoutPrefs(workspaceId);
@@ -418,11 +427,11 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
           onResetLayout={handleResetLayout}
           currentPage={workspaceId}
           centerSection={
-            <Box sx={{ position: "relative" }}>
-              <RunControls />
+            <>
+              <RunControls workspaceId={workspaceId} />
               {/* next to the run controls: why the target is stopped, and what the server has to say */}
               {connected && initialized && <ExecutionStatus placement="beside" />}
-            </Box>
+            </>
           }
           rightSection={
             <Stack direction="row" spacing={1.5} alignItems="center">

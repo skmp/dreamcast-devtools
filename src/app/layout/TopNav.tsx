@@ -3,6 +3,13 @@ import { Toolbar, Stack, Divider, Button, Box, Autocomplete, TextField } from "@
 import { useNavigate } from "react-router-dom";
 import { createNavigationItems } from "./navigationItems";
 
+/**
+ * Below this width a workspace page hides its side docks (`AppLayout`), and its toolbar has no
+ * room for the run controls between what is on its left and what is on its right: the centre
+ * section then has a line of its own under them.
+ */
+const NO_ROOM_IN_LINE = "@media (max-width: 1199.95px)";
+
 interface TopNavProps {
   onAboutClick: () => void;
   onResetLayout?: () => void;
@@ -29,7 +36,7 @@ export const TopNav = ({
     : null;
 
   return (
-    <Toolbar sx={{ gap: 2, position: "relative" }}>
+    <Toolbar sx={{ gap: 2, position: "relative", ...(centerSection ? { [NO_ROOM_IN_LINE]: { flexWrap: "wrap", rowGap: 0 } } : {}) }}>
       <Stack direction="row" spacing={1.5} alignItems="center" sx={{ flexShrink: 0 }}>
         <Autocomplete
           options={navigationItems}
@@ -70,13 +77,27 @@ export const TopNav = ({
           About
         </Button>
       </Stack>
-      {centerSection && (
-        <Box sx={{ position: "absolute", left: "50%", transform: "translateX(-50%)" }}>
+      {centerSection ? (
+        // In the line, and it has the room between the two sides: what is in it starts where
+        // the left side ends and stays there, whatever is beside it. (It was laid over the
+        // middle of the toolbar, where six buttons are on top of the left side in a window of
+        // 1280 px.)
+        <Box
+          sx={{
+            flex: "1 1 0",
+            minWidth: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 1.5,
+            [NO_ROOM_IN_LINE]: { order: 1, flex: "0 0 100%", justifyContent: "center", pb: 1 },
+          }}
+        >
           {centerSection}
         </Box>
+      ) : (
+        <Box sx={{ flexGrow: 1 }} />
       )}
-      <Box sx={{ flexGrow: 1 }} />
-      {rightSection}
+      {centerSection ? <Box sx={{ [NO_ROOM_IN_LINE]: { ml: "auto" } }}>{rightSection}</Box> : rightSection}
     </Toolbar>
   );
 };

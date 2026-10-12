@@ -5,11 +5,14 @@ import { describeStopReason } from "../../state/stopReasons";
 import { describeBreakpoint } from "../../state/targets";
 
 /**
- * From this width on the toolbar has room for the status between the run controls in its
- * middle and the buttons on its right: 240 px, which the longest state lines fill in two or
- * three lines. A narrower window shows the status in a line of its own under the toolbar.
+ * From this width on the toolbar has room for the status between the run controls and the
+ * buttons on its right: 240 px and more, which the longest state lines fill in two or three
+ * lines. (The left side of the toolbar ends at 555 px; the run controls with their six
+ * buttons take 270 behind a gap of 16; the right side takes 296 and a gap of 16. At 1440 px
+ * that leaves the status 276, behind a gap of 12.) A narrower window shows the status in a
+ * line of its own under the toolbar.
  */
-const ROOM_BESIDE = "@media (min-width: 1280px)";
+const ROOM_BESIDE = "@media (min-width: 1440px)";
 
 interface ExecutionStatusProps {
   /**
@@ -55,18 +58,15 @@ export const ExecutionStatus = ({ placement }: ExecutionStatusProps) => {
       sx={
         beside
           ? {
-              // To the right of the run controls and out of the flow, so that they stay where they are.
+              // To the right of the run controls, which are in front of it in their line and
+              // stay where they are: it has what is left of the line, up to the buttons on the
+              // right, and wraps in it.
               display: "none",
               [ROOM_BESIDE]: { display: "flex" },
-              position: "absolute",
-              left: "100%",
-              top: "50%",
-              transform: "translateY(-50%)",
-              ml: 1.5,
               flexDirection: "column",
-              width: "max-content",
-              // what is left between the run controls in the middle and the buttons on the right
-              maxWidth: "min(460px, calc(50vw - 400px))",
+              flex: "0 1 auto",
+              minWidth: 0,
+              maxWidth: 460,
               // and no more than the toolbar is high: what does not fit is in the title
               maxHeight: 64,
               overflow: "hidden",
