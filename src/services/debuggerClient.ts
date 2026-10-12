@@ -46,7 +46,6 @@ export class DebuggerClient {
   private readonly config: DebuggerClientConfig;
   private notificationHandlers = new Set<(notification: DebuggerNotification) => void>();
   private describedProtocol: number | undefined;
-  private described = false;
 
   constructor(config: DebuggerClientConfig) {
     this.config = config;
@@ -90,14 +89,13 @@ export class DebuggerClient {
       protocol: PROTOCOL_VERSION,
       client: this.config.clientName ?? defaultClientName(),
     });
-    this.described = true;
     this.describedProtocol = shape.protocol;
     return shape;
   }
 
   /**
    * `protocol` of the last debugger.describe result. Undefined before the first describe
-   * and for a v2 server, which does not report one.
+   * and for a server that does not report one.
    */
   get serverProtocol(): number | undefined {
     return this.describedProtocol;
@@ -222,14 +220,7 @@ export class DebuggerClient {
   async fetchSgcFrameData(): Promise<{ frameCount: number; data: ArrayBuffer }> {
     const { result, payload } = await this.callWithBinaryFrame(
       BinaryFrameKind.SGC_FRAMES,
-      async () => {
-        const answer = await this.rpc.call(RpcMethod.STATE_GET_SGC_FRAME_DATA, {});
-        if ("error" in answer) {
-          // the v2 mock's way of saying that nothing has been recorded
-          throw new Error(answer.error.message || "Failed to fetch SGC frame data");
-        }
-        return answer;
-      },
+      () => this.rpc.call(RpcMethod.STATE_GET_SGC_FRAME_DATA, {}),
       (announced) => {
         if (announced.totalBytes !== announced.frameCount * SGC_BYTES_PER_FRAME) {
           throw new Error(
@@ -286,10 +277,11 @@ export class DebuggerClient {
    * A request whose JSON result is followed by one binary frame. The subscription is made
    * before the request is sent and removed on every path.
    *
-   * v3 server: the frame carries a header; only the frame whose magic, kind and binaryId
-   * match is taken (the transport hands every binary frame to every subscriber), its
-   * payloadBytes must equal the announced totalBytes, and the header is stripped.
-   * v2 server (no `protocol` in debugger.describe): the next binary frame is the payload.
+   * The frame carries a header; only the frame whose magic, kind and binaryId match is taken
+   * (the transport hands every binary frame to every subscriber), its payloadBytes must equal
+   * the announced totalBytes, and the header is stripped. A frame without a header is never
+   * taken, and neither is any frame when the result names no binaryId: the request then ends
+   * in the error of the frame that did not arrive.
    */
   private async callWithBinaryFrame<R extends BinaryAnnouncement>(
     kind: number,
@@ -306,7 +298,6 @@ export class DebuggerClient {
 
     try {
       const result = check(await request());
-      const headerExpected = this.described ? (this.describedProtocol ?? 0) >= 3 : result.binaryId !== undefined;
 
       const deadline = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(
@@ -318,12 +309,8 @@ export class DebuggerClient {
       const nextPayload = async (): Promise<ArrayBuffer> => {
         for (;;) {
           while (frames.length > 0) {
-            const frame = frames.shift()!;
-            if (!headerExpected) {
-              return frame;
-            }
-            const parsed = parseBinaryFrame(frame);
-            // not ours: a frame of another request on this connection, or not a v3 frame
+            const parsed = parseBinaryFrame(frames.shift()!);
+            // not ours: a frame of another request on this connection, or one without a header
             if (!parsed.ok || parsed.header.kind !== kind || parsed.header.binaryId !== result.binaryId) {
               continue;
             }
@@ -341,9 +328,6 @@ export class DebuggerClient {
       };
 
       const payload = await Promise.race([nextPayload(), deadline]);
-      if (!headerExpected && payload.byteLength !== result.totalBytes) {
-        throw new Error(`The binary frame carries ${payload.byteLength} bytes, the server announced ${result.totalBytes}`);
-      }
       return { result, payload };
     } finally {
       if (timer !== undefined) {

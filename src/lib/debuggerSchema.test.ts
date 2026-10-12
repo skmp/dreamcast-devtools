@@ -24,9 +24,6 @@ interface Frame {
   error?: unknown;
 }
 
-const loadFrames = (name: string): Frame[] =>
-  JSON.parse(readFileSync(new URL(`./test-fixtures/${name}`, import.meta.url), "utf8")) as Frame[];
-
 type MethodName = keyof typeof DebuggerRpcMethodSchemas;
 
 const issuePaths = (result: { success: boolean; error?: z.ZodError }) =>
@@ -94,59 +91,58 @@ describe("protocol constants", () => {
   });
 });
 
-describe("a v2 server (captured from the mock before protocol v3)", () => {
-  const frames = loadFrames("protocol-v2-frames.json");
-  // the requests of the capture, by id
-  const methods: Record<number, MethodName> = {
-    1: "debugger.describe",
-    2: "control.pause",
-    3: "breakpoints.add",
-    4: "breakpoints.add",
-    5: "state.getMemorySlice",
-    6: "state.getDisassembly",
-    7: "state.getCallstack",
-    8: "state.watch",
-    9: "breakpoints.remove",
-    11: "control.runUntil",
+describe("a message without the fields a v3 server always sends", () => {
+  // The client copy takes it, so that the UI can say what is wrong with the server instead of
+  // dropping what it sends; the strict copy, which the contract runner holds a server to, names
+  // every field that is missing.
+  const describeResult = {
+    emulator: { name: "mockServer", version: "unspecified", build: "native" },
+    deviceTree: [{ path: "dc", label: "Dreamcast", description: "", registers: [{ name: "SYSCLK", value: "200MHz", width: 0 }] }],
+  };
+  const tick = {
+    tickId: 3,
+    timestamp: 1791150000000,
+    executionState: { state: "paused" },
+    registers: { "dc.sh4.cpu": [{ name: "PC", value: "0x8C0000A0", width: 32 }] },
+    breakpoints: { "1": { id: 1, event: "dc.sh4.cpu.pc", address: 0x8c0000a0, kind: "code", enabled: true } },
+    eventLog: [{ eventId: "41", timestamp: 1791150000000, subsystem: "gdrom", severity: "info", message: "command 0x30" }],
   };
 
-  it("is accepted by the client schemas, frame by frame", () => {
-    let responses = 0;
-    let ticks = 0;
-    for (const frame of frames) {
-      if (frame.method === "event.tick") {
-        const parsed = DebuggerRpcMethodSchemas["event.tick"].params.safeParse(frame.params);
-        expect(issuePaths(parsed)).toEqual([]);
-        ticks++;
-      } else if (frame.id !== undefined && methods[frame.id]) {
-        const parsed = DebuggerRpcMethodSchemas[methods[frame.id]].result.safeParse(frame.result);
-        expect(issuePaths(parsed), methods[frame.id]).toEqual([]);
-        responses++;
-      }
-    }
-    expect(responses).toBe(Object.keys(methods).length);
-    expect(ticks).toBeGreaterThanOrEqual(6);
-  });
-
-  it("selects the v2 behaviour: no protocol, targets, stopId or categories", () => {
-    const shape = DebuggerRpcMethodSchemas["debugger.describe"].result.parse(frames[0].result);
+  it("a describe result without protocol, ui, capabilities and targets is one for the client", () => {
+    const shape = DebuggerRpcMethodSchemas["debugger.describe"].result.parse(describeResult);
+    expect(shape).toEqual(describeResult);
     expect(shape.protocol).toBeUndefined();
+    expect(shape.capabilities).toBeUndefined();
     expect(shape.targets).toBeUndefined();
-    // the v2 mock's own, unlisted capabilities pass as open strings
-    expect(shape.capabilities).toEqual(["watches", "step", "breakpoints", "frame-log"]);
-    const tick = DebuggerRpcMethodSchemas["event.tick"].params.parse(frames[1].params);
-    expect(tick.executionState.stopId).toBeUndefined();
-    expect(tick.categories).toBeUndefined();
-    // the breakpoint id is only in the tick of the hit
-    const hit = DebuggerRpcMethodSchemas["event.tick"].params.parse(frames.at(-1)!.params);
-    expect(hit.executionState).toEqual({ state: "paused", breakpointId: 1 });
+    expect(issuePaths(StrictDebuggerRpcMethodSchemas["debugger.describe"].result.safeParse(describeResult)).sort()).toEqual([
+      "capabilities",
+      "protocol",
+      "targets",
+      "ui",
+    ]);
   });
 
-  it("is not a v3 server: the strict copy says what is missing", () => {
-    const shape = StrictDebuggerRpcMethodSchemas["debugger.describe"].result.safeParse(frames[0].result);
-    expect(issuePaths(shape)).toEqual(expect.arrayContaining(["protocol", "ui", "targets"]));
-    const tick = StrictDebuggerRpcMethodSchemas["event.tick"].params.safeParse(frames[3].params);
-    expect(issuePaths(tick)).toEqual(expect.arrayContaining(["executionState.stopId", "categories", "eventLog.0.metadata"]));
+  it("a tick without stopId, watches, callstacks and categories, and a log entry without metadata, is one for the client", () => {
+    const parsed = DebuggerRpcMethodSchemas["event.tick"].params.parse(tick);
+    expect(parsed).toEqual(tick);
+    expect(parsed.executionState.stopId).toBeUndefined();
+    expect(parsed.watches).toBeUndefined();
+    expect(parsed.callstacks).toBeUndefined();
+    expect(parsed.categories).toBeUndefined();
+    expect(parsed.eventLog[0].metadata).toBeUndefined();
+    expect(issuePaths(StrictDebuggerRpcMethodSchemas["event.tick"].params.safeParse(tick)).sort()).toEqual([
+      "callstacks",
+      "categories",
+      "eventLog.0.metadata",
+      "executionState.stopId",
+      "watches",
+    ]);
+  });
+
+  it("a state.getSgcFrameData result without binaryId is one for the client", () => {
+    const result = { frameCount: 1, channelsPerFrame: 64, bytesPerChannel: 128, totalBytes: 8192 };
+    expect(DebuggerRpcMethodSchemas["state.getSgcFrameData"].result.parse(result)).toEqual(result);
+    expect(issuePaths(StrictDebuggerRpcMethodSchemas["state.getSgcFrameData"].result.safeParse(result))).toEqual(["binaryId"]);
   });
 });
 
@@ -499,10 +495,10 @@ describe("the strict copy", () => {
       "binaryId",
       "channelsPerFrame",
     ]);
-    // "no capture" is the JSON-RPC error -32011 for a v3 server; only the client schema takes the v2 mock's in-band object
+    // "no capture" is the JSON-RPC error -32011: an in-band error object is no result of this method, in either copy
     const inBand = { error: { code: -32001, message: "No SGC frame data available. Record some data first." } };
     expect(sgc.safeParse(inBand).success).toBe(false);
-    expect(DebuggerRpcMethodSchemas["state.getSgcFrameData"].result.safeParse(inBand).success).toBe(true);
+    expect(DebuggerRpcMethodSchemas["state.getSgcFrameData"].result.safeParse(inBand).success).toBe(false);
   });
 });
 

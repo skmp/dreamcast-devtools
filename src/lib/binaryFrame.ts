@@ -8,7 +8,7 @@
  *   offset 12  u32      payloadBytes, the `totalBytes` of that result
  *
  * The JSON response is sent first and the frame second, to the requesting client only.
- * A v2 server sends the bare payload.
+ * A frame without the header belongs to no request, and no client takes it.
  */
 export const BINARY_FRAME_MAGIC = "NDB3";
 export const BINARY_FRAME_HEADER_BYTES = 16;

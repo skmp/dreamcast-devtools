@@ -11,16 +11,14 @@ const setup = () => {
 };
 
 const v3Describe = { emulator: { name: "nullDC", version: "3.0.0", build: "native" }, protocol: 3, ui: "none", capabilities: [], targets: [], deviceTree: [] };
-const v2Describe = { emulator: { name: "mockServer", version: "unspecified", build: "native" }, deviceTree: [] };
+/** a describe result without `protocol`: the server that gets the version banner */
+const describeWithoutProtocol = { emulator: { name: "mockServer", version: "unspecified", build: "native" }, deviceTree: [] };
 
 const describeAs = async (client: DebuggerClient, transport: FakeTransport, shape: unknown) => {
   const described = client.describe();
   transport.respond(shape);
   await described;
 };
-
-/** Lets the client's continuation after an awaited response run. */
-const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const sgcPayload = (frames: number) => {
   const payload = new Uint8Array(frames * SGC_BYTES_PER_FRAME);
@@ -45,7 +43,7 @@ describe("DebuggerClient", () => {
     await expect(described).resolves.toMatchObject({ protocol: 3, ui: "none", targets: [] });
     expect(client.serverProtocol).toBe(3);
 
-    await describeAs(client, transport, v2Describe);
+    await describeAs(client, transport, describeWithoutProtocol);
     expect(client.serverProtocol).toBeUndefined();
   });
 
@@ -113,7 +111,7 @@ describe("DebuggerClient", () => {
     }
   });
 
-  describe("binary frames of a v3 server", () => {
+  describe("binary frames", () => {
     it("subscribes before sending, takes the frame with its kind and binaryId, and strips the header", async () => {
       const { transport, client } = setup();
       await describeAs(client, transport, v3Describe);
@@ -206,30 +204,80 @@ describe("DebuggerClient", () => {
     });
   });
 
-  describe("binary frames of a v2 server", () => {
-    it("takes the next binary frame as the payload: there is no header", async () => {
-      const { transport, client } = setup();
-      await describeAs(client, transport, v2Describe);
-      const fetched = client.fetchSgcFrameData();
-      const payload = sgcPayload(1);
-      transport.respond({ frameCount: 1, channelsPerFrame: 64, bytesPerChannel: 128, totalBytes: payload.length });
-      await settle();
-      transport.deliverBinary(payload);
-      const { frameCount, data } = await fetched;
-      expect(frameCount).toBe(1);
-      expect(data.byteLength).toBe(SGC_BYTES_PER_FRAME);
-      expect(new Uint8Array(data)[0]).toBe(0xaa);
-      expect(transport.binarySubscribers).toBe(0);
-    });
+  describe("a binary frame without the header", () => {
+    const NOT_ARRIVED = "The binary frame announced by the server did not arrive within 10 s";
 
-    it("rejects with the message of the in-band error object the v2 mock sent when nothing was recorded", async () => {
+    /** What the server described itself as makes no difference: no describe yet, protocol 3, no `protocol`. */
+    const servers: Array<[string, unknown]> = [
+      ["a client that has not asked for debugger.describe", undefined],
+      ["a server of protocol 3", v3Describe],
+      ["a server whose describe result has no `protocol`", describeWithoutProtocol],
+    ];
+
+    for (const [who, shape] of servers) {
+      it(`is not taken, and the request ends in the error of the frame that did not arrive: ${who}`, async () => {
+        vi.useFakeTimers();
+        const { transport, client } = setup();
+        if (shape !== undefined) {
+          await describeAs(client, transport, shape);
+        }
+        const fetched = client.fetchSgcFrameData();
+        const outcome = expect(fetched).rejects.toThrow(NOT_ARRIVED);
+        const payload = sgcPayload(1);
+        transport.respond({ frameCount: 1, channelsPerFrame: 64, bytesPerChannel: 128, totalBytes: payload.length, binaryId: 1 });
+        await vi.advanceTimersByTimeAsync(0);
+        // the bare payload, with exactly the announced number of bytes
+        transport.deliverBinary(payload);
+        await vi.advanceTimersByTimeAsync(9_999);
+        expect(transport.binarySubscribers).toBe(1);
+        await vi.advanceTimersByTimeAsync(1);
+        await outcome;
+        expect(transport.binarySubscribers).toBe(0);
+      });
+
+      it(`a result that names no binaryId has no frame, with a header or without: ${who}`, async () => {
+        vi.useFakeTimers();
+        const { transport, client } = setup();
+        if (shape !== undefined) {
+          await describeAs(client, transport, shape);
+        }
+        const fetched = client.fetchSgcFrameData();
+        const outcome = expect(fetched).rejects.toThrow(NOT_ARRIVED);
+        const payload = sgcPayload(1);
+        transport.respond({ frameCount: 1, channelsPerFrame: 64, bytesPerChannel: 128, totalBytes: payload.length });
+        await vi.advanceTimersByTimeAsync(0);
+        transport.deliverBinary(payload);
+        transport.deliverBinary(encodeBinaryFrame(BinaryFrameKind.SGC_FRAMES, 0, payload));
+        transport.deliverBinary(encodeBinaryFrame(BinaryFrameKind.SGC_FRAMES, 1, payload));
+        await vi.advanceTimersByTimeAsync(10_000);
+        await outcome;
+        expect(transport.binarySubscribers).toBe(0);
+      });
+    }
+
+    it("the frame with the header that follows it is taken", async () => {
       const { transport, client } = setup();
-      await describeAs(client, transport, v2Describe);
-      const fetched = client.fetchSgcFrameData();
-      transport.respond({ error: { code: -32001, message: "No SGC frame data available. Record some data first." } });
-      await expect(fetched).rejects.toThrow("No SGC frame data available. Record some data first.");
+      const fetched = client.fetchMemoryBinary({ target: "sh4", address: 0x8c010000, length: 4 });
+      transport.respond({ baseAddress: 0x8c010000, totalBytes: 4, binaryId: 9 });
+      transport.deliverBinary(Uint8Array.from([9, 9, 9, 9]));
+      transport.deliverBinary(encodeBinaryFrame(BinaryFrameKind.MEMORY, 9, Uint8Array.from([1, 2, 3, 4])));
+      expect(Array.from(new Uint8Array((await fetched).data))).toEqual([1, 2, 3, 4]);
       expect(transport.binarySubscribers).toBe(0);
     });
+  });
+
+  it("an in-band error object is no result of state.getSgcFrameData: \"no capture\" is the JSON-RPC error -32011", async () => {
+    const { transport, client } = setup();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const problems: string[] = [];
+    client.onInvalidMessage((report) => problems.push(`${report.kind} ${report.method}`));
+    await describeAs(client, transport, v3Describe);
+    const fetched = client.fetchSgcFrameData();
+    transport.respond({ error: { code: -32001, message: "No SGC frame data available. Record some data first." } });
+    await expect(fetched).rejects.toThrow("Response validation failed for state.getSgcFrameData: frameCount:");
+    expect(transport.binarySubscribers).toBe(0);
+    expect(problems).toEqual(["response state.getSgcFrameData"]);
+    vi.restoreAllMocks();
   });
 
   it("reports a dropped tick through onInvalidMessage", () => {

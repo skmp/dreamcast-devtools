@@ -46,7 +46,7 @@ describe("binary frame header (protocol v3)", () => {
     expect(parsed).toMatchObject({ ok: true, header: { payloadBytes: 0 } });
   });
 
-  it("rejects a frame without the magic (a v2 payload)", () => {
+  it("rejects a frame without the magic (a bare payload)", () => {
     const parsed = parseBinaryFrame(new Uint8Array(8192));
     expect(parsed).toEqual({ ok: false, reason: 'frame does not start with "NDB3"' });
   });

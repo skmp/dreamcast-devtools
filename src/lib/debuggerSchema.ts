@@ -8,8 +8,10 @@ import { PROTOCOL_VERSION } from "./protocolVersion";
  * Two sets of zod schemas are built from the one definition in `defineProtocol`:
  *
  * - the client schemas (the named exports and `DebuggerRpcMethodSchemas`). Objects strip
- *   unknown keys, the fields protocol v3 added are optional and the open enums are plain
- *   strings, so the UI also works against a v2 server and against a newer v3 server;
+ *   unknown keys, the fields a v3 server always sends are optional and the open enums are
+ *   plain strings: a message without one of those fields is not dropped (a describe result
+ *   without `protocol` has to get as far as the version banner), and neither is one of a
+ *   newer server. Nothing is inferred from a field that is absent;
  * - `ConformanceSchemas` (and `StrictDebuggerRpcMethodSchemas`), the strict copy the
  *   contract runner holds a v3 server to: unknown keys fail, the fields a v3 server always
  *   sends are required, and the open enums are limited to the values a v3 server sends.
@@ -330,7 +332,7 @@ const within = (bounds: { min: number; max: number }) => z.number().int().min(bo
 const defineProtocol = (conformance: boolean) => {
   /** an object whose unknown keys fail in the strict copy */
   const object = (conformance ? z.strictObject : z.object) as unknown as typeof z.object;
-  /** a field protocol v3 added: a v3 server always sends it, a v2 server never does */
+  /** a field a v3 server always sends: required in the strict copy, optional for the client */
   const always = <T extends z.ZodType>(schema: T): z.ZodOptional<T> =>
     (conformance ? schema : schema.optional()) as unknown as z.ZodOptional<T>;
   /** an open enum: any string for the client, one of the listed values from a v3 server */
@@ -499,12 +501,13 @@ const defineProtocol = (conformance: boolean) => {
       version: z.string(),
       build: z.enum(["native", "wasm"]),
     }),
-    /** absent: a v2 server */
+    /** absent: the server gets the version banner, and lists no target and no capability */
     protocol: always(z.number().int()),
     /** "none" or the version of the UI bundle embedded in the emulator */
     ui: always(z.string()),
+    /** absent: the server has none */
     capabilities: always(z.array(z.string())),
-    /** a target missing from a present list is unsupported; absent: a v2 server */
+    /** a target that is not listed is unsupported; absent: the server lists none */
     targets: always(z.array(TargetSchema)),
     deviceTree: z.array(DeviceNodeDescriptorSchema),
   });
@@ -517,11 +520,11 @@ const defineProtocol = (conformance: boolean) => {
 
   const ExecutionStateBaseSchema = object({
     state: z.enum(["running", "paused"]),
-    /** counts stops; absent: a v2 server */
+    /** counts stops; a paused tick without it is no stop for the client */
     stopId: always(z.number().int().min(0)),
     /** in every paused tick of a v3 server; never in a running tick */
     reason: listed(STOP_REASONS).optional(),
-    /** v3: in every paused tick of a stop caused by a breakpoint. v2: only in the tick of the hit */
+    /** in every paused tick of a stop caused by a breakpoint */
     breakpointId: BreakpointIdSchema.optional(),
     /** only when true: running ticks omit `dc.sh4.cpu` */
     registersStale: (conformance ? z.literal(true) : z.boolean()).optional() as z.ZodOptional<z.ZodBoolean>,
@@ -608,11 +611,8 @@ const defineProtocol = (conformance: boolean) => {
     channelsPerFrame: (conformance ? z.literal(64) : z.number()) as z.ZodNumber,
     bytesPerChannel: (conformance ? z.literal(128) : z.number()) as z.ZodNumber,
     totalBytes: unsigned(),
-    /** absent: a v2 server, whose binary frame has no header */
+    /** the `binaryId` in the header of the frame; without it no frame is taken */
     binaryId: always(unsigned()),
-  });
-  const V2InBandErrorSchema = z.object({
-    error: z.object({ code: z.number(), message: z.string() }),
   });
 
   const targetParam = TargetProcessorSchema;
@@ -738,13 +738,10 @@ const defineProtocol = (conformance: boolean) => {
     [RpcMethod.STATE_GET_SGC_FRAME_DATA]: {
       params: object({}),
       /**
-       * then one binary frame of kind 1 with `frameCount` x 64 x 128 bytes. A v3 server
-       * reports "no capture" as the JSON-RPC error -32011; the v2 mock answered with an
-       * in-band error object, which only the client schema accepts.
+       * then one binary frame of kind 1 with `frameCount` x 64 x 128 bytes. "No capture" is
+       * the JSON-RPC error -32011.
        */
-      result: (conformance ? SgcFrameInfoSchema : z.union([SgcFrameInfoSchema, V2InBandErrorSchema])) as z.ZodUnion<
-        [typeof SgcFrameInfoSchema, typeof V2InBandErrorSchema]
-      >,
+      result: SgcFrameInfoSchema,
     },
     [RpcMethod.STATE_GET_TABLE]: {
       params: object({
