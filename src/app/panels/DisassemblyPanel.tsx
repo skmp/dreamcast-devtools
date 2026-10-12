@@ -27,6 +27,7 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
   const hasTick = useDebuggerDataStore((state) => state.ticks > 0);
   const epoch = useDebuggerDataStore((state) => state.epoch);
   const refresh = useDebuggerDataStore((state) => state.refresh);
+  const reread = useDebuggerDataStore((state) => state.reread);
   const steppable = useDebuggerDataStore((state) => canResume(state.executionState?.reason));
   const breakpoints = useDebuggerDataStore((state) => state.breakpoints);
   const categoryState = useDebuggerDataStore((state) => state.categories[target]);
@@ -76,10 +77,10 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
     );
   }, [ready, opening, info, waitedForConnection]);
 
-  // A stop the client has not acted on yet (stopId changed), or a game that was just loaded:
-  // fetch again, and scroll to the program counter if its line is not on screen. Ticks that are
-  // not a new stop, such as the one that follows a breakpoint or a watch being added, move
-  // nothing and fetch nothing.
+  // A stop the client has not acted on yet (stopId changed), a game that was just loaded, or
+  // a tick of the same stop that shows another program counter (it was written): fetch again,
+  // and scroll to the program counter if its line is not on screen. Other ticks, such as the
+  // one that follows a breakpoint or a watch being added, move nothing and fetch nothing.
   //
   // Not in the render of the tick, but from a timer that the next stop cancels. A server can
   // send stops faster than the page renders them (somebody steps through another client, or
@@ -151,6 +152,14 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
 
   // Build callbacks. They do not depend on the run state: a view that fetched again whenever
   // these changed would fetch with every pause and resume.
+  //
+  // They do depend on `reread`, for that very reason. A view reads its lines again, where it
+  // is, when it is given other callbacks to read them with, and that is what a write of this
+  // client asks of it (memory, a register, the register of a watch: the server accepted it, and
+  // what the lines say can be something else now). It is all the write asks: a byte edit must
+  // not move the listing, and a stop that is still being followed stays followed. Whether the
+  // view goes to the program counter is the tick's to say (`refresh`, above), in front of the
+  // answer to the write or behind it.
   const callbacks: DisassemblyViewCallbacks = useMemo(
     () => ({
       onFetchDisassembly: async (address: number, count: number) => {
@@ -186,7 +195,8 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
         void toggleCategorySolo(target);
       },
     }),
-    [client, target, info.breakpointEvent, control, addBreakpoint, removeBreakpoint, toggleBreakpoint, toggleCategoryMute, toggleCategorySolo],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `reread` is named for what it does, not for what is read from it: other callbacks, and with them one more read of the lines, for every accepted write
+    [client, target, info.breakpointEvent, control, addBreakpoint, removeBreakpoint, toggleBreakpoint, toggleCategoryMute, toggleCategorySolo, reread],
   );
 
   // Register with navigation service. The view's handle changes with its state, so what is
