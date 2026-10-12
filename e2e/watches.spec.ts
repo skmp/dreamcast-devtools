@@ -213,9 +213,10 @@ test("the value of a watch is an editor while the target is paused only, and one
   const value = watchRow(page, "dc.sh4.cpu.gbr").getByText("0x8C000000", { exact: true });
   const editor = watches.getByRole("listitem").getByRole("textbox");
 
-  // running: the value says why it is none, and a double click opens nothing
+  // running: the value says why it is none and that it cannot be used now, and a double click on it all the same opens nothing
   await expect(value).toHaveAttribute("title", "Read-only while the target runs: pause it to write the register");
-  await value.dblclick();
+  await expect(value).toHaveAttribute("aria-disabled", "true");
+  await value.dblclick({ force: true });
   await expect(editor).toHaveCount(0);
   // the expression is no write: it can be changed in either state
   await watches.getByText("dc.sh4.cpu.gbr", { exact: true }).dblclick();
@@ -233,6 +234,117 @@ test("the value of a watch is an editor while the target is paused only, and one
   await expect(editor).toHaveCount(0);
   await expect(watchRow(page, "dc.sh4.cpu.gbr")).toHaveText("dc.sh4.cpu.gbr = 0x8C000000");
   expect(rpc.requests("state.editWatch")).toEqual([]);
+});
+
+test("another client resumes the target while the focus is in the editor of a watch: the editor goes, and the next stop does not bring it back", async ({
+  page,
+}) => {
+  // The toolbar's Run would take the focus out of the box, and leaving the box puts an editor
+  // away by itself. Here nothing is clicked: the ticks say that the target runs, and stops again.
+  const server = await serveScriptedDebugger(page);
+  server.shape.capabilities = ["event-breakpoints", "callstack", "register-write"];
+  const cpu = (((server.shape.deviceTree as Json[])[0].children as Json[])[0].children as Json[])[0];
+  expect(cpu.path).toBe("dc.sh4.cpu");
+  cpu.registers = (cpu.registers as Json[]).map((register) => ({ ...register, flags: { writable: true } }));
+  server.state.watches = [{ id: 4, expression: "dc.sh4.cpu.pr", value: "0x8C000F00" }];
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await server.described();
+  const watches = panel(page, "watches");
+  const editor = watches.getByRole("listitem").getByRole("textbox");
+  const value = watches.getByRole("listitem").locator("span[title]");
+  const status = page.getByRole("status", { name: "Execution state" });
+
+  await value.dblclick();
+  await editor.fill("0x5A");
+  await expect(editor).toBeFocused();
+
+  server.state.execution = { state: "running", stopId: 1 };
+  server.tick();
+  await expect(status).toContainText("Running");
+  // no box while the target runs; the value has the focus the box had, and cannot be used
+  await expect(editor).toHaveCount(0);
+  await expect(value).toBeFocused();
+  await expect(value).toHaveAttribute("aria-disabled", "true");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("F2");
+  await expect(editor).toHaveCount(0);
+
+  // a new stop: the box is not back, and what was typed is gone with it
+  server.state.execution = { state: "paused", stopId: 2, reason: "pause" };
+  server.tick();
+  await expect(status).toContainText("stop 2");
+  await page.waitForTimeout(300);
+  await expect(editor).toHaveCount(0);
+  await expect(watches.getByRole("listitem")).toHaveText("dc.sh4.cpu.pr = 0x8C000F00");
+  // the value is a control again, where the focus still is
+  await expect(value).toBeFocused();
+  await expect(value).not.toHaveAttribute("aria-disabled");
+  await page.keyboard.press("Enter");
+  await expect(editor).toHaveValue("0x8C000F00");
+  await editor.press("Escape");
+  expect(server.requestsOf("state.editWatch")).toEqual([]);
+});
+
+test("the value of a watch is written with the keyboard: it is a stop of the Tab key, Enter, the space bar and F2 open the editor, and the value has the focus again when the editor goes", async ({
+  page,
+  rpc,
+}) => {
+  await openWorkspace(page, "sh4-debugger");
+  await pauseFromToolbar(page);
+  const watches = panel(page, "watches");
+  const input = watches.getByPlaceholder("Enter expression");
+  for (const expression of ["dc.sh4.cpu.gbr", "dc.sysclk"]) {
+    await input.fill(expression);
+    await input.press("Enter");
+    await expect(watchRow(page, expression)).toBeVisible();
+  }
+  const editor = watches.getByRole("listitem").getByRole("textbox");
+  // the value of a watch on a register that can be written is a control, and says whose value it is
+  const control = watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C000000, write" });
+  await expect(control).toHaveCount(1);
+  await expect(control).toHaveText("0x8C000000");
+  // dc.sh4.cpu.pc is another; free text has no writer, and its value is text
+  await expect(watches.getByRole("button", { name: /, write$/ })).toHaveCount(2);
+  await expect(watchRow(page, "dc.sysclk").locator("span[title]")).not.toHaveAttribute("tabindex");
+  await expect(watchRow(page, "dc.sysclk").locator("span[title]")).not.toHaveAttribute("role");
+
+  // it is the stop behind the Remove button of the watch above it
+  await watches.getByRole("button", { name: "Remove dc.sh4.cpu.pc" }).focus();
+  await page.keyboard.press("Tab");
+  await expect(control).toBeFocused();
+
+  // Enter: the editor, as after a double click
+  await page.keyboard.press("Enter");
+  await expect(editor).toBeFocused();
+  await expect(editor).toHaveAccessibleName("New value of dc.sh4.cpu.gbr");
+  await expect(editor).toHaveValue("0x8C000000");
+  await editor.fill("0x8C00FF00");
+  await page.keyboard.press("Enter");
+  await expect(editor).toHaveCount(0);
+  // accepted: the focus is on the value again, which is the tick's
+  await expect(watchRow(page, "dc.sh4.cpu.gbr")).toHaveText("dc.sh4.cpu.gbr = 0x8C00FF00");
+  await expect(watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C00FF00, write" })).toBeFocused();
+
+  // F2, and Escape: the same
+  await page.keyboard.press("F2");
+  await expect(editor).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(editor).toHaveCount(0);
+  await expect(watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C00FF00, write" })).toBeFocused();
+  // the space bar, which is no blank in the box
+  await page.keyboard.press("Space");
+  await expect(editor).toBeFocused();
+  await expect(editor).toHaveValue("0x8C00FF00");
+
+  // Tab leaves the box: the editor is put away, and the focus is where Tab took it
+  await page.keyboard.press("Tab");
+  await expect(editor).toHaveCount(0);
+  await expect(watches.getByRole("button", { name: "Remove dc.sh4.cpu.gbr" })).toBeFocused();
+  // any other key on a value opens nothing
+  await watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C00FF00, write" }).focus();
+  await page.keyboard.press("a");
+  await expect(editor).toHaveCount(0);
+  expect(rpc.requests("state.editWatch").map((frame) => frame.params?.value)).toEqual(["0x8C00FF00"]);
 });
 
 test("a watch on a register without a writer is no editor: free text, and a register that cannot be read", async ({ page, rpc }) => {
