@@ -85,10 +85,11 @@ const tableSx = (theme: Theme) => ({
     textAlign: "right",
     color: theme.palette.text.secondary,
   },
-  // the value takes the room that is left, so that the box of an editor has it
+  // the value takes the room that is left, so that the box of an editor has it, and never
+  // less than a value of 32 bits and its box need
   "& .register-value": {
     width: "100%",
-    minWidth: "20ch",
+    minWidth: "14ch",
   },
   "& .register-value [data-editable]": {
     cursor: "text",
@@ -98,7 +99,7 @@ const tableSx = (theme: Theme) => ({
     color: "inherit",
     boxSizing: "border-box",
     width: "100%",
-    minWidth: "18ch",
+    minWidth: "12ch",
     height: "22px",
     margin: 0,
     padding: "0 4px",
