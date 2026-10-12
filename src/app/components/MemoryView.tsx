@@ -5,7 +5,7 @@ import { RunControlButton } from "./RunControlButton";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import type { MemorySlice } from "../../lib/debuggerSchema";
 import { BYTES_PER_ROW, HEX_COLUMN_CHARACTERS, formatByte, hexColumnByte } from "./memoryEdit";
-import { useWriteEditor } from "./useWriteEditor";
+import { opensEditor, useFocusReturn, useWriteEditor } from "./useWriteEditor";
 import { WriteEditorInput } from "./WriteEditorInput";
 
 type MemoryRow = {
@@ -42,6 +42,13 @@ const ROW_FRAME_PX = 36;
 const LISTING_FONT_SIZE = `clamp(10px, calc((100cqw - ${ROW_FRAME_PX}px) / ${ROW_EM}), 1rem)`;
 /** the padding of a row at its left, in px (`px: 0.5` of the theme) */
 const ROW_PADDING_PX = 4;
+/** where an arrow key takes the place of the keyboard in the hex column: by rows, by bytes */
+const ARROW_STEPS: Readonly<Record<string, readonly [rows: number, bytes: number] | undefined>> = {
+  ArrowLeft: [0, -1],
+  ArrowRight: [0, 1],
+  ArrowUp: [-1, 0],
+  ArrowDown: [1, 0],
+};
 /** a cell of the listing: the listing's font, whatever the theme gives a text by itself */
 const CELL_SX = { font: "inherit", letterSpacing: 0, flexShrink: 0 } as const;
 
@@ -92,6 +99,13 @@ export interface MemoryViewProps {
    * there, and the run of bytes typed into it is written from that byte on (default: false).
    */
   editable?: boolean;
+  /**
+   * The bytes can be written on this server, now or when the target is paused again: the hex
+   * column then has a place for the keyboard, a byte of a row, which Enter opens the editor
+   * at. While the bytes cannot be edited now it says so, and keeps the focus it has
+   * (default: `editable`).
+   */
+  writable?: boolean;
   /** What the hex column says of editing when the pointer rests on it: how to, or why not now. */
   editHint?: string;
   /** What is said in place of the bytes while the view is not `initialized` (default: "No Data"). */
@@ -124,6 +138,7 @@ export const MemoryView = ({
   initialUrlAddress,
   refreshSignal,
   editable = false,
+  writable = editable,
   editHint,
   noDataText = "No Data",
   unplaced = false,
@@ -150,6 +165,8 @@ export const MemoryView = ({
   const wheelRemainder = useRef(0);
   const pendingScrollDelta = useRef(0);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  /** the box that scrolls the listing to the side, in a panel narrower than a row */
+  const sideScrollRef = useRef<HTMLDivElement | null>(null);
   const pendingHighlightRef = useRef<number | undefined>(undefined);
   const lineRefsMap = useRef<Map<number, HTMLDivElement>>(new Map());
   const urlHighlightTriggeredRef = useRef(false);
@@ -317,6 +334,18 @@ export const MemoryView = ({
     [config.maxAddress],
   );
 
+  /** Moves the view by `delta` bytes; while its bytes are being read, when they are in. */
+  const moveView = useCallback(
+    (delta: number) => {
+      if (loading) {
+        pendingScrollDelta.current += delta;
+      } else {
+        adjustAddress(delta);
+      }
+    },
+    [adjustAddress, loading],
+  );
+
   const handleWheel = useCallback(
     (event: WheelEvent) => {
       // A turn to the side is not a move through the addresses: it is left to the box around
@@ -329,19 +358,11 @@ export const MemoryView = ({
 
       while (Math.abs(wheelRemainder.current) >= WHEEL_PIXEL_THRESHOLD) {
         const direction = wheelRemainder.current > 0 ? 1 : -1;
-        const delta = direction * MEMORY_SCROLL_BYTES;
-
-        if (loading) {
-          // Queue the scroll while loading
-          pendingScrollDelta.current += delta;
-        } else {
-          adjustAddress(delta);
-        }
-
+        moveView(direction * MEMORY_SCROLL_BYTES);
         wheelRemainder.current -= direction * WHEEL_PIXEL_THRESHOLD;
       }
     },
-    [adjustAddress, loading],
+    [moveView],
   );
 
   useEffect(() => {
@@ -388,9 +409,17 @@ export const MemoryView = ({
     }
   }, [addressInput, config, callbacks, address, applyPendingHighlight, lastRow]);
 
-  // The editor of a byte: where it is, and what is typed into it. The row of its address shows
-  // it, wherever the view has been moved to in the meantime.
-  const [editAddress, setEditAddress] = useState<number | undefined>(undefined);
+  /** the rows are on screen, and not what is said in their place (no data, an error, a first read) */
+  const listed = initialized && !error && slice !== null && rows.length > 0;
+
+  // The editor of a byte: which byte, and where the view was when it was opened. Its box is in
+  // the row of that byte, and is there for as long as the row is: an editor whose box is not
+  // on screen is put away with what was typed, like one whose box was left. That is so when
+  // the view moves (the wheel is turned: the rows are other addresses then), when the rows
+  // give way to an error, and when the bytes cannot be written any more (the target runs
+  // again, the connection is lost). An editor that stayed open without its box would take the
+  // keyboard focus, from wherever it is by then, when its row is shown again.
+  const [edit, setEdit] = useState<{ at: number; view: number } | undefined>(undefined);
   const editAddressRef = useRef<number | undefined>(undefined);
   const { onWriteMemory } = callbacks;
   const writeTyped = useCallback(
@@ -405,43 +434,157 @@ export const MemoryView = ({
   );
   const editor = useWriteEditor(writeTyped);
   const canEdit = editable && initialized && onWriteMemory !== undefined;
-  const editing = canEdit && editor.text !== undefined && editAddress !== undefined;
-  // An editor is offered while the bytes can be written: one that is open when the target runs
-  // again, or the connection is lost, is not shown any more and is put away with what was typed.
+  const editAddress = edit?.at;
+  const editShown =
+    canEdit &&
+    listed &&
+    edit !== undefined &&
+    edit.view === address &&
+    rows.some((row) => edit.at >= row.address && edit.at < row.address + row.length);
+  const editing = editShown && editor.text !== undefined && editAddress !== undefined;
   const { text: draft, open: openEditor, close: closeEditor } = editor;
   useEffect(() => {
-    if (draft !== undefined && !canEdit) {
+    if (draft !== undefined && !editShown) {
       closeEditor();
     }
-  }, [draft, canEdit, closeEditor]);
+  }, [draft, editShown, closeEditor]);
 
-  // A double click on a byte of the hex column: the editor opens at that byte, with the byte
-  // in it. A row is one piece of text, so the byte is found from where in the column the
-  // pointer is. A byte that could not be read ("??") has no value to edit.
-  const handleListingDoubleClick = useCallback(
-    (event: React.MouseEvent<HTMLElement>) => {
-      const cell = (event.target as HTMLElement).closest<HTMLElement>("[data-memory-hex]");
-      if (!canEdit || !cell) {
-        return;
+  // The place the keyboard has in the hex column, on a server that writes memory: a row of the
+  // listing and a byte of it. It is a place on screen, not an address: the rows are the same
+  // ones when the view moves, and show other addresses. The hex column of that row is the one
+  // stop of the listing for the Tab key; the arrow keys move the place, Enter, the space bar
+  // and F2 open the editor at its byte, and a click on a byte puts it there.
+  const hasCursor = writable && initialized && onWriteMemory !== undefined;
+  const [cursor, setCursor] = useState({ row: 0, byte: 0 });
+  const cursorRow = Math.max(0, Math.min(cursor.row, rows.length - 1));
+  const cursorByte = Math.max(0, Math.min(cursor.byte, (rows[cursorRow]?.length ?? 1) - 1));
+  const cursorCell = useRef<HTMLSpanElement | null>(null);
+  const cursorMark = useRef<HTMLDivElement | null>(null);
+  /** the hex column of the cursor's row takes the focus once it is rendered */
+  const focusCursor = useRef(false);
+  useLayoutEffect(() => {
+    if (!focusCursor.current) {
+      return;
+    }
+    focusCursor.current = false;
+    // Nothing is scrolled up or down for it: the listing has no way back. To the side the
+    // listing is, in a panel narrower than a row, as far as the byte needs.
+    cursorCell.current?.focus({ preventScroll: true });
+    const side = sideScrollRef.current;
+    // the frame of the byte, which is drawn while the hex column has the focus
+    const mark = cursorMark.current?.getBoundingClientRect();
+    if (side && mark && mark.width > 0) {
+      const left = side.getBoundingClientRect().left + side.clientLeft;
+      if (mark.left < left) {
+        side.scrollLeft -= left - mark.left;
+      } else if (mark.right > left + side.clientWidth) {
+        side.scrollLeft += mark.right - (left + side.clientWidth);
       }
-      const row = rows.find((candidate) => candidate.address === Number(cell.dataset.memoryHex));
-      if (!row) {
-        return;
+    }
+  });
+  const placeCursor = useCallback((row: number, byte: number) => {
+    setCursor({ row, byte });
+    focusCursor.current = true;
+  }, []);
+  // the focus is on the byte again when its editor goes
+  const boxFocus = useFocusReturn(editing, cursorCell);
+
+  /** Opens the editor at a byte of a row, with the byte in it. A byte that could not be read ("??") has no value to edit. */
+  const openEditorAt = useCallback(
+    (rowIndex: number, byteIndex: number): boolean => {
+      const row = rows[rowIndex];
+      if (!canEdit || !row || byteIndex >= row.length) {
+        return false;
+      }
+      const byte = row.hex.slice(byteIndex * 3, byteIndex * 3 + 2);
+      if (!/^[0-9A-F]{2}$/.test(byte)) {
+        return false;
+      }
+      editAddressRef.current = row.address + byteIndex;
+      setEdit({ at: row.address + byteIndex, view: address });
+      setCursor({ row: rowIndex, byte: byteIndex });
+      openEditor(byte);
+      return true;
+    },
+    [canEdit, rows, address, openEditor],
+  );
+
+  /** The byte of the hex column a pointer is on: a row is one piece of text, so the byte is found from where in the column the pointer is. */
+  const byteAtPointer = useCallback(
+    (event: React.MouseEvent<HTMLElement>): { row: number; byte: number } | undefined => {
+      const cell = (event.target as HTMLElement).closest<HTMLElement>("[data-memory-hex]");
+      const row = cell ? rows.findIndex((candidate) => candidate.address === Number(cell.dataset.memoryHex)) : -1;
+      if (!cell || row < 0) {
+        return undefined;
       }
       const box = cell.getBoundingClientRect();
-      const index = hexColumnByte(event.clientX - box.left, box.width);
-      const byte = row.hex.slice(index * 3, index * 3 + 2);
-      if (index >= row.length || !/^[0-9A-F]{2}$/.test(byte)) {
-        return;
-      }
-      // the double click has selected the byte as text: the editor shows it selected instead
-      window.getSelection()?.removeAllRanges();
-      editAddressRef.current = row.address + index;
-      setEditAddress(row.address + index);
-      openEditor(byte);
+      const byte = hexColumnByte(event.clientX - box.left, box.width);
+      return byte < rows[row].length ? { row, byte } : undefined;
     },
-    [canEdit, rows, openEditor],
+    [rows],
   );
+
+  // A double click on a byte of the hex column: the editor opens at that byte.
+  const handleListingDoubleClick = useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      const at = byteAtPointer(event);
+      if (at && openEditorAt(at.row, at.byte)) {
+        // the double click has selected the byte as text: the editor shows it selected instead
+        window.getSelection()?.removeAllRanges();
+      }
+    },
+    [byteAtPointer, openEditorAt],
+  );
+
+  // A press on a byte of the hex column: the place of the keyboard is there.
+  const handleListingMouseDown = useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      const at = hasCursor && event.button === 0 ? byteAtPointer(event) : undefined;
+      if (at) {
+        placeCursor(at.row, at.byte);
+      }
+    },
+    [hasCursor, byteAtPointer, placeCursor],
+  );
+
+  /** Whether a row of the listing is on screen as a whole: the listing is cut at the edge of its panel. */
+  const rowOnScreen = (index: number): boolean => {
+    const row = rows[index];
+    const element = row ? lineRefsMap.current.get(row.address) : undefined;
+    const frame = containerRef.current?.getBoundingClientRect();
+    if (!element || !frame) {
+      return false;
+    }
+    const box = element.getBoundingClientRect();
+    return box.top >= frame.top && box.bottom <= frame.bottom;
+  };
+
+  const handleCursorKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    // with Alt, Ctrl or the command key an arrow is the browser's (back, forward)
+    if (event.altKey || event.ctrlKey || event.metaKey) {
+      return;
+    }
+    if (opensEditor(event.key)) {
+      event.preventDefault();
+      openEditorAt(cursorRow, cursorByte);
+      return;
+    }
+    const step = ARROW_STEPS[event.key];
+    if (!step) {
+      return;
+    }
+    event.preventDefault();
+    const [rowStep, byteStep] = step;
+    if (rowStep === 0) {
+      placeCursor(cursorRow, Math.max(0, Math.min(cursorByte + byteStep, rows[cursorRow].length - 1)));
+    } else if (rowOnScreen(cursorRow + rowStep)) {
+      placeCursor(cursorRow + rowStep, cursorByte);
+    } else {
+      // The next row is cut off by the edge of the panel, or there is none: the view moves by
+      // a row under the place, as a text does under a cursor in its last line.
+      moveView(rowStep * BYTES_PER_ROW);
+    }
+  };
 
   return (
     <Box
@@ -500,7 +643,7 @@ export const MemoryView = ({
       <Box sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}>
         {/* This box scrolls to the side when the panel is narrower than a row of the listing, and
             the listing's font is sized by its width (LISTING_FONT_SIZE). */}
-        <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", containerType: "inline-size" }}>
+        <Box ref={sideScrollRef} sx={{ flex: 1, minHeight: 0, overflow: "auto", containerType: "inline-size" }}>
           {!initialized ? (
             <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
               <Typography variant="body2" color="text.secondary">
@@ -518,7 +661,7 @@ export const MemoryView = ({
                 Loading memory.
               </Typography>
             </Stack>
-          ) : slice && rows.length > 0 ? (
+          ) : listed ? (
             <Box
               ref={containerRef}
               sx={{
@@ -527,7 +670,11 @@ export const MemoryView = ({
                 // Never narrower than its rows: what the panel has no room for is scrolled to,
                 // and no column is cut off for it.
                 minWidth: "min-content",
-                overflow: "hidden",
+                // Cut at the edge of the panel, and not scrolled: the rows below the edge are
+                // reached by moving the view through its addresses. ("hidden" would be a box
+                // that the browser scrolls, for a focus in a row at the edge or for a search
+                // in the page, and that nothing scrolls back: the wheel is the view's.)
+                overflow: "clip",
                 typography: "body1",
                 fontSize: LISTING_FONT_SIZE,
                 p: 1.5,
@@ -548,6 +695,7 @@ export const MemoryView = ({
               <Stack
                 spacing={0}
                 onDoubleClick={handleListingDoubleClick}
+                onMouseDown={handleListingMouseDown}
                 sx={{
                   "& .target-address": {
                     border: "2px solid",
@@ -564,6 +712,29 @@ export const MemoryView = ({
                     "100%": {
                       borderColor: "transparent",
                     },
+                  },
+                  // The place of the keyboard: a frame around its byte while the hex column of
+                  // its row has the focus, in place of a ring around the whole column.
+                  "& [data-memory-hex]": {
+                    outline: "none",
+                  },
+                  "& .memory-cursor": {
+                    display: "none",
+                    position: "absolute",
+                    top: 0,
+                    bottom: 0,
+                    width: "calc(2ch + 4px)",
+                    boxSizing: "border-box",
+                    border: "1px solid",
+                    borderColor: "primary.main",
+                    borderRadius: "3px",
+                    pointerEvents: "none",
+                  },
+                  "& [data-memory-hex]:focus ~ .memory-cursor": {
+                    display: "block",
+                  },
+                  "& [data-memory-hex][aria-disabled] ~ .memory-cursor": {
+                    borderColor: "action.disabled",
                   },
                   // the box of an open editor: over the bytes it starts at, in their font
                   "& .memory-editor": {
@@ -591,9 +762,11 @@ export const MemoryView = ({
                   },
                 }}
               >
-                {rows.map((row) => {
+                {rows.map((row, index) => {
                   // the byte of this row that is being edited, if one is
                   const edited = editing && editAddress >= row.address && editAddress < row.address + row.length ? editAddress - row.address : undefined;
+                  // the byte of this row the keyboard is on, if it is on this row
+                  const cursorAt = hasCursor && index === cursorRow ? cursorByte : undefined;
                   return (
                     <Box
                       key={row.id}
@@ -624,6 +797,15 @@ export const MemoryView = ({
                         component="span"
                         data-memory-hex={row.address}
                         title={editHint}
+                        {...(cursorAt !== undefined && {
+                          ref: cursorCell,
+                          role: "button",
+                          tabIndex: 0,
+                          // which byte, what it is, and what the control does
+                          "aria-label": `${config.formatAddress(row.address + cursorAt)} ${row.hex.slice(cursorAt * 3, cursorAt * 3 + 2)}, write`,
+                          "aria-disabled": !canEdit || undefined,
+                          onKeyDown: handleCursorKeyDown,
+                        })}
                         sx={{ ...CELL_SX, width: HEX_COLUMN, whiteSpace: "nowrap", mr: COLUMN_GAP, cursor: canEdit ? "text" : undefined }}
                       >
                         {row.hex}
@@ -631,6 +813,15 @@ export const MemoryView = ({
                       <Typography component="span" sx={{ ...CELL_SX, width: ASCII_COLUMN, whiteSpace: "pre" }}>
                         {row.ascii}
                       </Typography>
+                      {cursorAt !== undefined && (
+                        // behind the three cells, like the editor; it is a frame and has no text
+                        <div
+                          ref={cursorMark}
+                          className="memory-cursor"
+                          aria-hidden="true"
+                          style={{ left: `calc(${ADDRESS_CHARACTERS + GAP_CHARACTERS + cursorAt * 3}ch + ${ROW_PADDING_PX - 2}px)` }}
+                        />
+                      )}
                       {edited !== undefined && (
                         // Behind the three cells of the row, so that they stay its first three
                         // children; laid over the hex column from the byte that is edited on,
@@ -638,6 +829,7 @@ export const MemoryView = ({
                         <WriteEditorInput
                           editor={editor}
                           label={`Bytes to write from ${config.formatAddress(row.address + edited)}`}
+                          focus={boxFocus}
                           className="memory-editor"
                           style={{
                             left: `calc(${ADDRESS_CHARACTERS + GAP_CHARACTERS + edited * 3}ch + ${ROW_PADDING_PX - 4}px)`,
@@ -657,7 +849,7 @@ export const MemoryView = ({
             </Typography>
           )}
         </Box>
-        {initialized && !error && loading && slice && rows.length > 0 && (
+        {listed && loading && (
           <Stack direction="row" spacing={1} alignItems="center" sx={{ position: "absolute", top: 8, right: 16 }}>
             <CircularProgress size={12} thickness={5} />
             <Typography variant="caption" color="text.secondary">

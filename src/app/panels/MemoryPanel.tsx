@@ -33,7 +33,8 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
   const writeMemory = useDebuggerDataStore((state) => state.writeMemory);
   const showError = useDebuggerDataStore((state) => state.showError);
   // state.writeMemory is refused by a server without memory writes (-32004): the view then has
-  // no editor. Editing is offered while the target is paused.
+  // no editor, and no place for the keyboard in its bytes. Editing is offered while the target
+  // is paused.
   const memoryWriteCapability = useCapability(CAPABILITIES.MEMORY_WRITE);
   const paused = useRunState() === "paused";
 
@@ -153,6 +154,7 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
         // screen are read again, where the view is.
         refreshSignal={`${epoch}:${refresh}:${reread}`}
         editable={memoryWriteCapability && paused}
+        writable={memoryWriteCapability}
         editHint={memoryWriteCapability ? (paused ? EDIT_HINT : RUNNING_HINT) : NO_WRITES_HINT}
         noDataText={noDataText}
       />
