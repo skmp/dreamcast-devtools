@@ -771,6 +771,7 @@ describe("run control", () => {
       ["step", "arm7", "control.step", { target: "arm7" }],
       ["stepOver", "sh4", "control.stepOver", { target: "sh4" }],
       ["stepOut", "dsp", "control.stepOut", { target: "dsp" }],
+      ["reset", undefined, "control.reset", {}],
     ] as const) {
       const done = store().control(action, target);
       expect(transport.sent.at(-1)).toMatchObject({ method, params });
@@ -788,6 +789,7 @@ describe("run control", () => {
     ["step", "sh4", "Step"],
     ["stepOver", "arm7", "Step over"],
     ["stepOut", "sh4", "Step out"],
+    ["reset", undefined, "Reset"],
   ] as const)("%s: an in-band error and a JSON-RPC error are both shown, and resolve to false", async (action, target, label) => {
     const { transport } = await initialise();
     const refused = store().control(action, target);
@@ -802,6 +804,79 @@ describe("run control", () => {
       `error: ${label}: refused in the result`,
       `error: ${label}: internal error`,
     ]);
+  });
+
+  // A machine that runs is reset and runs on: no tick says so (design 2.3.2). What the views
+  // fetched is out of date all the same, and the answer is the only word the client gets.
+  describe("reset", () => {
+    it("answered {} it has the views read again where they are, and moves none of them", async () => {
+      const { transport } = await initialise(tickFrame({ state: "running", stopId: 1 }));
+      const before = { refresh: store().refresh, reread: store().reread, ticks: store().ticks };
+      const resetting = store().control("reset");
+      expect(transport.sent.at(-1)).toMatchObject({ method: "control.reset", params: {} });
+      // not before the server has said so
+      expect(store().reread).toBe(before.reread);
+      transport.respond({});
+      await expect(resetting).resolves.toBe(true);
+      expect(store().reread).toBe(before.reread + 1);
+      expect(store().refresh).toBe(before.refresh);
+      // and no tick was needed for it
+      expect(store().ticks).toBe(before.ticks);
+    });
+
+    it("paused, the new stop moves the views and the answer has them read again: in either order", async () => {
+      for (const tickFirst of [false, true]) {
+        const { transport } = await initialise(tickFrame({ state: "paused", stopId: 4, reason: "pause" }));
+        expect([store().refresh, store().reread]).toEqual([1, 0]);
+        const resetting = store().control("reset");
+        const request = transport.sent.at(-1)!;
+        const stop = tickFrame({ state: "paused", stopId: 5, reason: "reset" });
+        if (tickFirst) {
+          transport.deliver(stop);
+          expect([store().refresh, store().reread]).toEqual([2, 0]);
+        }
+        transport.deliver({ jsonrpc: "2.0", id: request.id, result: {} });
+        await expect(resetting).resolves.toBe(true);
+        if (!tickFirst) {
+          expect([store().refresh, store().reread]).toEqual([1, 1]);
+          transport.deliver(stop);
+        }
+        expect([store().refresh, store().reread]).toEqual([2, 1]);
+        expect(store().stop).toMatchObject({ stopId: 5, reason: "reset" });
+        store().reset();
+      }
+    });
+
+    it.each([
+      ["refused in the result", (transport: FakeTransport) => transport.respond({ error: { code: -32001, message: "emulator stopped by host UI" } })],
+      ["refused with a JSON-RPC error", (transport: FakeTransport) => transport.respondError(-32603, "internal error")],
+      ["not answered", (transport: FakeTransport) => transport.close()],
+    ])("%s, nothing is read again", async (_name, answer) => {
+      const { transport } = await initialise(tickFrame({ state: "running", stopId: 1 }));
+      const resetting = store().control("reset");
+      answer(transport);
+      await expect(resetting).resolves.toBe(false);
+      await settle();
+      expect(store().reread).toBe(0);
+      expect(store().toasts).toHaveLength(1);
+      expect(store().toasts[0].message).toMatch(/^Reset: /);
+    });
+
+    it("no other control request has the views read again", async () => {
+      const { transport } = await initialise();
+      for (const [action, target] of [
+        ["run", undefined],
+        ["pause", "sh4"],
+        ["step", "sh4"],
+        ["stepOver", "arm7"],
+        ["stepOut", "sh4"],
+      ] as const) {
+        const done = store().control(action, target);
+        transport.respond({});
+        await done;
+      }
+      expect(store().reread).toBe(0);
+    });
   });
 
   it("shows a lost connection, and resolves to false", async () => {

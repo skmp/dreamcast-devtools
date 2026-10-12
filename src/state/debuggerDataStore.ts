@@ -32,7 +32,7 @@ export interface InvalidMessages {
   last: InvalidMessageReport;
 }
 
-export type ControlAction = "run" | "pause" | "step" | "stepOver" | "stepOut";
+export type ControlAction = "run" | "pause" | "step" | "stepOver" | "stepOut" | "reset";
 
 const CONTROL_LABELS: Record<ControlAction, string> = {
   run: "Run",
@@ -40,6 +40,7 @@ const CONTROL_LABELS: Record<ControlAction, string> = {
   step: "Step",
   stepOver: "Step over",
   stepOut: "Step out",
+  reset: "Reset",
 };
 
 const TOAST_MS = 5000;
@@ -91,7 +92,15 @@ interface DebuggerDataState extends LiveState {
   toggleBreakpoint: (id: number, enabled: boolean) => Promise<void>;
   toggleCategoryMute: (category: BreakpointCategory) => Promise<void>;
   toggleCategorySolo: (category: BreakpointCategory) => Promise<void>;
-  /** A run-control request. Resolves to false, after showing why, when the server refused it or did not answer. */
+  /**
+   * A run-control request. Resolves to false, after showing why, when the server refused it or did not answer.
+   *
+   * "reset" (control.reset) is the one of them that changes what the views fetched without a
+   * word in a tick: a machine that runs is reset and runs on, and nothing is published. So an
+   * accepted reset counts as a write of this client does (`reread`), and the views read again
+   * where they are. A paused machine is in a new stop behind it, and that stop moves the views
+   * by itself (`refresh`).
+   */
   control: (action: ControlAction, target?: TargetProcessor) => Promise<boolean>;
   showError: (message: string) => void;
   dismissToast: (id: number) => void;
@@ -518,10 +527,15 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
                 ? await client.step(target ?? "sh4")
                 : action === "stepOver"
                   ? await client.stepOver(target ?? "sh4")
-                  : await client.stepOut(target ?? "sh4");
+                  : action === "stepOut"
+                    ? await client.stepOut(target ?? "sh4")
+                    : await client.reset();
         if (result.error) {
           get().showError(`${label}: ${result.error.message}`);
           return false;
+        }
+        if (action === "reset") {
+          set((state) => ({ reread: state.reread + 1 }));
         }
         return true;
       } catch (error) {
