@@ -1011,6 +1011,10 @@ test.describe("byte editing with the keyboard", () => {
     await expect(place(view)).toHaveAccessibleName(/^0x8C010027 [0-9A-F]{2}, write$/);
     await expect(mark).toBeVisible();
     expect(Math.abs((await frameOf(0x8c010027)).left + 2)).toBeLessThan(1);
+    // (with the first button: another one is the browser's)
+    await page.mouse.click(cell.x + (2 * 3 + 1.5) * (cell.width / 47), cell.y + cell.height / 2, { button: "right" });
+    await page.keyboard.press("Escape");
+    await expect(place(view)).toHaveAccessibleName(/^0x8C010027 [0-9A-F]{2}, write$/);
     await dblclickByte(view, 0x8c010039);
     await expect(editor).toHaveAccessibleName("Bytes to write from 0x8C010039");
     await editor.press("Escape");
@@ -1103,6 +1107,9 @@ test.describe("byte editing with the keyboard", () => {
     await expect(place(view)).toHaveCount(1);
     await expect(view.locator("[data-memory-hex][tabindex]")).toHaveCount(1);
     await expect(place(view)).toHaveAccessibleName("0x8C010027 27, write");
+    // behind the last byte of that row there is none: a double click there edits nothing
+    await dblclickByte(view, 0x8c01002c);
+    await expect(byteEditor(view)).toHaveCount(0);
     await place(view).focus();
     await page.keyboard.press("ArrowRight");
     await expect(place(view)).toHaveAccessibleName("0x8C010027 27, write");
