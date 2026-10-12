@@ -18,9 +18,18 @@ import { useCapability, useRunState } from "../../state/debuggerSelectors";
 import { ListFocusKeeper } from "../components/ListFocusKeeper";
 import { NoData } from "../components/PanelNotice";
 import { UNUSABLE_SX } from "../components/unusable";
-import { useWriteEditor } from "../components/useWriteEditor";
+import { opensEditor, useFocusReturn, useWriteEditor } from "../components/useWriteEditor";
 import { CAPABILITIES, type DeviceNodeDescriptor } from "../../lib/debuggerSchema";
-import { EDIT_TITLES, editability, hasWriter, indexRegisters, watchedRegister, type Editability } from "./registerPanelModel";
+import {
+  EDIT_TITLES,
+  controlName,
+  editability,
+  hasWriter,
+  indexRegisters,
+  isControl,
+  watchedRegister,
+  type Editability,
+} from "./registerPanelModel";
 
 // Component for individual watch item with inline editing
 const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModifyExpression }: {
@@ -53,6 +62,11 @@ const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModi
       closeValueEditor();
     }
   }, [valueDraft, writable, closeValueEditor]);
+  // The value of a watch on a register this server writes is a control, as in a register
+  // panel: the keyboard focus can be on it, Enter, the space bar and F2 open its editor, and it
+  // has the focus again when the editor goes.
+  const valueElement = useRef<HTMLSpanElement | null>(null);
+  const valueBoxFocus = useFocusReturn(isEditingValue, valueElement);
 
   const handleDoubleClickValue = () => {
     if (!writable) {
@@ -169,7 +183,11 @@ const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModi
                   value={valueEditor.text ?? ""}
                   onChange={(e) => valueEditor.change(e.target.value)}
                   onKeyDown={handleKeyDownValue}
-                  onBlur={valueEditor.close}
+                  onFocus={valueBoxFocus.onFocus}
+                  onBlur={() => {
+                    valueBoxFocus.onBlur();
+                    valueEditor.close();
+                  }}
                   autoFocus
                   error={valueEditor.refusal !== undefined}
                   slotProps={{
@@ -225,9 +243,27 @@ const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModi
           {" = "}
           <Box
             component="span"
+            ref={valueElement}
             onDoubleClick={handleDoubleClickValue}
             title={EDIT_TITLES[mode]}
-            sx={{ cursor: writable ? "text" : "default" }}
+            {...(isControl(mode) && {
+              role: "button",
+              tabIndex: 0,
+              "aria-label": controlName(expression, formatWatchValue(value)),
+              "aria-disabled": !writable || undefined,
+              onKeyDown: (event: React.KeyboardEvent) => {
+                if (opensEditor(event.key)) {
+                  event.preventDefault();
+                  handleDoubleClickValue();
+                }
+              },
+            })}
+            sx={{
+              cursor: writable ? "text" : "default",
+              borderRadius: "3px",
+              outline: "none",
+              "&:focus-visible": { outline: "2px solid", outlineColor: "primary.main", outlineOffset: "2px" },
+            }}
           >
             {formatWatchValue(value)}
           </Box>
