@@ -1023,6 +1023,38 @@ test.describe("the function keys", () => {
     expect(await press(page, keys, "F11")).toEqual(taken("F11"));
     await expect(executionState(page)).toHaveText("Paused · step completed · stop 2");
     expect(controlRequests(rpc)).toEqual(["control.step sh4"]);
+
+    // A dialog is open when it is on screen. One that is kept in the document while it is
+    // closed is not; one that is on screen is, whoever put it there and whatever kind it is.
+    const putDialog = (role: string, css: string) =>
+      page.evaluate(
+        ([dialogRole, style]) => {
+          const element = document.createElement("div");
+          element.id = "a-dialog-of-the-test";
+          element.setAttribute("role", dialogRole);
+          element.style.cssText = style;
+          element.textContent = "a dialog";
+          document.body.append(element);
+        },
+        [role, css],
+      );
+    const removeDialog = () => page.evaluate(() => document.getElementById("a-dialog-of-the-test")!.remove());
+    let stop = 2;
+    for (const css of ["display: none", "visibility: hidden"]) {
+      await putDialog("dialog", css);
+      expect(await press(page, keys, "F11"), css).toEqual(taken("F11"));
+      await expect(executionState(page)).toHaveText(`Paused · step completed · stop ${++stop}`);
+      await removeDialog();
+    }
+    for (const role of ["dialog", "alertdialog"]) {
+      await putDialog(role, "position: fixed; top: 0; left: 0");
+      expect(await press(page, keys, "F11"), role).toEqual(left("F11"));
+      expect(await press(page, keys, "F5"), role).toEqual(left("F5"));
+      await removeDialog();
+    }
+    await page.waitForTimeout(200);
+    await expect(executionState(page)).toHaveText(`Paused · step completed · stop ${stop}`);
+    expect(controlRequests(rpc)).toEqual(["control.step sh4", "control.step sh4", "control.step sh4"]);
   });
 
   test("a key with Ctrl is somebody else's, and so is every other key", async ({ page, rpc }) => {
@@ -1442,6 +1474,8 @@ test.describe("Reset", () => {
     const state = executionState(page);
     await expect(state).toHaveText("Running");
     const view = panel(page, "sh4-disassembly");
+    await expect(disassemblyRows(view)).toHaveCount(64);
+    await expect(panel(page, "sh4-memory").locator("[data-memory-hex]")).toHaveCount(60);
     const first = await disassemblyRows(view).first().getAttribute("data-address");
     const fetched = { listings: rpc.requests("state.getDisassembly").length, slices: rpc.requests("state.getMemorySlice").length };
 
