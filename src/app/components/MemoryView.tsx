@@ -4,25 +4,31 @@ import { HideOnHoverTooltip as Tooltip } from "./HideOnHoverTooltip";
 import { RunControlButton } from "./RunControlButton";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import type { MemorySlice } from "../../lib/debuggerSchema";
+import { BYTES_PER_ROW, HEX_COLUMN_CHARACTERS, formatByte, hexColumnByte } from "./memoryEdit";
+import { useWriteEditor } from "./useWriteEditor";
+import { WriteEditorInput } from "./WriteEditorInput";
 
 type MemoryRow = {
   id: number;
   address: number;
   hex: string;
   ascii: string;
+  /** how many bytes the row has: sixteen, but for a last row at the end of what was read */
+  length: number;
 };
 
 const WHEEL_PIXEL_THRESHOLD = 60;
 const MEMORY_SCROLL_BYTES = 96;
-const BYTES_PER_ROW = 16;
 
 // The three columns of a row, in characters: an address of up to ten ("0x8C010000"), sixteen
 // bytes with the spaces between them, sixteen characters of text; two characters between
 // columns. 79 characters in all, which a monospace font draws about 48 em wide.
-const ADDRESS_COLUMN = "10ch";
-const HEX_COLUMN = `${BYTES_PER_ROW * 3 - 1}ch`;
+const ADDRESS_CHARACTERS = 10;
+const GAP_CHARACTERS = 2;
+const ADDRESS_COLUMN = `${ADDRESS_CHARACTERS}ch`;
+const HEX_COLUMN = `${HEX_COLUMN_CHARACTERS}ch`;
 const ASCII_COLUMN = `${BYTES_PER_ROW}ch`;
-const COLUMN_GAP = "2ch";
+const COLUMN_GAP = `${GAP_CHARACTERS}ch`;
 const ROW_EM = 48;
 /** what is around the columns of a row, in px: the padding of the listing and of the row, and the row's border */
 const ROW_FRAME_PX = 36;
@@ -30,8 +36,12 @@ const ROW_FRAME_PX = 36;
  * The size of the listing's font: the size of the rest of the UI where a row fits at that
  * size, smaller in a narrower panel, so that the row still fits and no column is cut off, and
  * not smaller than can be read. (`cqw` is a hundredth of the width of the panel's listing.)
+ * In a panel narrower than a row is at that smallest size (about 520 px) the row does not
+ * fit: the listing is then scrolled to the side, and no column is squeezed or cut off for it.
  */
 const LISTING_FONT_SIZE = `clamp(10px, calc((100cqw - ${ROW_FRAME_PX}px) / ${ROW_EM}), 1rem)`;
+/** the padding of a row at its left, in px (`px: 0.5` of the theme) */
+const ROW_PADDING_PX = 4;
 /** a cell of the listing: the listing's font, whatever the theme gives a text by itself */
 const CELL_SX = { font: "inherit", letterSpacing: 0, flexShrink: 0 } as const;
 
@@ -53,6 +63,12 @@ export interface MemoryViewCallbacks {
   onFetchMemory: (address: number, length: number) => Promise<MemorySlice>;
   /** Handle address change (for URL sync) */
   onAddressChange?: (address: number) => void;
+  /**
+   * Writes what was typed into the editor of the byte at `address`, from that byte on: what
+   * the text is as bytes is the caller's to say. Rejects, with why, when nothing was written:
+   * the editor then stays open. Without it the view has no editor.
+   */
+  onWriteMemory?: (address: number, text: string) => Promise<void>;
 }
 
 export interface MemoryViewProps {
@@ -66,8 +82,18 @@ export interface MemoryViewProps {
   initialized: boolean;
   /** Initial address from URL if any */
   initialUrlAddress?: { address: number; fromUrl: boolean };
-  /** The bytes are fetched again, without moving, whenever this changes (the target stopped). */
+  /**
+   * The bytes are fetched again, without moving, whenever this changes (the target stopped,
+   * or this client wrote to it).
+   */
   refreshSignal?: unknown;
+  /**
+   * The bytes can be edited now: a double click on a byte of the hex column opens an editor
+   * there, and the run of bytes typed into it is written from that byte on (default: false).
+   */
+  editable?: boolean;
+  /** What the hex column says of editing when the pointer rests on it: how to, or why not now. */
+  editHint?: string;
   /** What is said in place of the bytes while the view is not `initialized` (default: "No Data"). */
   noDataText?: string;
   /**
@@ -97,6 +123,8 @@ export const MemoryView = ({
   initialized,
   initialUrlAddress,
   refreshSignal,
+  editable = false,
+  editHint,
   noDataText = "No Data",
   unplaced = false,
 }: MemoryViewProps) => {
@@ -262,7 +290,7 @@ export const MemoryView = ({
     for (let offset = 0; offset < bytes.length; offset += BYTES_PER_ROW) {
       const chunk = bytes.slice(offset, offset + BYTES_PER_ROW);
       const rowAddress = slice.baseAddress + offset;
-      const hex = chunk.map((b, index) => (unreadable[offset + index] ? "??" : b.toString(16).toUpperCase().padStart(2, "0"))).join(" ");
+      const hex = chunk.map((b, index) => (unreadable[offset + index] ? "??" : formatByte(b))).join(" ");
       const ascii = chunk
         .map((byte, index) => {
           if (unreadable[offset + index]) {
@@ -272,7 +300,7 @@ export const MemoryView = ({
           return /[\x20-\x7E]/.test(char) ? char : ".";
         })
         .join("");
-      result.push({ id: offset, address: rowAddress, hex, ascii });
+      result.push({ id: offset, address: rowAddress, hex, ascii, length: chunk.length });
     }
     return result;
   }, [slice]);
@@ -291,6 +319,11 @@ export const MemoryView = ({
 
   const handleWheel = useCallback(
     (event: WheelEvent) => {
+      // A turn to the side is not a move through the addresses: it is left to the box around
+      // the listing, which scrolls to the rest of the rows in a panel narrower than they are.
+      if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+        return;
+      }
       event.preventDefault();
       wheelRemainder.current += event.deltaY;
 
@@ -355,6 +388,61 @@ export const MemoryView = ({
     }
   }, [addressInput, config, callbacks, address, applyPendingHighlight, lastRow]);
 
+  // The editor of a byte: where it is, and what is typed into it. The row of its address shows
+  // it, wherever the view has been moved to in the meantime.
+  const [editAddress, setEditAddress] = useState<number | undefined>(undefined);
+  const editAddressRef = useRef<number | undefined>(undefined);
+  const { onWriteMemory } = callbacks;
+  const writeTyped = useCallback(
+    (text: string) => {
+      const at = editAddressRef.current;
+      if (at === undefined || !onWriteMemory) {
+        return Promise.reject(new Error("Nothing is being edited"));
+      }
+      return onWriteMemory(at, text);
+    },
+    [onWriteMemory],
+  );
+  const editor = useWriteEditor(writeTyped);
+  const canEdit = editable && initialized && onWriteMemory !== undefined;
+  const editing = canEdit && editor.text !== undefined && editAddress !== undefined;
+  // An editor is offered while the bytes can be written: one that is open when the target runs
+  // again, or the connection is lost, is not shown any more and is put away with what was typed.
+  const { text: draft, open: openEditor, close: closeEditor } = editor;
+  useEffect(() => {
+    if (draft !== undefined && !canEdit) {
+      closeEditor();
+    }
+  }, [draft, canEdit, closeEditor]);
+
+  // A double click on a byte of the hex column: the editor opens at that byte, with the byte
+  // in it. A row is one piece of text, so the byte is found from where in the column the
+  // pointer is. A byte that could not be read ("??") has no value to edit.
+  const handleListingDoubleClick = useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      const cell = (event.target as HTMLElement).closest<HTMLElement>("[data-memory-hex]");
+      if (!canEdit || !cell) {
+        return;
+      }
+      const row = rows.find((candidate) => candidate.address === Number(cell.dataset.memoryHex));
+      if (!row) {
+        return;
+      }
+      const box = cell.getBoundingClientRect();
+      const index = hexColumnByte(event.clientX - box.left, box.width);
+      const byte = row.hex.slice(index * 3, index * 3 + 2);
+      if (index >= row.length || !/^[0-9A-F]{2}$/.test(byte)) {
+        return;
+      }
+      // the double click has selected the byte as text: the editor shows it selected instead
+      window.getSelection()?.removeAllRanges();
+      editAddressRef.current = row.address + index;
+      setEditAddress(row.address + index);
+      openEditor(byte);
+    },
+    [canEdit, rows, openEditor],
+  );
+
   return (
     <Box
       sx={{
@@ -407,117 +495,175 @@ export const MemoryView = ({
           </Tooltip>
         </Stack>
       </Box>
-      {/* the listing's font is sized by the width of this box (LISTING_FONT_SIZE) */}
-      <Box sx={{ flex: 1, overflow: "auto", containerType: "inline-size" }}>
-        {!initialized ? (
-          <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
-            <Typography variant="body2" color="text.secondary">
-              {noDataText}
+      {/* The frame of the listing. What is said about the rows (that they are being read
+          again) is said here, and stays where it is when the rows are scrolled to the side. */}
+      <Box sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}>
+        {/* This box scrolls to the side when the panel is narrower than a row of the listing, and
+            the listing's font is sized by its width (LISTING_FONT_SIZE). */}
+        <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", containerType: "inline-size" }}>
+          {!initialized ? (
+            <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
+              <Typography variant="body2" color="text.secondary">
+                {noDataText}
+              </Typography>
+            </Stack>
+          ) : error ? (
+            <Typography variant="body2" color="error" sx={{ p: 2 }}>
+              {error}
             </Typography>
-          </Stack>
-        ) : error ? (
-          <Typography variant="body2" color="error" sx={{ p: 2 }}>
-            {error}
-          </Typography>
-        ) : loading && !slice ? (
-          <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }} spacing={1}>
-            <CircularProgress size={18} />
-            <Typography variant="body2" color="text.secondary">
-              Loading memory.
-            </Typography>
-          </Stack>
-        ) : slice && rows.length > 0 ? (
-          <Box
-            ref={containerRef}
-            sx={{
-              height: "100%",
-              flex: 1,
-              overflow: "hidden",
-              typography: "body1",
-              fontSize: LISTING_FONT_SIZE,
-              p: 1.5,
-              position: "relative",
-            }}
-          >
-            {loading && (
-              <Stack direction="row" spacing={1} alignItems="center" sx={{ position: "absolute", top: 8, right: 16 }}>
-                <CircularProgress size={12} thickness={5} />
-                <Typography variant="caption" color="text.secondary">
-                  Updating
-                </Typography>
-              </Stack>
-            )}
-            <Box sx={{ display: "flex", mb: 1, px: "6px", color: "text.secondary", fontWeight: 600 }}>
-              <Typography component="span" sx={{ ...CELL_SX, width: ADDRESS_COLUMN, mr: COLUMN_GAP }}>
-                Address
+          ) : loading && !slice ? (
+            <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }} spacing={1}>
+              <CircularProgress size={18} />
+              <Typography variant="body2" color="text.secondary">
+                Loading memory.
               </Typography>
-              <Typography component="span" sx={{ ...CELL_SX, width: HEX_COLUMN, mr: COLUMN_GAP }}>
-                Hex
-              </Typography>
-              <Typography component="span" sx={{ ...CELL_SX, width: ASCII_COLUMN }}>
-                ASCII
-              </Typography>
-            </Box>
-            <Stack
-              spacing={0}
+            </Stack>
+          ) : slice && rows.length > 0 ? (
+            <Box
+              ref={containerRef}
               sx={{
-                "& .target-address": {
-                  border: "2px solid",
-                  borderColor: "warning.main",
-                  animation: "fadeOutTarget 2s forwards",
-                  "&:hover": {
-                    borderColor: "inherit !important",
-                  },
-                },
-                "@keyframes fadeOutTarget": {
-                  "0%": {
-                    borderColor: "warning.main",
-                  },
-                  "100%": {
-                    borderColor: "transparent",
-                  },
-                },
+                height: "100%",
+                flex: 1,
+                // Never narrower than its rows: what the panel has no room for is scrolled to,
+                // and no column is cut off for it.
+                minWidth: "min-content",
+                overflow: "hidden",
+                typography: "body1",
+                fontSize: LISTING_FONT_SIZE,
+                p: 1.5,
+                position: "relative",
               }}
             >
-              {rows.map((row) => (
-                <Box
-                  key={row.id}
-                  ref={(el: HTMLDivElement | null) => {
-                    if (el) {
-                      lineRefsMap.current.set(row.address, el);
-                    } else {
-                      lineRefsMap.current.delete(row.address);
-                    }
-                  }}
-                  sx={{
-                    display: "flex",
-                    alignItems: "baseline",
-                    border: "2px solid transparent",
-                    borderRadius: 1,
-                    px: 0.5,
-                    py: 0,
+              <Box sx={{ display: "flex", mb: 1, px: "6px", color: "text.secondary", fontWeight: 600 }}>
+                <Typography component="span" sx={{ ...CELL_SX, width: ADDRESS_COLUMN, mr: COLUMN_GAP }}>
+                  Address
+                </Typography>
+                <Typography component="span" sx={{ ...CELL_SX, width: HEX_COLUMN, mr: COLUMN_GAP }}>
+                  Hex
+                </Typography>
+                <Typography component="span" sx={{ ...CELL_SX, width: ASCII_COLUMN }}>
+                  ASCII
+                </Typography>
+              </Box>
+              <Stack
+                spacing={0}
+                onDoubleClick={handleListingDoubleClick}
+                sx={{
+                  "& .target-address": {
+                    border: "2px solid",
+                    borderColor: "warning.main",
+                    animation: "fadeOutTarget 2s forwards",
                     "&:hover": {
-                      borderBottomColor: "primary.main",
+                      borderColor: "inherit !important",
                     },
-                  }}
-                >
-                  <Typography component="span" sx={{ ...CELL_SX, width: ADDRESS_COLUMN, mr: COLUMN_GAP }}>
-                    {config.formatAddress(row.address)}
-                  </Typography>
-                  <Typography component="span" sx={{ ...CELL_SX, width: HEX_COLUMN, whiteSpace: "nowrap", mr: COLUMN_GAP }}>
-                    {row.hex}
-                  </Typography>
-                  <Typography component="span" sx={{ ...CELL_SX, width: ASCII_COLUMN, whiteSpace: "pre" }}>
-                    {row.ascii}
-                  </Typography>
-                </Box>
-              ))}
-            </Stack>
-          </Box>
-        ) : (
-          <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
-            Memory slice unavailable.
-          </Typography>
+                  },
+                  "@keyframes fadeOutTarget": {
+                    "0%": {
+                      borderColor: "warning.main",
+                    },
+                    "100%": {
+                      borderColor: "transparent",
+                    },
+                  },
+                  // the box of an open editor: over the bytes it starts at, in their font
+                  "& .memory-editor": {
+                    position: "absolute",
+                    top: "-1px",
+                    bottom: "-1px",
+                    zIndex: 1,
+                    boxSizing: "border-box",
+                    margin: 0,
+                    padding: "0 3px",
+                    font: "inherit",
+                    letterSpacing: 0,
+                    color: "text.primary",
+                    backgroundColor: "background.default",
+                    border: "1px solid",
+                    borderColor: "primary.main",
+                    borderRadius: "3px",
+                    outline: "none",
+                    "&[aria-invalid]": {
+                      borderColor: "error.main",
+                    },
+                    "&[aria-busy]": {
+                      opacity: 0.6,
+                    },
+                  },
+                }}
+              >
+                {rows.map((row) => {
+                  // the byte of this row that is being edited, if one is
+                  const edited = editing && editAddress >= row.address && editAddress < row.address + row.length ? editAddress - row.address : undefined;
+                  return (
+                    <Box
+                      key={row.id}
+                      ref={(el: HTMLDivElement | null) => {
+                        if (el) {
+                          lineRefsMap.current.set(row.address, el);
+                        } else {
+                          lineRefsMap.current.delete(row.address);
+                        }
+                      }}
+                      sx={{
+                        display: "flex",
+                        alignItems: "baseline",
+                        border: "2px solid transparent",
+                        borderRadius: 1,
+                        px: 0.5,
+                        py: 0,
+                        position: "relative",
+                        "&:hover": {
+                          borderBottomColor: "primary.main",
+                        },
+                      }}
+                    >
+                      <Typography component="span" sx={{ ...CELL_SX, width: ADDRESS_COLUMN, mr: COLUMN_GAP }}>
+                        {config.formatAddress(row.address)}
+                      </Typography>
+                      <Typography
+                        component="span"
+                        data-memory-hex={row.address}
+                        title={editHint}
+                        sx={{ ...CELL_SX, width: HEX_COLUMN, whiteSpace: "nowrap", mr: COLUMN_GAP, cursor: canEdit ? "text" : undefined }}
+                      >
+                        {row.hex}
+                      </Typography>
+                      <Typography component="span" sx={{ ...CELL_SX, width: ASCII_COLUMN, whiteSpace: "pre" }}>
+                        {row.ascii}
+                      </Typography>
+                      {edited !== undefined && (
+                        // Behind the three cells of the row, so that they stay its first three
+                        // children; laid over the hex column from the byte that is edited on,
+                        // with the digits where those of the byte are.
+                        <WriteEditorInput
+                          editor={editor}
+                          label={`Bytes to write from ${config.formatAddress(row.address + edited)}`}
+                          className="memory-editor"
+                          style={{
+                            left: `calc(${ADDRESS_CHARACTERS + GAP_CHARACTERS + edited * 3}ch + ${ROW_PADDING_PX - 4}px)`,
+                            // to the end of the hex column, and never less than a few bytes wide
+                            width: `calc(${Math.max(HEX_COLUMN_CHARACTERS - edited * 3, 14)}ch + 8px)`,
+                          }}
+                        />
+                      )}
+                    </Box>
+                  );
+                })}
+              </Stack>
+            </Box>
+          ) : (
+            <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+              Memory slice unavailable.
+            </Typography>
+          )}
+        </Box>
+        {initialized && !error && loading && slice && rows.length > 0 && (
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ position: "absolute", top: 8, right: 16 }}>
+            <CircularProgress size={12} thickness={5} />
+            <Typography variant="caption" color="text.secondary">
+              Updating
+            </Typography>
+          </Stack>
         )}
       </Box>
     </Box>

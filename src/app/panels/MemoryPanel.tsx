@@ -1,17 +1,19 @@
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Panel } from "../layout/Panel";
-import { DebuggerErrorCode, type MemorySlice } from "../../lib/debuggerSchema";
+import { CAPABILITIES, DebuggerErrorCode, type MemorySlice } from "../../lib/debuggerSchema";
 import { JsonRpcException } from "../../lib/jsonRpc";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import { useNoDataText, useTarget } from "../../state/debuggerSelectors";
+import { useCapability, useNoDataText, useRunState, useTarget } from "../../state/debuggerSelectors";
 import { formatAddress, parseAddress } from "../../state/targets";
+import { BYTES_PER_ROW, memoryWrite } from "../components/memoryEdit";
 import { MemoryView, type MemoryViewConfig, type MemoryViewCallbacks } from "../components/MemoryView";
 import { PanelNotice } from "../components/PanelNotice";
 
-const BYTES_PER_ROW = 16;
 const VISIBLE_ROWS = 60;
+const EDIT_HINT = "Double-click a byte to write memory from there";
+const RUNNING_HINT = "Read-only while the target runs: pause it to write memory";
 
 interface MemoryPanelProps {
   target: "sh4" | "arm7";
@@ -25,6 +27,13 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
   const initialized = useDebuggerDataStore((state) => state.initialized);
   const epoch = useDebuggerDataStore((state) => state.epoch);
   const refresh = useDebuggerDataStore((state) => state.refresh);
+  const reread = useDebuggerDataStore((state) => state.reread);
+  const writeMemory = useDebuggerDataStore((state) => state.writeMemory);
+  const showError = useDebuggerDataStore((state) => state.showError);
+  // state.writeMemory is refused by a server without memory writes (-32004): the view then has
+  // no editor. Editing is offered while the target is paused.
+  const memoryWriteCapability = useCapability(CAPABILITIES.MEMORY_WRITE);
+  const paused = useRunState() === "paused";
 
   // The view is mounted once a server that reads this memory has been described, because
   // where it opens is that server's to say. After that it stays, and keeps its place when the
@@ -80,8 +89,18 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
       onAddressChange: (address: number) => {
         setSearchParams({ address: formatAddress(info, address) });
       },
+      // A run of bytes typed in one go is one request. What cannot be one is said here and not
+      // sent; what the server refuses is said by the store. Either way the editor stays open.
+      onWriteMemory: async (address: number, text: string): Promise<void> => {
+        const request = memoryWrite({ addressMax: info.addressMax, formatAddress: (value) => formatAddress(info, value) }, address, text);
+        if (!request.ok) {
+          showError(request.reason);
+          throw new Error(request.reason);
+        }
+        await writeMemory(target, request.address, request.data);
+      },
     }),
-    [client, target, info, setSearchParams],
+    [client, target, info, setSearchParams, writeMemory, showError],
   );
 
   // Get initial URL address
@@ -127,8 +146,12 @@ const MemoryPanel = ({ target }: MemoryPanelProps) => {
         defaultAddress={info.defaultMemoryAddress ?? 0}
         initialized={initialized}
         initialUrlAddress={initialUrlAddress}
-        // a stop the client has not acted on yet, or a game that was just loaded: the bytes on screen are read again
-        refreshSignal={`${epoch}:${refresh}`}
+        // A stop the client has not acted on yet, a game that was just loaded, a program counter
+        // that was written, or a write of this client that the server accepted: the bytes on
+        // screen are read again, where the view is.
+        refreshSignal={`${epoch}:${refresh}:${reread}`}
+        editable={memoryWriteCapability && paused}
+        editHint={memoryWriteCapability ? (paused ? EDIT_HINT : RUNNING_HINT) : undefined}
         noDataText={noDataText}
       />
     </Panel>
