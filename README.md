@@ -100,6 +100,8 @@ not run it. After changing the crate, run it and commit the regenerated files.
 - The window of the suite is 1600x1000, where the default layouts have their views side by
   side. `e2e/layout.spec.ts` opens every workspace in the window of a laptop (1366x768,
   1280x720, 1440x900) and holds the default layouts to being readable there.
+- `e2e/emulator-smoke.spec.ts` is the one spec that is not run against the mock, and is
+  skipped unless `E2E_EMULATOR_URL` is set: see [The UI against the emulator](#the-ui-against-the-emulator).
 
 Install the browser once with `npx playwright install chromium` (add `--with-deps` on a fresh
 Linux machine). Useful variations:
@@ -111,6 +113,32 @@ npx playwright test --headed --workers=1        # watch it
 E2E_SCREENSHOT_DIR=/tmp/shots npm run test:e2e  # also save the per-workspace screenshots there
 E2E_CPU_THROTTLE=4 npx playwright test e2e/docking.spec.ts  # the page gets a quarter of the CPU
 ```
+
+### The UI against the emulator
+
+`e2e/emulator-smoke.spec.ts` drives the page an emulator serves: the UI bundle that emulator
+embeds, against its debugger server. It is not part of `check` and starts nothing by itself;
+it is skipped unless `E2E_EMULATOR_URL` is the page URL the emulator prints
+(`Debugger: http://127.0.0.1:<port>/`). The emulator is one that carries this UI
+(`npm run build:native`, then the emulator's own configure with
+`-DNULLDC_DEVTOOLS_DIST=<this checkout>/dist-native`), started headless and paused on the
+sounding guest of its tree:
+
+```
+<emulator> -config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 , \
+                   Debugger:Enabled=yes , Debugger:Port=0 , Debugger:Required=yes , Debugger:StartPaused=yes \
+           <emulator tree>/tests/debugger/guest/dsptest/dsptest.elf
+E2E_EMULATOR_URL=http://127.0.0.1:<port>/ npx playwright test e2e/emulator-smoke.spec.ts --workers=1
+```
+
+(The commas are arguments of their own. `Debugger:Enabled=yes` is needed: a headless run has
+the server off by default, and `StartPaused` without a server ends the process with exit code
+2. `Port=0` takes a free port. A run of its own `HOME`, `XDG_CONFIG_HOME` and `XDG_DATA_HOME`
+leaves the settings and the memory cards of the user alone.)
+The spec connects at the start stop, runs to the entry of the program (a breakpoint at
+`0x8C010000`), steps the SH4 from the toolbar, writes `R0` in the register panel and sees it in
+the tick, writes a byte of memory and reads it back, resets, and after a resume steps the ARM7.
+It leaves the emulator paused; one run per emulator process.
 
 ## Error boundaries
 
@@ -211,16 +239,62 @@ where it opens is the server's to say.
 
 - **Run state.** Next to the run controls: `Running`, or `Paused`, why (`reason` of the tick)
   and which stop it is (`stopId`), and below it the `notice` of the server when it has one. The
-  line wraps where the toolbar has little room, and a window narrower than 1280 px shows both
+  line wraps where the toolbar has little room, and a window narrower than 1440 px shows both
   in lines of their own under the toolbar; the title of each has all of its text. In the stops
-  of the emulator's own window (`host-stopped`, `guest-exit`, `no-game`) Run and the step
-  buttons are off, because the server refuses them there. A run control that is off (also
+  of the emulator's own window (`host-stopped`, `guest-exit`, `no-game`) the run controls are
+  off, because the server refuses them there. A run control that is off (also
   while the target runs, and without a connection) keeps the keyboard focus, so that stepping
   with the keyboard goes on from the same button; so do `Refresh` of a view while the view
   reads and `Go to current PC` without a connection. Each of these buttons is named by what
-  its tooltip says (`Run`, `Step In`, `Go to current PC`, ...). The answer of every `control.*`
-  request is checked, and a refusal is shown; one that is repeated while its notice is on
-  screen is counted in that notice (`×n`) instead of shown again.
+  it does (`Run`, `Step In`, `Go to current PC`, ...), in every state. The answer of every
+  `control.*` request is checked, and a refusal is shown; one that is repeated while its notice
+  is on screen is counted in that notice (`×n`) instead of shown again.
+- **Run controls.** The toolbar of a workspace (`src/app/layout/RunControls.tsx`) has `Run`,
+  `Pause`, `Step Into`, `Step Over`, `Step Out` and `Reset`, in the line of the toolbar from a
+  window of 1200 px on and in a line of their own below that. `Run to next breakpoint` is
+  gone: it did what `Run` does. Run, Pause and Reset are the machine's. The three steps act
+  on the **focused target**, which the toolbar names in front of them: the target of the
+  panel of a target that last had the focus — a disassembly, memory, breakpoints, callstack or
+  registers panel, the ten of the SH4's on-chip modules included; a click in it or on its tab,
+  or the keyboard focus moving into it — and until one of them had it the target the
+  workspace is for: `sh4` for the SH4 and the Mixed Mode Debugger, `arm7` for the ARM7
+  Debugger, `dsp` for the Audio Debugger (`src/state/focusedTarget.ts`). A panel of no target
+  (device tree, watches, events) leaves it as it is, and every workspace page starts with its
+  own. The views keep their own step buttons, for their own target. `Pause` names the focused
+  target in its request when the server lists it, and no target otherwise (a server ignores
+  it either way): nothing is asked of a server about a target it does not have.
+- **Keys.** On a workspace page: F5 run, F6 pause, F10 step over, F11 step into, Shift+F11
+  step out, with F8 and Shift+F8 for F11 and Shift+F11. They work wherever the focus is — on
+  the page, in an address box (where F5 would otherwise load the page again), on a value, in
+  the editor of one — but for two places: in Monaco, and while a dialog is open, they are left
+  to the editor and to the browser. A key that is held down is used once, and its repeats are
+  taken from the browser all the same. A key does what its button does: nothing while the
+  button is off. A key with Ctrl, Alt or Meta is not one of them.
+- **What is off, and why.** A run control whose request could only be refused is off, by
+  button and by key, and its tooltip (which is also its description) says why behind its name:
+  `not connected`; `the target is running` (Run and the steps) or `the target is paused`
+  (Pause); in a stop of the emulator's own window the reason of that stop, for all six;
+  `this server cannot step the ARM7` (`targets[].stepping`) or `this server does not support
+  the DSP target` for the steps; `the DSP has no calls to step over or out of` for those two,
+  on every server; `this server cannot reset the machine` without the capability `reset`
+  (the button is shown all the same); and `the ARM7 is held in reset`. So no request is sent
+  that the server answers with -32003, -32004, -32012 or, for a stop of the host, -32001 or
+  -32002 (`src/state/runControls.ts` has the rules; the toolbar, the keys and the step buttons
+  of the views go by them).
+- **An ARM7 that is held in reset.** While `ENABLED` of the ARM7's node (`targets[].pcPath`)
+  reads 0 — behind a reset, and until the guest releases it — the three steps of the toolbar
+  are off when the ARM7 is the focused target, and so are the step buttons of its disassembly
+  view. The steps of another target, Run, Pause and Reset are as they were.
+- **Reset.** `control.reset`, one click and no question. Paused, the machine is in a new stop
+  with the reason `reset`, which the views follow like any stop. Running, it runs on and no
+  tick says anything: the answer `{}` is all there is, and on it the disassembly and memory
+  views read again where they are (`reread`, the counter the writes advance).
+- **What a write can do.** A program counter, or bytes of code, written so that the guest
+  reaches what is no instruction ends the emulator in its default build, as it does for a
+  guest that gets there by itself. The emulator checks one thing about a program counter: one
+  of the SH4 with bit 0 set is refused (-32013), because nothing executes at an odd address;
+  the ARM7's is stored aligned. Whether there is code where it points is the user's to know,
+  and the in-app documentation says so.
 - **Stops.** A stop is a paused tick whose `stopId` the client has not acted on; a paused
   tick without a `stopId` is no stop. On a stop the disassembly views scroll to the
   program counter if its line is not on screen, the disassembly and memory views read again,
