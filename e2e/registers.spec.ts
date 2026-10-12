@@ -629,6 +629,63 @@ test("an editor that was put away while its answer was late is not closed, or ma
   expect(server.requestsOf("state.setRegister").map((params) => params.value)).toEqual(["0x1", "0x2"]);
 });
 
+test("an emulator that is busy refuses a write (-32000): each of the three editors stays open with what was typed, and the notice says why", async ({ page }) => {
+  const server = await serveScriptedDebugger(page);
+  withRegisterWrites(server, ["dc.sh4.cpu"]);
+  describedNode(server, "dc.sh4.cpu").actions = ["sh4-disassembly", "sh4-memory", "sh4-registers"];
+  server.state.watches = [{ id: 4, expression: "dc.sh4.cpu.pr", value: "0x8C000F00" }];
+  for (const method of ["state.setRegister", "state.editWatch", "state.writeMemory"]) {
+    server.answer(method, () => inBandError(-32000, "emulator busy"));
+  }
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await server.described();
+  const busy = page.getByRole("alert").filter({ hasText: "emulator busy" });
+
+  // a register
+  const view = await showRegisters(page, "SH4");
+  await write(view, "R15", "0x8CFFE000");
+  await expect(busy).toBeVisible();
+  await expect(editor(view)).toHaveValue("0x8CFFE000");
+  await expect(editor(view)).toHaveAttribute("aria-invalid", "true");
+  await expect(editor(view)).toHaveAttribute("title", "emulator busy");
+  await expect(editor(view)).not.toHaveAttribute("aria-busy");
+  // ... and again, from the same box: the notice that is up counts it
+  await editor(view).press("Enter");
+  await expect(busy).toContainText("×2");
+  await expect(editor(view)).toHaveValue("0x8CFFE000");
+  await editor(view).press("Escape");
+
+  // the register of a watch
+  const watches = panel(page, "watches").getByRole("listitem");
+  await watches.getByText("0x8C000F00", { exact: true }).dblclick();
+  await watches.getByRole("textbox").fill("0x8C000F04");
+  await watches.getByRole("textbox").press("Enter");
+  await expect(busy).toContainText("×3");
+  await expect(watches.getByRole("textbox")).toHaveValue("0x8C000F04");
+  await expect(watches.getByRole("textbox")).toHaveAttribute("aria-invalid", "true");
+  await watches.getByRole("textbox").press("Escape");
+
+  // a byte of memory
+  const memory = panel(page, "sh4-memory");
+  const hex = memory.locator(`[data-memory-hex="${0x8c010000}"]`);
+  const box = (await hex.boundingBox())!;
+  await hex.dblclick({ position: { x: 1.5 * (box.width / 47), y: box.height / 2 } });
+  const bytes = memory.getByRole("textbox", { name: "Bytes to write from 0x8C010000" });
+  await bytes.fill("AA BB");
+  await bytes.press("Enter");
+  await expect(busy).toContainText("×4");
+  await expect(bytes).toHaveValue("AA BB");
+  await expect(bytes).toHaveAttribute("aria-invalid", "true");
+  await expect(bytes).toHaveAttribute("title", "emulator busy");
+
+  // nothing was written, so nothing is read again: the views are as they were
+  expect(server.requestsOf("state.setRegister")).toHaveLength(2);
+  expect(server.requestsOf("state.editWatch")).toHaveLength(1);
+  expect(server.requestsOf("state.writeMemory")).toEqual([{ target: "sh4", address: 0x8c010000, data: [0xaa, 0xbb] }]);
+  expect(server.requestsOf("state.getMemorySlice")).toHaveLength(1);
+  expect(server.requestsOf("state.getDisassembly")).toHaveLength(1);
+});
+
 // The tick a write caused reaches the client in front of its response or behind it, and is no
 // new stop. The disassembly follows the new PC in both orders.
 for (const order of ["the tick in front of the response", "the tick behind the response"] as const) {
