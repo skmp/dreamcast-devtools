@@ -1,9 +1,11 @@
 import type { DeviceNodeDescriptor, RegisterValue } from "../../lib/debuggerSchema";
 import {
   EDIT_TITLES,
+  controlName,
   editability,
   hasWriter,
   indexRegisters,
+  isControl,
   panelNode,
   registerRows,
   registerWrite,
@@ -142,6 +144,24 @@ describe("the value of a register is an editor", () => {
     for (const reason of ["no-capability", "no-writer", "running"] as const) {
       expect(EDIT_TITLES[reason]).toMatch(/^Read-only/);
     }
+  });
+});
+
+describe("the value of a register is a control for the keyboard", () => {
+  it("when this server writes the register: while it can be edited, and while the target runs", () => {
+    expect(isControl("editable")).toBe(true);
+    // it keeps the focus it has over a run, and says that it cannot be used
+    expect(isControl("running")).toBe(true);
+  });
+
+  it("and is text when the register is never an editor on this server", () => {
+    expect(isControl("no-writer")).toBe(false);
+    expect(isControl("no-capability")).toBe(false);
+  });
+
+  it("is named with whose value it is, the value and what it does", () => {
+    expect(controlName("R0", "0x00000042")).toBe("R0 0x00000042, write");
+    expect(controlName("dc.sh4.cpu.pc", "0x8C0000A0")).toBe("dc.sh4.cpu.pc 0x8C0000A0, write");
   });
 });
 

@@ -79,6 +79,21 @@ export interface EditConditions {
 export const editability = (writable: boolean, { registerWrite, paused }: EditConditions): Editability =>
   !registerWrite ? "no-capability" : !writable ? "no-writer" : !paused ? "running" : "editable";
 
+/**
+ * Whether the value of a register is a control: something the keyboard focus can be on, which
+ * opens the editor. It is one for a register this server writes, also while the target runs:
+ * it then says that it cannot be used (aria-disabled) and keeps the focus it has, so that
+ * writing with the keyboard goes on from the same value at the next stop. A value that is
+ * never an editor on this server is text.
+ */
+export const isControl = (mode: Editability): boolean => mode === "editable" || mode === "running";
+
+/**
+ * The name of that control: which register, what its value is, and what the control does. The
+ * text of the value alone ("0x00000000") would not say whose it is.
+ */
+export const controlName = (register: string, value: string): string => `${register} ${value}, write`;
+
 /** What the value of a register says of itself when the pointer rests on it. */
 export const EDIT_TITLES: Readonly<Record<Editability, string>> = {
   editable: "Double-click to write the register",

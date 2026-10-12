@@ -1,4 +1,62 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
+
+/**
+ * The keys that open the editor of a value that has the keyboard focus: Enter and the space
+ * bar, as for every button, and F2. (With the pointer it is a double click.)
+ */
+export const opensEditor = (key: string): boolean => key === "Enter" || key === " " || key === "F2";
+
+/** What the box of an editor reports of the keyboard focus (`useFocusReturn`). */
+export interface BoxFocus {
+  /** the focus is in the box */
+  onFocus(): void;
+  /** the focus has left the box by itself: Tab, a click somewhere else, another window */
+  onBlur(): void;
+}
+
+/**
+ * Gives the keyboard focus back to the value an editor was opened from, when the box of the
+ * editor goes with the focus in it: the write was accepted, Escape was pressed, the target runs
+ * again. The focus would be on the page body then, and somebody writing with the keyboard would
+ * start from the top of the page after every write.
+ *
+ * A focus that left the box by itself is where the user put it, and is not taken from there:
+ * also not when that is nowhere (a click on something that takes no focus), because a focus
+ * that came back would name this panel, and its target, as the one last used.
+ *
+ * `shown`: the box of the editor is on screen. `opener`: what gets the focus, if it is there.
+ * The result is for the box, which says where the focus is.
+ */
+export const useFocusReturn = (shown: boolean, opener: RefObject<HTMLElement | null>): BoxFocus => {
+  const wasShown = useRef(shown);
+  const inBox = useRef(false);
+  useLayoutEffect(() => {
+    const gone = wasShown.current && !shown;
+    wasShown.current = shown;
+    if (!gone) {
+      return;
+    }
+    // A box that is taken out of the document with the focus in it has not said that the
+    // focus left it, and the focus is on the body now.
+    const held = inBox.current;
+    inBox.current = false;
+    if (held && (document.activeElement === null || document.activeElement === document.body)) {
+      // without scrolling: the value is where the box was
+      opener.current?.focus({ preventScroll: true });
+    }
+  }, [shown, opener]);
+  return useMemo(
+    () => ({
+      onFocus: () => {
+        inBox.current = true;
+      },
+      onBlur: () => {
+        inBox.current = false;
+      },
+    }),
+    [],
+  );
+};
 
 /**
  * The state of an editor that writes to the target what is typed into it: the value of a
