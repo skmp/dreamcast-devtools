@@ -1203,10 +1203,13 @@ test.describe("a server of milestone M1", () => {
     const view = panel(page, "sh4-memory");
     await expect(memoryRows(view)).toHaveCount(60);
     await expect(hexCell(view, 0x8c010000)).toHaveAttribute("title", "Read-only: this server cannot write memory");
+    // the bytes are text: no stop of the Tab key, and no control
+    await expect(place(view)).toHaveCount(0);
+    await expect(view.locator("[data-memory-hex][tabindex], [data-memory-hex][role], .memory-cursor")).toHaveCount(0);
     await dblclickByte(view, 0x8c010004);
     await expect(byteEditor(view)).toHaveCount(0);
     await expect(view.getByRole("textbox")).toHaveCount(1);
-    // ... and the bytes are text: no stop of the Tab key, and no control
+    // ... also after a press on one of them
     await expect(place(view)).toHaveCount(0);
     await expect(view.locator("[data-memory-hex][tabindex], [data-memory-hex][role], .memory-cursor")).toHaveCount(0);
     expect(rpc.requests("state.writeMemory")).toEqual([]);
