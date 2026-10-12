@@ -186,9 +186,10 @@ test.describe("the register panels of the two processors", () => {
   test("editing is offered while the target is paused only: no editor while it runs, and one that is open goes when it runs again", async ({ page, rpc }) => {
     await openWorkspace(page, "sh4-debugger");
     const view = await showRegisters(page, "SH4");
-    // running
+    // running: the value says that it cannot be used now, and a double click on it all the same opens nothing
     await expect(value(view, "R0")).toHaveAttribute("title", "Read-only while the target runs: pause it to write the register");
-    await value(view, "R0").dblclick();
+    await expect(value(view, "R0")).toHaveAttribute("aria-disabled", "true");
+    await value(view, "R0").dblclick({ force: true });
     await expect(editor(view)).toHaveCount(0);
 
     await pauseFromToolbar(page);
@@ -203,6 +204,88 @@ test.describe("the register panels of the two processors", () => {
     await expect(editor(view)).toHaveCount(0);
     await expect(value(view, "R0")).toHaveText("0x00000000");
     expect(rpc.requests("state.setRegister")).toEqual([]);
+  });
+
+  test("a register is written with the keyboard: its value is a stop of the Tab key, Enter, the space bar and F2 open the editor, and the value has the focus again when the editor goes", async ({
+    page,
+    rpc,
+  }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = await showRegisters(page, "SH4");
+    // the value of a register that can be written is a control, and says whose value it is
+    const control = view.getByRole("button", { name: "R0 0x00000000, write" });
+    await expect(control).toHaveCount(1);
+    await expect(control).toHaveText("0x00000000");
+    await expect(control).not.toHaveAttribute("aria-disabled");
+    // it is the stop behind the + of the row above it
+    await row(view, "FPUL").locator("button.register-watch").focus();
+    await page.keyboard.press("Tab");
+    await expect(value(view, "R0")).toBeFocused();
+    await expect(control).toBeFocused();
+
+    // Enter: the editor, as after a double click; the key is not the first one typed into it
+    await page.keyboard.press("Enter");
+    await expect(editor(view)).toBeFocused();
+    await expect(editor(view)).toHaveAccessibleName("New value of R0");
+    await expect(editor(view)).toHaveValue("0x00000000");
+    await page.keyboard.type("0xAB");
+    await page.keyboard.press("Enter");
+    await expect(editor(view)).toHaveCount(0);
+    // accepted: the focus is on the value again, which is the tick's
+    await expect(value(view, "R0")).toHaveText("0x000000AB");
+    await expect(value(view, "R0")).toBeFocused();
+    await expect(view.getByRole("button", { name: "R0 0x000000AB, write" })).toBeFocused();
+
+    // F2, and Escape: the same
+    await page.keyboard.press("F2");
+    await expect(editor(view)).toBeFocused();
+    await page.keyboard.type("0x1");
+    await page.keyboard.press("Escape");
+    await expect(editor(view)).toHaveCount(0);
+    await expect(value(view, "R0")).toBeFocused();
+    // the space bar, which is no blank in the box and does not scroll the panel
+    const scrolled = () =>
+      view.locator("table").evaluate((table) => {
+        let box = table.parentElement;
+        while (box && !/auto|scroll/.test(getComputedStyle(box).overflowY)) {
+          box = box.parentElement;
+        }
+        return box ? box.scrollTop : undefined;
+      });
+    const before = await scrolled();
+    expect(before).toBeDefined();
+    await page.keyboard.press("Space");
+    await expect(editor(view)).toBeFocused();
+    await expect(editor(view)).toHaveValue("0x000000AB");
+    expect(await scrolled()).toBe(before);
+    // a write that is refused leaves the focus where the text is
+    await page.keyboard.type("nothing");
+    await page.keyboard.press("Enter");
+    await expect(editor(view)).toHaveAttribute("aria-invalid", "true");
+    await expect(editor(view)).toBeFocused();
+
+    // Tab leaves the box: the editor is put away, and the focus is where Tab took it
+    await page.keyboard.press("Tab");
+    await expect(editor(view)).toHaveCount(0);
+    await expect(row(view, "R0").locator("button.register-watch")).toBeFocused();
+    // ... and a click on something that takes no focus leaves it nowhere: it is not taken back to this panel
+    await value(view, "R1").dblclick();
+    await expect(editor(view)).toBeFocused();
+    await view.getByRole("columnheader", { name: "Bits" }).click();
+    await expect(editor(view)).toHaveCount(0);
+    await page.waitForTimeout(200);
+    await expect(value(view, "R1")).not.toBeFocused();
+    // any other key on a value is the page's
+    await value(view, "R1").focus();
+    await page.keyboard.press("a");
+    await page.keyboard.press("ArrowDown");
+    await expect(editor(view)).toHaveCount(0);
+
+    expect(rpc.requests("state.setRegister").map((frame) => frame.params)).toEqual([
+      { path: "dc.sh4.cpu", name: "R0", value: "0xAB" },
+      { path: "dc.sh4.cpu", name: "R0", value: "nothing" },
+    ]);
   });
 
   test("a write the server refuses leaves the editor open and says why", async ({ page, rpc }) => {
@@ -429,6 +512,10 @@ test.describe("a server that can do what the emulator of milestone M2 can, and n
     const arm7 = panel(page, "arm7-registers");
     // all of dc.aica.arm7 but ENABLED
     await expect(arm7.locator("td.register-value [data-editable]")).toHaveCount(ARM7_REGISTERS - 1);
+    // ... and those are the stops of the Tab key: a value that is never an editor is text
+    await expect(arm7.getByRole("button", { name: /, write$/ })).toHaveCount(ARM7_REGISTERS - 1);
+    await expect(value(arm7, "ENABLED")).not.toHaveAttribute("tabindex");
+    await expect(value(arm7, "ENABLED")).not.toHaveAttribute("role");
     await expect(value(arm7, "ENABLED")).toHaveAttribute("title", "Read-only: the server has no writer for this register");
     await value(arm7, "ENABLED").dblclick();
     await expect(editor(arm7)).toHaveCount(0);
@@ -454,6 +541,7 @@ test.describe("a server that can do what the emulator of milestone M2 can, and n
       // rows with values, and not one of them an editor
       await expect(view.locator("tbody tr").first(), id).toBeVisible();
       await expect(view.locator("td.register-value [data-editable]"), id).toHaveCount(0);
+      await expect(view.locator("td.register-value [tabindex]"), id).toHaveCount(0);
       await expect(value(view, firstRegister), id).toHaveAttribute("title", "Read-only: the server has no writer for this register");
       await value(view, firstRegister).dblclick();
       await expect(editor(view), id).toHaveCount(0);
@@ -490,6 +578,8 @@ test.describe("a server of milestone M1", () => {
     const view = panel(page, "tmu-registers");
     expect(await cells(view, "TCOR0")).toEqual(["TCOR0", "0xFFFFFFFF", "32"]);
     await expect(view.locator("td.register-value [data-editable]")).toHaveCount(0);
+    await expect(view.locator("td.register-value [tabindex]")).toHaveCount(0);
+    await expect(view.getByRole("button", { name: /, write$/ })).toHaveCount(0);
     await expect(value(view, "TCOR0")).toHaveAttribute("title", "Read-only: this server cannot write registers");
     await value(view, "TCOR0").dblclick();
     await expect(editor(view)).toHaveCount(0);
@@ -627,6 +717,143 @@ test("an editor that was put away while its answer was late is not closed, or ma
   answers[1]({});
   await expect(editor(view)).toHaveCount(0);
   expect(server.requestsOf("state.setRegister").map((params) => params.value)).toEqual(["0x1", "0x2"]);
+});
+
+test("an editor that was put away while its answer was late is not closed by that answer when the write is accepted: the box opened since keeps what is typed into it", async ({
+  page,
+}) => {
+  // the three editors: of a register, of a watch, of a byte
+  const server = await serveScriptedDebugger(page);
+  withRegisterWrites(server, ["dc.sh4.cpu"]);
+  describedNode(server, "dc.sh4.cpu").actions = ["sh4-disassembly", "sh4-memory", "sh4-registers"];
+  server.state.watches = [{ id: 4, expression: "dc.sh4.cpu.pr", value: "0x8C000F00" }];
+  const answers: Array<(answer: unknown) => void> = [];
+  for (const method of ["state.setRegister", "state.editWatch", "state.writeMemory"]) {
+    server.answer(method, () => new Promise((resolve) => answers.push(resolve)));
+  }
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await server.described();
+  const memory = panel(page, "sh4-memory");
+  await expect(memory.locator("[data-memory-hex]")).toHaveCount(60);
+
+  // a register: the first write is given up with Escape, and the register is edited again
+  const view = await showRegisters(page, "SH4");
+  await write(view, "R15", "0x1");
+  await expect.poll(() => answers.length).toBe(1);
+  await editor(view).press("Escape");
+  await expect(editor(view)).toHaveCount(0);
+  await value(view, "R15").dblclick();
+  await editor(view).fill("0x2");
+  // the server accepts the first write now: that is not this box's answer
+  answers[0]({});
+  await page.waitForTimeout(300);
+  await expect(editor(view)).toHaveValue("0x2");
+  await expect(editor(view)).toBeFocused();
+  await expect(editor(view)).not.toHaveAttribute("aria-busy");
+  await expect(editor(view)).not.toHaveAttribute("readonly");
+  // ... and the box sends its own, once
+  await editor(view).press("Enter");
+  await expect.poll(() => answers.length).toBe(2);
+  await expect(editor(view)).toHaveAttribute("aria-busy", "true");
+  answers[1]({});
+  await expect(editor(view)).toHaveCount(0);
+  expect(server.requestsOf("state.setRegister").map((params) => params.value)).toEqual(["0x1", "0x2"]);
+
+  // the register of a watch
+  const watches = panel(page, "watches").getByRole("listitem");
+  await watches.getByText("0x8C000F00", { exact: true }).dblclick();
+  await watches.getByRole("textbox").fill("0x3");
+  await watches.getByRole("textbox").press("Enter");
+  await expect.poll(() => answers.length).toBe(3);
+  await watches.getByRole("textbox").press("Escape");
+  await expect(watches.getByRole("textbox")).toHaveCount(0);
+  await watches.getByText("0x8C000F00", { exact: true }).dblclick();
+  await watches.getByRole("textbox").fill("0x4");
+  answers[2]({});
+  await page.waitForTimeout(300);
+  await expect(watches.getByRole("textbox")).toHaveValue("0x4");
+  await expect(watches.getByRole("textbox")).not.toHaveAttribute("aria-busy");
+  await watches.getByRole("textbox").press("Enter");
+  await expect.poll(() => answers.length).toBe(4);
+  answers[3]({});
+  await expect(watches.getByRole("textbox")).toHaveCount(0);
+  expect(server.requestsOf("state.editWatch")).toEqual([
+    { watchId: 4, value: "0x3" },
+    { watchId: 4, value: "0x4" },
+  ]);
+
+  // a byte of memory: another byte is being edited when the answer for the first arrives
+  const byteAt = async (address: number) => {
+    const hex = memory.locator(`[data-memory-hex="${address - (address % 16)}"]`);
+    const box = (await hex.boundingBox())!;
+    await hex.dblclick({ position: { x: ((address % 16) * 3 + 1.5) * (box.width / 47), y: box.height / 2 } });
+  };
+  const bytes = memory.getByRole("textbox", { name: /^Bytes to write from / });
+  await byteAt(0x8c010002);
+  await bytes.fill("AA");
+  await bytes.press("Enter");
+  await expect.poll(() => answers.length).toBe(5);
+  await bytes.press("Escape");
+  await expect(bytes).toHaveCount(0);
+  await byteAt(0x8c010008);
+  await bytes.fill("BB");
+  answers[4]({});
+  await page.waitForTimeout(300);
+  await expect(bytes).toHaveValue("BB");
+  await expect(bytes).toHaveAccessibleName("Bytes to write from 0x8C010008");
+  await expect(bytes).not.toHaveAttribute("aria-busy");
+  await bytes.press("Enter");
+  await expect.poll(() => answers.length).toBe(6);
+  answers[5]({});
+  await expect(bytes).toHaveCount(0);
+  expect(server.requestsOf("state.writeMemory")).toEqual([
+    { target: "sh4", address: 0x8c010002, data: [0xaa] },
+    { target: "sh4", address: 0x8c010008, data: [0xbb] },
+  ]);
+});
+
+test("another client resumes the target while the focus is in the editor of a register: the editor goes, and the next stop does not bring it back", async ({
+  page,
+}) => {
+  // The toolbar's Run would take the focus out of the box, and leaving the box puts an editor
+  // away by itself. Here nothing is clicked: the ticks say that the target runs, and stops again.
+  const server = await serveScriptedDebugger(page);
+  withRegisterWrites(server, ["dc.sh4.cpu"]);
+  describedNode(server, "dc.sh4.cpu").actions = ["sh4-disassembly", "sh4-memory", "sh4-registers"];
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await server.described();
+  const view = await showRegisters(page, "SH4");
+  const status = page.getByRole("status", { name: "Execution state" });
+
+  await value(view, "R15").dblclick();
+  await editor(view).fill("0x5A");
+  await expect(editor(view)).toBeFocused();
+
+  server.state.execution = { state: "running", stopId: 1 };
+  server.tick();
+  await expect(status).toContainText("Running");
+  // no box while the target runs; the value has the focus the box had, and cannot be used
+  await expect(editor(view)).toHaveCount(0);
+  await expect(value(view, "R15")).toBeFocused();
+  await expect(value(view, "R15")).toHaveAttribute("aria-disabled", "true");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("F2");
+  await expect(editor(view)).toHaveCount(0);
+
+  // a new stop: the box is not back, and what was typed is gone with it
+  server.state.execution = { state: "paused", stopId: 2, reason: "pause" };
+  server.tick();
+  await expect(status).toContainText("stop 2");
+  await page.waitForTimeout(300);
+  await expect(editor(view)).toHaveCount(0);
+  await expect(value(view, "R15")).toHaveText("0x8CFFF000");
+  // the value is a control again, where the focus still is
+  await expect(value(view, "R15")).toBeFocused();
+  await expect(value(view, "R15")).not.toHaveAttribute("aria-disabled");
+  await page.keyboard.press("Enter");
+  await expect(editor(view)).toHaveValue("0x8CFFF000");
+  await editor(view).press("Escape");
+  expect(server.requestsOf("state.setRegister")).toEqual([]);
 });
 
 test("an emulator that is busy refuses a write (-32000): each of the three editors stays open with what was typed, and the notice says why", async ({ page }) => {
@@ -868,7 +1095,8 @@ test.describe("in a window of 1366x768", () => {
           await expect(cell).toBeVisible();
           expect(await inside(cell), `${name}: ${await cell.innerText()}`).toBe(true);
         }
-        await expect(row(view, name).getByRole("button")).toBeInViewport({ ratio: 1 });
+        // (the + of the row: the value of a register that can be written is a button as well)
+        await expect(row(view, name).locator("button.register-watch")).toBeInViewport({ ratio: 1 });
       }
       for (const header of await view.getByRole("columnheader").all()) {
         expect(await inside(header)).toBe(true);
