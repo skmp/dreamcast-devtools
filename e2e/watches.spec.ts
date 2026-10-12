@@ -1,6 +1,8 @@
 import {
   test,
   expect,
+  gotoRoute,
+  holdResponses,
   openWorkspace,
   panel,
   pauseFromToolbar,
@@ -9,6 +11,8 @@ import {
   treeItemRow,
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
+import { serveScriptedDebugger, type Json } from "./support/scriptedDebugger";
+import { MOCK_M2_SUPPORT } from "../server/mockDebugger";
 
 const watchRow = (page: Page, expression: string): Locator =>
   panel(page, "watches").getByRole("listitem").filter({ hasText: `${expression} = ` });
@@ -172,27 +176,189 @@ test("double-clicking the value writes the register behind a watch", async ({ pa
   await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toHaveText(/PC = 0x8C0000AC/);
 });
 
-test("a rejected edit keeps the editor open and shows the server's error", async ({ page, diagnostics }) => {
-  diagnostics.allow(
-    /^console\.error: (Failed to edit watch|handleSaveValue failed:)/,
-    "debuggerDataStore.editWatch logs the server's refusal with console.error before showing it as a toast",
-  );
+test("a rejected edit keeps the editor open and shows the server's error", async ({ page, rpc }) => {
+  await openWorkspace(page, "sh4-debugger");
+  await pauseFromToolbar(page);
+  const watches = panel(page, "watches");
+  const editor = watches.getByRole("listitem").getByRole("textbox");
+
+  // a value the device refuses: nothing executes at an odd address (-32013)
+  await watchRow(page, "dc.sh4.cpu.pc").getByText(/^0x8C0000A[0-9A-E]$/).dblclick();
+  await expect(editor).toHaveAccessibleName("New value of dc.sh4.cpu.pc");
+  await editor.fill("0x8C0000A1");
+  await editor.press("Enter");
+  await expect(page.getByRole("alert").filter({ hasText: "not writable: dc.sh4.cpu.PC = 0x8C0000A1: the address is odd" })).toBeVisible();
+  await expect(editor).toBeVisible();
+  await expect(editor).toHaveValue("0x8C0000A1");
+  await expect(editor).toHaveAttribute("aria-invalid", "true");
+  // a text that is no number (-32602)
+  await editor.fill("nowhere");
+  await editor.press("Enter");
+  await expect(page.getByRole("alert").filter({ hasText: 'invalid params: value: "nowhere" is neither 0x hex nor decimal' })).toBeVisible();
+  await expect(editor).toHaveValue("nowhere");
+  expect(rpc.requests("state.editWatch")).toHaveLength(2);
+
+  await editor.press("Escape");
+  await expect(editor).toHaveCount(0);
+  await expect(watchRow(page, "dc.sh4.cpu.pc")).toHaveText(/dc\.sh4\.cpu\.pc = 0x8C0000A[0-9A-E]$/);
+});
+
+test("the value of a watch is an editor while the target is paused only, and one that is open goes when the target runs again", async ({ page, rpc }) => {
   await openWorkspace(page, "sh4-debugger");
   const watches = panel(page, "watches");
-  // a text register: it can be watched, and it cannot be written
   const input = watches.getByPlaceholder("Enter expression");
-  await input.fill("dc.sysclk");
+  // a register the running target does not change
+  await input.fill("dc.sh4.cpu.gbr");
   await input.press("Enter");
-
-  await watchRow(page, "dc.sysclk").getByText("200MHz", { exact: true }).dblclick();
+  const value = watchRow(page, "dc.sh4.cpu.gbr").getByText("0x8C000000", { exact: true });
   const editor = watches.getByRole("listitem").getByRole("textbox");
-  await editor.fill("100MHz");
-  await editor.press("Enter");
 
-  await expect(page.getByRole("alert").filter({ hasText: "not writable: dc.SYSCLK" })).toBeVisible();
-  await expect(editor).toBeVisible();
+  // running: the value says why it is none, and a double click opens nothing
+  await expect(value).toHaveAttribute("title", "Read-only while the target runs: pause it to write the register");
+  await value.dblclick();
+  await expect(editor).toHaveCount(0);
+  // the expression is no write: it can be changed in either state
+  await watches.getByText("dc.sh4.cpu.gbr", { exact: true }).dblclick();
+  await expect(editor).toHaveValue("dc.sh4.cpu.gbr");
   await editor.press("Escape");
-  await expect(watchRow(page, "dc.sysclk")).toHaveText("dc.sysclk = 200MHz");
+
+  await pauseFromToolbar(page);
+  await expect(value).toHaveAttribute("title", "Double-click to write the register");
+  await value.dblclick();
+  await editor.fill("0x8C00FF00");
+  await tooltipButton(page, "Run").click();
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
+  await expect(editor).toHaveCount(0);
+  await pauseFromToolbar(page);
+  await expect(editor).toHaveCount(0);
+  await expect(watchRow(page, "dc.sh4.cpu.gbr")).toHaveText("dc.sh4.cpu.gbr = 0x8C000000");
+  expect(rpc.requests("state.editWatch")).toEqual([]);
+});
+
+test("a watch on a register without a writer is no editor: free text, and a register that cannot be read", async ({ page, rpc }) => {
+  await openWorkspace(page, "sh4-debugger");
+  await pauseFromToolbar(page);
+  const watches = panel(page, "watches");
+  const input = watches.getByPlaceholder("Enter expression");
+  for (const expression of ["dc.sysclk", "dc.sh4.scif.scfrdr2"]) {
+    await input.fill(expression);
+    await input.press("Enter");
+  }
+  for (const [expression, text] of [
+    ["dc.sysclk", "200MHz"],
+    ["dc.sh4.scif.scfrdr2", "n/a"],
+  ]) {
+    const value = watchRow(page, expression).getByText(text, { exact: true });
+    await expect(value).toHaveAttribute("title", "Read-only: the server has no writer for this register");
+    await value.dblclick();
+    await expect(watches.getByRole("listitem").getByRole("textbox")).toHaveCount(0);
+  }
+  // the one beside them is
+  await expect(watchRow(page, "dc.sh4.cpu.pc").getByText(/^0x8C0000A[0-9A-E]$/)).toHaveAttribute("title", "Double-click to write the register");
+  expect(rpc.requests("state.editWatch")).toEqual([]);
+});
+
+test("an answer that is late: the editor waits with what was typed, sends nothing more, and closes when the server has accepted", async ({ page }) => {
+  const held = await holdResponses(page, "state.editWatch");
+  await openWorkspace(page, "sh4-debugger");
+  await pauseFromToolbar(page);
+  const watches = panel(page, "watches");
+  const editor = watches.getByRole("listitem").getByRole("textbox");
+
+  await watchRow(page, "dc.sh4.cpu.pc").getByText(/^0x8C0000A[0-9A-E]$/).dblclick();
+  await editor.fill("0x8C0000A8");
+  await editor.press("Enter");
+  await expect.poll(held.held).toBe(1);
+  await expect(editor).toHaveValue("0x8C0000A8");
+  await expect(editor).toHaveAttribute("aria-busy", "true");
+  await editor.press("Enter");
+  await editor.press("Enter");
+  await page.waitForTimeout(300);
+  expect(held.requests("state.editWatch")).toHaveLength(1);
+
+  held.release();
+  await expect(editor).toHaveCount(0);
+  await expect(watchRow(page, "dc.sh4.cpu.pc")).toHaveText("dc.sh4.cpu.pc = 0x8C0000A8");
+  expect(held.requests("state.editWatch")).toHaveLength(1);
+});
+
+test.describe("a server that can do what the emulator of milestone M2 can, and no more", () => {
+  test.use({ mockOptions: { supports: MOCK_M2_SUPPORT, startPaused: true, graceMs: 600_000 } });
+
+  test("a watch on a register of the two processors is an editor; one on any other register is not, and nothing is sent that the server refuses by rule", async ({
+    page,
+    rpc,
+  }) => {
+    await openWorkspace(page, "sh4-debugger");
+    const watches = panel(page, "watches");
+    const input = watches.getByPlaceholder("Enter expression");
+    const editor = watches.getByRole("listitem").getByRole("textbox");
+    const WRITTEN = ["dc.sh4.cpu.r4", "dc.aica.arm7.r2"];
+    // ENABLED of the ARM7, an on-chip module, the system bus, a channel, the DSP and the time
+    const READ = ["dc.aica.arm7.enabled", "dc.sh4.tmu.tcor0", "dc.holly.sb.g2.sb_g2id", "dc.aica.sgc.5.vol", "dc.aica.dsp.rbl", "dc.timing.sh4_cycles"];
+    for (const expression of [...WRITTEN, ...READ]) {
+      await input.fill(expression);
+      await input.press("Enter");
+      await expect(watchRow(page, expression)).toBeVisible();
+    }
+
+    for (const expression of READ) {
+      const value = watchRow(page, expression).locator("span[title]");
+      await expect(value, expression).toHaveAttribute("title", "Read-only: the server has no writer for this register");
+      await value.dblclick();
+      await expect(editor, expression).toHaveCount(0);
+    }
+    for (const expression of WRITTEN) {
+      const value = watchRow(page, expression).locator("span[title]");
+      await expect(value, expression).toHaveAttribute("title", "Double-click to write the register");
+      await value.dblclick();
+      await editor.fill("0xBEEF");
+      await editor.press("Enter");
+      await expect(editor, expression).toHaveCount(0);
+      await expect(watchRow(page, expression)).toHaveText(`${expression} = 0x0000BEEF`);
+    }
+    expect(rpc.requests("state.editWatch")).toHaveLength(WRITTEN.length);
+    expect(rpc.received.filter((frame) => /-320(13|04)/.test(JSON.stringify(frame)))).toEqual([]);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+});
+
+test("a watch finds its register by its expression, without regard to case; one that names no described register is no editor", async ({ page }) => {
+  const server = await serveScriptedDebugger(page);
+  server.shape.capabilities = ["event-breakpoints", "callstack", "register-write"];
+  // the registers of dc.sh4.cpu have a writer, and no other register has
+  const cpu = (((server.shape.deviceTree as Json[])[0].children as Json[])[0].children as Json[])[0];
+  expect(cpu.path).toBe("dc.sh4.cpu");
+  cpu.registers = (cpu.registers as Json[]).map((register) => ({ ...register, flags: { writable: true } }));
+  // What the ticks list as watches is the server's: an expression in another case than the
+  // tree's, one of a register without a writer, and three that name nothing the tree describes.
+  server.state.watches = [
+    { id: 1, expression: "DC.SH4.CPU.Pr", value: "0x8C000F00" },
+    { id: 2, expression: "dc.sh4.tmu.tcnt0", value: "0xFFFFFFFF" },
+    { id: 3, expression: "dc.sh4.cpu.nothing", value: "0x00000001" },
+    { id: 4, expression: "dc.sh4.cpu", value: "0x00000002" },
+    { id: 5, expression: "pr", value: "0x00000003" },
+  ];
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await server.described();
+  const watches = panel(page, "watches");
+  const editor = watches.getByRole("listitem").getByRole("textbox");
+  await expect(watches.getByRole("listitem")).toHaveCount(5);
+
+  for (const expression of ["dc.sh4.tmu.tcnt0", "dc.sh4.cpu.nothing", "dc.sh4.cpu", "pr"]) {
+    const value = watches.getByRole("listitem").filter({ hasText: new RegExp(`^${expression.replaceAll(".", "\\.")} = `) }).locator("span[title]");
+    await expect(value, expression).toHaveAttribute("title", "Read-only: the server has no writer for this register");
+    await value.dblclick();
+    await expect(editor, expression).toHaveCount(0);
+  }
+  const value = watches.getByRole("listitem").filter({ hasText: "DC.SH4.CPU.Pr = " }).locator("span[title]");
+  await expect(value).toHaveAttribute("title", "Double-click to write the register");
+  await value.dblclick();
+  await editor.fill("0x8C000F02");
+  await editor.press("Enter");
+  await expect(editor).toHaveCount(0);
+  expect(server.requestsOf("state.editWatch")).toEqual([{ watchId: 1, value: "0x8C000F02" }]);
+  expect(server.requestsOf("state.setRegister")).toEqual([]);
 });
 
 test("the delete button removes a watch", async ({ page }) => {
