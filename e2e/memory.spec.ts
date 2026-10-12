@@ -739,7 +739,10 @@ test.describe("byte editing: the box of an editor is in a row of the listing", (
     const server = await serveScriptedDebugger(page);
     server.shape.capabilities = ["event-breakpoints", "callstack", "memory-write"];
     let failing = false;
-    server.answer("state.getMemorySlice", (params) => (failing ? jsonRpcError(-32000, "emulator busy") : defaultAnswer("state.getMemorySlice", params)));
+    let elsewhere = 0;
+    server.answer("state.getMemorySlice", (params) =>
+      failing ? jsonRpcError(-32000, "emulator busy") : defaultAnswer("state.getMemorySlice", { ...params, address: Number(params.address) + elsewhere }),
+    );
     await gotoRoute(page, "/workspace/sh4-debugger");
     await server.described();
     const view = panel(page, "sh4-memory");
@@ -763,6 +766,23 @@ test.describe("byte editing: the box of an editor is in a row of the listing", (
     await page.waitForTimeout(300);
     await expect(byteEditor(view)).toHaveCount(0);
     await expect(view.getByRole("textbox")).toHaveCount(1);
+    expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe("INPUT");
+
+    // The same for rows that are other addresses than the view asked for (a server that answers
+    // with another base): the byte of the editor is in none of them.
+    await dblclickByte(view, 0x8c010004);
+    await byteEditor(view).fill("BB");
+    elsewhere = 0x400;
+    server.state.execution = { state: "paused", stopId: 4, reason: "pause" };
+    server.tick();
+    await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(0x8c010400));
+    await expect(byteEditor(view)).toHaveCount(0);
+    elsewhere = 0;
+    server.state.execution = { state: "paused", stopId: 5, reason: "pause" };
+    server.tick();
+    await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(0x8c010000));
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view)).toHaveCount(0);
     expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe("INPUT");
     expect(server.requestsOf("state.writeMemory")).toEqual([]);
   });

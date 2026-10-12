@@ -340,6 +340,13 @@ test("the value of a watch is written with the keyboard: it is a stop of the Tab
   await page.keyboard.press("Tab");
   await expect(editor).toHaveCount(0);
   await expect(watches.getByRole("button", { name: "Remove dc.sh4.cpu.gbr" })).toBeFocused();
+  // ... and a click on something that takes no focus leaves it nowhere: it is not taken back to the value
+  await watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C00FF00, write" }).dblclick();
+  await expect(editor).toBeFocused();
+  await watchRow(page, "dc.sysclk").getByText("dc.sysclk", { exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  await page.waitForTimeout(200);
+  await expect(watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C00FF00, write" })).not.toBeFocused();
   // any other key on a value opens nothing
   await watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C00FF00, write" }).focus();
   await page.keyboard.press("a");
