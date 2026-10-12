@@ -8,7 +8,7 @@ import { useNoDataText, useProgramCounter, useRunState, useTarget } from "../../
 import { formatAddress, formatAddressInput, parseAddress, programCounter, withContextAbove } from "../../state/targets";
 import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks, type DisassemblyViewRef } from "../components/DisassemblyView";
 import { PanelNotice } from "../components/PanelNotice";
-import { canResume } from "../../state/stopReasons";
+import { arm7Held, stepOff } from "../../state/runControls";
 import { Panel } from "../layout/Panel";
 import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
 import { generateUUID } from "../../lib/uuid";
@@ -28,7 +28,21 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
   const epoch = useDebuggerDataStore((state) => state.epoch);
   const refresh = useDebuggerDataStore((state) => state.refresh);
   const reread = useDebuggerDataStore((state) => state.reread);
-  const steppable = useDebuggerDataStore((state) => canResume(state.executionState?.reason));
+  // Why this view cannot step its target now, by the rules the toolbar has for its own step
+  // buttons (`stepOff`): the target runs, the stop is one of the emulator's own window, or
+  // the target is an ARM7 that is held in reset (`ENABLED` reads 0, and the server would
+  // answer -32012). The buttons are off then, and say why. (A target the server cannot step
+  // at all has a notice in place of the buttons: `steppingNotice`, below.)
+  const connected = useSessionStore((state) => state.connectionState === "connected");
+  const stepOffReason = useDebuggerDataStore((state) =>
+    stepOff({
+      connected,
+      initialized: state.initialized,
+      execution: state.executionState,
+      target: info,
+      held: target === "arm7" && arm7Held(state.registersByPath, info),
+    }),
+  );
   const breakpoints = useDebuggerDataStore((state) => state.breakpoints);
   const categoryState = useDebuggerDataStore((state) => state.categories[target]);
   const addBreakpoint = useDebuggerDataStore((state) => state.addBreakpoint);
@@ -239,6 +253,7 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
         executionState="running"
         categoryState={categoryState}
         followOnPause={false}
+        stepOffReason={stepOffReason}
         noDataText={noDataText}
       />
     );
@@ -260,7 +275,8 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
       target={target}
       followOnPause={false}
       refetchAfterBreakpointEdit
-      canStep={steppable}
+      canStep={stepOffReason === undefined}
+      stepOffReason={stepOffReason}
       noDataText={noDataText}
     />
   );

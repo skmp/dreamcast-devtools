@@ -137,6 +137,11 @@ export interface DisassemblyViewProps {
   refetchAfterBreakpointEdit?: boolean;
   /** false: the step buttons are disabled although the target is paused (default: true). */
   canStep?: boolean;
+  /**
+   * Why the step buttons cannot be used, when they cannot: their tooltips say it behind their
+   * names ("Step Over: the ARM7 is held in reset"). It turns nothing off by itself.
+   */
+  stepOffReason?: string;
   /** What is said in place of the lines while the view is not `initialized` (default: "No Data"). */
   noDataText?: string;
   /**
@@ -280,6 +285,7 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   followOnPause = true,
   refetchAfterBreakpointEdit = false,
   canStep = true,
+  stepOffReason,
   noDataText = "No Data",
   unplaced = false,
 }, ref) => {
@@ -833,6 +839,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
   // the view shows lines (or that the server returned none), not something in place of them
   const listed = initialized && !error && !(lines.length === 0 && loading);
   const stepDisabled = executionState !== "paused" || !canStep;
+  // A step button is called what it does, in every state; its tooltip adds why it is off, when
+  // the caller says why, and is then the description of the button as well.
+  const stepTitle = (label: string) => ((stepDisabled || !initialized) && stepOffReason ? `${label}: ${stepOffReason}` : label);
   const stepping = config.steppingNotice === undefined;
   const StepIcon = config.stepIcon;
 
@@ -904,9 +913,9 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
             );
           })}
           {stepping ? (
-            // the tooltips of the step buttons are on the buttons: the title is the button's name
-            <Tooltip title={config.stepLabel}>
-              <RunControlButton size="small" onClick={handleStep} disabled={stepDisabled || !initialized}>
+            // the tooltips of the step buttons are on the buttons, which are named by their labels
+            <Tooltip title={stepTitle(config.stepLabel)} describeChild={stepTitle(config.stepLabel) !== config.stepLabel}>
+              <RunControlButton size="small" aria-label={config.stepLabel} onClick={handleStep} disabled={stepDisabled || !initialized}>
                 <StepIcon fontSize="small" />
               </RunControlButton>
             </Tooltip>
@@ -917,13 +926,13 @@ export const DisassemblyView = forwardRef<DisassemblyViewRef, DisassemblyViewPro
           )}
           {stepping && config.showStepInOut && (
             <>
-              <Tooltip title="Step In">
-                <RunControlButton size="small" onClick={handleStepIn} disabled={stepDisabled || !initialized}>
+              <Tooltip title={stepTitle("Step In")} describeChild={stepTitle("Step In") !== "Step In"}>
+                <RunControlButton size="small" aria-label="Step In" onClick={handleStepIn} disabled={stepDisabled || !initialized}>
                   <ArrowDownwardRoundedIcon fontSize="small" />
                 </RunControlButton>
               </Tooltip>
-              <Tooltip title="Step Out">
-                <RunControlButton size="small" onClick={handleStepOut} disabled={stepDisabled || !initialized}>
+              <Tooltip title={stepTitle("Step Out")} describeChild={stepTitle("Step Out") !== "Step Out"}>
+                <RunControlButton size="small" aria-label="Step Out" onClick={handleStepOut} disabled={stepDisabled || !initialized}>
                   <ArrowUpwardRoundedIcon fontSize="small" />
                 </RunControlButton>
               </Tooltip>
