@@ -267,10 +267,12 @@ where it opens is the server's to say.
   step out, with F8 and Shift+F8 for F11 and Shift+F11. They work wherever the focus is — on
   the page, in an address box (where F5 would otherwise load the page again), on a value, in
   the editor of one — but for two places: in Monaco, and while a dialog is open, they are left
-  to the editor and to the browser. A key that is held down is used once, and its repeats are
-  taken from the browser all the same. A key does what its button does: nothing while the
-  button is off. A key with Ctrl, Alt or Meta is not one of them: Ctrl+R and Ctrl+F5 load the
-  page again, which F5 no longer does on these pages.
+  to the editor and to the browser. The Find box of an editor is a part of that editor, and no
+  dialog of the page: with the focus anywhere else the keys work, whether the box is open or
+  was closed. A key that is held down is used once, and its repeats are taken from the browser
+  all the same. A key does what its button does: nothing while the button is off. A key with
+  Ctrl, Alt or Meta is not one of them: Ctrl+R and Ctrl+F5 load the page again, which F5 no
+  longer does on these pages.
 - **What is off, and why.** A run control whose request could only be refused is off, by
   button and by key, and its tooltip (which is also its description) says why behind its name:
   `not connected`; `the target is running` (Run and the steps) or `the target is paused`
