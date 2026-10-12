@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, type KeyboardEvent } from "react";
 import { Box, Typography } from "@mui/material";
 import { alpha, type Theme } from "@mui/material/styles";
 import { useShallow } from "zustand/react/shallow";
@@ -10,12 +10,14 @@ import { useCapability, useRunState } from "../../state/debuggerSelectors";
 import { targetInfo } from "../../state/targets";
 import { NO_GAME } from "../../state/tickState";
 import { NoData, PanelNotice } from "../components/PanelNotice";
-import { useWriteEditor } from "../components/useWriteEditor";
+import { opensEditor, useFocusReturn, useWriteEditor } from "../components/useWriteEditor";
 import { WriteEditorInput } from "../components/WriteEditorInput";
 import { liveRegisterValues } from "./deviceTreeModel";
 import {
   EDIT_TITLES,
+  controlName,
   editability,
+  isControl,
   panelNode,
   registerRows,
   registerWrite,
@@ -93,6 +95,15 @@ const tableSx = (theme: Theme) => ({
   },
   "& .register-value [data-editable]": {
     cursor: "text",
+  },
+  // a value the keyboard focus is on
+  "& .register-value [role=button]": {
+    borderRadius: "3px",
+    outline: "none",
+    "&:focus-visible": {
+      outline: `2px solid ${theme.palette.primary.main}`,
+      outlineOffset: "2px",
+    },
   },
   "& .register-editor": {
     font: "inherit",
@@ -174,12 +185,19 @@ const RegisterRow = memo(({ nodePath, row, value, mode, watched }: RegisterRowPr
   // runs again (or the server is another one) is not shown any more, and is put away with
   // what was typed.
   const editing = editor.text !== undefined && mode === "editable";
-  const { text: draft, close } = editor;
+  const { text: draft, open, close } = editor;
   useEffect(() => {
     if (draft !== undefined && mode !== "editable") {
       close();
     }
   }, [draft, mode, close]);
+  // The value of a register this server writes is a control: the keyboard focus can be on it,
+  // Enter, the space bar and F2 open its editor as a double click does, and it has the focus
+  // again when the editor goes. It keeps the focus while the target runs, and does nothing then.
+  const control = isControl(mode);
+  const valueElement = useRef<HTMLSpanElement | null>(null);
+  const boxFocus = useFocusReturn(editing, valueElement);
+  const openEditor = mode === "editable" ? () => open(value) : undefined;
   const watchTitle = watched ? "Already in watch" : "Add to watch";
 
   return (
@@ -187,12 +205,26 @@ const RegisterRow = memo(({ nodePath, row, value, mode, watched }: RegisterRowPr
       <td>{row.name}</td>
       <td className="register-value">
         {editing ? (
-          <WriteEditorInput editor={editor} label={`New value of ${row.name}`} className="register-editor" />
+          <WriteEditorInput editor={editor} label={`New value of ${row.name}`} focus={boxFocus} className="register-editor" />
         ) : (
           <span
+            ref={valueElement}
             data-editable={mode === "editable" ? "" : undefined}
             title={EDIT_TITLES[mode]}
-            onDoubleClick={mode === "editable" ? () => editor.open(value) : undefined}
+            onDoubleClick={openEditor}
+            {...(control && {
+              role: "button",
+              tabIndex: 0,
+              "aria-label": controlName(row.name, value),
+              "aria-disabled": mode !== "editable" || undefined,
+              onKeyDown: (event: KeyboardEvent<HTMLSpanElement>) => {
+                if (opensEditor(event.key)) {
+                  // the key is not the page's (the space bar scrolls it), and not the first key of the box
+                  event.preventDefault();
+                  openEditor?.();
+                }
+              },
+            })}
           >
             {value}
           </span>
