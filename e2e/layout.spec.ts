@@ -178,6 +178,19 @@ for (const size of [
           await expect(breakpoints.getByRole("button", { name: "Add", exact: true })).toBeInViewport({ ratio: 1 });
           expect(await cutOff(page)).toEqual([]);
         }
+        // and so is the register panel of the processor, behind the breakpoints
+        const registers = { "sh4-debugger": "SH4: Registers", "arm7-debugger": "ARM7: Registers" }[workspace as string];
+        if (registers) {
+          await dockTab(page, registers).click();
+          const table = panel(page, `${registers.slice(0, registers.indexOf(":")).toLowerCase()}-registers`);
+          const first = table.locator("tbody tr").first();
+          await expect(first.locator("td").first()).toHaveText("PC");
+          for (const cell of await first.locator("td").all()) {
+            await expect(cell, registers).toBeInViewport({ ratio: 1 });
+          }
+          await expectUsable(first.getByRole("button", { name: /watch/ }), `${registers}: watch`);
+          expect(await cutOff(page)).toEqual([]);
+        }
       });
     }
   });
@@ -308,6 +321,120 @@ test.describe("in a window that got narrower under views that are side by side",
       await expect.poll(() => whole(view, address)).toBe(true);
     });
   }
+
+  /** The rows of a memory view, and the three cells of its first row: address, hex, text. */
+  const memoryRows = (view: Locator): Locator =>
+    view.locator("div").filter({ has: view.page().locator(":scope > span:nth-child(3)") }).filter({ hasText: /^0x[0-9A-F]{8}/ });
+
+  for (const size of [
+    { width: 1366, height: 768 },
+    { width: 1280, height: 720 },
+  ]) {
+    test(`${size.width}x${size.height}: a memory view narrower than its rows cuts no column, and scrolls to the rest of them`, async ({ page, rpc }) => {
+      await openWorkspace(page, "sh4-debugger");
+      const view = panel(page, "sh4-memory");
+      await expect(memoryRows(view)).toHaveCount(60);
+
+      await page.setViewportSize(size);
+      // still beside the listing, in a narrower dock: less than a row needs at the smallest font it is given
+      await expect.poll(async () => (await view.boundingBox())!.width).toBeLessThan(340);
+      const box = (await view.boundingBox())!;
+      const listing = (await panel(page, "sh4-disassembly").boundingBox())!;
+      expect(box.x).toBeGreaterThanOrEqual(listing.x + listing.width);
+
+      // the toolbar is inside the panel
+      for (const [name, control] of [
+        ["address box", view.getByRole("textbox")],
+        ["Go", view.getByRole("button", { name: "Go", exact: true })],
+        ["Refresh", view.getByRole("button", { name: "Refresh", exact: true })],
+      ] as const) {
+        await expectUsable(control, name);
+        expect(await whole(view, control), `${name} is inside the panel`).toBe(true);
+      }
+
+      // a row has its three columns at their width, in a font that can be read: nothing is squeezed for the panel
+      const row = memoryRows(view).first();
+      const [address, hex, text] = [row.locator("span").nth(0), row.locator("span").nth(1), row.locator("span").nth(2)];
+      const measure = (cell: Locator) =>
+        cell.evaluate((element) => ({
+          width: element.getBoundingClientRect().width,
+          scrollWidth: element.scrollWidth,
+          clientWidth: element.clientWidth,
+          fontSize: Number.parseFloat(getComputedStyle(element).fontSize),
+        }));
+      const cells = { address: await measure(address), hex: await measure(hex), text: await measure(text) };
+      expect(cells.hex.fontSize, "font size of the listing").toBe(10);
+      // sixteen bytes and the blanks between them are 47 characters, the text sixteen (a character of a monospace font is 0.6 em wide or more)
+      expect(cells.hex.width, "width of the hex column").toBeGreaterThanOrEqual(47 * 0.6 * cells.hex.fontSize - 1);
+      expect(cells.text.width, "width of the text column").toBeGreaterThanOrEqual(16 * 0.6 * cells.text.fontSize - 1);
+      for (const [name, cell] of Object.entries(cells)) {
+        expect(cell.scrollWidth, `the ${name} fits its column`).toBeLessThanOrEqual(cell.clientWidth + 1);
+      }
+      await expect(hex).toHaveText(/^([0-9A-F]{2} ){15}[0-9A-F]{2}$/);
+      expect((await text.innerText()).length).toBe(16);
+
+      // The view shows the start of its rows, and the rest of them when it is scrolled to the
+      // side: with the wheel, which moves the view through its addresses only when it is
+      // turned up or down.
+      expect(await whole(view, address), "the address is shown").toBe(true);
+      expect(await whole(view, text), "the text column does not fit beside it").toBe(false);
+      const first = await address.innerText();
+      const slices = rpc.requests("state.getMemorySlice").length;
+      await address.hover();
+      await page.mouse.wheel(600, 0);
+      await expect.poll(() => whole(view, text), { message: "the text column is scrolled to" }).toBe(true);
+      expect(await whole(view, hex.locator("xpath=..").locator("span").nth(2))).toBe(true);
+      // to the side only: the view is where it was, and has read nothing
+      await expect(address).toHaveText(first);
+      expect(rpc.requests("state.getMemorySlice").length).toBe(slices);
+      // every row is whole there, the last one on screen too
+      const rows = await memoryRows(view).all();
+      expect(await whole(view, rows[5].locator("span").nth(2))).toBe(true);
+      // and back
+      await page.mouse.wheel(-600, 0);
+      await expect.poll(() => whole(view, address)).toBe(true);
+      // a turn down is still a move through the addresses
+      await page.mouse.wheel(0, 60);
+      await expect(memoryRows(view).first().locator("span").first()).not.toHaveText(first);
+      expect(rpc.requests("state.getMemorySlice").length).toBe(slices + 1);
+    });
+  }
+
+  test("what such a memory view says about its rows is in the panel, and is not scrolled away with them", async ({ page }) => {
+    // a server that takes its time over the bytes when told to
+    const server = await serveScriptedDebugger(page);
+    let held: Array<() => void> | undefined;
+    server.answer("state.getMemorySlice", (params) => {
+      const answer = defaultAnswer("state.getMemorySlice", params);
+      return held ? new Promise((resolve) => held!.push(() => resolve(answer))) : answer;
+    });
+    await gotoRoute(page, "/workspace/sh4-debugger");
+    await server.described();
+    const view = panel(page, "sh4-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await expect.poll(async () => (await view.boundingBox())!.width).toBeLessThan(340);
+    const row = memoryRows(view).first();
+
+    // the bytes are read again, and the answer is late: the view says that it is reading, over the rows
+    held = [];
+    await view.getByRole("button", { name: "Refresh", exact: true }).click();
+    const updating = view.getByText("Updating");
+    await expect(updating).toBeVisible();
+    expect(await whole(view, updating), '"Updating" is inside the panel').toBe(true);
+    const toolbar = (await view.getByRole("textbox").boundingBox())!;
+    expect((await updating.boundingBox())!.y, '"Updating" is below the toolbar').toBeGreaterThanOrEqual(toolbar.y + toolbar.height);
+    // also when the rows are scrolled to the side
+    await row.locator("span").first().hover();
+    await page.mouse.wheel(600, 0);
+    await expect.poll(() => whole(view, row.locator("span").nth(2))).toBe(true);
+    expect(await whole(view, updating), '"Updating" is inside the panel, with the rows scrolled to the side').toBe(true);
+
+    held.splice(0).forEach((answer) => answer());
+    held = undefined;
+    await expect(updating).toBeHidden();
+    await expect(memoryRows(view)).toHaveCount(60);
+  });
 
   test("what such a listing says about its lines is in the panel, and is not scrolled away with them", async ({ page }) => {
     // a server that takes its time over a listing when told to, and that can list an address twice

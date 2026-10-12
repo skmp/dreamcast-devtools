@@ -1,7 +1,11 @@
 import {
   test,
   expect,
+  currentInstructionAddress,
+  disassemblyRow,
+  disassemblyRows,
   gotoRoute,
+  holdResponses,
   openWorkspace,
   panel,
   pauseFromToolbar,
@@ -10,6 +14,8 @@ import {
   tooltipButton,
 } from "./support/fixtures";
 import type { Locator } from "@playwright/test";
+import { serveScriptedDebugger, type Json } from "./support/scriptedDebugger";
+import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT } from "../server/mockDebugger";
 
 const hex8 = (address: number) => `0x${address.toString(16).toUpperCase().padStart(8, "0")}`;
 
@@ -302,3 +308,394 @@ test("the memory is read again when the target stops, and not for any other tick
   // where the user had the view
   expect(rpc.requests("state.getMemorySlice").at(-1)?.params).toEqual({ target: "sh4", address: 0x8c010000, length: 960 });
 });
+
+// ---------------------------------------------------------------------------------------
+// Byte editing: a double click on a byte of the hex column opens an editor there, and the run
+// of bytes typed into it is one state.writeMemory, from that byte on. It is offered on a
+// server with `memory-write`, while the target is paused.
+// ---------------------------------------------------------------------------------------
+
+/** The hex column of the row that starts at `address`. */
+const hexCell = (view: Locator, address: number): Locator => view.locator(`[data-memory-hex="${address}"]`);
+
+/**
+ * Double-clicks the byte at `address`. A row is one piece of text, and the view finds the byte
+ * from where in the hex column the pointer is: here the middle of the byte's second digit.
+ */
+const dblclickByte = async (view: Locator, address: number) => {
+  const cell = hexCell(view, address - (address % 16));
+  const box = (await cell.boundingBox())!;
+  await cell.dblclick({ position: { x: ((address % 16) * 3 + 1.5) * (box.width / 47), y: box.height / 2 } });
+};
+
+/** The open editor of a memory view (its other box is the address box). */
+const byteEditor = (view: Locator): Locator => view.getByRole("textbox", { name: /^Bytes to write from / });
+
+const EDIT_HINT = "Double-click a byte to write memory from there";
+const RUNNING_HINT = "Read-only while the target runs: pause it to write memory";
+
+test.describe("byte editing", () => {
+  test("a run of bytes typed in one go is one request, from the byte that was double-clicked; the views read again where they are", async ({
+    page,
+    rpc,
+  }, testInfo) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const listing = panel(page, "sh4-disassembly");
+    const hex = (address: number) => rowAt(view, address).locator("span").nth(1);
+    await expect(hex(0x8c010000)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    await expect(hexCell(view, 0x8c010000)).toHaveAttribute("title", EDIT_HINT);
+    const slices = () => rpc.requests("state.getMemorySlice").length;
+    const listings = () => rpc.requests("state.getDisassembly").length;
+    const firstLine = await disassemblyRows(listing).first().getAttribute("data-address");
+    const before = { slices: slices(), listings: listings() };
+
+    // the editor opens over the byte, with the byte in it, selected: typing replaces it
+    await dblclickByte(view, 0x8c010004);
+    const editor = byteEditor(view);
+    await expect(editor).toBeFocused();
+    await expect(editor).toHaveAccessibleName("Bytes to write from 0x8C010004");
+    await expect(editor).toHaveValue("1F");
+    expect(await editor.evaluate((input: HTMLInputElement) => [input.selectionStart, input.selectionEnd])).toEqual([0, 2]);
+    // ... where the byte is: its digits are where those of the byte were
+    const cell = (await hexCell(view, 0x8c010000).boundingBox())!;
+    const box = (await editor.boundingBox())!;
+    expect(Math.abs(box.x + 4 - (cell.x + 4 * 3 * (cell.width / 47)))).toBeLessThan(1.5);
+    expect(box.x + box.width).toBeLessThanOrEqual(cell.x + cell.width + 9);
+    // the row is what it was while the box is open
+    await expect(hex(0x8c010000)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+
+    await page.keyboard.type("DE AD be ef");
+    await saveScreenshot(page, testInfo, "memory-editing");
+    await page.keyboard.press("Enter");
+    await expect(editor).toHaveCount(0);
+    await expect(hex(0x8c010000)).toHaveText("45 BC 32 04 DE AD BE EF 89 E9 C0 58 4D 3C 9B 6B");
+    expect(rpc.requests("state.writeMemory").map((frame) => frame.params)).toEqual([
+      { target: "sh4", address: 0x8c010004, data: [0xde, 0xad, 0xbe, 0xef] },
+    ]);
+    // the text column follows: what was written is no printable text
+    await expect(rowAt(view, 0x8c010000).locator("span").nth(2)).toHaveText(/^.{4}\.{4}/);
+
+    // both views read again, once, and where they are; nothing moved, and it was no stop
+    await expect.poll(slices).toBe(before.slices + 1);
+    await expect.poll(listings).toBe(before.listings + 1);
+    expect(rpc.requests("state.getMemorySlice").at(-1)?.params).toEqual({ target: "sh4", address: 0x8c010000, length: 960 });
+    await expect(disassemblyRows(listing).first()).toHaveAttribute("data-address", firstLine!);
+    await expect(memoryRows(view).first().locator("span").first()).toHaveText("0x8C010000");
+    await expect(page.getByRole("status", { name: "Execution state" })).toHaveText("Paused · paused by the debugger · stop 1");
+
+    // a run is not cut at the end of its row; digits need no blanks between them, and one digit alone is a byte
+    await dblclickByte(view, 0x8c01000e);
+    await byteEditor(view).fill("0011 2233 7");
+    await byteEditor(view).press("Enter");
+    await expect(hex(0x8c010000)).toHaveText("45 BC 32 04 DE AD BE EF 89 E9 C0 58 4D 3C 00 11");
+    await expect(hex(0x8c010010)).toHaveText(/^22 33 07 /);
+    expect(rpc.requests("state.writeMemory").at(-1)?.params).toEqual({ target: "sh4", address: 0x8c01000e, data: [0x00, 0x11, 0x22, 0x33, 0x07] });
+    // the last byte of a row, and the first
+    await dblclickByte(view, 0x8c01002f);
+    await expect(byteEditor(view)).toHaveAccessibleName("Bytes to write from 0x8C01002F");
+    await byteEditor(view).press("Escape");
+    await dblclickByte(view, 0x8c010030);
+    await expect(byteEditor(view)).toHaveAccessibleName("Bytes to write from 0x8C010030");
+    await byteEditor(view).press("Escape");
+    expect(rpc.requests("state.writeMemory")).toHaveLength(2);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+
+  test("code that is written is what the disassembly shows, where it was", async ({ page }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const listing = panel(page, "sh4-disassembly");
+    const pc = await currentInstructionAddress(listing);
+    const firstLine = await disassemblyRows(listing).first().getAttribute("data-address");
+
+    // the memory view is taken to the code the SH4 is in
+    await view.getByRole("textbox").fill(hex8(pc));
+    await view.getByRole("textbox").press("Enter");
+    await expect(rowAt(view, pc - (pc % 16))).toBeVisible();
+    // `mov #42, r1` at the program counter
+    await dblclickByte(view, pc);
+    await byteEditor(view).fill("2A E1");
+    await byteEditor(view).press("Enter");
+    await expect(byteEditor(view)).toHaveCount(0);
+
+    const line = disassemblyRow(listing, pc);
+    await expect(line).toContainText("2A E1");
+    await expect(line).toContainText("mov #42, r1");
+    // the listing did not move for it, and the line is still the current one
+    await expect(disassemblyRows(listing).first()).toHaveAttribute("data-address", firstLine!);
+    expect(await currentInstructionAddress(listing)).toBe(pc);
+  });
+
+  test("editing is offered while the target is paused only; Escape, leaving the box and a target that runs again put the editor away", async ({
+    page,
+    rpc,
+  }) => {
+    await openWorkspace(page, "sh4-debugger");
+    const view = panel(page, "sh4-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+    // running
+    await expect(hexCell(view, 0x8c010000)).toHaveAttribute("title", RUNNING_HINT);
+    await dblclickByte(view, 0x8c010002);
+    await expect(byteEditor(view)).toHaveCount(0);
+
+    await pauseFromToolbar(page);
+    await expect(hexCell(view, 0x8c010000)).toHaveAttribute("title", EDIT_HINT);
+    await dblclickByte(view, 0x8c010002);
+    await byteEditor(view).fill("AA");
+    await byteEditor(view).press("Escape");
+    await expect(byteEditor(view)).toHaveCount(0);
+
+    await dblclickByte(view, 0x8c010002);
+    await byteEditor(view).fill("BB");
+    await view.getByText("ASCII", { exact: true }).click();
+    await expect(byteEditor(view)).toHaveCount(0);
+
+    await dblclickByte(view, 0x8c010002);
+    await byteEditor(view).fill("CC");
+    await tooltipButton(page, "Run").click();
+    await expect(tooltipButton(page, "Pause")).toBeEnabled();
+    await expect(byteEditor(view)).toHaveCount(0);
+    await pauseFromToolbar(page);
+    await expect(byteEditor(view)).toHaveCount(0);
+
+    expect(rpc.requests("state.writeMemory")).toEqual([]);
+    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+  });
+
+  test("what is no run of bytes is not sent, and what the server refuses is not written: the editor stays open and says why", async ({ page, rpc }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const alerts = page.getByRole("alert");
+
+    await dblclickByte(view, 0x8c010008);
+    const editor = byteEditor(view);
+    // three digits are no bytes
+    await editor.fill("ABC");
+    await editor.press("Enter");
+    await expect(alerts.filter({ hasText: '"ABC" has 3 digits: a byte is two hex digits' })).toBeVisible();
+    await expect(editor).toHaveValue("ABC");
+    await expect(editor).toHaveAttribute("aria-invalid", "true");
+    await expect(editor).toHaveAttribute("title", '"ABC" has 3 digits: a byte is two hex digits');
+    // the column is hex: no "0x", no decimal
+    await editor.fill("0x12");
+    await expect(editor).not.toHaveAttribute("aria-invalid");
+    await editor.press("Enter");
+    await expect(alerts.filter({ hasText: '"0x12" is not hex: a byte is two hex digits' })).toBeVisible();
+    await editor.fill("");
+    await editor.press("Enter");
+    await expect(alerts.filter({ hasText: "Type the bytes to write: two hex digits a byte" })).toBeVisible();
+    await expect(editor).toBeVisible();
+    expect(rpc.requests("state.writeMemory")).toEqual([]);
+    await editor.press("Escape");
+
+    // The boot ROM can be read and not written (-32013), and a range is refused whole. The
+    // flash ROM of the mock ends at 0x0021FFFF; what follows is not mapped.
+    const box = view.getByRole("textbox").first();
+    await box.fill("0x0021FFF0");
+    await box.press("Enter");
+    await expect(rowAt(view, 0x0021fff0)).toBeVisible();
+    const rom = await rowAt(view, 0x0021fff0).locator("span").nth(1).innerText();
+    await dblclickByte(view, 0x0021fff4);
+    await editor.fill("00 01");
+    await editor.press("Enter");
+    await expect(alerts.filter({ hasText: "not writable: sh4 0x0021FFF4..0x0021FFF5" })).toBeVisible();
+    await expect(editor).toHaveValue("00 01");
+    await expect(editor).toHaveAttribute("aria-invalid", "true");
+    expect(rpc.received.find((frame) => frame.id === rpc.requests("state.writeMemory").at(-1)?.id)?.result).toEqual({
+      error: { code: -32013, message: "not writable: sh4 0x0021FFF4..0x0021FFF5" },
+    });
+    await editor.press("Escape");
+    await expect(rowAt(view, 0x0021fff0).locator("span").nth(1)).toHaveText(rom);
+
+    // a byte that could not be read has no value to edit: no editor opens on "??"
+    await expect(rowAt(view, 0x00220000).locator("span").nth(1)).toHaveText("?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??");
+    await dblclickByte(view, 0x00220003);
+    await expect(editor).toHaveCount(0);
+    expect(rpc.requests("state.writeMemory")).toHaveLength(1);
+  });
+
+  test("a run that would pass the last address of the target is not sent", async ({ page, rpc }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const box = view.getByRole("textbox").first();
+    // the last row of the SH4's address space: on-chip registers, which are read
+    await box.fill("0xFFFFFFFF");
+    await box.press("Enter");
+    await expect(memoryRows(view).last().locator("span").first()).toHaveText("0xFFFFFFF0");
+    await dblclickByte(view, 0xffffffff);
+    const editor = byteEditor(view);
+    await expect(editor).toHaveAccessibleName("Bytes to write from 0xFFFFFFFF");
+    await editor.fill("01 02");
+    await editor.press("Enter");
+    await expect(page.getByRole("alert").filter({ hasText: "2 bytes from 0xFFFFFFFF would pass the last address, 0xFFFFFFFF" })).toBeVisible();
+    await expect(editor).toHaveValue("01 02");
+    await expect(editor).toHaveAttribute("aria-invalid", "true");
+    expect(rpc.requests("state.writeMemory")).toEqual([]);
+    // the last byte alone is a run inside the space: it is sent, and it is the server that says what is there
+    await editor.fill("01");
+    await editor.press("Enter");
+    await expect(page.getByRole("alert").filter({ hasText: "not writable: sh4 0xFFFFFFFF..0xFFFFFFFF" })).toBeVisible();
+    expect(rpc.requests("state.writeMemory").map((frame) => frame.params)).toEqual([{ target: "sh4", address: 0xffffffff, data: [1] }]);
+  });
+
+  test("a run that ends in what cannot be written is refused whole by the server", async ({ page, rpc }) => {
+    await openWorkspace(page, "arm7-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "arm7-memory");
+    const box = view.getByRole("textbox").first();
+    // wave memory ends at 0x007FFFFF; behind it are the registers of the AICA
+    await box.fill("0x007FFFF0");
+    await box.press("Enter");
+    await expect(rowAt(view, 0x007ffff0)).toBeVisible();
+    const last = await rowAt(view, 0x007ffff0).locator("span").nth(1).innerText();
+    await dblclickByte(view, 0x007fffff);
+    await byteEditor(view).fill("01 02");
+    await byteEditor(view).press("Enter");
+    await expect(page.getByRole("alert").filter({ hasText: "not writable: arm7 0x007FFFFF..0x00800000" })).toBeVisible();
+    await expect(byteEditor(view)).toBeVisible();
+    // nothing of the run was written: the first byte is what it was
+    await expect(rowAt(view, 0x007ffff0).locator("span").nth(1)).toHaveText(last);
+    // ... and the last byte of wave memory alone is written
+    await byteEditor(view).fill("5A");
+    await byteEditor(view).press("Enter");
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(rowAt(view, 0x007ffff0).locator("span").nth(1)).toHaveText(/ 5A$/);
+    expect(rpc.requests("state.writeMemory").map((frame) => frame.params)).toEqual([
+      { target: "arm7", address: 0x007fffff, data: [1, 2] },
+      { target: "arm7", address: 0x007fffff, data: [0x5a] },
+    ]);
+  });
+
+  test("an answer that is late: the editor waits with what was typed, sends nothing more, and closes when the server has accepted", async ({ page }) => {
+    const held = await holdResponses(page, "state.writeMemory");
+    await openWorkspace(page, "arm7-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "arm7-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+
+    await dblclickByte(view, 0x00000021);
+    const editor = byteEditor(view);
+    await expect(editor).toHaveAccessibleName("Bytes to write from 0x00000021");
+    await editor.fill("C0 FF EE");
+    await editor.press("Enter");
+    await expect.poll(held.held).toBe(1);
+    await expect(editor).toHaveValue("C0 FF EE");
+    await expect(editor).toHaveAttribute("aria-busy", "true");
+    await editor.press("Enter");
+    await editor.press("Enter");
+    await page.waitForTimeout(300);
+    expect(held.requests("state.writeMemory")).toHaveLength(1);
+    expect(held.requests("state.writeMemory")[0].params).toEqual({ target: "arm7", address: 0x21, data: [0xc0, 0xff, 0xee] });
+
+    held.release();
+    await expect(editor).toHaveCount(0);
+    await expect(rowAt(view, 0x20).locator("span").nth(1)).toHaveText(/^[0-9A-F]{2} C0 FF EE /);
+    expect(held.requests("state.writeMemory")).toHaveLength(1);
+  });
+});
+
+test.describe("byte editing on a server that can do what the emulator of milestone M2 can", () => {
+  test.use({ mockOptions: { supports: MOCK_M2_SUPPORT } });
+
+  test("the memory of both processors is written", async ({ page, rpc }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    await dblclickByte(view, 0x8c010000);
+    await byteEditor(view).fill("01 02 03");
+    await byteEditor(view).press("Enter");
+    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText(/^01 02 03 04 /);
+
+    await gotoRoute(page, "/workspace/arm7-debugger");
+    const arm7 = panel(page, "arm7-memory");
+    await expect(memoryRows(arm7)).toHaveCount(60);
+    await dblclickByte(arm7, 0x00000010);
+    await byteEditor(arm7).fill("7f");
+    await byteEditor(arm7).press("Enter");
+    await expect(rowAt(arm7, 0x10).locator("span").nth(1)).toHaveText(/^7F /);
+    expect(rpc.requests("state.writeMemory").map((frame) => frame.params)).toEqual([
+      { target: "sh4", address: 0x8c010000, data: [1, 2, 3] },
+      { target: "arm7", address: 0x10, data: [0x7f] },
+    ]);
+    expect(rpc.received.filter((frame) => /-320(13|04)/.test(JSON.stringify(frame)))).toEqual([]);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+});
+
+test.describe("a server of milestone M1", () => {
+  test.use({ mockOptions: { supports: MOCK_M1_SUPPORT } });
+
+  test("no memory writes: the bytes are no editor, and nothing is sent", async ({ page, rpc }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+    await expect(hexCell(view, 0x8c010000)).not.toHaveAttribute("title");
+    await dblclickByte(view, 0x8c010004);
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(view.getByRole("textbox")).toHaveCount(1);
+    expect(rpc.requests("state.writeMemory")).toEqual([]);
+    expect(rpc.received.filter((frame) => JSON.stringify(frame).includes("-32004"))).toEqual([]);
+  });
+});
+
+// The tick a write caused reaches the client in front of its response or behind it. A byte
+// edit moves the disassembly in neither order: the lines are read again where the view is.
+for (const order of ["the tick in front of the response", "the tick behind the response"] as const) {
+  test(`a byte edit with ${order}: the disassembly reads again and does not move`, async ({ page }) => {
+    const server = await serveScriptedDebugger(page);
+    server.shape.capabilities = ["event-breakpoints", "callstack", "memory-write"];
+    const written = new Map<number, number>();
+    server.answer("state.getMemorySlice", (params) => ({
+      baseAddress: Number(params.address),
+      data: Array.from({ length: Number(params.length) }, (_, index) => written.get(Number(params.address) + index) ?? (Number(params.address) + index) & 0xff),
+      validity: "ok",
+    }));
+    server.answer("state.writeMemory", (params: Json) => {
+      (params.data as number[]).forEach((byte, index) => written.set(Number(params.address) + index, byte));
+      if (order === "the tick in front of the response") {
+        // a paused tick of the same stop, with the registers as they were
+        server.tick();
+        return new Promise((resolve) => setTimeout(() => resolve({}), 400));
+      }
+      setTimeout(() => server.tick(), 400);
+      return {};
+    });
+    await gotoRoute(page, "/workspace/sh4-debugger");
+    await server.described();
+    const listing = panel(page, "sh4-disassembly");
+    const view = panel(page, "sh4-memory");
+    expect(await currentInstructionAddress(listing)).toBe(0x8c001000);
+
+    // the listing is somewhere else than the program counter: a view that followed it would be seen to move
+    await listing.getByRole("textbox").fill("0x8C005000");
+    await listing.getByRole("textbox").press("Enter");
+    const away = String(0x8c005000 - 10 * 2);
+    await expect(disassemblyRows(listing).first()).toHaveAttribute("data-address", away);
+    await expect(listing.locator(".current-instruction")).toHaveCount(0);
+    const listings = () => server.requestsOf("state.getDisassembly").length;
+    const settled = listings();
+
+    await expect(memoryRows(view)).toHaveCount(60);
+    await dblclickByte(view, 0x8c010003);
+    await byteEditor(view).fill("AB CD");
+    await byteEditor(view).press("Enter");
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText(/^00 01 02 AB CD 05 /);
+    expect(server.requestsOf("state.writeMemory")).toEqual([{ target: "sh4", address: 0x8c010003, data: [0xab, 0xcd] }]);
+
+    // read again once, in place; and still there when the tick and the response are both in
+    await expect.poll(listings).toBe(settled + 1);
+    expect(server.requestsOf("state.getDisassembly").at(-1)).toMatchObject({ target: "sh4", address: Number(away) });
+    await page.waitForTimeout(700);
+    expect(listings()).toBe(settled + 1);
+    await expect(disassemblyRows(listing).first()).toHaveAttribute("data-address", away);
+    await expect(listing.getByRole("textbox")).toHaveValue("0x8C005000");
+    await expect(memoryRows(view).first().locator("span").first()).toHaveText("0x8C010000");
+  });
+}
