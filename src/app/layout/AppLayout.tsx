@@ -162,8 +162,8 @@ const connectionIcons = {
 /** What the server's `protocol` means for this build, when it is not the build's own. */
 const protocolMismatch = (protocol: number | undefined): string =>
   protocol === undefined
-    ? `This server speaks debugger protocol 2 (it reports no protocol version); this UI is built for protocol ${PROTOCOL_VERSION}. ` +
-      "It behaves as it did for protocol 2: stops are taken from the change of the run state, and every target and method is assumed to exist."
+    ? `This server reports no debugger protocol version; this UI is built for protocol ${PROTOCOL_VERSION}. ` +
+      "It is treated as a server that lists no target and no capability: the panels say what is missing. Use the UI that belongs to the emulator."
     : `This server speaks debugger protocol ${protocol}; this UI is built for protocol ${PROTOCOL_VERSION}. ` +
       "Parts of it may not work. Use the UI that belongs to the emulator.";
 

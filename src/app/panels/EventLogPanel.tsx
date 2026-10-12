@@ -35,7 +35,8 @@ export const EventLogPanel = () => {
               fractionalSecondDigits: 3
             });
             const tag = entry.subsystem.toUpperCase().padEnd(6, " ");
-            // a v3 server says which event this is and when, in SH4 cycles, it was raised
+            // which event this is and when, in SH4 cycles, it was raised; an entry without
+            // `metadata` is a row without the two
             const event = typeof entry.metadata?.event === "string" ? entry.metadata.event : undefined;
             const cycles = typeof entry.metadata?.cycles === "string" ? entry.metadata.cycles : undefined;
 

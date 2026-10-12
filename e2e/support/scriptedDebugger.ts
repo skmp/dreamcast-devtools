@@ -1,7 +1,4 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Page, WebSocketRoute } from "@playwright/test";
-import { REPO_ROOT } from "./paths";
 
 /**
  * A debugger server that the test writes: the page's WebSocket to /ws is answered here
@@ -9,9 +6,9 @@ import { REPO_ROOT } from "./paths";
  * is still served by the mock server.
  *
  * It exists for what the mock cannot be asked to do: send exactly this tick and no other,
- * answer a request with an error, send a message that breaks the schema, or be a server of
- * protocol v2. The test changes `shape` (what debugger.describe answers) and `state` (what
- * the next tick is built from) and calls `tick()`.
+ * answer a request with an error, send a message that breaks the schema, or leave out what
+ * a server of protocol v3 always sends. The test changes `shape` (what debugger.describe
+ * answers) and `state` (what the next tick is built from) and calls `tick()`.
  */
 
 export type Json = Record<string, unknown>;
@@ -29,7 +26,7 @@ export interface ScriptedState {
   registers: Record<string, ScriptedRegister[]>;
   breakpoints: Record<string, Json>;
   eventLog: Json[];
-  /** undefined: the tick has no such key (protocol v2 had it optional) */
+  /** undefined: the tick has no such key (which a server of protocol v3 always sends) */
   watches: Json[] | undefined;
   callstacks: Json | undefined;
   categories: Json | undefined;
@@ -69,6 +66,8 @@ export interface ScriptedDebugger {
   tick(options?: { paths?: string[]; patch?: Json }): void;
   /** Sends any JSON message, or any text, as a frame. */
   send(message: unknown): void;
+  /** Sends a binary frame with exactly these bytes: what stands in front of a payload is the test's to write. */
+  sendBinary(bytes: Uint8Array): void;
   /**
    * How a method is answered from now on: the handler returns the result, or `jsonRpcError()`,
    * or a promise of either, and the request is then answered when the promise resolves (a
@@ -281,6 +280,9 @@ export const serveScriptedDebugger = async (page: Page): Promise<ScriptedDebugge
     send(message) {
       socket?.send(typeof message === "string" ? message : JSON.stringify(message));
     },
+    sendBinary(bytes) {
+      socket?.send(Buffer.from(bytes));
+    },
     answer(method, handler) {
       handlers.set(method, handler);
     },
@@ -337,18 +339,3 @@ export const serveScriptedDebugger = async (page: Page): Promise<ScriptedDebugge
   waiters = [];
   return server;
 };
-
-/** One frame of a protocol v2 session, as the mock sent it before protocol v3. */
-export interface CapturedFrame {
-  id?: number;
-  method?: string;
-  params?: Json;
-  result?: Json;
-}
-
-/**
- * The frames of a session with the protocol v2 mock (src/lib/test-fixtures): the describe
- * result, running and paused ticks, and the tick of a breakpoint hit.
- */
-export const loadV2Frames = (): CapturedFrame[] =>
-  JSON.parse(readFileSync(join(REPO_ROOT, "src/lib/test-fixtures/protocol-v2-frames.json"), "utf8")) as CapturedFrame[];

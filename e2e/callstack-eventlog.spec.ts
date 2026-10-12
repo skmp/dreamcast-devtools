@@ -219,7 +219,7 @@ test("the event log shows what it does not know as it comes: a new subsystem, a 
   server.state.eventLog = [
     { eventId: "1", timestamp: 1_700_000_000_000, subsystem: "sh4", severity: "info", message: "known", metadata: { event: "dc.sh4.interrupt", cycles: "448" } },
     { eventId: "2", timestamp: 1_700_000_000_001, subsystem: "netplay", severity: "fatal", message: "from the future", metadata: { event: "dc.netplay.desync", cycles: "18446744073709551615", extra: 1 } },
-    // a v2 server sends no metadata
+    // an entry without `metadata`: a row without the event name and the cycles
     { eventId: "3", timestamp: 1_700_000_000_002, subsystem: "holly", severity: "warn", message: "bare" },
   ];
   await gotoRoute(page, "/workspace/sh4-debugger");
