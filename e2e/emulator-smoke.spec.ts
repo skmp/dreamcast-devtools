@@ -11,10 +11,12 @@ import { branchTarget, isArmControlFlow, isSh4ControlFlow, mnemonicOf } from "..
 // or a server the test writes; this one is the only place where the UI meets the real one.
 //
 // It starts nothing. It is skipped unless E2E_EMULATOR_URL is the page URL the emulator prints
-// ("Debugger: http://127.0.0.1:<port>/"), of an emulator that was started headless and paused
-// on the sounding guest of its tree (the recipe is in README.md, "The UI against the
-// emulator"):
+// ("Debugger: http://127.0.0.1:<port>/"), of an emulator that embeds the bundle of this
+// checkout and was started headless and paused on the sounding guest of its tree, with a
+// configuration and a data directory of its own (the recipe is in README.md, "The UI against
+// the emulator"):
 //
+//   HOME=<run>/home XDG_CONFIG_HOME=<run>/cfg XDG_DATA_HOME=<run>/data \
 //   <emulator> -config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 ,
 //       Debugger:Enabled=yes , Debugger:Port=0 , Debugger:Required=yes , Debugger:StartPaused=yes
 //       <emulator tree>/tests/debugger/guest/dsptest/dsptest.elf
@@ -22,8 +24,11 @@ import { branchTarget, isArmControlFlow, isSh4ControlFlow, mnemonicOf } from "..
 // The guest (tests/debugger/guest/dsptest of the emulator's tree): reios enters it at
 // 0x8C010000, where it has `_start`; it copies an ARM7 program of 352 bytes to the start of the
 // wave memory and releases the ARM7 onto it, and then counts in a loop while the ARM7 and the
-// timer of the AICA make the sound. The spec expects the machine in its start stop and leaves
-// it paused: one run per emulator process.
+// timer of the AICA make the sound. The spec expects the machine in its start stop: one run
+// per emulator process. It ends with the machine paused, which lasts as long as the page: ten
+// seconds after the last client has gone the server releases the stop, and the guest runs
+// until the process is ended. Whoever started the emulator ends it, by its pid, when
+// Playwright has returned.
 
 const EMULATOR_URL = process.env.E2E_EMULATOR_URL;
 

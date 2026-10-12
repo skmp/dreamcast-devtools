@@ -121,24 +121,51 @@ embeds, against its debugger server. It is not part of `check` and starts nothin
 it is skipped unless `E2E_EMULATOR_URL` is the page URL the emulator prints
 (`Debugger: http://127.0.0.1:<port>/`). The emulator is one that carries this UI
 (`npm run build:native`, then the emulator's own configure with
-`-DNULLDC_DEVTOOLS_DIST=<this checkout>/dist-native`), started headless and paused on the
-sounding guest of its tree:
+`-DNULLDC_DEVTOOLS_DIST=<this checkout>/dist-native`, and its build), started headless and
+paused on the sounding guest of its tree, as the emulator's own tests start one
+(`tests/debugger/contract/contract.py`): with a home, a configuration and a data directory of
+its own, three directories that exist.
 
 ```
+HOME=<run dir>/home XDG_CONFIG_HOME=<run dir>/cfg XDG_DATA_HOME=<run dir>/data \
 <emulator> -config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 , \
                    Debugger:Enabled=yes , Debugger:Port=0 , Debugger:Required=yes , Debugger:StartPaused=yes \
-           <emulator tree>/tests/debugger/guest/dsptest/dsptest.elf
+           <emulator tree>/tests/debugger/guest/dsptest/dsptest.elf &
 E2E_EMULATOR_URL=http://127.0.0.1:<port>/ npx playwright test e2e/emulator-smoke.spec.ts --workers=1
+kill <pid of the emulator>
 ```
 
-(The commas are arguments of their own. `Debugger:Enabled=yes` is needed: a headless run has
-the server off by default, and `StartPaused` without a server ends the process with exit code
-2. `Port=0` takes a free port. A run of its own `HOME`, `XDG_CONFIG_HOME` and `XDG_DATA_HOME`
-leaves the settings and the memory cards of the user alone.)
+- The commas are arguments of their own. `Debugger:Enabled=yes` is needed: a headless run has
+  the server off by default, and `StartPaused` without a server ends the process with exit code
+  2. `Port=0` takes a free port.
+- The three variables are needed too. Without them the emulator reads the `emu.cfg` of the
+  user, and takes from it what the command line does not give: an address to listen on that
+  may not be the loopback one (`Debugger:Bind`, `Debugger:AllowedHosts`), a directory to serve
+  in place of the bundle it embeds (`Debugger:WebRoot`). And it opens the memory cards and
+  the flash memory in the data directory of the user, which an emulator the user has running
+  holds open.
+- The emulator is ended by its pid when Playwright has returned (`SIGTERM`; it ends within
+  seconds). The spec leaves the machine paused, and that lasts as long as its page: ten
+  seconds after the last client has gone the server releases the stop, and the guest runs
+  from there, as fast as one core goes, until the process is ended.
+
 The spec connects at the start stop, runs to the entry of the program (a breakpoint at
 `0x8C010000`), steps the SH4 from the toolbar, writes `R0` in the register panel and sees it in
 the tick, writes a byte of memory and reads it back, resets, and after a resume steps the ARM7.
-It leaves the emulator paused; one run per emulator process.
+One run per emulator process: it expects the machine in its start stop.
+
+What it holds the run to, beyond those steps:
+
+- **The page is this checkout's.** `ui` of `debugger.describe` is the version in
+  `dist-native/bundle-info.json`, and every file listed there is served by the emulator byte
+  for byte (the set-up of the suite builds `dist-native/` again when a source is newer, so
+  that directory is the build of this tree). An emulator that was built before the sources
+  changed fails the first step: build the bundle, then the emulator, then run the spec.
+- **A step is one instruction.** The two steps of the SH4 end at `0x8C010002` and
+  `0x8C010004` (the guest starts with two instructions that are no branch). A step of the ARM7
+  ends at the next instruction, at the target of the branch it stands on, where `lr` says for
+  the two ways its program goes back, or at `0x1C`, the vector of the timer interrupt its
+  program gets every 13 samples.
 
 ## Error boundaries
 
