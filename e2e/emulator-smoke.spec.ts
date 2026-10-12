@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { Diagnostics, currentInstructionAddress, dockTab, panel, saveScreenshot, statusBar, type RpcFrame } from "./support/fixtures";
+import { Diagnostics, currentInstructionAddress, disassemblyRow, dockTab, panel, saveScreenshot, statusBar, type RpcFrame } from "./support/fixtures";
 import { DIST_DIR } from "./support/paths";
+import { branchTarget, isArmControlFlow, isSh4ControlFlow, mnemonicOf } from "../scripts/contract/disasm";
 
 // The UI against the emulator: the page an emulator serves (the bundle it embeds), driven
 // against the debugger server of that emulator. Every other spec of this suite meets the mock
@@ -32,6 +33,10 @@ const ENTRY = 0x8c010000;
 const SCRATCH = 0x8c200000;
 /** The length of the guest's ARM7 program, which is at 0 of the wave memory. */
 const ARM7_PROGRAM_BYTES = 352;
+/** Where the ARM7 enters its timer interrupt, which the guest's AICA asks for every 13 samples. */
+const ARM7_FIQ_VECTOR = 0x1c;
+/** The node of the device tree that has the registers of the ARM7. */
+const ARM7_REGISTERS = "dc.aica.arm7";
 
 /** What `dist-native/bundle-info.json` says of a build (scripts/bundle-info.ts). */
 interface BundleInfo {
@@ -39,7 +44,41 @@ interface BundleInfo {
   files: Array<{ path: string; bytes: number; sha256: string }>;
 }
 
+/**
+ * Where one step of the ARM7 ends, by the line it stands on: `ends`, or anywhere in the
+ * program when the line takes the PC from somewhere this spec does not follow.
+ *
+ * A step executes one instruction: it ends at the next one, or where a branch goes. It ends
+ * at the vector of the interrupt instead when the timer's request is entered, behind the
+ * instruction or in front of it (the step is complete there with nothing executed).
+ * `lr` is R14 of the mode the ARM7 is in, for the two ways the guest's program goes back:
+ * `mov pc, lr` from its routine, `subs pc, lr, #4` from its interrupt.
+ */
+const arm7StepEnds = (pc: number, line: string, lr: number | undefined): { ends?: number[]; why: string } => {
+  if (!isArmControlFlow(line)) {
+    return { ends: [pc + 4, ARM7_FIQ_VECTOR], why: "no control flow" };
+  }
+  const branch = /^bl?(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?$/.exec(mnemonicOf(line));
+  const target = branchTarget(line);
+  if (branch !== null && target !== undefined) {
+    const always = branch[1] === undefined || branch[1] === "al";
+    return { ends: always ? [target, ARM7_FIQ_VECTOR] : [target, pc + 4, ARM7_FIQ_VECTOR], why: always ? "a branch" : "a conditional branch" };
+  }
+  const back = /^(?:mov|subs)\s+pc,\s*lr(?:,\s*#(\d+))?$/.exec(line.trim().toLowerCase());
+  if (back !== null && lr !== undefined) {
+    return { ends: [(lr - Number(back[1] ?? 0)) & ~3, ARM7_FIQ_VECTOR], why: "the PC from lr" };
+  }
+  return { why: "the PC from somewhere this spec does not follow" };
+};
+
 const hex8 = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
+
+/** The text of the line a listing shows at `address`. */
+const lineAt = async (view: Locator, address: number): Promise<string> => {
+  const row = disassemblyRow(view, address);
+  await expect(row, `the line at ${hex8(address)}`).toHaveCount(1);
+  return (await row.locator("span").last().innerText()).trim();
+};
 
 const runControls = (page: Page): Locator => page.locator("header").getByRole("group", { name: "Run controls" });
 const control = (page: Page, name: string): Locator => runControls(page).getByRole("button", { name, exact: true });
@@ -112,6 +151,17 @@ test.describe("the UI the emulator serves, against that emulator", () => {
       return received.find((frame) => frame.id === request.id && frame.method === undefined)!;
     };
     const ticks = () => received.filter((frame) => frame.method === "event.tick").map((frame) => frame.params as unknown as Tick);
+    /** The last tick of the stop with this number, once it is there. */
+    const pausedTick = async (stopId: number): Promise<Tick> => {
+      const of = (tick: Tick) => tick.executionState.state === "paused" && tick.executionState.stopId === stopId;
+      await expect.poll(() => ticks().some(of), { message: `a paused tick of stop ${stopId}` }).toBe(true);
+      return ticks().findLast(of)!;
+    };
+    /** A register of the ARM7 as a tick has it. */
+    const arm7Register = (tick: Tick, name: string): number | undefined => {
+      const value = tick.registers[ARM7_REGISTERS]?.find((register) => register.name === name)?.value;
+      return value === undefined ? undefined : Number(value);
+    };
     /** Every control request was accepted: none of them could only be refused. */
     const expectAccepted = async (method: string, count: number) => {
       await expect.poll(() => requests(method).length, { message: method }).toBe(count);
@@ -198,22 +248,26 @@ test.describe("the UI the emulator serves, against that emulator", () => {
 
     await test.step("steps the SH4 from the toolbar", async () => {
       const stop = await stopNumber(page);
+      // `_start` begins with two instructions that are no branch (it loads a constant and
+      // writes SR with it): the listing says so, and a step from each ends two bytes on.
+      const first = await lineAt(sh4, ENTRY);
+      const second = await lineAt(sh4, ENTRY + 2);
+      expect(isSh4ControlFlow(first), `"${first}" at ${hex8(ENTRY)} is no control flow`).toBe(false);
+      expect(isSh4ControlFlow(second), `"${second}" at ${hex8(ENTRY + 2)} is no control flow`).toBe(false);
+
       await control(page, "Step Into").click();
       await expect(state).toHaveText(`Paused · step completed · stop ${stop + 1}`);
-      // one instruction of `_start` was executed: the program counter is another one, and on screen
-      await expect(sh4.locator(".current-instruction")).not.toHaveAttribute("data-address", String(ENTRY));
-      const pc = await currentInstructionAddress(sh4);
-      expect(pc).toBeGreaterThan(ENTRY);
-      expect(pc).toBeLessThan(ENTRY + 0x1000);
+      // one instruction of `_start` was executed, and no more: the program counter is at the next one, on screen
+      await expect(sh4.locator(".current-instruction")).toHaveAttribute("data-address", String(ENTRY + 2));
       await expect(sh4.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
       expect(requests("control.step").map((frame) => frame.params)).toEqual([{ target: "sh4" }]);
       await expectAccepted("control.step", 1);
       // and with the key
       await page.keyboard.press("F11");
       await expect(state).toHaveText(`Paused · step completed · stop ${stop + 2}`);
-      await expect(sh4.locator(".current-instruction")).not.toHaveAttribute("data-address", String(pc));
+      await expect(sh4.locator(".current-instruction")).toHaveAttribute("data-address", String(ENTRY + 4));
       await expectAccepted("control.step", 2);
-      note(`SH4 steps: ${hex8(ENTRY)} -> ${hex8(pc)} (Step Into) -> ${hex8(await currentInstructionAddress(sh4))} (F11)`);
+      note(`SH4 steps: ${hex8(ENTRY)} "${first}" -> ${hex8(ENTRY + 2)} "${second}" (Step Into) -> ${hex8(await currentInstructionAddress(sh4))} (F11)`);
     });
 
     await test.step("writes R0 in the register panel, and sees it in the tick", async () => {
@@ -358,26 +412,47 @@ test.describe("the UI the emulator serves, against that emulator", () => {
       const pc = await currentInstructionAddress(arm7);
       expect(pc).toBeLessThan(ARM7_PROGRAM_BYTES);
       expect(pc % 4).toBe(0);
+      expect(arm7Register(await pausedTick(stop), "PC"), "the listing marks the PC of the tick").toBe(pc);
 
-      const steps = requests("control.step").length;
-      await control(page, "Step Into").click();
-      await expect(state).toHaveText(`Paused · step completed · stop ${stop + 1}`);
-      expect(requests("control.step").at(-1)?.params).toEqual({ target: "arm7" });
-      expect((await answerTo(requests("control.step").at(-1)!)).result).toEqual({});
-      expect(requests("control.step")).toHaveLength(steps + 1);
-      // one instruction of the ARM7's program: its program counter is another one, in the program, and on screen
-      await expect(arm7.locator(".current-instruction")).not.toHaveAttribute("data-address", String(pc));
-      const next = await currentInstructionAddress(arm7);
-      expect(next).toBeLessThan(ARM7_PROGRAM_BYTES);
-      expect(next % 4).toBe(0);
-      await expect(arm7.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
+      /**
+       * One step of the ARM7 from `from`, asked for by `ask`: one request, for the ARM7, that
+       * is accepted; a new stop; and one instruction of the program was executed, and no
+       * more. Returns where the ARM7 is then, and the line it left.
+       */
+      const stepArm7 = async (from: number, stopId: number, ask: () => Promise<void>): Promise<{ to: number; line: string; why: string }> => {
+        const line = await lineAt(arm7, from);
+        const lr = arm7Register(await pausedTick(stopId), "R14");
+        const steps = requests("control.step").length;
+        await ask();
+        await expect(state).toHaveText(`Paused · step completed · stop ${stopId + 1}`);
+        expect(requests("control.step")).toHaveLength(steps + 1);
+        expect(requests("control.step").at(-1)?.params).toEqual({ target: "arm7" });
+        expect((await answerTo(requests("control.step").at(-1)!)).result).toEqual({});
+        // where the server says the ARM7 is, which is where the listing shows it, on screen
+        const to = arm7Register(await pausedTick(stopId + 1), "PC");
+        expect(to, "the PC of the ARM7 in the tick of the step").toBeDefined();
+        await expect(arm7.locator(".current-instruction")).toHaveAttribute("data-address", String(to));
+        await expect(arm7.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
+        // in the program, and where one instruction takes it
+        expect(to).toBeLessThan(ARM7_PROGRAM_BYTES);
+        expect(to! % 4).toBe(0);
+        const { ends, why } = arm7StepEnds(from, line, lr);
+        if (ends !== undefined) {
+          expect(
+            ends.map(hex8),
+            `one step of the ARM7 from ${hex8(from)} "${line}" (${why}) ends at one of these, and it ended at ${hex8(to!)}`,
+          ).toContain(hex8(to!));
+        }
+        return { to: to!, line, why };
+      };
+
+      const first = await stepArm7(pc, stop, () => control(page, "Step Into").click());
       // and once more with the key, which acts on the focused target
-      await page.keyboard.press("F11");
-      await expect(state).toHaveText(`Paused · step completed · stop ${stop + 2}`);
-      expect(requests("control.step").at(-1)?.params).toEqual({ target: "arm7" });
-      expect((await answerTo(requests("control.step").at(-1)!)).result).toEqual({});
-      await expect(arm7.locator(".current-instruction")).not.toHaveAttribute("data-address", String(next));
-      note(`ARM7 steps: ${hex8(pc)} -> ${hex8(next)} (Step Into) -> ${hex8(await currentInstructionAddress(arm7))} (F11); ${await state.innerText()}`);
+      const second = await stepArm7(first.to, stop + 1, () => page.keyboard.press("F11"));
+      note(
+        `ARM7 steps: ${hex8(pc)} "${first.line}" (${first.why}) -> ${hex8(first.to)} (Step Into); ` +
+          `"${second.line}" (${second.why}) -> ${hex8(second.to)} (F11); ${await state.innerText()}`,
+      );
       await saveScreenshot(page, testInfo, "emulator-7-arm7-step");
     });
 
