@@ -127,7 +127,7 @@ describe("what did not change keeps its identity", () => {
   });
 });
 
-describe("stops of a v3 server (stopId)", () => {
+describe("stops (stopId)", () => {
   it("the first paused tick of a connection is a stop", () => {
     const { outcomes, state } = run([tick({ state: "paused", stopId: 7, reason: "start" })]);
     expect(outcomes[0].newStop).toBe(true);
@@ -231,41 +231,84 @@ describe("a game that is started where there was none (the ticks of the emulator
   });
 });
 
-describe("stops of a v2 server (no stopId)", () => {
-  it("a stop is the change from running to paused, and the first paused tick", () => {
+describe("ticks without a stopId", () => {
+  it("are no stop: none is made from the first paused tick, nor from running, then paused", () => {
     const { outcomes, state } = run([
       tick({ state: "paused" }),
       tick({ state: "paused" }),
       tick({ state: "running" }),
       tick({ state: "paused" }),
-      tick({ state: "paused" }),
+      tick({ state: "paused", reason: "breakpoint" }),
     ]);
-    expect(outcomes.map((outcome) => outcome.newStop)).toEqual([true, false, false, true, false]);
-    expect(state.stop).toEqual({ serial: 2, stopId: undefined, reason: undefined, breakpointId: undefined });
+    expect(outcomes.map((outcome) => outcome.newStop)).toEqual([false, false, false, false, false]);
+    expect(state.stop).toBeUndefined();
+    // the views are not moved: `refresh` is what makes them read again and follow the PC
+    expect(outcomes.map((outcome) => outcome.state.refresh)).toEqual([0, 0, 0, 0, 0]);
+    expect(state.first).toEqual({ registers: {}, refresh: 0 });
+    // what the tick says is still shown
+    expect(state.executionState).toEqual({ state: "paused", reason: "breakpoint" });
   });
 
-  it("the breakpoint is announced by the tick that names it, which is the tick of the hit only", () => {
+  it("announce no breakpoint: a breakpoint is announced with its stop", () => {
     const { outcomes } = run([
       tick({ state: "running" }),
       tick({ state: "paused", breakpointId: 1 }, { breakpoints: { "1": breakpoint(1) } }),
       tick({ state: "paused" }, { breakpoints: { "1": breakpoint(1) } }),
     ]);
-    expect(outcomes.map((outcome) => outcome.hit)).toEqual([undefined, breakpoint(1), undefined]);
+    expect(outcomes.map((outcome) => outcome.hit)).toEqual([undefined, undefined, undefined]);
+  });
+
+  it("leave the stop that was acted on as it is, and the next tick with its stopId is not a stop again", () => {
+    const stopped = run([tick({ state: "paused", stopId: 4, reason: "breakpoint", breakpointId: 1 }, { breakpoints: { "1": breakpoint(1) } })]);
+    const { outcomes, state } = run(
+      [
+        tick({ state: "running" }),
+        tick({ state: "paused", breakpointId: 1 }, { breakpoints: { "1": breakpoint(1) } }),
+        tick({ state: "paused", stopId: 4, reason: "breakpoint", breakpointId: 1 }, { breakpoints: { "1": breakpoint(1) } }),
+        tick({ state: "paused", stopId: 5, reason: "step" }),
+      ],
+      stopped.state,
+    );
+    expect(outcomes.map((outcome) => outcome.newStop)).toEqual([false, false, false, true]);
+    expect(outcomes.map((outcome) => outcome.hit)).toEqual([undefined, undefined, undefined, undefined]);
+    expect(outcomes[1].state.stop).toBe(stopped.state.stop);
+    expect(state.stop).toEqual({ serial: 2, stopId: 5, reason: "step", breakpointId: undefined });
+    expect(state.refresh).toBe(2);
+  });
+
+  it("a running tick with a stopId that was not acted on is no stop either; stopId 0 of a paused tick is one", () => {
+    const { outcomes, state } = run([tick({ state: "running", stopId: 3 }), tick({ state: "paused", stopId: 0, reason: "pause" })]);
+    expect(outcomes.map((outcome) => outcome.newStop)).toEqual([false, true]);
+    expect(state.stop).toEqual({ serial: 1, stopId: 0, reason: "pause", breakpointId: undefined });
   });
 });
 
 describe("callstacks", () => {
   const frames = { sh4: [{ index: 0, pc: 0x8c0000a0 }], arm7: [{ index: 0, pc: 0x00200010 }] };
 
-  it("are what the tick says: a v3 server sends empty arrays while the target runs", () => {
+  it("are what the tick says: the server sends empty arrays while the target runs", () => {
     const { state } = run([tick({ state: "paused", stopId: 1, reason: "pause" }, { callstacks: frames }), tick({ state: "running", stopId: 1 })]);
     expect(state.callstacks).toEqual({ sh4: [], arm7: [] });
   });
 
-  it("when a tick does not say: kept while the target is stopped, empty while it runs", () => {
-    const paused = run([tick({ state: "paused" }, { callstacks: frames }), tick({ state: "paused" }, { callstacks: undefined })]);
-    expect(paused.state.callstacks).toEqual(frames);
-    expect(run([tick({ state: "running" }, { callstacks: undefined })], paused.state).state.callstacks).toEqual({});
+  it("a tick without `callstacks` has no frames: none are kept from the stop before, paused or running", () => {
+    const stop = { state: "paused", stopId: 1, reason: "pause" } as const;
+    const paused = run([tick(stop, { callstacks: frames }), tick(stop, { callstacks: undefined })]);
+    expect(paused.outcomes[0].state.callstacks).toEqual(frames);
+    expect(paused.state.callstacks).toEqual({});
+    const running = run([tick(stop, { callstacks: frames }), tick({ state: "running", stopId: 1 }, { callstacks: undefined })]);
+    expect(running.state.callstacks).toEqual({});
+    // and the frames of a later tick are shown again
+    expect(run([tick(stop, { callstacks: frames })], paused.state).state.callstacks).toEqual(frames);
+  });
+});
+
+describe("watches", () => {
+  it("are those of the tick, and none when the tick has no `watches`", () => {
+    const watch = { id: 1, expression: "dc.sh4.cpu.pc", value: "0x8C0000A0" };
+    const watched = run([tick({ state: "running", stopId: 0 }, { watches: [watch] })]);
+    expect(watched.state.watches).toEqual([watch]);
+    expect(run([tick({ state: "running", stopId: 0 }, { watches: undefined })], watched.state).state.watches).toEqual([]);
   });
 });
 
@@ -279,11 +322,14 @@ describe("category states", () => {
     expect(state.categories).toEqual({ events: unmuted, sh4: { muted: true, soloed: false }, arm7: { muted: false, soloed: true }, dsp: unmuted });
   });
 
-  it("keep their state when a tick has none (a v2 server), or lacks a key", () => {
+  it("keep their state when a tick has no `categories`, or lacks a key", () => {
     const muted = run([tick({ state: "running", stopId: 0 }, { categories: { sh4: { muted: true, soloed: false } } })]);
     expect(muted.state.categories.sh4).toEqual({ muted: true, soloed: false });
     expect(muted.state.categories.dsp).toEqual(unmuted);
-    const after = run([tick({ state: "running" }, { categories: undefined })], muted.state);
+    const after = run([tick({ state: "running", stopId: 0 }, { categories: undefined })], muted.state);
     expect(after.state.categories).toBe(muted.state.categories);
+    // per key: the tick carries one key, and the other three keep what they had
+    const soloed = run([tick({ state: "running", stopId: 0 }, { categories: { arm7: { muted: false, soloed: true } } })], after.state);
+    expect(soloed.state.categories).toEqual({ events: unmuted, sh4: { muted: true, soloed: false }, arm7: { muted: false, soloed: true }, dsp: unmuted });
   });
 });

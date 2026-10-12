@@ -27,8 +27,8 @@ export type CategoryStates = Record<BreakpointCategory, BreakpointCategoryState>
 export interface StopInfo {
   /** counts the stops of this connection, from 1; what follows a stop is keyed on it */
   serial: number;
-  /** `executionState.stopId`; absent for a v2 server */
-  stopId?: number;
+  /** `executionState.stopId` of its tick */
+  stopId: number;
   reason?: string;
   breakpointId?: number;
 }
@@ -174,30 +174,26 @@ export const applyTick = (previous: LiveState, tick: DebuggerTick): TickOutcome 
   const execution = tick.executionState;
   const paused = execution.state === "paused";
 
-  // A v3 server counts its stops: a stop is new when its stopId is not the one acted on last,
+  // The server counts its stops: a stop is new when its stopId is not the one acted on last,
   // and the first paused tick of a connection counts. A paused tick that merely arrives (after
-  // a breakpoint or a watch was added, say) is not a stop. A v2 server has no stopId: there
-  // the stop is the change from running to paused, and breakpointId is only in the tick of
-  // the hit.
-  const v3 = execution.stopId !== undefined;
-  const newStop = v3
-    ? paused && (previous.stop === undefined || previous.stop.stopId !== execution.stopId)
-    : paused && previous.executionState?.state !== "paused";
-  const announce = execution.breakpointId !== undefined && paused && (v3 ? newStop : true);
-
-  const stop: StopInfo | undefined = newStop
-    ? {
-        serial: (previous.stop?.serial ?? 0) + 1,
-        stopId: execution.stopId,
-        reason: execution.reason,
-        breakpointId: execution.breakpointId,
-      }
-    : previous.stop;
+  // a breakpoint or a watch was added, say) is not a stop, and neither is a paused tick
+  // without a stopId: no stop is made from the run state changing to paused.
+  const stopId = paused ? execution.stopId : undefined;
+  const stop: StopInfo | undefined =
+    stopId !== undefined && previous.stop?.stopId !== stopId
+      ? {
+          serial: (previous.stop?.serial ?? 0) + 1,
+          stopId,
+          reason: execution.reason,
+          breakpointId: execution.breakpointId,
+        }
+      : previous.stop;
+  const newStop = stop !== previous.stop;
 
   const breakpoints = keep(previous.breakpoints, Object.values(tick.breakpoints));
-  // A running target has no callstack. A v3 server says so with empty arrays; when a tick
-  // says nothing, the frames of the last stop stay only for as long as the target is stopped.
-  const callstacks = tick.callstacks ?? (paused ? previous.callstacks : {});
+  // The frames are those of the tick, and a tick without `callstacks` has none: nothing is
+  // kept from the stop before.
+  const callstacks = tick.callstacks ?? {};
 
   // With no game loaded there is no machine, and its ticks carry no registers: under the
   // merge the values of the machine that is gone would stay. Nothing has a value then.
@@ -224,8 +220,10 @@ export const applyTick = (previous: LiveState, tick: DebuggerTick): TickOutcome 
     first: previous.first ?? { registers: tick.registers, refresh },
   };
 
-  const hit = announce
-    ? (tick.breakpoints[String(execution.breakpointId)] ?? { id: execution.breakpointId as number })
-    : undefined;
+  // every paused tick of a stop names its breakpoint; it is announced once, with the stop
+  const hit =
+    newStop && execution.breakpointId !== undefined
+      ? (tick.breakpoints[String(execution.breakpointId)] ?? { id: execution.breakpointId })
+      : undefined;
   return { state, newStop, hit };
 };
