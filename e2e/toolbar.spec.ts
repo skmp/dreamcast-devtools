@@ -1643,6 +1643,7 @@ test("the documentation says what the run controls and the keys do, and what a w
     "the SH4 in the SH4 Debugger and the Mixed Mode Debugger, the ARM7 in the ARM7 Debugger, the DSP in the Audio Debugger",
     "F5 run, F6 pause, F10 step over, F11 step into, Shift+F11 step out; F8 and Shift+F8 do what F11 and Shift+F11 do",
     "A key that is held down is used once",
+    "F5 does not load the page again here; Ctrl+R and Ctrl+F5 do",
     "the ARM7 is held in reset",
     "Reset resets the machine at once, without a question",
     // M2-D42: the help says it, since nothing keeps a write from doing it

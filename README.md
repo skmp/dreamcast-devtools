@@ -269,7 +269,8 @@ where it opens is the server's to say.
   the editor of one — but for two places: in Monaco, and while a dialog is open, they are left
   to the editor and to the browser. A key that is held down is used once, and its repeats are
   taken from the browser all the same. A key does what its button does: nothing while the
-  button is off. A key with Ctrl, Alt or Meta is not one of them.
+  button is off. A key with Ctrl, Alt or Meta is not one of them: Ctrl+R and Ctrl+F5 load the
+  page again, which F5 no longer does on these pages.
 - **What is off, and why.** A run control whose request could only be refused is off, by
   button and by key, and its tooltip (which is also its description) says why behind its name:
   `not connected`; `the target is running` (Run and the steps) or `the target is paused`
