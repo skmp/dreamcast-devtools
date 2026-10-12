@@ -1072,6 +1072,53 @@ test.describe("byte editing with the keyboard", () => {
     expect(await headerTop(view)).toBe(top);
   });
 
+  test("the place is inside the rows there are: fewer rows, and a last row of fewer bytes, take it along", async ({ page }) => {
+    // a server that answers with fewer bytes than the view asked for, when told to
+    const server = await serveScriptedDebugger(page);
+    server.shape.capabilities = ["event-breakpoints", "callstack", "memory-write"];
+    let bytes = 960;
+    server.answer("state.getMemorySlice", (params) => defaultAnswer("state.getMemorySlice", { ...params, length: Math.min(bytes, Number(params.length)) }));
+    await gotoRoute(page, "/workspace/sh4-debugger");
+    await server.described();
+    const view = panel(page, "sh4-memory");
+    await expect(memoryRows(view)).toHaveCount(60);
+
+    // the place: the tenth byte of the sixth row
+    await place(view).focus();
+    for (let press = 0; press < 5; press++) {
+      await page.keyboard.press("ArrowDown");
+    }
+    for (let press = 0; press < 9; press++) {
+      await page.keyboard.press("ArrowRight");
+    }
+    await expect(place(view)).toHaveAccessibleName("0x8C010059 59, write");
+
+    // the next stop reads two rows and eight bytes of a third
+    bytes = 40;
+    server.state.execution = { state: "paused", stopId: 2, reason: "pause" };
+    server.tick();
+    await expect(memoryRows(view)).toHaveCount(3);
+    await expect(hexCell(view, 0x8c010020)).toHaveText("20 21 22 23 24 25 26 27");
+    // one stop of the Tab key, as before: in the last row there is, on its last byte
+    await expect(place(view)).toHaveCount(1);
+    await expect(view.locator("[data-memory-hex][tabindex]")).toHaveCount(1);
+    await expect(place(view)).toHaveAccessibleName("0x8C010027 27, write");
+    await place(view).focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(place(view)).toHaveAccessibleName("0x8C010027 27, write");
+    // there is no row below it to go to: the view moves by a row under the place, as at the edge of the panel
+    await page.keyboard.press("ArrowDown");
+    await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(0x8c010010));
+    await expect(place(view)).toHaveAccessibleName("0x8C010037 37, write");
+    // and that byte is the one Enter edits
+    await page.keyboard.press("Enter");
+    await expect(byteEditor(view)).toHaveAccessibleName("Bytes to write from 0x8C010037");
+    await expect(byteEditor(view)).toHaveValue("37");
+    await byteEditor(view).press("Escape");
+    await expect(place(view)).toBeFocused();
+    expect(server.requestsOf("state.writeMemory")).toEqual([]);
+  });
+
   test("in a panel narrower than its rows the listing is scrolled to the side for the place of the keyboard, and never up or down", async ({ page }) => {
     await openWorkspace(page, "sh4-debugger");
     await pauseFromToolbar(page);
@@ -1084,6 +1131,14 @@ test.describe("byte editing with the keyboard", () => {
 
     await place(view).focus();
     await sideScroll(view, "start");
+    // a place that is on screen moves nothing: the hex column of a row is wider than this panel,
+    // and is not brought on screen as a whole when the focus goes from row to row
+    await page.keyboard.press("ArrowDown");
+    await expect(hexCell(view, 0x8c010010)).toBeFocused();
+    expect(await sideScroll(view)).toBe(0);
+    await page.keyboard.press("ArrowUp");
+    await expect(hexCell(view, 0x8c010000)).toBeFocused();
+    expect(await sideScroll(view)).toBe(0);
     for (let press = 0; press < 15; press++) {
       await page.keyboard.press("ArrowRight");
     }
