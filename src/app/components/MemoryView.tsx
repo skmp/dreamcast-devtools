@@ -456,6 +456,7 @@ export const MemoryView = ({
   // and F2 open the editor at its byte, and a click on a byte puts it there.
   const hasCursor = writable && initialized && onWriteMemory !== undefined;
   const [cursor, setCursor] = useState({ row: 0, byte: 0 });
+  // inside the listing and inside its row, whatever the rows are now and wherever an arrow took it
   const cursorRow = Math.max(0, Math.min(cursor.row, rows.length - 1));
   const cursorByte = Math.max(0, Math.min(cursor.byte, (rows[cursorRow]?.length ?? 1) - 1));
   const cursorCell = useRef<HTMLSpanElement | null>(null);
@@ -500,9 +501,10 @@ export const MemoryView = ({
       if (!/^[0-9A-F]{2}$/.test(byte)) {
         return false;
       }
+      // (the place of the keyboard is at this byte already: the keys open the editor where the
+      // place is, and the first press of a double click has put it there)
       editAddressRef.current = row.address + byteIndex;
       setEdit({ at: row.address + byteIndex, view: address });
-      setCursor({ row: rowIndex, byte: byteIndex });
       openEditor(byte);
       return true;
     },
@@ -576,7 +578,8 @@ export const MemoryView = ({
     event.preventDefault();
     const [rowStep, byteStep] = step;
     if (rowStep === 0) {
-      placeCursor(cursorRow, Math.max(0, Math.min(cursorByte + byteStep, rows[cursorRow].length - 1)));
+      // (a row has its ends: see cursorByte)
+      placeCursor(cursorRow, cursorByte + byteStep);
     } else if (rowOnScreen(cursorRow + rowStep)) {
       placeCursor(cursorRow + rowStep, cursorByte);
     } else {
