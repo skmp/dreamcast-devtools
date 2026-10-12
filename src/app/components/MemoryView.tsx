@@ -468,9 +468,9 @@ export const MemoryView = ({
       return;
     }
     focusCursor.current = false;
-    // Nothing is scrolled up or down for it: the listing has no way back. To the side the
-    // listing is, in a panel narrower than a row, as far as the byte needs.
-    cursorCell.current?.focus({ preventScroll: true });
+    // Nothing is scrolled up or down for it: the listing is cut, not scrolled. To the side the
+    // listing is scrolled, in a panel narrower than a row, as far as the byte needs.
+    cursorCell.current?.focus();
     const side = sideScrollRef.current;
     // the frame of the byte, which is drawn while the hex column has the focus
     const mark = cursorMark.current?.getBoundingClientRect();
@@ -494,11 +494,9 @@ export const MemoryView = ({
   const openEditorAt = useCallback(
     (rowIndex: number, byteIndex: number): boolean => {
       const row = rows[rowIndex];
-      if (!canEdit || !row || byteIndex >= row.length) {
-        return false;
-      }
-      const byte = row.hex.slice(byteIndex * 3, byteIndex * 3 + 2);
-      if (!/^[0-9A-F]{2}$/.test(byte)) {
+      // (behind the last byte of a short row there are no digits either)
+      const byte = row?.hex.slice(byteIndex * 3, byteIndex * 3 + 2) ?? "";
+      if (!canEdit || !row || !/^[0-9A-F]{2}$/.test(byte)) {
         return false;
       }
       // (the place of the keyboard is at this byte already: the keys open the editor where the
@@ -520,8 +518,7 @@ export const MemoryView = ({
         return undefined;
       }
       const box = cell.getBoundingClientRect();
-      const byte = hexColumnByte(event.clientX - box.left, box.width);
-      return byte < rows[row].length ? { row, byte } : undefined;
+      return { row, byte: hexColumnByte(event.clientX - box.left, box.width) };
     },
     [rows],
   );
@@ -538,27 +535,23 @@ export const MemoryView = ({
     [byteAtPointer, openEditorAt],
   );
 
-  // A press on a byte of the hex column: the place of the keyboard is there.
+  // A press on a byte of the hex column, with the first button: the place of the keyboard is there.
   const handleListingMouseDown = useCallback(
     (event: React.MouseEvent<HTMLElement>) => {
-      const at = hasCursor && event.button === 0 ? byteAtPointer(event) : undefined;
+      const at = event.button === 0 ? byteAtPointer(event) : undefined;
       if (at) {
         placeCursor(at.row, at.byte);
       }
     },
-    [hasCursor, byteAtPointer, placeCursor],
+    [byteAtPointer, placeCursor],
   );
 
-  /** Whether a row of the listing is on screen as a whole: the listing is cut at the edge of its panel. */
+  /** Whether there is such a row, on screen as a whole: the listing is cut at the lower edge of its panel. */
   const rowOnScreen = (index: number): boolean => {
     const row = rows[index];
     const element = row ? lineRefsMap.current.get(row.address) : undefined;
     const frame = containerRef.current?.getBoundingClientRect();
-    if (!element || !frame) {
-      return false;
-    }
-    const box = element.getBoundingClientRect();
-    return box.top >= frame.top && box.bottom <= frame.bottom;
+    return element !== undefined && frame !== undefined && element.getBoundingClientRect().bottom <= frame.bottom;
   };
 
   const handleCursorKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {

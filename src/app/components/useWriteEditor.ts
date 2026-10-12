@@ -41,8 +41,7 @@ export const useFocusReturn = (shown: boolean, opener: RefObject<HTMLElement | n
     const held = inBox.current;
     inBox.current = false;
     if (held && (document.activeElement === null || document.activeElement === document.body)) {
-      // without scrolling: the value is where the box was
-      opener.current?.focus({ preventScroll: true });
+      opener.current?.focus();
     }
   }, [shown, opener]);
   return useMemo(
