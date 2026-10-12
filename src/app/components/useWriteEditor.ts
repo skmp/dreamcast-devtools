@@ -37,10 +37,10 @@ export const useFocusReturn = (shown: boolean, opener: RefObject<HTMLElement | n
       return;
     }
     // A box that is taken out of the document with the focus in it has not said that the
-    // focus left it, and the focus is on the body now.
+    // focus left it: the focus is on the page body now, and nothing else has it.
     const held = inBox.current;
     inBox.current = false;
-    if (held && (document.activeElement === null || document.activeElement === document.body)) {
+    if (held) {
       opener.current?.focus();
     }
   }, [shown, opener]);
