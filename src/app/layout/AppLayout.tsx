@@ -267,6 +267,8 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
         { id: PANEL_IDS.SH4_DISASSEMBLY, title: "SH4: Disassembly", component: <Sh4DisassemblyPanel /> },
         { id: PANEL_IDS.SH4_MEMORY, title: "SH4: Memory", component: <Sh4MemoryPanel /> },
         { id: PANEL_IDS.SH4_BREAKPOINTS, title: "SH4: Breakpoints", component: <Sh4BreakpointsPanel /> },
+        // a tab behind the breakpoints, which stay the panel their group shows
+        { id: PANEL_IDS.SH4_REGISTERS, title: "SH4: Registers", component: <Sh4RegistersPanel /> },
       ];
     }
 
@@ -275,6 +277,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
         { id: PANEL_IDS.ARM7_DISASSEMBLY, title: "ARM7: Disassembly", component: <Arm7DisassemblyPanel /> },
         { id: PANEL_IDS.ARM7_MEMORY, title: "ARM7: Memory", component: <Arm7MemoryPanel /> },
         { id: PANEL_IDS.ARM7_BREAKPOINTS, title: "ARM7: Breakpoints", component: <Arm7BreakpointsPanel /> },
+        { id: PANEL_IDS.ARM7_REGISTERS, title: "ARM7: Registers", component: <Arm7RegistersPanel /> },
       ];
     }
 

@@ -445,7 +445,8 @@ function createDefaultLayout(
     // Focus the first panel in the left group
     firstPanel.api.setActive();
   } else if (mode === 'sh4-layout') {
-    // SH4 layout: First panel on left, remaining panels vertically stacked on right
+    // SH4 layout: first panel on the left, the second and third stacked on the right, and
+    // the rest (the register panel of the processor) as tabs behind the third
     if (panels.length === 0) return;
 
     // Add first panel (SH4 Disassembly)
@@ -481,7 +482,7 @@ function createDefaultLayout(
       });
     }
 
-    // Any additional panels go as tabs in the last group
+    // Any additional panels go as tabs in the last group, behind its first panel
     for (let i = 3; i < panels.length; i++) {
       api.addPanel({
         id: panels[i].id,
@@ -491,6 +492,8 @@ function createDefaultLayout(
           referencePanel: panels[2].id,
           direction: 'within',
         },
+        // the third panel stays the one its group shows
+        inactive: true,
       });
     }
 
