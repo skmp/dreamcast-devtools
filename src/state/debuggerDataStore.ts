@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { TargetProcessorSchema } from "../lib/debuggerSchema";
 import type {
   BreakpointCategory,
   BreakpointDescriptor,
@@ -12,9 +13,9 @@ import type { DebuggerClient } from "../services/debuggerClient";
 import type { InvalidMessageReport } from "../services/jsonRpcClient";
 import { toggleMuted, toggleSoloed } from "./breakpointCategoryState";
 import { reconnectDelayMs } from "./sessionController";
-import { describeBreakpoint } from "./targets";
+import { describeBreakpoint, targetInfo } from "./targets";
 import { applyTick, emptyLiveState } from "./tickState";
-import type { CategoryStates, LiveState } from "./tickState";
+import type { CategoryStates, LiveState, ProgramCounterRegister } from "./tickState";
 
 /** A notice in the corner of a workspace; it goes away by itself. */
 export interface Toast {
@@ -74,7 +75,16 @@ interface DebuggerDataState extends LiveState {
   reset: () => void;
   addWatch: (expression: string) => Promise<void>;
   removeWatch: (watchId: number) => Promise<void>;
+  /**
+   * state.editWatch: writes the register of a watch. Like the other two writes below it rejects,
+   * after showing why, when the server refused it or did not answer, so that an editor stays
+   * open; and when the server accepted it, what the views fetched is read again (`reread`).
+   */
   editWatch: (watchId: number, value: string) => Promise<void>;
+  /** state.setRegister: `value` is what was typed ("0x" hex or decimal); the server is the one that reads it. */
+  setRegister: (path: string, name: string, value: string) => Promise<void>;
+  /** state.writeMemory: the bytes of `data` from `address` on, all of them or none. */
+  writeMemory: (target: "sh4" | "arm7", address: number, data: number[]) => Promise<void>;
   modifyWatchExpression: (watchId: number, newExpression: string) => Promise<void>;
   addBreakpoint: (event: string, address?: number, kind?: BreakpointDescriptor["kind"]) => Promise<void>;
   removeBreakpoint: (id: number) => Promise<void>;
@@ -103,6 +113,16 @@ const collectEventsFromTree = (nodes: DeviceNodeDescriptor[]): string[] => {
 };
 
 const messageOf = (error: unknown, fallback: string): string => (error instanceof Error && error.message ? error.message : fallback);
+
+/**
+ * Where the program counters of the server's targets are: of the targets it lists, once it has
+ * described itself. Until then nothing says what the ticks of a connection are of (`shape` is
+ * still what the server before it said).
+ */
+const listedProgramCounters = (state: Pick<DebuggerDataState, "initialized" | "shape">): ProgramCounterRegister[] =>
+  state.initialized
+    ? TargetProcessorSchema.options.map((id) => targetInfo(state.shape, id)).filter((target) => target.supported)
+    : [];
 
 /** Identifies the connection that `initialize` was last called for; what an older one still delivers is ignored. */
 let generation = 0;
@@ -155,12 +175,45 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
   };
 
   const handleTick = (tick: DebuggerTick) => {
-    const outcome = applyTick(get(), tick);
+    const outcome = applyTick(get(), tick, listedProgramCounters(get()));
     publish(outcome.state);
     if (outcome.hit) {
       const text = "event" in outcome.hit ? describeBreakpoint(get().shape, outcome.hit) : `#${outcome.hit.id}`;
       notify("warning", `Breakpoint hit: ${text}`);
     }
+  };
+
+  /**
+   * One write of this client (state.setRegister, state.editWatch, state.writeMemory): sent, and
+   * when the server answered {} what the views fetched is read again, where they are (`reread`).
+   * Nothing here moves a view: when the write moved a program counter, the tick says so, in
+   * front of this answer or behind it (`refresh`, see applyTick).
+   *
+   * A refusal and a request that was not answered are shown, and reject: the editor that asked
+   * stays open with what was typed. A refusal is the server's word on what was typed (these
+   * methods report every failure of a well-formed request in-band) and no failure of the UI:
+   * it is shown and not logged.
+   */
+  const write = async (send: (client: DebuggerClient) => Promise<RpcError>, failure: string): Promise<void> => {
+    const { client } = get();
+    if (!client) {
+      const error = new Error("No client connected");
+      get().showError(error.message);
+      throw error;
+    }
+    let result: RpcError;
+    try {
+      result = await send(client);
+    } catch (error) {
+      console.error(failure, error);
+      get().showError(messageOf(error, failure));
+      throw error;
+    }
+    if (result.error) {
+      get().showError(result.error.message);
+      throw new Error(result.error.message);
+    }
+    set((state) => ({ reread: state.reread + 1 }));
   };
 
   /** Sends new category states. The buttons show them at once; the next tick of a v3 server says what they are. */
@@ -355,29 +408,17 @@ export const useDebuggerDataStore = create<DebuggerDataState>()((set, get) => {
     },
 
     async editWatch(watchId, value) {
-      const { client, watches } = get();
-      if (!client) {
-        const error = new Error("No client connected");
-        get().showError(error.message);
-        throw error;
-      }
-      const watch = watches.find((w) => w.id === watchId);
-      if (!watch) {
+      if (get().client && !get().watches.some((w) => w.id === watchId)) {
         const error = new Error("Watch not found");
         get().showError(error.message);
         throw error;
       }
-      try {
-        const result = (await client.editWatch(watchId, value)) as RpcError;
-        if (result.error) {
-          throw new Error(result.error.message);
-        }
-      } catch (error) {
-        console.error("Failed to edit watch", error);
-        get().showError(messageOf(error, "Failed to edit watch"));
-        throw error;
-      }
+      await write((client) => client.editWatch(watchId, value), "Failed to edit watch");
     },
+
+    setRegister: (path, name, value) => write((client) => client.setRegister(path, name, value), "Failed to write the register"),
+
+    writeMemory: (target, address, data) => write((client) => client.writeMemory({ target, address, data }), "Failed to write memory"),
 
     async modifyWatchExpression(watchId, newExpression) {
       const { client, watches } = get();

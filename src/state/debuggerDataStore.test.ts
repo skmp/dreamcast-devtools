@@ -558,6 +558,178 @@ describe("watches", () => {
   });
 });
 
+describe("writes (state.setRegister, state.editWatch, state.writeMemory)", () => {
+  const WATCHED = { watches: [{ id: 7, expression: "dc.sh4.cpu.pc", value: "0x8C0000A0" }] };
+  const target = (id: string, pcPath: string) => ({
+    id,
+    label: id.toUpperCase(),
+    pcPath,
+    pcRegister: "PC",
+    breakpointEvent: `${pcPath}.pc`,
+    instructionSize: 2,
+    addressMax: 0xffffffff,
+    addressRadix: 16,
+    addressDigits: 8,
+    defaultDisassemblyAddress: 0,
+    defaultMemoryAddress: 0,
+    memory: true,
+    stepping: true,
+  });
+  const TARGETS = [target("sh4", "dc.sh4.cpu"), target("arm7", "dc.aica.arm7")];
+  /** A server that lists the SH4 and the ARM7, paused in stop 1 with both program counters in its tick. */
+  const machine = (sh4: string, arm7 = "0x00200010") => ({ "dc.sh4.cpu": pc(sh4), "dc.aica.arm7": pc(arm7) });
+  const paused = (registers: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    tickFrame({ state: "paused", stopId: 1, reason: "pause" }, { registers, ...WATCHED, ...extra });
+  const start = () => initialise(paused(machine("0x8C0000A0")), describeResult({ targets: TARGETS, capabilities: ["register-write", "memory-write"] }));
+
+  /** The three writes: what the store is asked, and the request that is sent for it. */
+  const WRITES = [
+    ["setRegister", () => store().setRegister("dc.sh4.cpu", "R0", "0x1234"), "state.setRegister", { path: "dc.sh4.cpu", name: "R0", value: "0x1234" }],
+    ["editWatch", () => store().editWatch(7, " 4660 "), "state.editWatch", { watchId: 7, value: " 4660 " }],
+    ["writeMemory", () => store().writeMemory("arm7", 0x00200000, [0xde, 0xad]), "state.writeMemory", { target: "arm7", address: 0x00200000, data: [0xde, 0xad] }],
+  ] as const;
+
+  it.each(WRITES)("%s: sends its request as it was asked, and when it is answered {} the views read again where they are", async (_name, send, method, params) => {
+    const { transport } = await start();
+    const before = { refresh: store().refresh, reread: store().reread };
+    const writing = send();
+    expect(transport.sent.at(-1)).toMatchObject({ method, params });
+    // not before the server has answered
+    expect(store().reread).toBe(before.reread);
+    transport.respond({});
+    await writing;
+    expect(store().reread).toBe(before.reread + 1);
+    // the answer moves no view: that is the tick's to say
+    expect(store().refresh).toBe(before.refresh);
+    expect(store().toasts).toEqual([]);
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it.each(WRITES)("%s: a refusal is said once and rejects, so that the editor stays open; nothing is read again", async (_name, send) => {
+    const { transport } = await start();
+    const before = { refresh: store().refresh, reread: store().reread };
+    for (const [code, message] of [
+      [-32013, "not writable: dc.sh4.cpu.PC = 0x8C0000A1: the address is odd"],
+      [-32602, 'invalid params: value: "zz" is neither 0x hex nor decimal'],
+      [-32001, "emulator stopped by host UI"],
+      [-32000, "emulator busy"],
+    ] as const) {
+      const writing = send();
+      transport.respond({ error: { code, message } });
+      await expect(writing).rejects.toThrow(message);
+      expect(store().toasts.at(-1)?.message).toBe(message);
+    }
+    expect(store().toasts.map((toast) => toast.count)).toEqual([1, 1, 1, 1]);
+    expect(store().reread).toBe(before.reread);
+    expect(store().refresh).toBe(before.refresh);
+    // what the server says of a value is no failure of the UI: it is shown, not logged
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it.each(WRITES)("%s: a JSON-RPC error and a lost connection are said and reject", async (_name, send, method) => {
+    const { transport } = await start();
+    const failed = send();
+    transport.respondError(-32603, "internal error");
+    await expect(failed).rejects.toThrow("internal error");
+    const lost = send();
+    transport.close();
+    await expect(lost).rejects.toThrow(`Connection closed before ${method} was answered`);
+    expect(store().toasts.map((toast) => toast.message)).toEqual(["internal error", `Connection closed before ${method} was answered`]);
+    expect(store().reread).toBe(0);
+  });
+
+  it("without a connection a write is refused here, and says so", async () => {
+    await expect(store().setRegister("dc.sh4.cpu", "PC", "0")).rejects.toThrow("No client connected");
+    await expect(store().writeMemory("sh4", 0x8c010000, [0])).rejects.toThrow("No client connected");
+    await expect(store().editWatch(1, "0")).rejects.toThrow("No client connected");
+    expect(store().toasts.map((toast) => `${toast.message} x${toast.count}`)).toEqual(["No client connected x3"]);
+  });
+
+  it("a watch the ticks do not list is not written", async () => {
+    const { transport } = await start();
+    const before = transport.sent.length;
+    await expect(store().editWatch(8, "0x1")).rejects.toThrow("Watch not found");
+    expect(transport.sent).toHaveLength(before);
+  });
+
+  // The tick a write caused reaches the client in front of its response or behind it (design
+  // 2.9, "Order"), and it is no new stop. The views that follow the PC move with the tick
+  // that shows another PC, and with nothing else: the order does not matter.
+  describe("a write of the PC", () => {
+    it("the tick behind the response: the answer reads again in place, the tick moves the views", async () => {
+      const { transport } = await start();
+      expect([store().refresh, store().reread]).toEqual([1, 0]);
+      const writing = store().setRegister("dc.sh4.cpu", "PC", "0x8C0000AC");
+      transport.respond({});
+      await writing;
+      expect([store().refresh, store().reread]).toEqual([1, 1]);
+      transport.deliver(paused(machine("0x8C0000AC")));
+      expect([store().refresh, store().reread]).toEqual([2, 1]);
+      // it was no stop
+      expect(store().stop).toMatchObject({ serial: 1, stopId: 1 });
+    });
+
+    it("the tick in front of the response: the views are moved once, by the tick", async () => {
+      const { transport } = await start();
+      const writing = store().setRegister("dc.sh4.cpu", "PC", "0x8C0000AC");
+      const request = transport.sent.at(-1)!;
+      transport.deliver(paused(machine("0x8C0000AC")));
+      expect([store().refresh, store().reread]).toEqual([2, 0]);
+      transport.deliver({ jsonrpc: "2.0", id: request.id, result: {} });
+      await writing;
+      expect([store().refresh, store().reread]).toEqual([2, 1]);
+    });
+
+    it("through a watch, of the ARM7, and by another client: the tick moves the views the same way", async () => {
+      const { transport } = await start();
+      const writing = store().editWatch(7, "0x8C0000A4");
+      transport.respond({});
+      transport.deliver(paused(machine("0x8C0000A4")));
+      await writing;
+      expect([store().refresh, store().reread]).toEqual([2, 1]);
+      // nobody here asked for this one
+      transport.deliver(paused(machine("0x8C0000A4", "0x00200030")));
+      expect([store().refresh, store().reread]).toEqual([3, 1]);
+    });
+
+    it("a write that leaves every PC where it was moves nothing: a register, a byte, the PC written as it is", async () => {
+      const { transport } = await start();
+      for (const send of [
+        () => store().setRegister("dc.sh4.cpu", "R0", "0x1"),
+        () => store().writeMemory("sh4", 0x8c0000a0, [0x09, 0x00]),
+        () => store().setRegister("dc.sh4.cpu", "PC", "0x8C0000A0"),
+      ]) {
+        const writing = send();
+        transport.respond({});
+        transport.deliver(paused(machine("0x8C0000A0")));
+        await writing;
+      }
+      expect([store().refresh, store().reread]).toEqual([1, 3]);
+    });
+
+    it("the PC of a target the server does not list moves nothing", async () => {
+      // the server of `initialise` lists no target at all
+      const { transport } = await initialise(paused(machine("0x8C0000A0")));
+      transport.deliver(paused(machine("0x8C0000AC", "0x00200030")));
+      expect(store().refresh).toBe(1);
+    });
+
+    it("the ticks of a server that has not described itself are read with no target of the server before it", async () => {
+      await start();
+      // the next connection: its ticks arrive before its debugger.describe is answered
+      const { transport, client } = connect();
+      const done = store().initialize(client);
+      transport.deliver(paused(machine("0x8C0000A0")));
+      transport.deliver(paused(machine("0x8C0000AC")));
+      expect(store().refresh).toBe(1);
+      transport.respond(describeResult({ targets: TARGETS }));
+      await done;
+      transport.deliver(paused(machine("0x8C0000AE")));
+      expect(store().refresh).toBe(2);
+    });
+  });
+});
+
 describe("category states", () => {
   it("a click sends all four states, shows them at once, and the tick has the last word", async () => {
     const { transport } = await initialise();

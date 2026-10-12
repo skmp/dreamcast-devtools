@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { BreakpointDescriptor, DebuggerTick, RegisterValue } from "../lib/debuggerSchema";
-import { applyTick, emptyLiveState, type LiveState } from "./tickState";
+import { applyTick, emptyLiveState, type LiveState, type ProgramCounterRegister } from "./tickState";
 
 const reg = (name: string, value: string, width = 32): RegisterValue => ({ name, value, width });
 const unmuted = { muted: false, soloed: false };
@@ -19,10 +19,10 @@ const tick = (execution: DebuggerTick["executionState"], extra: Partial<Debugger
   ...extra,
 });
 
-const run = (ticks: DebuggerTick[], from: LiveState = emptyLiveState()) => {
+const run = (ticks: DebuggerTick[], from: LiveState = emptyLiveState(), programCounters?: readonly ProgramCounterRegister[]) => {
   let state = from;
   const outcomes = ticks.map((next) => {
-    const outcome = applyTick(state, next);
+    const outcome = applyTick(state, next, programCounters);
     state = outcome.state;
     return outcome;
   });
@@ -228,6 +228,114 @@ describe("a game that is started where there was none (the ticks of the emulator
     ]);
     expect(outcomes.map((outcome) => outcome.state.refresh)).toEqual([1, 2, 2, 2]);
     expect(outcomes[3].state.registersByPath).toEqual(cpu("0x8C010002"));
+  });
+});
+
+describe("a program counter that is written while the target is stopped", () => {
+  // what `targets` of debugger.describe says about where the program counters are
+  const SH4 = { pcPath: "dc.sh4.cpu", pcRegister: "PC" };
+  const ARM7 = { pcPath: "dc.aica.arm7", pcRegister: "PC" };
+  const DSP = { pcPath: "dc.aica.dsp", pcRegister: "STEP" };
+  const LISTED = [SH4, ARM7, DSP];
+  const stop = { state: "paused", stopId: 4, reason: "pause" } as const;
+  const machine = (sh4: string, arm7 = "0x00200010", step = "0x05") => ({
+    "dc.sh4.cpu": [reg("PC", sh4), reg("PR", "0x8C0000A2")],
+    "dc.aica.arm7": [reg("PC", arm7), reg("R0", "0x00000000")],
+    "dc.aica.dsp": [reg("STEP", step, 8)],
+  });
+  const refreshes = (ticks: DebuggerTick[], programCounters: readonly ProgramCounterRegister[] = LISTED) =>
+    run(ticks, emptyLiveState(), programCounters).outcomes.map((outcome) => outcome.state.refresh);
+
+  it("a paused tick of the stored stop with another PC moves the views; it is no stop", () => {
+    const { outcomes, state } = run(
+      [tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8C0000AC") })],
+      emptyLiveState(),
+      LISTED,
+    );
+    expect(outcomes.map((outcome) => outcome.state.refresh)).toEqual([1, 2]);
+    expect(outcomes.map((outcome) => outcome.newStop)).toEqual([true, false]);
+    expect(state.stop).toMatchObject({ serial: 1, stopId: 4 });
+    expect(outcomes[1].hit).toBeUndefined();
+  });
+
+  it("the PC of every listed target counts, whichever register it is said to be", () => {
+    expect(refreshes([tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8C0000A0", "0x00200030") })])).toEqual([1, 2]);
+    expect(refreshes([tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8C0000A0", "0x00200010", "0x06") })])).toEqual([1, 2]);
+    // two of them in one tick are one moment
+    expect(refreshes([tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8C0000A2", "0x00200014") })])).toEqual([1, 2]);
+    // a server that says its PC is in another register: that one counts, and `PC` does not
+    const elsewhere = [{ pcPath: "dc.sh4.cpu", pcRegister: "PR" }];
+    expect(refreshes([tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8C0000AC") })], elsewhere)).toEqual([1, 1]);
+    expect(
+      refreshes(
+        [tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: { "dc.sh4.cpu": [reg("PC", "0x8C0000A0"), reg("PR", "0x8C000100")] } })],
+        elsewhere,
+      ),
+    ).toEqual([1, 2]);
+  });
+
+  it("the same PC again, and another register that changed, move nothing", () => {
+    const written = { ...machine("0x8C0000A0"), "dc.aica.arm7": [reg("PC", "0x00200010"), reg("R0", "0x00001234")] };
+    expect(refreshes([tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: written })])).toEqual([1, 1, 1]);
+    // the same number written another way is the same PC
+    expect(refreshes([tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8c0000a0") })])).toEqual([1, 1]);
+  });
+
+  it("a new stop is one moment, also when its PC is another one", () => {
+    expect(
+      refreshes([tick(stop, { registers: machine("0x8C0000A0") }), tick({ state: "paused", stopId: 5, reason: "step" }, { registers: machine("0x8C0000A2") })]),
+    ).toEqual([1, 2]);
+  });
+
+  it("a running tick moves nothing, whatever its PC; the stop that ends the run does, once", () => {
+    expect(
+      refreshes([
+        tick(stop, { registers: machine("0x8C0000A0") }),
+        tick({ state: "running", stopId: 4 }, { registers: machine("0x8C0000A4") }),
+        tick({ state: "running", stopId: 4 }, { registers: machine("0x8C0000A8") }),
+        tick({ state: "paused", stopId: 5, reason: "pause" }, { registers: machine("0x8C0000AC") }),
+      ]),
+    ).toEqual([1, 1, 1, 2]);
+  });
+
+  it("a tick without a stopId is of no stop: its PC moves nothing", () => {
+    expect(refreshes([tick(stop, { registers: machine("0x8C0000A0") }), tick({ state: "paused", reason: "pause" }, { registers: machine("0x8C0000AC") })])).toEqual([1, 1]);
+  });
+
+  it("a tick that does not carry the register, or carries no number in it, shows no other PC", () => {
+    expect(
+      refreshes([
+        tick(stop, { registers: machine("0x8C0000A0") }),
+        // the node of another device alone
+        tick(stop, { registers: { "dc.sh4.tmu": [reg("TCNT0", "0x00000001")] } }),
+        // the node without its PC
+        tick(stop, { registers: { "dc.sh4.cpu": [reg("PR", "0x8C0000A2")] } }),
+        tick(stop, { registers: machine("n/a") }),
+        // behind "n/a" nothing is stored that a PC could be another one than
+        tick(stop, { registers: machine("0x8C0000AC") }),
+        tick(stop, { registers: machine("0x8C0000AE") }),
+      ]),
+    ).toEqual([1, 1, 1, 1, 1, 2]);
+  });
+
+  it("only the PCs of listed targets count: a server that lists none moves no view this way", () => {
+    const ticks = () => [tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8C0000AC", "0x00200030") })];
+    expect(refreshes(ticks(), [])).toEqual([1, 1]);
+    // (and so does a caller that names none)
+    expect(run(ticks()).outcomes.map((outcome) => outcome.state.refresh)).toEqual([1, 1]);
+    expect(refreshes(ticks(), [DSP])).toEqual([1, 1]);
+    expect(refreshes(ticks(), [ARM7])).toEqual([1, 2]);
+  });
+
+  it("no tick advances the counter of this client's writes, and a tick keeps it", () => {
+    const written = { ...emptyLiveState(), reread: 3 };
+    const { outcomes } = run(
+      [tick(stop, { registers: machine("0x8C0000A0") }), tick(stop, { registers: machine("0x8C0000AC") }), tick({ state: "running", stopId: 4 })],
+      written,
+      LISTED,
+    );
+    expect(outcomes.map((outcome) => outcome.state.reread)).toEqual([3, 3, 3]);
+    expect(emptyLiveState().reread).toBe(0);
   });
 });
 

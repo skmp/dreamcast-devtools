@@ -4,12 +4,14 @@ import type {
   BreakpointCategoryState,
   BreakpointDescriptor,
   CallstackFrame,
+  DebuggerTarget,
   DebuggerTick,
   EventLogEntry,
   ExecutionState,
   RegisterValue,
   WatchDescriptor,
 } from "../lib/debuggerSchema";
+import { programCounter } from "./targets";
 
 // What the client knows from the ticks of one connection, and how a tick changes it. Pure:
 // the store applies it, the tests call it directly.
@@ -47,10 +49,20 @@ export interface LiveState {
   /** the last stop acted on; stays while the target runs again */
   stop?: StopInfo;
   /**
-   * Counts the moments at which what a view fetched (disassembly, memory) is out of date:
-   * every new stop, and a game being loaded where there was none. Never a tick as such.
+   * Counts the moments at which what a view fetched (disassembly, memory) is out of date and
+   * the target may be somewhere else: every new stop, a game being loaded where there was none,
+   * and a paused tick of the stop that is stored in which a program counter is another one (it
+   * was written: by this client, through a watch, or by another client). The views read again
+   * and follow the program counter. Never a tick as such, and never a request of this client:
+   * its tick can be in front of its response or behind it, and the tick is what counts.
    */
   refresh: number;
+  /**
+   * Counts the writes of this client that the server accepted (memory, a register, the
+   * register of a watch; a reset): what a view fetched is read again where the view is. It
+   * moves no view, and no tick advances it.
+   */
+  reread: number;
   /**
    * The first tick of the connection: its registers, and `refresh` after it. A view that
    * was waiting for the connection opens where the target was then.
@@ -80,6 +92,7 @@ export const emptyLiveState = (): LiveState => ({
   categories: defaultCategoryStates(),
   stop: undefined,
   refresh: 0,
+  reread: 0,
   first: undefined,
 });
 
@@ -170,7 +183,34 @@ const mergeCategories = (stored: CategoryStates, incoming: DebuggerTick["categor
   return keep(stored, merged);
 };
 
-export const applyTick = (previous: LiveState, tick: DebuggerTick): TickOutcome => {
+/** Where the program counter (or step) of a target is in the registers: `pcPath` and `pcRegister` of `targets`. */
+export type ProgramCounterRegister = Pick<DebuggerTarget, "pcPath" | "pcRegister">;
+
+/**
+ * Whether the tick shows a program counter that is not the stored one. A tick that does not
+ * carry the register, or carries it without a number ("n/a"), shows none, and neither does a
+ * register of which nothing is stored: there is no value it would be another one than.
+ */
+const programCounterMoved = (
+  stored: Record<string, RegisterValue[]>,
+  incoming: Record<string, RegisterValue[]>,
+  programCounters: readonly ProgramCounterRegister[],
+): boolean =>
+  programCounters.some((target) => {
+    const before = programCounter(stored, target);
+    const after = programCounter(incoming, target);
+    return before !== undefined && after !== undefined && before !== after;
+  });
+
+/**
+ * `programCounters`: the program counters of the targets the server lists (`targets` of
+ * debugger.describe); none for a server that has not described itself.
+ */
+export const applyTick = (
+  previous: LiveState,
+  tick: DebuggerTick,
+  programCounters: readonly ProgramCounterRegister[] = [],
+): TickOutcome => {
   const execution = tick.executionState;
   const paused = execution.state === "paused";
 
@@ -204,7 +244,14 @@ export const applyTick = (previous: LiveState, tick: DebuggerTick): TickOutcome 
 
   // a stop moves the views, and so does a game that has just been loaded: until then they had nothing to read
   const appeared = previous.executionState?.reason === NO_GAME && !noMachine;
-  const refresh = previous.refresh + (newStop || appeared ? 1 : 0);
+  // A paused tick of the stop that was acted on, with a program counter that is another one:
+  // somebody wrote it. No request of this client moves the views for that, because the tick a
+  // request caused can arrive in front of its response or behind it, and is no new stop that
+  // would move them later; and a write through a watch, or by another client, has no request
+  // here at all. What the tick shows is the same in every one of these cases.
+  const rewritten =
+    stopId !== undefined && !newStop && programCounterMoved(previous.registersByPath, tick.registers, programCounters);
+  const refresh = previous.refresh + (newStop || appeared || rewritten ? 1 : 0);
 
   const state: LiveState = {
     ticks: previous.ticks + 1,
@@ -217,6 +264,7 @@ export const applyTick = (previous: LiveState, tick: DebuggerTick): TickOutcome 
     categories: mergeCategories(previous.categories, tick.categories),
     stop,
     refresh,
+    reread: previous.reread,
     first: previous.first ?? { registers: tick.registers, refresh },
   };
 
