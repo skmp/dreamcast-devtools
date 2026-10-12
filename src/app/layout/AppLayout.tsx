@@ -2,7 +2,6 @@ import { useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { AppBar, Box, Button, Divider, IconButton, Link, Stack, Switch, Typography, Alert } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
 import { lazyImport } from "../components/lazyImport";
-import { RunControlButton } from "../components/RunControlButton";
 import PowerSettingsNewIcon from "@mui/icons-material/PowerSettingsNew";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudOffIcon from "@mui/icons-material/CloudOff";
@@ -11,9 +10,6 @@ import ChevronLeftIcon from "@mui/icons-material/ChevronLeft";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import DarkModeIcon from "@mui/icons-material/DarkMode";
 import LightModeIcon from "@mui/icons-material/LightMode";
-import PlayArrowIcon from "@mui/icons-material/PlayArrow";
-import PauseIcon from "@mui/icons-material/Pause";
-import SkipNextIcon from "@mui/icons-material/SkipNext";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { DeviceTreePanel } from "../panels/DeviceTreePanel";
@@ -56,8 +52,8 @@ import { DockingLayout, type PanelDefinition } from "./DockingLayout";
 import { clearDockingLayout } from "./dockingLayoutStorage";
 import type { DockviewApi } from "dockview";
 import { PANEL_IDS, PROTOCOL_VERSION, type PanelId } from "../../lib/debuggerSchema";
-import { canResume } from "../../state/stopReasons";
 import { ExecutionStatus } from "./ExecutionStatus";
+import { RunControls } from "./RunControls";
 
 // Panels that are large or bring a large dependency (Monaco, the DSP WebAssembly module,
 // the WebGL waveform renderer) are fetched when they are first shown. DockingLayout shows a
@@ -182,8 +178,6 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const retry = useSessionStore((state) => state.retry);
   const showConnectionModal = useSessionStore((state) => state.showConnectionModal);
   const setShowConnectionModal = useSessionStore((state) => state.setShowConnectionModal);
-  const execution = useDebuggerDataStore((state) => state.executionState);
-  const control = useDebuggerDataStore((state) => state.control);
   const toasts = useDebuggerDataStore((state) => state.toasts);
   const dismissToast = useDebuggerDataStore((state) => state.dismissToast);
   const initError = useDebuggerDataStore((state) => state.initError);
@@ -414,14 +408,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
     }
   }, [workspaceId]);
 
-  // The server answers a control request as soon as it is armed; the ticks report what then
-  // happens. A refusal (no game loaded, stopped in the emulator's window, ...) is shown.
-  const handleRun = useCallback(() => void control("run"), [control]);
-  const handlePause = useCallback(() => void control("pause", "sh4"), [control]);
-
   const connected = connectionState === "connected";
-  const runState = connected ? execution?.state : undefined;
-  const resumable = runState === "paused" && canResume(execution?.reason);
 
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
@@ -432,26 +419,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
           currentPage={workspaceId}
           centerSection={
             <Box sx={{ position: "relative" }}>
-              <Stack direction="row" spacing={1} alignItems="center">
-                {/* The tooltip is on the button itself: its title is the button's name. (A button
-                    that cannot be used is not `disabled`, so it needs no element around it to
-                    carry the tooltip.) */}
-                <Tooltip title="Run">
-                  <RunControlButton size="small" color="success" disabled={!resumable} onClick={handleRun}>
-                    <PlayArrowIcon />
-                  </RunControlButton>
-                </Tooltip>
-                <Tooltip title="Pause">
-                  <RunControlButton size="small" color="warning" disabled={runState !== "running"} onClick={handlePause}>
-                    <PauseIcon />
-                  </RunControlButton>
-                </Tooltip>
-                <Tooltip title="Run to next breakpoint">
-                  <RunControlButton size="small" color="primary" disabled={!resumable} onClick={handleRun}>
-                    <SkipNextIcon />
-                  </RunControlButton>
-                </Tooltip>
-              </Stack>
+              <RunControls />
               {/* next to the run controls: why the target is stopped, and what the server has to say */}
               {connected && initialized && <ExecutionStatus placement="beside" />}
             </Box>
