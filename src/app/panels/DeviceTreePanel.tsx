@@ -205,9 +205,11 @@ const NodeRegisters = memo(({ nodePath, depth, registers }: NodeRegistersProps) 
 
   // A core without a complete context while it runs sends running ticks without its registers
   // and says so (`registersStale`): what is on screen for it is from the last stop.
-  const stale = useDebuggerDataStore(
-    (state) => state.executionState?.registersStale === true && nodePath === targetInfo(state.shape, "sh4").pcPath,
-  );
+  // (That node is the one the server names for the SH4 in `targets`: a server that lists no SH4 has none.)
+  const stale = useDebuggerDataStore((state) => {
+    const sh4 = targetInfo(state.shape, "sh4");
+    return state.executionState?.registersStale === true && sh4.supported && nodePath === sh4.pcPath;
+  });
 
   const indent = LABEL_OFFSET_PX + INDENT_PX * (depth + 1);
   return (

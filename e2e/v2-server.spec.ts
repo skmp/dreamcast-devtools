@@ -11,13 +11,14 @@ import {
   statusBar,
   tooltipButton,
   treeItem,
+  treeItemRow,
   KNOWN,
   type WorkspaceId,
 } from "./support/fixtures";
 import type { Page } from "@playwright/test";
 import { encodeBinaryFrame, BinaryFrameKind, SGC_BYTES_PER_FRAME } from "../src/lib/binaryFrame";
 import { StrictDebuggerRpcMethodSchemas } from "../src/lib/debuggerSchema";
-import { jsonRpcError, serveScriptedDebugger, type ScriptedDebugger } from "./support/scriptedDebugger";
+import { jsonRpcError, serveScriptedDebugger, type Json, type ScriptedDebugger } from "./support/scriptedDebugger";
 import { serveSyntheticDebugger } from "./support/syntheticDebugger";
 
 // The client no longer serves a server of protocol v2. A debugger.describe result without
@@ -190,6 +191,36 @@ test("a describe result without `targets` lists none: every panel of a target sa
   await expect(events.getByRole("heading", { name: "SH4", exact: true })).toHaveCount(0);
   expect(asked(server)).toEqual([]);
 });
+
+// A running tick that says `registersStale` is about the registers of the SH4, whose node is
+// `pcPath` of the SH4 in `targets`: the device tree dims them. A server that does not list the
+// SH4 names no such node, and nothing is dimmed for a node the client knows of by itself.
+for (const listed of [true, false]) {
+  test(`a stale running tick dims the SH4's registers in the device tree ${listed ? "of a server that lists the SH4" : "only on a server that lists the SH4"}`, async ({
+    page,
+  }) => {
+    const server = await serveScriptedDebugger(page);
+    if (!listed) {
+      server.shape.targets = (server.shape.targets as Json[]).filter((target) => target.id !== "sh4");
+    }
+    server.state.execution = { state: "running", stopId: 1, registersStale: true };
+    await gotoRoute(page, "/workspace/arm7-debugger");
+    await expect(statusBar(page)).toContainText("Connection: connected");
+    await server.described();
+    await treeItemRow(page, "dc.sh4.cpu").click();
+    await expect(registerRow(page, "dc.sh4.cpu.reg.PC")).toBeVisible();
+    // a tick of the stale run is in, and shown
+    await tickAndWait(page, server);
+    await expect(page.getByRole("status", { name: "Execution state" })).toContainText("Running");
+    const stale = panel(page, "device-tree").locator(".device-tree-registers[data-stale]");
+    await expect(stale).toHaveCount(listed ? 1 : 0);
+    if (listed) {
+      await expect(stale.locator('[data-register="dc.sh4.cpu.reg.PC"]')).toBeVisible();
+    } else {
+      await expect(registerRow(page, "dc.sh4.cpu.reg.PC").locator("xpath=..")).not.toHaveAttribute("data-stale");
+    }
+  });
+}
 
 test("a describe result without `capabilities` has none: no callstack, no event breakpoints, no SGC capture, and the targets as listed", async ({
   page,
