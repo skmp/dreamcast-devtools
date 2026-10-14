@@ -31,8 +31,12 @@ import {
   type Editability,
 } from "./registerPanelModel";
 
+/** What the expression of a watch says of itself when the pointer rests on it. */
+const RENAME_TITLE = "Double-click to rename the watch";
+const RENAME_RUNNING_TITLE = "Renamed while the target is paused: pause it to rename the watch";
+
 // Component for individual watch item with inline editing
-const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModifyExpression }: {
+const WatchItem = ({ expression, value, mode, paused, focusKey, onRemove, onEdit, onModifyExpression }: {
   expression: string;
   value: unknown;
   /** names the Remove button of this watch for the keyboard focus (see ListFocusKeeper) */
@@ -43,13 +47,28 @@ const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModi
    * target runs.
    */
   mode: Editability;
+  /** the target is paused: the expression can be renamed, like every editor of the page while paused only */
+  paused: boolean;
   onRemove: () => void;
   onEdit: (newValue: string) => Promise<void>;
   onModifyExpression: (newExpression: string) => Promise<void>;
 }) => {
-  const [isEditingExpression, setIsEditingExpression] = useState(false);
+  const [editingExpression, setIsEditingExpression] = useState(false);
   const [editExpression, setEditExpression] = useState("");
   const [hasExpressionError, setHasExpressionError] = useState(false);
+  // The editor of the expression is offered while the target is paused, and one that is open
+  // when the target runs again is put away, with what was typed.
+  const isEditingExpression = editingExpression && paused;
+  useEffect(() => {
+    if (editingExpression && !paused) {
+      setIsEditingExpression(false);
+      setHasExpressionError(false);
+    }
+  }, [editingExpression, paused]);
+  // The expression is a control: the keyboard focus can be on it, Enter, the space bar and F2
+  // open its editor, and it has the focus again when the editor goes with the focus in its box.
+  const expressionElement = useRef<HTMLSpanElement | null>(null);
+  const expressionBoxFocus = useFocusReturn(isEditingExpression, expressionElement);
   // The editor of the value: open until the server has accepted the write, and one request at
   // a time. Like every editor of a register it is offered while the register can be written;
   // one that is open when the target runs again is put away.
@@ -76,6 +95,9 @@ const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModi
   };
 
   const handleDoubleClickExpression = () => {
+    if (!paused) {
+      return;
+    }
     setEditExpression(expression);
     setIsEditingExpression(true);
     setHasExpressionError(false);
@@ -138,12 +160,15 @@ const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModi
               value={editExpression}
               onChange={(e) => setEditExpression(e.target.value)}
               onKeyDown={handleKeyDownExpression}
+              onFocus={expressionBoxFocus.onFocus}
               onBlur={() => {
+                expressionBoxFocus.onBlur();
                 setIsEditingExpression(false);
                 setHasExpressionError(false);
               }}
               autoFocus
               error={hasExpressionError}
+              slotProps={{ htmlInput: { "aria-label": `New expression of ${expression}` } }}
               sx={{
                 flex: 1,
                 "& .MuiOutlinedInput-root": {
@@ -235,8 +260,25 @@ const WatchItem = ({ expression, value, mode, focusKey, onRemove, onEdit, onModi
         >
           <Box
             component="span"
+            ref={expressionElement}
             onDoubleClick={handleDoubleClickExpression}
-            sx={{ cursor: "text" }}
+            title={paused ? RENAME_TITLE : RENAME_RUNNING_TITLE}
+            role="button"
+            tabIndex={0}
+            aria-label={`${expression}, rename`}
+            aria-disabled={!paused || undefined}
+            onKeyDown={(event: React.KeyboardEvent) => {
+              if (opensEditor(event.key)) {
+                event.preventDefault();
+                handleDoubleClickExpression();
+              }
+            }}
+            sx={{
+              cursor: paused ? "text" : "default",
+              borderRadius: "3px",
+              outline: "none",
+              "&:focus-visible": { outline: "2px solid", outlineColor: "primary.main", outlineOffset: "2px" },
+            }}
           >
             {expression}
           </Box>
@@ -430,6 +472,7 @@ export const WatchesPanel = () => {
               expression={watch.expression}
               value={watch.value}
               mode={modeOf(watch.expression)}
+              paused={paused}
               // the expression, not the id: it is what the user sees, and it is the same watch after the server was restarted
               focusKey={`${scope}:${watch.expression}:remove`}
               onRemove={() => void handleRemove(watch.id)}

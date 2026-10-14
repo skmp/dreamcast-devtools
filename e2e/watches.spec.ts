@@ -17,6 +17,15 @@ import { MOCK_M2_SUPPORT } from "../server/mockDebugger";
 const watchRow = (page: Page, expression: string): Locator =>
   panel(page, "watches").getByRole("listitem").filter({ hasText: `${expression} = ` });
 
+/** The value of a watch (`row`: its list item). The expression in front of it says something of itself as well. */
+const valueOf = (row: Locator): Locator => row.locator("span[title]").last();
+
+/** The expression of a watch, a control that opens the editor of its name. */
+const expressionOf = (page: Page, expression: string): Locator => panel(page, "watches").getByRole("button", { name: `${expression}, rename`, exact: true });
+
+const RENAME_TITLE = "Double-click to rename the watch";
+const RENAME_RUNNING_TITLE = "Renamed while the target is paused: pause it to rename the watch";
+
 test("the watches the server already has are listed with their values", async ({ page }) => {
   // watches belong to the server: this one was added by another client before the page connected
   await openWorkspace(page, "sh4-debugger");
@@ -142,8 +151,10 @@ test("a watch picked from the suggestions shows the register's live value", asyn
 
 test("double-clicking the expression renames a watch", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
+  await pauseFromToolbar(page);
   const watches = panel(page, "watches");
 
+  await expect(expressionOf(page, "dc.sh4.cpu.pc")).toHaveAttribute("title", RENAME_TITLE);
   await watches.getByText("dc.sh4.cpu.pc", { exact: true }).dblclick();
   const editor = watches.getByRole("listitem").getByRole("textbox");
   await expect(editor).toHaveValue("dc.sh4.cpu.pc");
@@ -218,13 +229,17 @@ test("the value of a watch is an editor while the target is paused only, and one
   await expect(value).toHaveAttribute("aria-disabled", "true");
   await value.dblclick({ force: true });
   await expect(editor).toHaveCount(0);
-  // the expression is no write: it can be changed in either state
-  await watches.getByText("dc.sh4.cpu.gbr", { exact: true }).dblclick();
-  await expect(editor).toHaveValue("dc.sh4.cpu.gbr");
-  await editor.press("Escape");
+  // nor is the expression renamed while the target runs, like every editor of the page
+  const name = expressionOf(page, "dc.sh4.cpu.gbr");
+  await expect(name).toHaveAttribute("title", RENAME_RUNNING_TITLE);
+  await expect(name).toHaveAttribute("aria-disabled", "true");
+  await name.dblclick({ force: true });
+  await expect(editor).toHaveCount(0);
 
   await pauseFromToolbar(page);
   await expect(value).toHaveAttribute("title", "Double-click to write the register");
+  await expect(name).toHaveAttribute("title", RENAME_TITLE);
+  await expect(name).not.toHaveAttribute("aria-disabled");
   await value.dblclick();
   await editor.fill("0x8C00FF00");
   await tooltipButton(page, "Run").click();
@@ -232,8 +247,118 @@ test("the value of a watch is an editor while the target is paused only, and one
   await expect(editor).toHaveCount(0);
   await pauseFromToolbar(page);
   await expect(editor).toHaveCount(0);
+  // the same for the editor of the expression
+  await name.dblclick();
+  await expect(editor).toHaveValue("dc.sh4.cpu.gbr");
+  await editor.fill("dc.sh4.cpu.vbr");
+  await tooltipButton(page, "Run").click();
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
+  await expect(editor).toHaveCount(0);
+  await pauseFromToolbar(page);
+  await expect(editor).toHaveCount(0);
   await expect(watchRow(page, "dc.sh4.cpu.gbr")).toHaveText("dc.sh4.cpu.gbr = 0x8C000000");
   expect(rpc.requests("state.editWatch")).toEqual([]);
+  expect(rpc.requests("state.modifyWatchExpression")).toEqual([]);
+});
+
+test("the expression of a watch is renamed with the keyboard: a stop of the Tab key, Enter, the space bar and F2 open its editor, the expression has the focus again when the editor goes, and nothing opens while the target runs", async ({
+  page,
+  rpc,
+  diagnostics,
+}) => {
+  diagnostics.allow(/^console\.error: Failed to modify watch expression/, "a name that is no register is refused by the server");
+  await openWorkspace(page, "sh4-debugger");
+  await pauseFromToolbar(page);
+  const watches = panel(page, "watches");
+  const input = watches.getByPlaceholder("Enter expression");
+  await input.fill("dc.sh4.cpu.gbr");
+  await input.press("Enter");
+  await expect(watchRow(page, "dc.sh4.cpu.gbr")).toBeVisible();
+  const editor = watches.getByRole("listitem").getByRole("textbox");
+  const renamed = () => rpc.requests("state.modifyWatchExpression").map((frame) => (frame.params as { newExpression: string }).newExpression);
+
+  // the expression of every watch is a control, and says whose it is and what it does
+  await expect(watches.getByRole("button", { name: /, rename$/ })).toHaveCount(2);
+  await expect(expressionOf(page, "dc.sh4.cpu.gbr")).toHaveText("dc.sh4.cpu.gbr");
+  await expect(expressionOf(page, "dc.sh4.cpu.gbr")).toHaveAttribute("title", RENAME_TITLE);
+  // it is the stop behind the Remove button of the watch above it, in front of its value
+  await watches.getByRole("button", { name: "Remove dc.sh4.cpu.pc" }).focus();
+  await page.keyboard.press("Tab");
+  await expect(expressionOf(page, "dc.sh4.cpu.gbr")).toBeFocused();
+
+  // Enter: the editor, as after a double click
+  await page.keyboard.press("Enter");
+  await expect(editor).toBeFocused();
+  await expect(editor).toHaveAccessibleName("New expression of dc.sh4.cpu.gbr");
+  await expect(editor).toHaveValue("dc.sh4.cpu.gbr");
+  await editor.fill("dc.sh4.cpu.VBR");
+  await page.keyboard.press("Enter");
+  await expect(editor).toHaveCount(0);
+  await expect(watchRow(page, "dc.sh4.cpu.vbr")).toHaveText("dc.sh4.cpu.vbr = 0x8C000000");
+  // accepted: the focus is on the expression again, which is the new one
+  await expect(expressionOf(page, "dc.sh4.cpu.vbr")).toBeFocused();
+
+  // F2, and Escape: the same
+  await page.keyboard.press("F2");
+  await expect(editor).toBeFocused();
+  await page.keyboard.type("x");
+  await page.keyboard.press("Escape");
+  await expect(editor).toHaveCount(0);
+  await expect(expressionOf(page, "dc.sh4.cpu.vbr")).toBeFocused();
+  // a name that is no register is refused: the editor stays open, and the watch is as it was
+  await page.keyboard.press("Enter");
+  await editor.fill("dc.sh4.cpu.nothing");
+  await editor.press("Enter");
+  await expect(page.getByRole("alert").filter({ hasText: "dc.sh4.cpu.nothing" })).toBeVisible();
+  await expect(editor).toHaveValue("dc.sh4.cpu.nothing");
+  await expect(editor).toBeFocused();
+  await editor.press("Escape");
+  await expect(expressionOf(page, "dc.sh4.cpu.vbr")).toBeFocused();
+  // the space bar, which is no blank in the box
+  await page.keyboard.press("Space");
+  await expect(editor).toBeFocused();
+  await expect(editor).toHaveValue("dc.sh4.cpu.vbr");
+  // Tab leaves the box: the editor is put away, and the focus is where Tab took it
+  await page.keyboard.press("Tab");
+  await expect(editor).toHaveCount(0);
+  await expect(watches.getByRole("button", { name: "Remove dc.sh4.cpu.vbr" })).toBeFocused();
+  // any other key on the expression opens nothing
+  await expressionOf(page, "dc.sh4.cpu.vbr").focus();
+  await page.keyboard.press("a");
+  await expect(editor).toHaveCount(0);
+
+  // While the target runs (F5, which leaves the focus where it is) the expression keeps the
+  // focus, says that it cannot be used, and opens nothing.
+  await page.keyboard.press("F5");
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
+  const name = expressionOf(page, "dc.sh4.cpu.vbr");
+  await expect(name).toBeFocused();
+  await expect(name).toHaveAttribute("aria-disabled", "true");
+  await expect(name).toHaveAttribute("title", RENAME_RUNNING_TITLE);
+  for (const key of ["Enter", "F2", "Space"]) {
+    await page.keyboard.press(key);
+  }
+  await name.dblclick({ force: true });
+  await page.waitForTimeout(300);
+  await expect(editor).toHaveCount(0);
+
+  // an editor that is open when the target runs again goes, and the focus it had is on the expression
+  await page.keyboard.press("F6");
+  await expect(tooltipButton(page, "Run")).toBeEnabled();
+  await expect(name).not.toHaveAttribute("aria-disabled");
+  await page.keyboard.press("Enter");
+  await editor.fill("dc.sh4.cpu.sr");
+  await page.keyboard.press("F5");
+  await expect(tooltipButton(page, "Pause")).toBeEnabled();
+  await expect(editor).toHaveCount(0);
+  await expect(name).toBeFocused();
+  // and the next stop does not bring it back
+  await page.keyboard.press("F6");
+  await expect(tooltipButton(page, "Run")).toBeEnabled();
+  await page.waitForTimeout(300);
+  await expect(editor).toHaveCount(0);
+  await expect(watchRow(page, "dc.sh4.cpu.vbr")).toBeVisible();
+  expect(renamed()).toEqual(["dc.sh4.cpu.vbr", "dc.sh4.cpu.nothing"]);
 });
 
 test("another client resumes the target while the focus is in the editor of a watch: the editor goes, and the next stop does not bring it back", async ({
@@ -251,7 +376,7 @@ test("another client resumes the target while the focus is in the editor of a wa
   await server.described();
   const watches = panel(page, "watches");
   const editor = watches.getByRole("listitem").getByRole("textbox");
-  const value = watches.getByRole("listitem").locator("span[title]");
+  const value = valueOf(watches.getByRole("listitem"));
   const status = page.getByRole("status", { name: "Execution state" });
 
   await value.dblclick();
@@ -305,11 +430,13 @@ test("the value of a watch is written with the keyboard: it is a stop of the Tab
   await expect(control).toHaveText("0x8C000000");
   // dc.sh4.cpu.pc is another; free text has no writer, and its value is text
   await expect(watches.getByRole("button", { name: /, write$/ })).toHaveCount(2);
-  await expect(watchRow(page, "dc.sysclk").locator("span[title]")).not.toHaveAttribute("tabindex");
-  await expect(watchRow(page, "dc.sysclk").locator("span[title]")).not.toHaveAttribute("role");
+  await expect(valueOf(watchRow(page, "dc.sysclk"))).not.toHaveAttribute("tabindex");
+  await expect(valueOf(watchRow(page, "dc.sysclk"))).not.toHaveAttribute("role");
 
-  // it is the stop behind the Remove button of the watch above it
+  // it is the stop behind the expression of its watch
   await watches.getByRole("button", { name: "Remove dc.sh4.cpu.pc" }).focus();
+  await page.keyboard.press("Tab");
+  await expect(expressionOf(page, "dc.sh4.cpu.gbr")).toBeFocused();
   await page.keyboard.press("Tab");
   await expect(control).toBeFocused();
 
@@ -343,7 +470,9 @@ test("the value of a watch is written with the keyboard: it is a stop of the Tab
   // ... and a click on something that takes no focus leaves it nowhere: it is not taken back to the value
   await watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C00FF00, write" }).dblclick();
   await expect(editor).toBeFocused();
-  await watchRow(page, "dc.sysclk").getByText("dc.sysclk", { exact: true }).click();
+  // (below the list, in the panel: no control is there)
+  const area = (await watches.boundingBox())!;
+  await page.mouse.click(area.x + 20, area.y + area.height - 10);
   await expect(editor).toHaveCount(0);
   await page.waitForTimeout(200);
   await expect(watches.getByRole("button", { name: "dc.sh4.cpu.gbr 0x8C00FF00, write" })).not.toBeFocused();
@@ -422,13 +551,13 @@ test.describe("a server that can do what the emulator of milestone M2 can, and n
     }
 
     for (const expression of READ) {
-      const value = watchRow(page, expression).locator("span[title]");
+      const value = valueOf(watchRow(page, expression));
       await expect(value, expression).toHaveAttribute("title", "Read-only: the server has no writer for this register");
       await value.dblclick();
       await expect(editor, expression).toHaveCount(0);
     }
     for (const expression of WRITTEN) {
-      const value = watchRow(page, expression).locator("span[title]");
+      const value = valueOf(watchRow(page, expression));
       await expect(value, expression).toHaveAttribute("title", "Double-click to write the register");
       await value.dblclick();
       await editor.fill("0xBEEF");
@@ -465,12 +594,12 @@ test("a watch finds its register by its expression, without regard to case; one 
   await expect(watches.getByRole("listitem")).toHaveCount(5);
 
   for (const expression of ["dc.sh4.tmu.tcnt0", "dc.sh4.cpu.nothing", "dc.sh4.cpu", "pr"]) {
-    const value = watches.getByRole("listitem").filter({ hasText: new RegExp(`^${expression.replaceAll(".", "\\.")} = `) }).locator("span[title]");
+    const value = valueOf(watches.getByRole("listitem").filter({ hasText: new RegExp(`^${expression.replaceAll(".", "\\.")} = `) }));
     await expect(value, expression).toHaveAttribute("title", "Read-only: the server has no writer for this register");
     await value.dblclick();
     await expect(editor, expression).toHaveCount(0);
   }
-  const value = watches.getByRole("listitem").filter({ hasText: "DC.SH4.CPU.Pr = " }).locator("span[title]");
+  const value = valueOf(watches.getByRole("listitem").filter({ hasText: "DC.SH4.CPU.Pr = " }));
   await expect(value).toHaveAttribute("title", "Double-click to write the register");
   await value.dblclick();
   await editor.fill("0x8C000F02");
@@ -531,7 +660,9 @@ test("an expression is sent in lower case, whichever way it was added, and one t
     await expect(tooltipButton(registerRow(page, `dc.sh4.cpu.reg.${register}`), "Already in watch")).toBeDisabled();
   }
 
-  // renaming sends lower case too, and keeps the place of the watch in the list
+  // renaming sends lower case too, and keeps the place of the watch in the list (a name is
+  // changed while the target is paused, like every editor of the page)
+  await pauseFromToolbar(page);
   await watches.getByText("dc.sh4.cpu.vbr", { exact: true }).dblclick();
   await watches.getByRole("listitem").getByRole("textbox").fill("dc.sh4.cpu.SR");
   await watches.getByRole("listitem").getByRole("textbox").press("Enter");
