@@ -53,18 +53,19 @@ const WatchItem = ({ expression, value, mode, paused, focusKey, onRemove, onEdit
   onEdit: (newValue: string) => Promise<void>;
   onModifyExpression: (newExpression: string) => Promise<void>;
 }) => {
-  const [editingExpression, setIsEditingExpression] = useState(false);
-  const [editExpression, setEditExpression] = useState("");
-  const [hasExpressionError, setHasExpressionError] = useState(false);
-  // The editor of the expression is offered while the target is paused, and one that is open
-  // when the target runs again is put away, with what was typed.
-  const isEditingExpression = editingExpression && paused;
+  // The editor of the expression (state.modifyWatchExpression), with the rules of the editors
+  // of a value: open until the server has accepted the name, one request at a time, and an
+  // answer for a box that was put away does not close the one opened since. It is offered while
+  // the target is paused, and one that is open when the target runs again is put away, with
+  // what was typed.
+  const nameEditor = useWriteEditor(onModifyExpression);
+  const isEditingExpression = nameEditor.text !== undefined && paused;
+  const { text: nameDraft, close: closeNameEditor } = nameEditor;
   useEffect(() => {
-    if (editingExpression && !paused) {
-      setIsEditingExpression(false);
-      setHasExpressionError(false);
+    if (nameDraft !== undefined && !paused) {
+      closeNameEditor();
     }
-  }, [editingExpression, paused]);
+  }, [nameDraft, paused, closeNameEditor]);
   // The expression is a control: the keyboard focus can be on it, Enter, the space bar and F2
   // open its editor, and it has the focus again when the editor goes with the focus in its box.
   const expressionElement = useRef<HTMLSpanElement | null>(null);
@@ -95,24 +96,12 @@ const WatchItem = ({ expression, value, mode, paused, focusKey, onRemove, onEdit
   };
 
   const handleDoubleClickExpression = () => {
+    // (Not while the target runs. A box opened then would be hidden, and the effect above
+    // would not always put it away: an open behind a close in one render changes no draft.)
     if (!paused) {
       return;
     }
-    setEditExpression(expression);
-    setIsEditingExpression(true);
-    setHasExpressionError(false);
-  };
-
-  const handleSaveExpression = async () => {
-    try {
-      await onModifyExpression(editExpression);
-      setIsEditingExpression(false);
-      setHasExpressionError(false);
-    } catch {
-      // Flash red border on error - keep edit box open
-      setHasExpressionError(true);
-      setTimeout(() => setHasExpressionError(false), 500);
-    }
+    nameEditor.open(expression);
   };
 
   const handleKeyDownValue = (e: React.KeyboardEvent) => {
@@ -128,12 +117,10 @@ const WatchItem = ({ expression, value, mode, paused, focusKey, onRemove, onEdit
   const handleKeyDownExpression = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      handleSaveExpression().catch((error) => {
-        console.error("handleSaveExpression failed:", error);
-      });
+      // a refused name keeps the box open, marked, and the notice of the store says why
+      nameEditor.submit();
     } else if (e.key === "Escape") {
-      setIsEditingExpression(false);
-      setHasExpressionError(false);
+      nameEditor.close();
     }
   };
 
@@ -157,18 +144,24 @@ const WatchItem = ({ expression, value, mode, paused, focusKey, onRemove, onEdit
           {isEditingExpression ? (
             <TextField
               size="small"
-              value={editExpression}
-              onChange={(e) => setEditExpression(e.target.value)}
+              value={nameEditor.text ?? ""}
+              onChange={(e) => nameEditor.change(e.target.value)}
               onKeyDown={handleKeyDownExpression}
               onFocus={expressionBoxFocus.onFocus}
               onBlur={() => {
                 expressionBoxFocus.onBlur();
-                setIsEditingExpression(false);
-                setHasExpressionError(false);
+                nameEditor.close();
               }}
               autoFocus
-              error={hasExpressionError}
-              slotProps={{ htmlInput: { "aria-label": `New expression of ${expression}` } }}
+              error={nameEditor.refusal !== undefined}
+              slotProps={{
+                htmlInput: {
+                  "aria-label": `New expression of ${expression}`,
+                  "aria-busy": nameEditor.sending || undefined,
+                  readOnly: nameEditor.sending,
+                  title: nameEditor.refusal,
+                },
+              }}
               sx={{
                 flex: 1,
                 "& .MuiOutlinedInput-root": {

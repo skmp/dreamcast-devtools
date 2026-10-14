@@ -311,6 +311,8 @@ test("the expression of a watch is renamed with the keyboard: a stop of the Tab 
   await editor.press("Enter");
   await expect(page.getByRole("alert").filter({ hasText: "dc.sh4.cpu.nothing" })).toBeVisible();
   await expect(editor).toHaveValue("dc.sh4.cpu.nothing");
+  await expect(editor).toHaveAttribute("aria-invalid", "true");
+  await expect(editor).toHaveAttribute("title", /dc\.sh4\.cpu\.nothing/);
   await expect(editor).toBeFocused();
   await editor.press("Escape");
   await expect(expressionOf(page, "dc.sh4.cpu.vbr")).toBeFocused();
@@ -481,6 +483,54 @@ test("the value of a watch is written with the keyboard: it is a stop of the Tab
   await page.keyboard.press("a");
   await expect(editor).toHaveCount(0);
   expect(rpc.requests("state.editWatch").map((frame) => frame.params?.value)).toEqual(["0x8C00FF00"]);
+});
+
+test("a name whose answer is late: the box waits with what was typed, sends nothing more, and an answer for a box that was put away does not close the one opened since", async ({
+  page,
+}) => {
+  const held = await holdResponses(page, "state.modifyWatchExpression");
+  await openWorkspace(page, "sh4-debugger");
+  await pauseFromToolbar(page);
+  const watches = panel(page, "watches");
+  const editor = watches.getByRole("listitem").getByRole("textbox");
+  const sent = () => held.requests("state.modifyWatchExpression").map((frame) => (frame.params as { newExpression: string }).newExpression);
+
+  await expressionOf(page, "dc.sh4.cpu.pc").focus();
+  await page.keyboard.press("Enter");
+  await editor.fill("dc.sh4.cpu.pr");
+  await editor.press("Enter");
+  await expect.poll(held.held).toBe(1);
+  await expect(editor).toHaveValue("dc.sh4.cpu.pr");
+  await expect(editor).toHaveAttribute("aria-busy", "true");
+  await editor.press("Enter");
+  await editor.press("Enter");
+  await page.waitForTimeout(300);
+  expect(sent()).toEqual(["dc.sh4.cpu.pr"]);
+
+  // put away, and opened again with another name, before the answer is in (the server has
+  // renamed the watch, and its tick says so: a tick is no answer)
+  await editor.press("Escape");
+  await expect(editor).toHaveCount(0);
+  await expect(expressionOf(page, "dc.sh4.cpu.pr")).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(editor).toHaveValue("dc.sh4.cpu.pr");
+  await editor.fill("dc.sh4.cpu.gbr");
+  held.release();
+  await expect.poll(() => held.answered(held.requests("state.modifyWatchExpression")[0])).toBe(true);
+  // the answer is the first box's: the box opened since stays, with what is typed in it
+  await page.waitForTimeout(300);
+  await expect(editor).toHaveValue("dc.sh4.cpu.gbr");
+  await expect(editor).toBeFocused();
+  await expect(editor).not.toHaveAttribute("aria-busy");
+  // the second name is sent, and that box closes when it is accepted
+  await expect(editor).toHaveAccessibleName("New expression of dc.sh4.cpu.pr");
+  await editor.press("Enter");
+  await expect.poll(held.held).toBe(1);
+  held.release();
+  await expect(editor).toHaveCount(0);
+  await expect(watchRow(page, "dc.sh4.cpu.gbr")).toBeVisible();
+  await expect(expressionOf(page, "dc.sh4.cpu.gbr")).toBeFocused();
+  expect(sent()).toEqual(["dc.sh4.cpu.pr", "dc.sh4.cpu.gbr"]);
 });
 
 test("a watch on a register without a writer is no editor: free text, and a register that cannot be read", async ({ page, rpc }) => {
