@@ -1137,43 +1137,185 @@ test.describe("the function keys", () => {
     expect(controlRequests(rpc)).toEqual(["control.step sh4", "control.step sh4", "control.step sh4"]);
   });
 
-  test("a dialog that is closing is closed: a key right behind Escape is the toolbar's, while the dialog fades out", async ({ page, rpc }) => {
-    const keys = await recordKeys(page);
-    // how many dialogs of the page are in the document when a key goes down, before anybody has handled it
+  /**
+   * Records, for every key that goes down, how many dialogs of the page are in the document and
+   * whether one of them is fading out, before anybody has handled the key.
+   */
+  const recordDialogsAtKeys = async (page: Page) => {
     await page.addInitScript(() => {
-      const store = window as unknown as { __dialogsAtKey: Array<{ key: string; dialogs: number }> };
+      const store = window as unknown as { __dialogsAtKey: Array<{ key: string; dialogs: number; fading: boolean }> };
       store.__dialogsAtKey = [];
       window.addEventListener(
         "keydown",
         (event) => {
           const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter((dialog) => dialog.closest(".monaco-editor") === null);
-          store.__dialogsAtKey.push({ key: event.key, dialogs: dialogs.length });
+          // (the exit transition sets the opacity it goes to, 0, on what it fades, at its start)
+          const fading = dialogs.some((dialog) => {
+            for (let node: Element | null = dialog; node !== null && node !== document.body; node = node.parentElement) {
+              if (node instanceof HTMLElement && node.style.opacity === "0") {
+                return true;
+              }
+            }
+            return false;
+          });
+          store.__dialogsAtKey.push({ key: event.key, dialogs: dialogs.length, fading });
         },
         true,
       );
     });
-    const dialogsAt = (key: string) =>
-      page.evaluate((pressed) => (window as unknown as { __dialogsAtKey: Array<{ key: string; dialogs: number }> }).__dialogsAtKey.filter((entry) => entry.key === pressed).map((entry) => entry.dialogs), key);
+    return (key: string) =>
+      page.evaluate(
+        (pressed) =>
+          (window as unknown as { __dialogsAtKey: Array<{ key: string; dialogs: number; fading: boolean }> }).__dialogsAtKey.filter((entry) => entry.key === pressed).at(-1),
+        key,
+      );
+  };
+
+  test("a dialog that Escape closes is closed from the Escape on: a key pressed right behind it is the toolbar's, before the page has rendered the close", async ({
+    page,
+    rpc,
+  }) => {
+    const keys = await recordKeys(page);
+    const atKey = await recordDialogsAtKeys(page);
     await openWorkspace(page, "sh4-debugger");
     await expect(executionState(page)).toHaveText("Paused · waiting at the start · stop 1");
     const dialog = page.getByRole("dialog");
 
-    // the About dialog, the connection picker and the list of panels to add; a key each
+    // The About dialog, the connection picker and the list of panels to add; a key each. About
+    // is closed by a change of the page's address, which the page renders as a transition: the
+    // key right behind the Escape goes down while the dialog is still on screen as it was, not
+    // fading yet. The other two start to fade at once.
+    const seen: string[] = [];
     for (const [name, open, key, state, request] of [
-      ["About", () => page.getByRole("button", { name: "About", exact: true }).click(), "F11", "Paused · step completed · stop 2", "control.step sh4"],
-      ["connection picker", () => statusBar(page).getByRole("button", { name: /^Endpoint: / }).click(), "F5", "Running", "control.runUntil"],
-      ["panel list", () => page.getByLabel("Add Panel", { exact: true }).nth(1).click(), "F6", "Paused · paused by the debugger · stop 3", "control.pause sh4"],
+      ["About", () => page.getByRole("button", { name: "About", exact: true }).click(), "F5", "Running", "control.runUntil"],
+      ["connection picker", () => statusBar(page).getByRole("button", { name: /^Endpoint: / }).click(), "F6", "Paused · paused by the debugger · stop 2", "control.pause sh4"],
+      ["panel list", () => page.getByLabel("Add Panel", { exact: true }).nth(1).click(), "F11", "Paused · step completed · stop 3", "control.step sh4"],
     ] as const) {
       await open();
       await expect(dialog, name).toBeVisible();
       // open, the key is left to the browser
       expect(await press(page, keys, key), `${name}: ${key} while the dialog is open`).toEqual(left(key));
-      // Closed with Escape, and fading out (its exit transition takes what is around the dialog
-      // to transparent, and the dialog is in the document until it is over): the key is the
-      // toolbar's. (The key goes down as soon as the dialog is fading, as one right behind
-      // Escape does: a page that is busy may render the close a little after the Escape.)
+      // Escape, and the key right behind it, with nothing in between: the toolbar's
       await keys();
       await page.keyboard.press("Escape");
+      await page.keyboard.press(key);
+      expect((await keys()).filter((pressed) => pressed.key === key), `${name}: ${key} right behind Escape`).toEqual(taken(key));
+      const at = await atKey(key);
+      expect(at?.dialogs, `${name}: the dialog was still in the document when ${key} went down`).toBeGreaterThanOrEqual(1);
+      seen.push(`${name}: ${at?.fading ? "fading" : "not fading yet"} at ${key}`);
+      await expect(dialog, name).toHaveCount(0);
+      await expect(executionState(page), name).toContainText(state);
+      expect(controlRequests(rpc).at(-1), name).toBe(request);
+    }
+    test.info().annotations.push({ type: "the dialogs when the key went down", description: seen.join("; ") });
+    expect(controlRequests(rpc)).toEqual(["control.runUntil", "control.pause sh4", "control.step sh4"]);
+
+    // The same with the two keys in one task of the page: nothing is rendered between them, so
+    // every dialog is on screen as it was, and not fading, when the second key goes down.
+    // (Keys that a script dispatches have no default action, but whether the page put it away
+    // is said all the same.)
+    for (const [name, open, key, state, request] of [
+      ["About", () => page.getByRole("button", { name: "About", exact: true }).click(), "F11", "Paused · step completed · stop 4", "control.step sh4"],
+      ["connection picker", () => statusBar(page).getByRole("button", { name: /^Endpoint: / }).click(), "F5", "Running", "control.runUntil"],
+      ["panel list", () => page.getByLabel("Add Panel", { exact: true }).nth(1).click(), "F6", "Paused · paused by the debugger · stop 5", "control.pause sh4"],
+    ] as const) {
+      await open();
+      await expect(dialog, name).toBeVisible();
+      const pressed = await page.evaluate((second) => {
+        const down = (key: string) =>
+          (document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, composed: true }));
+        down("Escape");
+        const shown = document.querySelector('[role="dialog"]');
+        let fading = false;
+        for (let node = shown; node !== null && node !== document.body; node = node.parentElement) {
+          fading ||= node instanceof HTMLElement && node.style.opacity === "0";
+        }
+        return { inDocument: shown !== null, fading, prevented: !down(second) };
+      }, key);
+      expect(pressed, `${name}: ${key} in the task of the Escape`).toEqual({ inDocument: true, fading: false, prevented: true });
+      await expect(dialog, name).toHaveCount(0);
+      await expect(executionState(page), name).toContainText(state);
+      expect(controlRequests(rpc).at(-1), name).toBe(request);
+    }
+    expect(controlRequests(rpc)).toEqual(["control.runUntil", "control.pause sh4", "control.step sh4", "control.step sh4", "control.runUntil", "control.pause sh4"]);
+
+    // A dialog that Escape went to and that stays open (one that does not close on Escape) is
+    // open again for the keys a moment later: the keys are left to the browser in front of it.
+    await page.evaluate(() => {
+      const element = document.createElement("div");
+      element.id = "a-dialog-of-the-test";
+      element.setAttribute("role", "dialog");
+      element.tabIndex = -1;
+      element.style.cssText = "position: fixed; top: 0; left: 0";
+      element.textContent = "a dialog that Escape does not close";
+      document.body.append(element);
+      element.focus();
+    });
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(700);
+    expect(await press(page, keys, "F11"), "a dialog that stayed open behind its Escape").toEqual(left("F11"));
+    expect(await press(page, keys, "F5"), "a dialog that stayed open behind its Escape").toEqual(left("F5"));
+    // An Escape with the focus out of the dialog went to something else (a menu in front of it,
+    // a box of the page): the dialog is open for the key right behind it.
+    const outside = panel(page, "sh4-memory").getByRole("textbox");
+    await outside.focus();
+    await keys();
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("F11");
+    expect((await keys()).filter((pressed) => pressed.key === "F11"), "F11 behind an Escape that went to no dialog").toEqual(left("F11"));
+    await page.evaluate(() => document.getElementById("a-dialog-of-the-test")!.remove());
+    await page.waitForTimeout(200);
+    expect(controlRequests(rpc)).toEqual(["control.runUntil", "control.pause sh4", "control.step sh4", "control.step sh4", "control.runUntil", "control.pause sh4"]);
+    await expect(executionState(page)).toHaveText("Paused · paused by the debugger · stop 5");
+  });
+
+  test("a dialog that is fading out is closed: closed by its button or by a click beside it, a key is the toolbar's while the dialog fades", async ({
+    page,
+    rpc,
+  }) => {
+    const keys = await recordKeys(page);
+    const atKey = await recordDialogsAtKeys(page);
+    await openWorkspace(page, "sh4-debugger");
+    await expect(executionState(page)).toHaveText("Paused · waiting at the start · stop 1");
+    const dialog = page.getByRole("dialog");
+
+    // the About dialog, the connection picker and the list of panels to add; a key each
+    for (const [name, open, close, key, state, request] of [
+      [
+        "About",
+        () => page.getByRole("button", { name: "About", exact: true }).click(),
+        () => dialog.getByRole("button", { name: "Close", exact: true }).click(),
+        "F11",
+        "Paused · step completed · stop 2",
+        "control.step sh4",
+      ],
+      [
+        "connection picker",
+        () => statusBar(page).getByRole("button", { name: /^Endpoint: / }).click(),
+        () => dialog.getByRole("button", { name: "Cancel", exact: true }).click(),
+        "F5",
+        "Running",
+        "control.runUntil",
+      ],
+      [
+        "panel list",
+        () => page.getByLabel("Add Panel", { exact: true }).nth(1).click(),
+        // beside the dialog, on what is laid over the page behind it
+        () => page.mouse.click(8, 8),
+        "F6",
+        "Paused · paused by the debugger · stop 3",
+        "control.pause sh4",
+      ],
+    ] as const) {
+      await open();
+      await expect(dialog, name).toBeVisible();
+      // open, the key is left to the browser
+      expect(await press(page, keys, key), `${name}: ${key} while the dialog is open`).toEqual(left(key));
+      // Closed, and fading out (its exit transition takes what is around the dialog to
+      // transparent, and the dialog is in the document until it is over): the key is the
+      // toolbar's. No Escape went to the dialog: the fade alone says that it is closed.
+      await keys();
+      await close();
       await page.waitForFunction(
         () => {
           const shown = document.querySelector('[role="dialog"]');
@@ -1188,8 +1330,10 @@ test.describe("the function keys", () => {
         { polling: "raf" },
       );
       await page.keyboard.press(key);
-      expect((await keys()).filter((pressed) => pressed.key === key), `${name}: ${key} right behind Escape`).toEqual(taken(key));
-      expect((await dialogsAt(key)).at(-1), `${name}: the dialog was still in the document when ${key} went down`).toBeGreaterThanOrEqual(1);
+      expect((await keys()).filter((pressed) => pressed.key === key), `${name}: ${key} while the dialog fades`).toEqual(taken(key));
+      const at = await atKey(key);
+      expect(at?.dialogs, `${name}: the dialog was still in the document when ${key} went down`).toBeGreaterThanOrEqual(1);
+      expect(at?.fading, `${name}: the dialog was fading when ${key} went down`).toBe(true);
       await expect(dialog, name).toHaveCount(0);
       await expect(executionState(page), name).toContainText(state);
       expect(controlRequests(rpc).at(-1), name).toBe(request);
