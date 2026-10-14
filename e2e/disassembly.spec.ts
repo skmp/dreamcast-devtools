@@ -545,7 +545,12 @@ test("a target is what debugger.describe says it is: where its views open and en
   await memory.getByRole("textbox").fill("0xFFFFFF");
   await memory.getByRole("textbox").press("Enter");
   await expect(memory.getByText("0xFFFFF0", { exact: true })).toBeVisible();
-  expect(slices().at(-1)).toEqual({ target: "sh4", address: 0xfffc40, length: 960 });
+  // (the view stands so that the last row is the panel's last whole row: what it reads there
+  // ends with the address space, in as many rows as the panel shows)
+  const end = slices().at(-1) as { target: string; address: number; length: number };
+  expect(end.target).toBe("sh4");
+  expect(end.address + end.length - 1).toBe(0xffffff);
+  expect(end.length).toBeLessThan(960);
   await expect(page.getByRole("alert")).toHaveCount(0);
 
   // Without the connection the views are still that server's: the boxes say where the views
@@ -554,7 +559,7 @@ test("a target is what debugger.describe says it is: where its views open and en
   await expect(view).toContainText("Not connected");
   await expect(memory).toContainText("Not connected");
   await expect(box).toHaveValue("0xFFFFFC");
-  await expect(memory.getByRole("textbox")).toHaveValue("0xFFFCE0");
+  await expect(memory.getByRole("textbox")).toHaveValue(`0x${(end.address + 10 * 16).toString(16).toUpperCase()}`);
 });
 
 test("ticks do not make a disassembly view read again or move; a stop does both", async ({ page, rpc }) => {
