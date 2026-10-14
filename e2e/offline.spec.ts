@@ -241,6 +241,18 @@ test.describe("served as plain files from a sub-path (python3 -m http.server)", 
       await expect(panel(page, "watches").getByPlaceholder("Enter expression")).toBeVisible();
       await expect(panel(page, "sh4-disassembly").getByRole("button", { name: "Step In", exact: true })).toBeVisible();
       await expect(panel(page, "sh4-memory").getByRole("button", { name: "Refresh", exact: true })).toBeVisible();
+      // A page that has had no server yet has every capability: no panel says that the server
+      // lacks one. The callstack has no such note, and the SGC panel has its Record button.
+      const callstack = panel(page, "sh4-callstack");
+      await expect(callstack).toContainText("Not connected");
+      await expect(callstack.getByRole("note")).toHaveCount(0);
+      await expect(callstack).not.toContainText("This server has no callstack");
+      await page.goto(`${server.url}#/workspace/audio-debugger`);
+      await expect(statusBar(page)).toContainText("Connection: reconnecting");
+      const sgc = panel(page, "sgc");
+      await expect(sgc.getByRole("button", { name: "Run the emulator and record 1024 frames", exact: true })).toBeVisible();
+      await expect(sgc.getByRole("note")).toHaveCount(0);
+      await expect(sgc).not.toContainText("This server cannot capture SGC frames");
       await page.waitForLoadState("networkidle");
     } finally {
       await server.stop();
