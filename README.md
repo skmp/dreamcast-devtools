@@ -127,6 +127,7 @@ paused on the sounding guest of its tree, as the emulator's own tests start one
 its own, three directories made for the run.
 
 ```
+mkdir -p <run dir>/home <run dir>/cfg <run dir>/data
 HOME=<run dir>/home XDG_CONFIG_HOME=<run dir>/cfg XDG_DATA_HOME=<run dir>/data \
 <emulator> -config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 , \
                    Debugger:Enabled=yes , Debugger:Port=0 , Debugger:Required=yes , Debugger:StartPaused=yes \
@@ -295,7 +296,9 @@ where it opens is the server's to say.
   step out, with F8 and Shift+F8 for F11 and Shift+F11. They work wherever the focus is — on
   the page, in an address box (where F5 would otherwise load the page again), on a value, in
   the editor of one — but for two places: in Monaco, and while a dialog is open, they are left
-  to the editor and to the browser. The Find box of an editor is a part of that editor, and no
+  to the editor and to the browser. A dialog that is closing is not open: one that Escape
+  closed fades out for a moment, and a key right behind the Escape is the toolbar's (F5 runs,
+  and does not load the page). The Find box of an editor is a part of that editor, and no
   dialog of the page: with the focus anywhere else the keys work, whether the box is open or
   was closed. A key that is held down is used once, and its repeats are taken from the browser
   all the same. A key does what its button does: nothing while the button is off. A key with
@@ -377,8 +380,8 @@ where it opens is the server's to say.
   a memory view the hex column of one row is the stop, and names the byte the keyboard is on.
   The arrow keys move that place from byte to byte and from row to row, a click on a byte puts
   it there, and Enter, the space bar and F2 open the editor at its byte. At the first row, and
-  at the last one that is whole on screen, an arrow moves the view by a row instead: the place
-  is never on a row the panel cuts off. When an editor goes with the focus in its box (the
+  at the last one that is whole on screen, an arrow moves the view by a row instead: an arrow
+  never takes the place to a row the panel cuts off. When an editor goes with the focus in its box (the
   write was accepted, Escape, the target runs again) the focus is on the value, or the byte,
   it was opened from; a focus that left the box by itself stays where it went. While the
   target runs the values and the place keep the focus they have, say that they cannot be used
