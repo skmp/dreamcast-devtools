@@ -387,6 +387,19 @@ where it opens is the server's to say.
   addresses, and nothing the browser does for a focus or a search in the page scrolls the
   listing, which would have no way back. In a panel narrower than a row it is scrolled to the
   side, by its scroll bar, the wheel and the place of the keyboard.
+- **The end of an address space, in a small panel.** A panel that shows fewer rows than the
+  sixty of a slice would never show the last rows of the address space if the view stopped
+  where sixty rows end with the last one. So the view goes further: as far as the place at
+  which the last row of the target (`0xFFFFFFF0` of the SH4, the row of `addressMax`) is the
+  panel's last whole row, by the wheel, by the arrow keys and for an address typed into the
+  box. What is read there is as many rows as the panel shows, and ends at the last address.
+  The view measures how many rows its panel shows whole, and measures again when the panel
+  changes size; a panel that has grown at the end of the space takes the view back up as far
+  as the panel is then full. An address typed into the box is shown with ten rows of context
+  above it, or with as many as there is room for in a panel of ten rows or fewer, so that its
+  row is on screen (the last whole one), and the box says the address of the row that many
+  rows below the first; a view opened with `?address=` in such a panel is placed the same way
+  once its panel has been measured. A panel that has room for sixty rows is as before.
 - **After a write.** When one of this client's writes is answered `{}`, the disassembly and
   memory views read again where they are (`reread` of the store, a counter beside `refresh`):
   a byte edit does not move a listing. No request moves a view to the program counter. That is
