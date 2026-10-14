@@ -5,16 +5,35 @@ import { hotkeyControl, type RunControlId } from "../../state/runControls";
 const MONACO = ".monaco-editor";
 
 /**
+ * Whether a dialog is on its way out: its exit transition is taking it, or what is around it,
+ * to transparent. It stays in the document, on screen, until the transition is over (a dialog
+ * of the page fades out in 195 ms), and it is closed all the same: Escape closed it. The
+ * transition sets the opacity it goes to, 0, on the element it fades, at its start. (Not the
+ * opacity on screen, which is somewhere between meanwhile, and is 0 as well at the start of
+ * the transition that brings a dialog in.)
+ */
+const closing = (dialog: Element): boolean => {
+  for (let node: Element | null = dialog; node !== null && node !== document.body; node = node.parentElement) {
+    if (node instanceof HTMLElement && node.style.opacity === "0") {
+      return true;
+    }
+  }
+  return false;
+};
+
+/**
  * Whether a key press is somebody else's. Monaco has uses of its own for the function keys,
  * and what is typed into an editor is the editor's. A dialog that is open is in front of the
  * page: what is behind it is not operated while it is up (the browser's own meaning of the
  * key, F5 to reload, is the one that is left).
  *
  * A dialog is open when it is on screen. One that is kept in the document while it is closed
- * is hidden, and not open. A widget of a code editor is no dialog of the page, whatever role
- * it gives itself: Monaco's Find box is a `dialog` that stays in its editor from the first
- * Ctrl+F on, moved out of sight when it is closed, and in front of nothing but that editor
- * when it is open. What is typed into it is the editor's by the first rule.
+ * is hidden, and not open; one that is fading out after it was closed (`closing`) is not open
+ * either: F5 right behind Escape is the toolbar's. A widget of a code editor is no dialog of
+ * the page, whatever role it gives itself: Monaco's Find box is a `dialog` that stays in its
+ * editor from the first Ctrl+F on, moved out of sight when it is closed, and in front of
+ * nothing but that editor when it is open. What is typed into it is the editor's by the first
+ * rule.
  */
 const belongsElsewhere = (event: KeyboardEvent): boolean => {
   const target = event.target;
@@ -22,7 +41,11 @@ const belongsElsewhere = (event: KeyboardEvent): boolean => {
     return true;
   }
   return Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).some(
-    (dialog) => dialog.closest(MONACO) === null && dialog.getClientRects().length > 0 && getComputedStyle(dialog).visibility !== "hidden",
+    (dialog) =>
+      dialog.closest(MONACO) === null &&
+      dialog.getClientRects().length > 0 &&
+      getComputedStyle(dialog).visibility !== "hidden" &&
+      !closing(dialog),
   );
 };
 

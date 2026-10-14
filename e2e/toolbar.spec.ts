@@ -1137,6 +1137,66 @@ test.describe("the function keys", () => {
     expect(controlRequests(rpc)).toEqual(["control.step sh4", "control.step sh4", "control.step sh4"]);
   });
 
+  test("a dialog that is closing is closed: a key right behind Escape is the toolbar's, while the dialog fades out", async ({ page, rpc }) => {
+    const keys = await recordKeys(page);
+    // how many dialogs of the page are in the document when a key goes down, before anybody has handled it
+    await page.addInitScript(() => {
+      const store = window as unknown as { __dialogsAtKey: Array<{ key: string; dialogs: number }> };
+      store.__dialogsAtKey = [];
+      window.addEventListener(
+        "keydown",
+        (event) => {
+          const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter((dialog) => dialog.closest(".monaco-editor") === null);
+          store.__dialogsAtKey.push({ key: event.key, dialogs: dialogs.length });
+        },
+        true,
+      );
+    });
+    const dialogsAt = (key: string) =>
+      page.evaluate((pressed) => (window as unknown as { __dialogsAtKey: Array<{ key: string; dialogs: number }> }).__dialogsAtKey.filter((entry) => entry.key === pressed).map((entry) => entry.dialogs), key);
+    await openWorkspace(page, "sh4-debugger");
+    await expect(executionState(page)).toHaveText("Paused · waiting at the start · stop 1");
+    const dialog = page.getByRole("dialog");
+
+    // the About dialog, the connection picker and the list of panels to add; a key each
+    for (const [name, open, key, state, request] of [
+      ["About", () => page.getByRole("button", { name: "About", exact: true }).click(), "F11", "Paused · step completed · stop 2", "control.step sh4"],
+      ["connection picker", () => statusBar(page).getByRole("button", { name: /^Endpoint: / }).click(), "F5", "Running", "control.runUntil"],
+      ["panel list", () => page.getByLabel("Add Panel", { exact: true }).nth(1).click(), "F6", "Paused · paused by the debugger · stop 3", "control.pause sh4"],
+    ] as const) {
+      await open();
+      await expect(dialog, name).toBeVisible();
+      // open, the key is left to the browser
+      expect(await press(page, keys, key), `${name}: ${key} while the dialog is open`).toEqual(left(key));
+      // Closed with Escape, and fading out (its exit transition takes what is around the dialog
+      // to transparent, and the dialog is in the document until it is over): the key is the
+      // toolbar's. (The key goes down as soon as the dialog is fading, as one right behind
+      // Escape does: a page that is busy may render the close a little after the Escape.)
+      await keys();
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(
+        () => {
+          const shown = document.querySelector('[role="dialog"]');
+          for (let node = shown; node !== null && node !== document.body; node = node.parentElement) {
+            if (node instanceof HTMLElement && node.style.opacity === "0") {
+              return true;
+            }
+          }
+          return false;
+        },
+        undefined,
+        { polling: "raf" },
+      );
+      await page.keyboard.press(key);
+      expect((await keys()).filter((pressed) => pressed.key === key), `${name}: ${key} right behind Escape`).toEqual(taken(key));
+      expect((await dialogsAt(key)).at(-1), `${name}: the dialog was still in the document when ${key} went down`).toBeGreaterThanOrEqual(1);
+      await expect(dialog, name).toHaveCount(0);
+      await expect(executionState(page), name).toContainText(state);
+      expect(controlRequests(rpc).at(-1), name).toBe(request);
+    }
+    expect(controlRequests(rpc)).toEqual(["control.step sh4", "control.runUntil", "control.pause sh4"]);
+  });
+
   test("a key with Ctrl is somebody else's, and so is every other key", async ({ page, rpc }) => {
     const keys = await recordKeys(page);
     await openWorkspace(page, "sh4-debugger");
