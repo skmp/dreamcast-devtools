@@ -459,6 +459,12 @@ export const MemoryView = ({
 
   /** the rows are on screen, and not what is said in their place (no data, an error, a first read) */
   const listed = initialized && !error && slice !== null && rows.length > 0;
+  /**
+   * The rows on screen are those of the place the view is at. They are not while the slice of
+   * a move is being read (the view has moved, and its rows are still those of the old place),
+   * nor when a server has answered with the rows of another place.
+   */
+  const rowsOfView = listed && slice.baseAddress === viewStart;
 
   // How many rows the panel shows whole (`viewLimits`): measured when the rows are on screen,
   // and again when the panel or a row changes size. A row is as high as the first one.
@@ -526,7 +532,7 @@ export const MemoryView = ({
   const editAddress = edit?.at;
   const editShown =
     canEdit &&
-    listed &&
+    rowsOfView &&
     edit !== undefined &&
     edit.view === viewStart &&
     rows.some((row) => edit.at >= row.address && edit.at < row.address + row.length);
@@ -579,13 +585,18 @@ export const MemoryView = ({
   // the focus is on the byte again when its editor goes
   const boxFocus = useFocusReturn(editing, cursorCell);
 
-  /** Opens the editor at a byte of a row, with the byte in it. A byte that could not be read ("??") has no value to edit. */
+  /**
+   * Opens the editor at a byte of a row, with the byte in it. A byte that could not be read
+   * ("??") has no value to edit. No editor opens in rows that are not those of the view's place
+   * (`rowsOfView`): while the slice of a move is being read the rows on screen are about to show
+   * other addresses, and an editor opened in one of them would follow its byte into another row.
+   */
   const openEditorAt = useCallback(
     (rowIndex: number, byteIndex: number): boolean => {
       const row = rows[rowIndex];
       // (behind the last byte of a short row there are no digits either)
       const byte = row?.hex.slice(byteIndex * 3, byteIndex * 3 + 2) ?? "";
-      if (!canEdit || !row || !/^[0-9A-F]{2}$/.test(byte)) {
+      if (!canEdit || !rowsOfView || !row || !/^[0-9A-F]{2}$/.test(byte)) {
         return false;
       }
       // (the place of the keyboard is at this byte already: the keys open the editor where the
@@ -595,7 +606,7 @@ export const MemoryView = ({
       openEditor(byte);
       return true;
     },
-    [canEdit, rows, viewStart, openEditor],
+    [canEdit, rowsOfView, rows, viewStart, openEditor],
   );
 
   /** The byte of the hex column a pointer is on: a row is one piece of text, so the byte is found from where in the column the pointer is. */
@@ -661,7 +672,7 @@ export const MemoryView = ({
     const [rowStep, byteStep] = step;
     // The view stands as far as it goes that way, and its rows are on screen: at the first
     // address, or with the last row of the target the panel's last whole row.
-    const viewAtItsEnd = !loading && slice?.baseAddress === viewStart && (rowStep < 0 ? viewStart <= 0 : viewStart >= maxStart);
+    const viewAtItsEnd = !loading && rowsOfView && (rowStep < 0 ? viewStart <= 0 : viewStart >= maxStart);
     if (rowStep === 0) {
       // (a row has its ends: see cursorByte)
       placeCursor(cursorRow, cursorByte + byteStep);

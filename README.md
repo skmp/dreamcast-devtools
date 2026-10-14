@@ -359,7 +359,9 @@ where it opens is the server's to say.
   `state.writeMemory`, from that byte on (`DE AD BE EF`, `deadbeef`; hex, two digits a byte).
   Enter sends, Escape and leaving the box put it away; for the box of a byte, which is in a row
   of the listing, a view that moves (the wheel) is leaving the box, and so are rows that give
-  way to an error. The three editors are offered while the
+  way to an error; and no box opens while the bytes of a move are being read, when the rows on
+  screen are still those of the place the view has left (an editor opened there would follow
+  its byte into another row when the new rows are in). The three editors are offered while the
   target is paused, on a server with the capability (`register-write`, `memory-write`), and
   for a register only when it carries `flags.writable` in `debugger.describe` (a watch finds
   its register by its expression: `<path>.<name>` without regard to case, split at the last

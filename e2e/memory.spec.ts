@@ -856,6 +856,65 @@ test.describe("byte editing: the box of an editor is in a row of the listing", (
     await expect(page.getByRole("alert")).toHaveCount(0);
   });
 
+  test("no editor opens while the bytes of a move are being read: the rows on screen are about to be other addresses", async ({ page }) => {
+    // the bytes of every read are held back until the test lets them through
+    const held = await holdResponses(page, "state.getMemorySlice");
+    const releasing = setInterval(() => held.release(), 50);
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const first = memoryRows(view).first().locator("span").first();
+    await expect(memoryRows(view)).toHaveCount(60);
+    await settledCount(() => held.requests("state.getMemorySlice").length);
+    clearInterval(releasing);
+    held.release();
+    expect(held.held()).toBe(0);
+    const before = held.requests("state.getMemorySlice").length;
+
+    // a notch of the wheel moves the view by six rows: its bytes are being read, and the rows on
+    // screen are still those of the old place
+    await memoryRows(view).nth(5).hover();
+    await page.mouse.wheel(0, 60);
+    await expect.poll(() => held.requests("state.getMemorySlice").length).toBe(before + 1);
+    expect(held.requests("state.getMemorySlice").at(-1)?.params).toEqual({ target: "sh4", address: 0x8c010060, length: 960 });
+    await expect.poll(held.held).toBe(1);
+    await expect(first).toHaveText(hex8(0x8c010000));
+    // a double click on a byte of them opens nothing, and neither do the keys at the place of the keyboard
+    await dblclickByte(view, 0x8c010084);
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(hexCell(view, 0x8c010080)).toBeFocused();
+    for (const key of ["Enter", "F2", "Space"]) {
+      await page.keyboard.press(key);
+    }
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(first).toHaveText(hex8(0x8c010000));
+
+    // the bytes of the new place are in: there is no editor in their rows either
+    held.release();
+    await expect(first).toHaveText(hex8(0x8c010060));
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view)).toHaveCount(0);
+    expect(held.requests("state.writeMemory")).toEqual([]);
+
+    // the byte is edited in its row of the new place, where the view now is
+    await dblclickByte(view, 0x8c010084);
+    await expect(byteEditor(view)).toHaveAccessibleName("Bytes to write from 0x8C010084");
+    const row = (await rowAt(view, 0x8c010080).boundingBox())!;
+    const box = (await byteEditor(view).boundingBox())!;
+    expect(box.y + box.height / 2).toBeGreaterThan(row.y);
+    expect(box.y + box.height / 2).toBeLessThan(row.y + row.height);
+    await page.keyboard.type("AB");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => held.requests("state.writeMemory").length).toBe(1);
+    expect(held.requests("state.writeMemory")[0].params).toEqual({ target: "sh4", address: 0x8c010084, data: [0xab] });
+    // (the bytes read again for the write)
+    await expect.poll(held.held).toBe(1);
+    held.release();
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(rowAt(view, 0x8c010080).locator("span").nth(1)).toHaveText(/^([0-9A-F]{2} ){4}AB /);
+  });
+
   test("the wheel over the memory view takes the focus out of no other box: an address typed elsewhere is not written to memory", async ({ page, rpc }) => {
     await openWorkspace(page, "sh4-debugger");
     await pauseFromToolbar(page);
