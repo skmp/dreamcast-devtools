@@ -180,6 +180,11 @@ export const MemoryView = ({
   const [error, setError] = useState<string | undefined>();
   /** how many rows of the listing the panel shows whole; undefined until rows have been on screen */
   const [shownRows, setShownRows] = useState<number | undefined>(undefined);
+  /**
+   * How many rows the panel shows whole or in part: the row the edge of the panel cuts is
+   * among them, the rows below it are not. Undefined until rows have been on screen.
+   */
+  const [seenRows, setSeenRows] = useState<number | undefined>(undefined);
   const { maxStart, contextRows } = viewLimits(config, shownRows);
 
   // Initialize address from URL or default. An address from the URL is treated like a
@@ -466,8 +471,9 @@ export const MemoryView = ({
    */
   const rowsOfView = listed && slice.baseAddress === viewStart;
 
-  // How many rows the panel shows whole (`viewLimits`): measured when the rows are on screen,
-  // and again when the panel or a row changes size. A row is as high as the first one.
+  // How many rows the panel shows whole (`viewLimits`), and how many it shows at least a part
+  // of (`seenRows`): measured when the rows are on screen, and again when the panel or a row
+  // changes size. A row is as high as the first one.
   const rowsRef = useRef<HTMLDivElement | null>(null);
   const measuredConfig = useRef(config);
   /** where the view is, for the measure: the place the rows on screen were read at */
@@ -476,54 +482,17 @@ export const MemoryView = ({
     measuredConfig.current = config;
     measuredView.current = viewStart;
   });
-  useEffect(() => {
-    const frame = containerRef.current;
-    const first = rowsRef.current?.firstElementChild;
-    if (!listed || !frame || !(first instanceof HTMLElement) || typeof ResizeObserver === "undefined") {
-      return;
-    }
-    const measure = () => {
-      const row = first.getBoundingClientRect();
-      // (a panel that is not on screen, a dock tab behind another, has no size to go by)
-      if (!(row.height > 0)) {
-        return;
-      }
-      const shown = Math.max(0, Math.floor((frame.getBoundingClientRect().bottom - row.top) / row.height));
-      setShownRows(shown);
-      const fromUrl = urlPlacement.current;
-      urlPlacement.current = undefined;
-      if (fromUrl !== undefined) {
-        // A view an address of the URL placed: the row is placed where it is on screen, as a
-        // typed address is, in a panel of any size. The first view was placed for a whole slice
-        // and ten rows of context; in a panel that has no room for those ten rows, and at the
-        // end of the space in a panel that shows fewer rows than a slice, the view moves.
-        const limits = viewLimits(measuredConfig.current, shown);
-        const placed = clampAddress(Math.max(0, fromUrl - BYTES_PER_ROW * limits.contextRows), limits.maxStart, BYTES_PER_ROW);
-        setAddress(placed);
-        if (placed !== measuredView.current) {
-          // The rows on screen will show other addresses: the row of the URL is marked again
-          // when the rows of the new place are in, and the mark of the first view goes (it is on
-          // a row that shows another address by then). Where the view does not move, the row of
-          // the URL is marked already, in the rows it stays in, and nothing is left to mark later.
-          pendingHighlightRef.current = fromUrl;
-        }
-      }
-      // (In a panel that has grown at the end of the space the view comes back as far as it has
-      // to, so that the panel is full of rows: `viewStart` is inside the new limits.)
-    };
-    const observer = new ResizeObserver(measure);
-    observer.observe(frame);
-    observer.observe(first);
-    return () => observer.disconnect();
-  }, [listed]);
+  // (The panel is measured further down, where the place of the keyboard is known: a panel made
+  // smaller takes the place up with its edge.)
 
   // The editor of a byte: which byte, and where the view was when it was opened. Its box is in
   // the row of that byte, and is there for as long as the row is: an editor whose box is not
   // on screen is put away with what was typed, like one whose box was left. That is so when
   // the view moves (the wheel is turned: the rows are other addresses then), when the rows
-  // give way to an error, and when the bytes cannot be written any more (the target runs
-  // again, the connection is lost). An editor that stayed open without its box would take the
-  // keyboard focus, from wherever it is by then, when its row is shown again.
+  // give way to an error, when the panel is made so small that the row of the editor is below
+  // its edge, and when the bytes cannot be written any more (the target runs again, the
+  // connection is lost). An editor that stayed open without its box would take the keyboard
+  // focus, from wherever it is by then, when its row is shown again.
   const [edit, setEdit] = useState<{ at: number; view: number } | undefined>(undefined);
   const editAddressRef = useRef<number | undefined>(undefined);
   const { onWriteMemory } = callbacks;
@@ -540,12 +509,16 @@ export const MemoryView = ({
   const editor = useWriteEditor(writeTyped);
   const canEdit = editable && initialized && onWriteMemory !== undefined;
   const editAddress = edit?.at;
+  /** the row of the listing the editor is in, if it is in one */
+  const editRow = edit === undefined ? -1 : rows.findIndex((row) => edit.at >= row.address && edit.at < row.address + row.length);
   const editShown =
     canEdit &&
     rowsOfView &&
     edit !== undefined &&
     edit.view === viewStart &&
-    rows.some((row) => edit.at >= row.address && edit.at < row.address + row.length);
+    editRow >= 0 &&
+    // (a row the panel shows a part of is on screen; the row the edge cuts is among them)
+    (seenRows === undefined || editRow < seenRows);
   const editing = editShown && editor.text !== undefined && editAddress !== undefined;
   const { text: draft, open: openEditor, close: closeEditor } = editor;
   useEffect(() => {
@@ -561,7 +534,9 @@ export const MemoryView = ({
   // and F2 open the editor at its byte, and a click on a byte puts it there.
   const hasCursor = writable && initialized && onWriteMemory !== undefined;
   const [cursor, setCursor] = useState({ row: 0, byte: 0 });
-  // inside the listing and inside its row, whatever the rows are now and wherever an arrow took it
+  // Inside the listing and inside its row, whatever the rows are now and wherever an arrow took
+  // it. (On screen as well: a panel made smaller takes the place up with its edge, to the last
+  // row it shows, whole or cut by the edge, where a click can put the place too. See the measure.)
   const cursorRow = Math.max(0, Math.min(cursor.row, rows.length - 1));
   const cursorByte = Math.max(0, Math.min(cursor.byte, (rows[cursorRow]?.length ?? 1) - 1));
   const cursorCell = useRef<HTMLSpanElement | null>(null);
@@ -594,6 +569,67 @@ export const MemoryView = ({
   }, []);
   // the focus is on the byte again when its editor goes
   const boxFocus = useFocusReturn(editing, cursorCell);
+
+  // The panel is measured: how many rows it shows whole (`viewLimits`) and in part (`seenRows`).
+  /** the row the place of the keyboard is on, for the measure */
+  const measuredPlace = useRef(cursorRow);
+  useLayoutEffect(() => {
+    measuredPlace.current = cursorRow;
+  });
+  useEffect(() => {
+    const frame = containerRef.current;
+    const first = rowsRef.current?.firstElementChild;
+    if (!listed || !frame || !(first instanceof HTMLElement) || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const measure = () => {
+      const row = first.getBoundingClientRect();
+      // (a panel that is not on screen, a dock tab behind another, has no size to go by)
+      if (!(row.height > 0)) {
+        return;
+      }
+      const room = frame.getBoundingClientRect().bottom - row.top;
+      const shown = Math.max(0, Math.floor(room / row.height));
+      setShownRows(shown);
+      // (a row of which less than a pixel is on screen is not seen)
+      const seen = Math.max(0, Math.ceil((room - 1) / row.height));
+      setSeenRows(seen);
+      if (measuredPlace.current > Math.max(0, seen - 1)) {
+        // The place of the keyboard is on a row the panel no longer shows: it comes up with the
+        // edge, to the last row the panel shows, and stays there when the panel grows again. It
+        // keeps the focus it has (the hex column of the row it leaves is no stop of the Tab key
+        // any more, and would let the focus go to the page).
+        if (cursorCell.current !== null && cursorCell.current === document.activeElement) {
+          focusCursor.current = true;
+        }
+        setCursor((current) => ({ ...current, row: Math.max(0, seen - 1) }));
+      }
+      const fromUrl = urlPlacement.current;
+      urlPlacement.current = undefined;
+      if (fromUrl !== undefined) {
+        // A view an address of the URL placed: the row is placed where it is on screen, as a
+        // typed address is, in a panel of any size. The first view was placed for a whole slice
+        // and ten rows of context; in a panel that has no room for those ten rows, and at the
+        // end of the space in a panel that shows fewer rows than a slice, the view moves.
+        const limits = viewLimits(measuredConfig.current, shown);
+        const placed = clampAddress(Math.max(0, fromUrl - BYTES_PER_ROW * limits.contextRows), limits.maxStart, BYTES_PER_ROW);
+        setAddress(placed);
+        if (placed !== measuredView.current) {
+          // The rows on screen will show other addresses: the row of the URL is marked again
+          // when the rows of the new place are in, and the mark of the first view goes (it is on
+          // a row that shows another address by then). Where the view does not move, the row of
+          // the URL is marked already, in the rows it stays in, and nothing is left to mark later.
+          pendingHighlightRef.current = fromUrl;
+        }
+      }
+      // (In a panel that has grown at the end of the space the view comes back as far as it has
+      // to, so that the panel is full of rows: `viewStart` is inside the new limits.)
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(frame);
+    observer.observe(first);
+    return () => observer.disconnect();
+  }, [listed]);
 
   /**
    * Opens the editor at a byte of a row, with the byte in it. A byte that could not be read

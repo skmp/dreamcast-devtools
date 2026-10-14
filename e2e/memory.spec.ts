@@ -1449,6 +1449,68 @@ test.describe("byte editing with the keyboard", () => {
     expect(await headerTop(view)).toBe(top);
   });
 
+  test("a panel that is made smaller takes the place up with its edge, and puts away an editor whose row it no longer shows", async ({ page, rpc }) => {
+    await openWorkspace(page, "sh4-debugger");
+    await pauseFromToolbar(page);
+    const view = panel(page, "sh4-memory");
+    const box = view.getByRole("textbox");
+    const first = memoryRows(view).first().locator("span").first();
+    await expect(memoryRows(view)).toHaveCount(60);
+    await panelOfRows(page, view, 40);
+    await expect(first).toHaveText(hex8(0x8c010000));
+
+    // the place on the fourth byte of the thirty-first row, and its editor open with a byte typed
+    const row30 = 0x8c010000 + 30 * 16;
+    const cell = hexCell(view, row30);
+    const cellBox = (await cell.boundingBox())!;
+    await cell.click({ position: { x: (3 * 3 + 1.5) * (cellBox.width / 47), y: cellBox.height / 2 } });
+    await expect(place(view)).toHaveAccessibleName(new RegExp(`^${hex8(row30 + 3)} [0-9A-F]{2}, write$`));
+    await expect(place(view)).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(byteEditor(view)).toHaveAccessibleName(`Bytes to write from ${hex8(row30 + 3)}`);
+    await page.keyboard.type("5A");
+
+    // Ten rows: the row of the editor is far below the edge of the panel. The editor is put
+    // away with what was typed, the place is on a row the panel shows, and has the focus (the
+    // editor went with the focus in it).
+    await panelOfRows(page, view, 10);
+    await expect(first).toHaveText(hex8(0x8c010000));
+    await expect(byteEditor(view)).toHaveCount(0);
+    await expect(place(view)).toBeInViewport();
+    await expect(place(view)).toBeFocused();
+    const at = Number(await place(view).getAttribute("data-memory-hex"));
+    expect(at, "the place is on a row the panel shows").toBeLessThanOrEqual(0x8c010000 + 10 * 16);
+    await expect(place(view)).toHaveAccessibleName(new RegExp(`^${hex8(at + 3)} [0-9A-F]{2}, write$`));
+
+    // The place stays there when the panel grows again, with the focus, and the editor is not back.
+    await panelOfRows(page, view, 40);
+    await expect(place(view)).toHaveAccessibleName(new RegExp(`^${hex8(at + 3)} [0-9A-F]{2}, write$`));
+    await expect(place(view)).toBeFocused();
+    await expect(byteEditor(view)).toHaveCount(0);
+    await panelOfRows(page, view, 10);
+    await expect(place(view)).toHaveAccessibleName(new RegExp(`^${hex8(at + 3)} [0-9A-F]{2}, write$`));
+
+    // Tab from the address box comes to the place, on screen
+    await box.focus();
+    for (let press = 0; press < 6 && !(await place(view).evaluate((element) => element === document.activeElement)); press++) {
+      await page.keyboard.press("Tab");
+    }
+    await expect(place(view)).toBeFocused();
+    await expect(place(view)).toBeInViewport();
+    // an arrow up moves the place up a row, and not the view
+    await page.keyboard.press("ArrowUp");
+    await expect(place(view)).toHaveAccessibleName(new RegExp(`^${hex8(at - 16 + 3)} [0-9A-F]{2}, write$`));
+    await expect(place(view)).toBeFocused();
+    await expect(place(view)).toBeInViewport({ ratio: 1 });
+    await expect(first).toHaveText(hex8(0x8c010000));
+    // and Enter opens the editor there, on screen
+    await page.keyboard.press("Enter");
+    await expect(byteEditor(view)).toHaveAccessibleName(`Bytes to write from ${hex8(at - 16 + 3)}`);
+    await expect(byteEditor(view)).toBeInViewport();
+    await page.keyboard.press("Escape");
+    expect(rpc.requests("state.writeMemory")).toEqual([]);
+  });
+
   test("the place is inside the rows there are: fewer rows, and a last row of fewer bytes, take it along", async ({ page }) => {
     // a server that answers with fewer bytes than the view asked for, when told to
     const server = await serveScriptedDebugger(page);
