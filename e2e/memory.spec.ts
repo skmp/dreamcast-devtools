@@ -13,7 +13,7 @@ import {
   statusBar,
   tooltipButton,
 } from "./support/fixtures";
-import type { Locator } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { defaultAnswer, jsonRpcError, serveScriptedDebugger, type Json } from "./support/scriptedDebugger";
 import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT } from "../server/mockDebugger";
 
@@ -24,6 +24,26 @@ const memoryRows = (view: Locator): Locator =>
   view.locator("div").filter({ has: view.page().locator(":scope > span:nth-child(3)") }).filter({ hasText: /^0x[0-9A-F]{8}/ });
 
 const rowAt = (view: Locator, address: number): Locator => memoryRows(view).filter({ hasText: hex8(address) });
+
+/**
+ * A count of requests once no more come: read when it has held still for half a second. Under
+ * a slow CPU the requests of one action can arrive in more than one turn of the page.
+ */
+const settledCount = async (count: () => number): Promise<number> => {
+  let seen = -1;
+  await expect
+    .poll(
+      () => {
+        const now = count();
+        const still = now === seen;
+        seen = now;
+        return still;
+      },
+      { intervals: [500], message: "the requests settle" },
+    )
+    .toBe(true);
+  return seen;
+};
 
 // `start` is where the view opens: `defaultMemoryAddress` of the target in debugger.describe.
 // `base` is an address in the middle of the target's memory, for the tests that type one.
@@ -239,32 +259,166 @@ test("ARM7 memory ends where the address space of the ARM7 ends: its last row is
   const box = view.getByRole("textbox");
   const slices = () => rpc.requests("state.getMemorySlice").map((frame) => frame.params as { target: string; address: number; length: number });
   await expect(memoryRows(view)).toHaveCount(60);
+  // the panel shows some of the sixty rows of a slice whole (sixteen in the window of the suite)
+  const whole = await wholeRows(view);
+  expect(whole).toBeGreaterThan(10);
+  expect(whole).toBeLessThan(60);
+  const end = 0x01000000 - whole * 16;
 
   await box.fill("0x00FFFFFF");
   await box.press("Enter");
-  // sixty rows that end with the last one, and no ten rows of context that would push it out
-  await expect(memoryRows(view).first().locator("span").first()).toHaveText("0x00FFFC40");
+  // The view goes as far as the place at which the last row is the panel's last whole row, and
+  // no ten rows of context push it out. What is read there ends with the last address.
+  await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(end));
   await expect(memoryRows(view).last().locator("span").first()).toHaveText("0x00FFFFF0");
-  await expect(memoryRows(view)).toHaveCount(60);
-  expect(slices().at(-1)).toEqual({ target: "arm7", address: 0x00fffc40, length: 960 });
+  await expect(memoryRows(view)).toHaveCount(whole);
+  expect(await wholeRows(view)).toBe(whole);
   await expect(rowAt(view, 0x00fffff0)).toHaveClass(/target-address/);
-  const settled = slices().length;
+  const settled = await settledCount(() => slices().length);
+  expect(slices().at(-1)).toEqual({ target: "arm7", address: end, length: whole * 16 });
 
-  // an address above the space, and the wheel: the view stays on the last sixty rows, and reads nothing
+  // an address above the space, and the wheel: the view stays at the last rows, and reads nothing
   await box.fill("0x12345678");
   await box.press("Enter");
   await memoryRows(view).nth(5).hover();
   await page.mouse.wheel(0, 600);
   await page.waitForTimeout(300);
   await expect(memoryRows(view).last().locator("span").first()).toHaveText("0x00FFFFF0");
+  await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(end));
   expect(slices()).toHaveLength(settled);
   for (const { address, length } of slices()) {
     expect(address + length - 1, hex8(address)).toBeLessThanOrEqual(0x00ffffff);
   }
   // and scrolls back
   await page.mouse.wheel(0, -60);
-  await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(0x00fffc40 - 96));
+  await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(end - 96));
 });
+
+/**
+ * Makes the window as high as it has to be for the memory panel `view` to show `rows` rows of
+ * its listing whole, at the width of the suite's window. The rows the listing has are the
+ * sixty of a slice, so that what is counted is the room the panel has.
+ */
+const panelOfRows = async (page: Page, view: Locator, rows: number) => {
+  const at = async (height: number) => {
+    await page.setViewportSize({ width: 1600, height });
+    await page.waitForTimeout(150);
+    return wholeRows(view);
+  };
+  // the fewest pixels at which the panel has room for that many rows
+  let low = 400;
+  let high = 2400;
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    if ((await at(middle)) >= rows) {
+      high = middle;
+    } else {
+      low = middle;
+    }
+  }
+  expect(await at(high), `a window in which the panel shows ${rows} rows whole`).toBe(rows);
+};
+
+// In a panel that shows fewer rows than a slice holds, the last rows of an address space are
+// on screen when the view stands so that the last row is the panel's last whole row: the view
+// goes that far, by the wheel, by the keys and for an address typed into the box. The listing is
+// cut at the edge of the panel and is not scrolled, as everywhere.
+for (const { name, workspace, id, target, addressMax } of [
+  { name: "SH4", workspace: "sh4-debugger", id: "sh4-memory", target: "sh4", addressMax: 0xffffffff },
+  { name: "ARM7", workspace: "arm7-debugger", id: "arm7-memory", target: "arm7", addressMax: 0x00ffffff },
+] as const) {
+  for (const tall of [10, 3]) {
+    test(`${name} memory in a panel ${tall} rows tall: the last row of the address space is reached by the wheel, by the keys and by the address box`, async ({
+      page,
+      rpc,
+    }) => {
+      const last = addressMax - 15;
+      // where the view stands with the last row the panel's last
+      const end = last - (tall - 1) * 16;
+      await openWorkspace(page, workspace);
+      const view = panel(page, id);
+      const box = view.getByRole("textbox");
+      const first = memoryRows(view).first().locator("span").first();
+      const slices = () => rpc.requests("state.getMemorySlice").map((frame) => frame.params as { target: string; address: number; length: number });
+      await expect(memoryRows(view)).toHaveCount(60);
+      await panelOfRows(page, view, tall);
+      const top = await headerTop(view);
+      /** the last row of the space is the panel's last, whole, and nothing is scrolled for it */
+      const lastRowIsTheLastOnScreen = async () => {
+        await expect(first).toHaveText(hex8(end));
+        await expect(memoryRows(view)).toHaveCount(tall);
+        await expect(memoryRows(view).last().locator("span").first()).toHaveText(hex8(last));
+        expect(await wholeRows(view)).toBe(tall);
+        // (in a panel narrower than a row the listing is scrolled to the side: the address of the row is on screen)
+        await expect(rowAt(view, last).locator("span").first()).toBeInViewport({ ratio: 1 });
+        expect(await scrolledDown(view)).toBe(0);
+        expect(await headerTop(view)).toBe(top);
+        // what was read there ends at the last address, and nothing was asked for above it
+        expect(slices().at(-1)).toEqual({ target, address: end, length: tall * 16 });
+        for (const { address, length } of slices()) {
+          expect(address + length - 1, hex8(address)).toBeLessThanOrEqual(addressMax);
+        }
+      };
+      // the listing is cut at the edge of the panel, not scrolled
+      const overflow = await view
+        .locator("[data-memory-hex]")
+        .first()
+        .evaluate((cell) => {
+          let listing = cell.parentElement;
+          while (listing && getComputedStyle(listing).overflowY === "visible") {
+            listing = listing.parentElement;
+          }
+          return getComputedStyle(listing!).overflowY;
+        });
+      expect(overflow).toBe("clip");
+
+      // --- the wheel, from 0x400 bytes above the last row on ---
+      await box.fill(hex8(last - 0x400));
+      await box.press("Enter");
+      await expect(rowAt(view, last - 0x400).locator("span").first()).toBeInViewport({ ratio: 1 });
+      await memoryRows(view).first().hover();
+      for (let notch = 0; notch < 14; notch++) {
+        await page.mouse.wheel(0, 60);
+      }
+      await lastRowIsTheLastOnScreen();
+      // further: nothing moves, and nothing is read
+      const read = await settledCount(() => slices().length);
+      await page.mouse.wheel(0, 600);
+      await page.waitForTimeout(300);
+      await expect(first).toHaveText(hex8(end));
+      expect(slices()).toHaveLength(read);
+
+      // --- the keys: the place of the keyboard is taken down from 0x200 bytes above it ---
+      await box.fill(hex8(last - 0x200));
+      await box.press("Enter");
+      await expect(first).not.toHaveText(hex8(end));
+      await place(view).focus();
+      // the rows between, and some more presses, which do nothing at the last row
+      for (let press = 0; press < 0x200 / 16 + 12; press++) {
+        await page.keyboard.press("ArrowDown");
+      }
+      await expect(hexCell(view, last)).toBeFocused();
+      await expect(place(view)).toHaveAccessibleName(new RegExp(`^${hex8(last)} (\\?\\?|[0-9A-F]{2}), write$`));
+      await lastRowIsTheLastOnScreen();
+      await expect(view.locator(".memory-cursor")).toBeInViewport({ ratio: 1 });
+      // and up again: the place goes up the rows that are on screen
+      await page.keyboard.press("ArrowUp");
+      await expect(hexCell(view, last - 16)).toBeFocused();
+      await expect(first).toHaveText(hex8(end));
+
+      // --- the box: the last address of the space ---
+      await box.fill(hex8(last - 0x1000));
+      await box.press("Enter");
+      await expect(first).not.toHaveText(hex8(end));
+      await box.fill(hex8(addressMax));
+      await box.press("Enter");
+      await lastRowIsTheLastOnScreen();
+      await expect(rowAt(view, last)).toHaveClass(/target-address/);
+      await expect(box).toHaveValue(hex8(last));
+      expect(rpc.requests("state.writeMemory")).toEqual([]);
+    });
+  }
+}
 
 test("the memory is read again when the target stops, and not for any other tick", async ({ page, rpc }) => {
   await openWorkspace(page, "sh4-debugger");

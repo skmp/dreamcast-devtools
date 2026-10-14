@@ -19,6 +19,8 @@ type MemoryRow = {
 
 const WHEEL_PIXEL_THRESHOLD = 60;
 const MEMORY_SCROLL_BYTES = 96;
+/** The rows above an address typed into the box, in a panel that has room for them below the first. */
+const CONTEXT_ROWS = 10;
 
 // The three columns of a row, in characters: an address of up to ten ("0x8C010000"), sixteen
 // bytes with the spaces between them, sixteen characters of text; two characters between
@@ -57,7 +59,11 @@ export interface MemoryViewConfig {
   formatAddress: (value: number) => string;
   /** Parse an address string from user input */
   parseAddress: (input: string) => number | undefined;
-  /** The highest address a view can start at: `length` bytes from there end at the last address of the target */
+  /**
+   * The highest address a view of a whole slice can start at: `length` bytes from there end at
+   * the last address of the target. In a panel that shows fewer rows than a slice has, the view
+   * goes further, until the last row of the target is the panel's last whole row.
+   */
   maxAddress: number;
   /** The last address of the target (default: 0xFFFFFFFF) */
   addressMax?: number;
@@ -130,6 +136,29 @@ const clampAddress = (value: number, max: number, alignment = 1) => {
   return clamped - (clamped % alignment);
 };
 
+/**
+ * Where a view can stand, for a panel that shows `shown` rows of the listing whole (undefined:
+ * not measured yet, which is taken as room for a whole slice).
+ *
+ * The listing is cut at the edge of its panel and is not scrolled: a row is on screen when the
+ * view stands so that it is. So the view goes as far as the place at which the last row of
+ * the target is the panel's last whole row, and the slice read there ends at the last address
+ * of the target, with as many rows as the panel shows. In a panel with room for a whole slice
+ * that is `config.maxAddress`, where the last row of a slice is the last row of the target.
+ *
+ * An address typed into the box is shown with ten rows of context above it, or with as many as
+ * the panel has room for above it: in a panel of ten rows or fewer, that row is the last whole one.
+ */
+const viewLimits = (config: MemoryViewConfig, shown: number | undefined) => {
+  const lastRow = (config.addressMax ?? 0xffffffff) - (BYTES_PER_ROW - 1);
+  const sliceRows = Math.ceil(config.length / BYTES_PER_ROW);
+  const rows = shown === undefined ? sliceRows : Math.max(1, Math.min(shown, sliceRows));
+  return {
+    maxStart: Math.max(config.maxAddress, lastRow - (rows - 1) * BYTES_PER_ROW),
+    contextRows: Math.min(CONTEXT_ROWS, rows - 1),
+  };
+};
+
 export const MemoryView = ({
   config,
   callbacks,
@@ -149,17 +178,25 @@ export const MemoryView = ({
   const [slice, setSlice] = useState<MemorySlice | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  /** how many rows of the listing the panel shows whole; undefined until rows have been on screen */
+  const [shownRows, setShownRows] = useState<number | undefined>(undefined);
+  const { maxStart, contextRows } = viewLimits(config, shownRows);
 
   // Initialize address from URL or default. An address from the URL is treated like a
-  // submitted one: aligned to its row and shown with ten rows of context above it.
-  const initialAddress = initialUrlAddress
-    ? Math.max(
-        0,
-        clampAddress(initialUrlAddress.address, lastRow, BYTES_PER_ROW) - BYTES_PER_ROW * 10,
-      )
-    : defaultAddress;
+  // submitted one: aligned to its row and shown with ten rows of context above it. (Or with
+  // fewer, in a small panel: see `urlPlacement`.)
+  const urlRow = initialUrlAddress ? clampAddress(initialUrlAddress.address, lastRow, BYTES_PER_ROW) : undefined;
+  const initialAddress = urlRow !== undefined ? Math.max(0, urlRow - BYTES_PER_ROW * CONTEXT_ROWS) : defaultAddress;
   const [address, setAddress] = useState(initialAddress);
+  // Where the view is: the address it was taken to, inside what the panel's size allows.
+  const viewStart = clampAddress(address, maxStart, BYTES_PER_ROW);
   const [addressInput, setAddressInput] = useState(config.formatAddress(initialAddress));
+  /**
+   * The row of an address from the URL, until the rows the panel shows are known: the view is
+   * placed again then, with the context that fits above the row. Nothing else moves the view
+   * when the panel is measured, and a move of the user's comes first.
+   */
+  const urlPlacement = useRef(urlRow);
 
   const requestIdRef = useRef(0);
   const wheelRemainder = useRef(0);
@@ -218,9 +255,9 @@ export const MemoryView = ({
     [callbacks, config.length, addressMax],
   );
 
-  // What the box says where the view is: the address 10 rows down (the intended target), not
-  // the fetch start, as the target writes its addresses.
-  const shownAddress = config.formatAddress(Math.min(lastRow, clampAddress(address, config.maxAddress, BYTES_PER_ROW) + BYTES_PER_ROW * 10));
+  // What the box says where the view is: the address 10 rows down (the intended target; fewer
+  // in a panel of ten rows or fewer), not the fetch start, as the target writes its addresses.
+  const shownAddress = config.formatAddress(Math.min(lastRow, viewStart + BYTES_PER_ROW * contextRows));
 
   // The box follows the view when the view moves (a submit, the wheel: a view that has moved
   // says another address), and the target when it writes its addresses in another way, and
@@ -232,15 +269,17 @@ export const MemoryView = ({
     setAddressInput(shownAddress);
   }, [shownAddress]);
 
+  // (By where the view is, not by the limits: a panel that is measured, or resized, reads
+  // nothing unless the view has to move for it.)
   useEffect(() => {
     if (initialized) {
-      void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
+      void fetchSlice(viewStart);
     }
-  }, [address, fetchSlice, config.maxAddress, initialized]);
+  }, [viewStart, fetchSlice, initialized]);
 
   const handleRefresh = useCallback(() => {
-    void fetchSlice(clampAddress(address, config.maxAddress, BYTES_PER_ROW));
-  }, [fetchSlice, address, config.maxAddress]);
+    void fetchSlice(viewStart);
+  }, [fetchSlice, viewStart]);
 
   // What a timer calls: the view as it is when the timer runs, not as it was when it was set.
   const latest = useRef({ initialized, refresh: handleRefresh });
@@ -283,14 +322,20 @@ export const MemoryView = ({
     applyPendingHighlight();
   }, [initialUrlAddress, initialized, slice, applyPendingHighlight, lastRow]);
 
+  /** The view `delta` bytes from where it is, inside what the panel's size allows. */
+  const movedBy = useCallback(
+    (from: number, delta: number) => clampAddress(clampAddress(from, maxStart, BYTES_PER_ROW) + delta, maxStart, BYTES_PER_ROW),
+    [maxStart],
+  );
+
   // Process pending scroll delta after loading completes
   useEffect(() => {
     if (!loading && pendingScrollDelta.current !== 0) {
       const delta = pendingScrollDelta.current;
       pendingScrollDelta.current = 0;
-      setAddress((prev) => clampAddress(prev + delta, config.maxAddress, BYTES_PER_ROW));
+      setAddress((prev) => movedBy(prev, delta));
     }
-  }, [loading, config.maxAddress]);
+  }, [loading, movedBy]);
 
   const rows = useMemo<MemoryRow[]>(() => {
     if (!slice) {
@@ -329,14 +374,16 @@ export const MemoryView = ({
 
   const adjustAddress = useCallback(
     (delta: number) => {
-      setAddress((prev) => clampAddress(prev + delta, config.maxAddress, BYTES_PER_ROW));
+      setAddress((prev) => movedBy(prev, delta));
     },
-    [config.maxAddress],
+    [movedBy],
   );
 
   /** Moves the view by `delta` bytes; while its bytes are being read, when they are in. */
   const moveView = useCallback(
     (delta: number) => {
+      // the user has the view now: it is not placed again for an address of the URL
+      urlPlacement.current = undefined;
       if (loading) {
         pendingScrollDelta.current += delta;
       } else {
@@ -393,24 +440,66 @@ export const MemoryView = ({
     // Update the input field to show the aligned address
     setAddressInput(config.formatAddress(alignedAddress));
 
-    // Start 10 rows before for context
-    const contextOffset = BYTES_PER_ROW * 10;
+    // Start 10 rows before for context (fewer in a panel that would cut the row off then)
+    const contextOffset = BYTES_PER_ROW * contextRows;
     const targetAddress = Math.max(0, alignedAddress - contextOffset);
-    const clampedTarget = clampAddress(targetAddress, config.maxAddress, BYTES_PER_ROW);
+    const clampedTarget = clampAddress(targetAddress, maxStart, BYTES_PER_ROW);
 
+    urlPlacement.current = undefined;
     setAddress(clampedTarget);
     callbacks.onAddressChange?.(alignedAddress);
 
     // Highlight the row once it is on screen: right away when the view does not move,
     // otherwise after the new slice has been fetched and rendered (see the rows effect)
     pendingHighlightRef.current = alignedAddress;
-    if (clampedTarget === address) {
+    if (clampedTarget === viewStart) {
       applyPendingHighlight();
     }
-  }, [addressInput, config, callbacks, address, applyPendingHighlight, lastRow]);
+  }, [addressInput, config, callbacks, viewStart, applyPendingHighlight, lastRow, contextRows, maxStart]);
 
   /** the rows are on screen, and not what is said in their place (no data, an error, a first read) */
   const listed = initialized && !error && slice !== null && rows.length > 0;
+
+  // How many rows the panel shows whole (`viewLimits`): measured when the rows are on screen,
+  // and again when the panel or a row changes size. A row is as high as the first one.
+  const rowsRef = useRef<HTMLDivElement | null>(null);
+  const measuredConfig = useRef(config);
+  useLayoutEffect(() => {
+    measuredConfig.current = config;
+  });
+  useEffect(() => {
+    const frame = containerRef.current;
+    const first = rowsRef.current?.firstElementChild;
+    if (!listed || !frame || !(first instanceof HTMLElement) || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const measure = () => {
+      const row = first.getBoundingClientRect();
+      // (a panel that is not on screen, a dock tab behind another, has no size to go by)
+      if (!(row.height > 0)) {
+        return;
+      }
+      const shown = Math.max(0, Math.floor((frame.getBoundingClientRect().bottom - row.top) / row.height));
+      setShownRows(shown);
+      const limits = viewLimits(measuredConfig.current, shown);
+      const fromUrl = urlPlacement.current;
+      urlPlacement.current = undefined;
+      if (fromUrl !== undefined && limits.contextRows !== CONTEXT_ROWS) {
+        // A view an address of the URL placed, in a panel that has no room for ten rows above
+        // it: the row is placed where it is on screen, as a typed address is.
+        pendingHighlightRef.current = fromUrl;
+        setAddress(clampAddress(Math.max(0, fromUrl - BYTES_PER_ROW * limits.contextRows), limits.maxStart, BYTES_PER_ROW));
+      } else {
+        // In a panel that has grown the view comes back as far as it has to (and no further),
+        // so that the panel is full of rows.
+        setAddress((prev) => clampAddress(prev, limits.maxStart, BYTES_PER_ROW));
+      }
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(frame);
+    observer.observe(first);
+    return () => observer.disconnect();
+  }, [listed]);
 
   // The editor of a byte: which byte, and where the view was when it was opened. Its box is in
   // the row of that byte, and is there for as long as the row is: an editor whose box is not
@@ -439,7 +528,7 @@ export const MemoryView = ({
     canEdit &&
     listed &&
     edit !== undefined &&
-    edit.view === address &&
+    edit.view === viewStart &&
     rows.some((row) => edit.at >= row.address && edit.at < row.address + row.length);
   const editing = editShown && editor.text !== undefined && editAddress !== undefined;
   const { text: draft, open: openEditor, close: closeEditor } = editor;
@@ -502,11 +591,11 @@ export const MemoryView = ({
       // (the place of the keyboard is at this byte already: the keys open the editor where the
       // place is, and the first press of a double click has put it there)
       editAddressRef.current = row.address + byteIndex;
-      setEdit({ at: row.address + byteIndex, view: address });
+      setEdit({ at: row.address + byteIndex, view: viewStart });
       openEditor(byte);
       return true;
     },
-    [canEdit, rows, address, openEditor],
+    [canEdit, rows, viewStart, openEditor],
   );
 
   /** The byte of the hex column a pointer is on: a row is one piece of text, so the byte is found from where in the column the pointer is. */
@@ -570,10 +659,15 @@ export const MemoryView = ({
     }
     event.preventDefault();
     const [rowStep, byteStep] = step;
+    // The view stands as far as it goes that way, and its rows are on screen: at the first
+    // address, or with the last row of the target the panel's last whole row.
+    const viewAtItsEnd = !loading && slice?.baseAddress === viewStart && (rowStep < 0 ? viewStart <= 0 : viewStart >= maxStart);
     if (rowStep === 0) {
       // (a row has its ends: see cursorByte)
       placeCursor(cursorRow, cursorByte + byteStep);
-    } else if (rowOnScreen(cursorRow + rowStep)) {
+    } else if (rowOnScreen(cursorRow + rowStep) || (viewAtItsEnd && rows[cursorRow + rowStep] !== undefined)) {
+      // (where the view cannot move, a row there is gone to: the last row of the target, which a
+      // measure of the panel that is off by a fraction of a pixel may take for one it cuts)
       placeCursor(cursorRow + rowStep, cursorByte);
     } else {
       // The next row is cut off by the edge of the panel, or there is none: the view moves by
@@ -689,6 +783,7 @@ export const MemoryView = ({
                 </Typography>
               </Box>
               <Stack
+                ref={rowsRef}
                 spacing={0}
                 onDoubleClick={handleListingDoubleClick}
                 onMouseDown={handleListingMouseDown}
