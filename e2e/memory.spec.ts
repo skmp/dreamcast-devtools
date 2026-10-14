@@ -319,6 +319,51 @@ const panelOfRows = async (page: Page, view: Locator, rows: number) => {
   expect(await at(high), `a window in which the panel shows ${rows} rows whole`).toBe(rows);
 };
 
+test("a panel that grows at the end of an address space stays full: the view comes back up as far as the panel has room, and a move starts from there", async ({
+  page,
+  rpc,
+}) => {
+  await openWorkspace(page, "sh4-debugger");
+  const view = panel(page, "sh4-memory");
+  const box = view.getByRole("textbox");
+  const first = memoryRows(view).first().locator("span").first();
+  await expect(memoryRows(view)).toHaveCount(60);
+  await panelOfRows(page, view, 10);
+  await box.fill("0xFFFFFFFF");
+  await box.press("Enter");
+  await expect(first).toHaveText(hex8(0xfffffff0 - 9 * 16));
+  await expect(memoryRows(view)).toHaveCount(10);
+
+  // the panel has room for twenty rows now: twenty are read, and the last row of the space is the last of them
+  await panelOfRows(page, view, 20);
+  await expect(first).toHaveText(hex8(0xfffffff0 - 19 * 16));
+  await expect(memoryRows(view)).toHaveCount(20);
+  expect(await wholeRows(view)).toBe(20);
+  expect(rpc.requests("state.getMemorySlice").at(-1)?.params).toEqual({ target: "sh4", address: 0xfffffff0 - 19 * 16, length: 20 * 16 });
+  // a notch of the wheel up moves the view six rows up from where it is now
+  await memoryRows(view).first().hover();
+  await page.mouse.wheel(0, -60);
+  await expect(first).toHaveText(hex8(0xfffffff0 - 25 * 16));
+});
+
+test("a memory panel of three rows opened with ?address= shows and highlights that address: the context above it is what fits", async ({ page }) => {
+  await openWorkspace(page, "sh4-debugger");
+  await expect(memoryRows(panel(page, "sh4-memory"))).toHaveCount(60);
+  await panelOfRows(page, panel(page, "sh4-memory"), 3);
+  // the same window, the same layout: a page opened with an address
+  await gotoRoute(page, "/workspace/sh4-debugger?address=0x8C004560");
+  await page.reload();
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  const view = panel(page, "sh4-memory");
+  await expect(memoryRows(view).first().locator("span").first()).toHaveText("0x8C004540");
+  await expect(rowAt(view, 0x8c004560)).toHaveClass(/target-address/);
+  await expect(rowAt(view, 0x8c004560).locator("span").first()).toBeInViewport({ ratio: 1 });
+  expect(await wholeRows(view)).toBe(3);
+  await expect(view.getByRole("textbox")).toHaveValue("0x8C004560");
+  // exactly one row is marked
+  await expect(view.locator(".target-address")).toHaveCount(1);
+});
+
 // In a panel that shows fewer rows than a slice holds, the last rows of an address space are
 // on screen when the view stands so that the last row is the panel's last whole row: the view
 // goes that far, by the wheel, by the keys and for an address typed into the box. The listing is
@@ -327,7 +372,7 @@ for (const { name, workspace, id, target, addressMax } of [
   { name: "SH4", workspace: "sh4-debugger", id: "sh4-memory", target: "sh4", addressMax: 0xffffffff },
   { name: "ARM7", workspace: "arm7-debugger", id: "arm7-memory", target: "arm7", addressMax: 0x00ffffff },
 ] as const) {
-  for (const tall of [10, 3]) {
+  for (const tall of [10, 3, 40]) {
     test(`${name} memory in a panel ${tall} rows tall: the last row of the address space is reached by the wheel, by the keys and by the address box`, async ({
       page,
       rpc,
@@ -414,7 +459,8 @@ for (const { name, workspace, id, target, addressMax } of [
       await box.press("Enter");
       await lastRowIsTheLastOnScreen();
       await expect(rowAt(view, last)).toHaveClass(/target-address/);
-      await expect(box).toHaveValue(hex8(last));
+      // the box says the row ten rows below the first, or the last whole row in a panel of ten rows or fewer
+      await expect(box).toHaveValue(hex8(end + Math.min(10, tall - 1) * 16));
       expect(rpc.requests("state.writeMemory")).toEqual([]);
     });
   }
@@ -997,6 +1043,22 @@ test.describe("byte editing: the box of an editor is in a row of the listing", (
     await page.waitForTimeout(300);
     await expect(byteEditor(view)).toHaveCount(0);
     expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe("INPUT");
+
+    // And for rows of another place that hold the byte of the editor (a server that answers a
+    // row earlier): they are not the rows of the view, and the editor does not follow its byte
+    // into another row of them.
+    await dblclickByte(view, 0x8c010004);
+    await byteEditor(view).fill("CC");
+    elsewhere = -0x10;
+    server.state.execution = { state: "paused", stopId: 6, reason: "pause" };
+    server.tick();
+    await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(0x8c00fff0));
+    await expect(rowAt(view, 0x8c010000)).toBeVisible();
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view)).toHaveCount(0);
+    // nor does one open in them
+    await dblclickByte(view, 0x8c010004);
+    await expect(byteEditor(view)).toHaveCount(0);
     expect(server.requestsOf("state.writeMemory")).toEqual([]);
   });
 

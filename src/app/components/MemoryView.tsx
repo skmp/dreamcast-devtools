@@ -495,11 +495,9 @@ export const MemoryView = ({
         // it: the row is placed where it is on screen, as a typed address is.
         pendingHighlightRef.current = fromUrl;
         setAddress(clampAddress(Math.max(0, fromUrl - BYTES_PER_ROW * limits.contextRows), limits.maxStart, BYTES_PER_ROW));
-      } else {
-        // In a panel that has grown the view comes back as far as it has to (and no further),
-        // so that the panel is full of rows.
-        setAddress((prev) => clampAddress(prev, limits.maxStart, BYTES_PER_ROW));
       }
+      // (In a panel that has grown at the end of the space the view comes back as far as it has
+      // to, so that the panel is full of rows: `viewStart` is inside the new limits.)
     };
     const observer = new ResizeObserver(measure);
     observer.observe(frame);
