@@ -390,8 +390,10 @@ where it opens is the server's to say.
 - **Renaming a watch.** The expression of a watch is renamed by a double click on it, or from
   the keyboard: it is a stop of the Tab key in front of the value of its watch, and Enter, the
   space bar and F2 open the box of its name (`state.modifyWatchExpression`; Enter sends,
-  Escape and leaving the box put it away, and a name the server refuses leaves the box open).
-  The rules of the editors are its rules: the focus is on the expression again when the box
+  Escape and leaving the box put it away, and a name the server refuses leaves the box open,
+  marked, with the reason as its title). The rules of the editors are its rules: while a
+  request is out the box waits and sends nothing more, an answer for a box that was put away
+  closes no box opened since, the focus is on the expression again when the box
   goes with the focus in it, the box is offered while the target is paused, and one that is
   open when the target runs again goes with what was typed; while the target runs the
   expression keeps the focus it has, says why it cannot be used (`aria-disabled`, its title)
