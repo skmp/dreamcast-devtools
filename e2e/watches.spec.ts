@@ -337,10 +337,14 @@ test("the expression of a watch is renamed with the keyboard: a stop of the Tab 
   await expect(name).toBeFocused();
   await expect(name).toHaveAttribute("aria-disabled", "true");
   await expect(name).toHaveAttribute("title", RENAME_RUNNING_TITLE);
-  for (const key of ["Enter", "F2", "Space"]) {
-    await page.keyboard.press(key);
+  // (a few times over, quickly: a box that opened now would be hidden, and could be left open
+  // behind the next stop)
+  for (let round = 0; round < 5; round++) {
+    for (const key of ["Enter", "F2", "Space"]) {
+      await page.keyboard.press(key);
+    }
+    await name.dblclick({ force: true });
   }
-  await name.dblclick({ force: true });
   await page.waitForTimeout(300);
   await expect(editor).toHaveCount(0);
 
