@@ -364,6 +364,104 @@ test("a memory panel of three rows opened with ?address= shows and highlights th
   await expect(view.locator(".target-address")).toHaveCount(1);
 });
 
+/**
+ * Records every flash of the mark of a row (`target-address`, whose animation starts again
+ * whenever a row is marked), with the address the row shows at that moment.
+ */
+const recordFlashes = async (page: Page) => {
+  await page.addInitScript(() => {
+    const store = window as unknown as { __flashes: string[] };
+    store.__flashes = [];
+    document.addEventListener(
+      "animationstart",
+      (event) => {
+        const row = event.target;
+        if (row instanceof HTMLElement && row.classList.contains("target-address")) {
+          store.__flashes.push(row.querySelector("span")?.textContent ?? "");
+        }
+      },
+      true,
+    );
+  });
+  return () => page.evaluate(() => (window as unknown as { __flashes: string[] }).__flashes.slice());
+};
+
+// An address of the URL near the end of an address space, in a panel that shows more than ten
+// rows and fewer than a slice (sixteen in the window of the suite, or forty): the first view
+// is placed for a whole slice, and the view moves once the panel has been measured. The row of
+// the URL is on screen then, and it is the one row that is marked, not the row of the listing
+// that showed it before the move.
+for (const { name, workspace, id, target, address, tall } of [
+  { name: "SH4", workspace: "sh4-debugger", id: "sh4-memory", target: "sh4", address: 0xfffffe60, tall: undefined },
+  { name: "SH4, its last row,", workspace: "sh4-debugger", id: "sh4-memory", target: "sh4", address: 0xfffffff0, tall: undefined },
+  { name: "ARM7", workspace: "arm7-debugger", id: "arm7-memory", target: "arm7", address: 0x00fffe60, tall: undefined },
+  { name: "ARM7, 25 rows before its last row,", workspace: "arm7-debugger", id: "arm7-memory", target: "arm7", address: 0x00fffe00, tall: 40 },
+] as const) {
+  test(`${name} opened with ?address=${hex8(address)} in a panel of ${tall ?? "the suite's window"}${tall ? " rows" : ""}: that row is on screen, and the only row marked`, async ({
+    page,
+    rpc,
+  }) => {
+    const flashes = await recordFlashes(page);
+    if (tall !== undefined) {
+      await openWorkspace(page, workspace);
+      await expect(memoryRows(panel(page, id))).toHaveCount(60);
+      await panelOfRows(page, panel(page, id), tall);
+    }
+    // the same window, the same layout: a page opened with an address
+    await gotoRoute(page, `/workspace/${workspace}?address=${hex8(address)}`);
+    if (tall !== undefined) {
+      await page.reload();
+    }
+    await expect(statusBar(page)).toContainText("Connection: connected");
+    const view = panel(page, id);
+    const slices = () => rpc.requests("state.getMemorySlice").filter((frame) => (frame.params as { target: string }).target === target);
+    await expect(rowAt(view, address)).toBeVisible();
+    // (the view has been placed for the panel, and has read its rows)
+    await settledCount(() => slices().length);
+    const whole = await wholeRows(view);
+    expect(whole).toBeGreaterThan(10);
+    expect(whole).toBeLessThan(60);
+    if (tall !== undefined) {
+      expect(whole).toBe(tall);
+    }
+    // ten rows of context above it, or as many as there are above the last rows of the space
+    const lastRow = (target === "arm7" ? 0x00ffffff : 0xffffffff) - 15;
+    const firstRow = Math.min(address - 10 * 16, lastRow - (whole - 1) * 16);
+    await expect(memoryRows(view).first().locator("span").first()).toHaveText(hex8(firstRow));
+    await expect(rowAt(view, address).locator("span").first()).toBeInViewport({ ratio: 1 });
+    await expect(view.locator(".target-address")).toHaveCount(1);
+    await expect(rowAt(view, address)).toHaveClass(/target-address/);
+    expect((await flashes()).at(-1)).toBe(hex8(address));
+    // the box says where the view is, as it does for a typed address: the row ten rows below the first
+    await expect(view.getByRole("textbox")).toHaveValue(hex8(firstRow + 10 * 16));
+  });
+}
+
+test("an address of the URL whose view does not move when the panel is measured is marked once: a later read marks nothing", async ({ page }) => {
+  const flashes = await recordFlashes(page);
+  await openWorkspace(page, "arm7-debugger");
+  await expect(memoryRows(panel(page, "arm7-memory"))).toHaveCount(60);
+  await panelOfRows(page, panel(page, "arm7-memory"), 3);
+  // Near the first address the view stands at 0 whether it has ten rows of context or two: the
+  // measure of the panel does not move it, and the row of the URL is marked in the rows it is in.
+  await gotoRoute(page, "/workspace/arm7-debugger?address=0x00000020");
+  await page.reload();
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  const view = panel(page, "arm7-memory");
+  await expect(memoryRows(view).first().locator("span").first()).toHaveText("0x00000000");
+  await expect(rowAt(view, 0x20)).toHaveClass(/target-address/);
+  await expect(rowAt(view, 0x20).locator("span").first()).toBeInViewport({ ratio: 1 });
+  expect(await wholeRows(view)).toBe(3);
+  await page.waitForTimeout(500);
+  expect(await flashes()).toEqual(["0x00000020"]);
+  // a stop reads the rows again, where they are: nothing is marked again
+  await pauseFromToolbar(page);
+  await expect(page.getByRole("status", { name: "Execution state" })).toContainText("Paused");
+  await page.waitForTimeout(500);
+  expect(await flashes()).toEqual(["0x00000020"]);
+  await expect(view.locator(".target-address")).toHaveCount(1);
+});
+
 // In a panel that shows fewer rows than a slice holds, the last rows of an address space are
 // on screen when the view stands so that the last row is the panel's last whole row: the view
 // goes that far, by the wheel, by the keys and for an address typed into the box. The listing is

@@ -470,8 +470,11 @@ export const MemoryView = ({
   // and again when the panel or a row changes size. A row is as high as the first one.
   const rowsRef = useRef<HTMLDivElement | null>(null);
   const measuredConfig = useRef(config);
+  /** where the view is, for the measure: the place the rows on screen were read at */
+  const measuredView = useRef(viewStart);
   useLayoutEffect(() => {
     measuredConfig.current = config;
+    measuredView.current = viewStart;
   });
   useEffect(() => {
     const frame = containerRef.current;
@@ -487,14 +490,23 @@ export const MemoryView = ({
       }
       const shown = Math.max(0, Math.floor((frame.getBoundingClientRect().bottom - row.top) / row.height));
       setShownRows(shown);
-      const limits = viewLimits(measuredConfig.current, shown);
       const fromUrl = urlPlacement.current;
       urlPlacement.current = undefined;
-      if (fromUrl !== undefined && limits.contextRows !== CONTEXT_ROWS) {
-        // A view an address of the URL placed, in a panel that has no room for ten rows above
-        // it: the row is placed where it is on screen, as a typed address is.
-        pendingHighlightRef.current = fromUrl;
-        setAddress(clampAddress(Math.max(0, fromUrl - BYTES_PER_ROW * limits.contextRows), limits.maxStart, BYTES_PER_ROW));
+      if (fromUrl !== undefined) {
+        // A view an address of the URL placed: the row is placed where it is on screen, as a
+        // typed address is, in a panel of any size. The first view was placed for a whole slice
+        // and ten rows of context; in a panel that has no room for those ten rows, and at the
+        // end of the space in a panel that shows fewer rows than a slice, the view moves.
+        const limits = viewLimits(measuredConfig.current, shown);
+        const placed = clampAddress(Math.max(0, fromUrl - BYTES_PER_ROW * limits.contextRows), limits.maxStart, BYTES_PER_ROW);
+        setAddress(placed);
+        if (placed !== measuredView.current) {
+          // The rows on screen will show other addresses: the row of the URL is marked again
+          // when the rows of the new place are in, and the mark of the first view goes (it is on
+          // a row that shows another address by then). Where the view does not move, the row of
+          // the URL is marked already, in the rows it stays in, and nothing is left to mark later.
+          pendingHighlightRef.current = fromUrl;
+        }
       }
       // (In a panel that has grown at the end of the space the view comes back as far as it has
       // to, so that the panel is full of rows: `viewStart` is inside the new limits.)
