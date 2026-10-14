@@ -158,9 +158,14 @@ test("a describe result without `targets` lists none: every panel of a target sa
 }) => {
   const server = await serveScriptedDebugger(page);
   delete server.shape.targets;
-  // a stop with a breakpoint in it, as a server sends one: there is nothing to follow it with
+  // A stop with a breakpoint in it, as a server sends one: there is nothing to follow it with.
+  // Their addresses print otherwise in the format of any target (0x00001000 for the SH4, 005
+  // for the DSP), which is not taken for a target the server does not list.
   server.state.execution = { state: "paused", stopId: 4, reason: "breakpoint", breakpointId: 7 };
-  server.state.breakpoints = { "7": { id: 7, event: "dc.sh4.cpu.pc", address: 0x8c001000, kind: "code", enabled: true } };
+  server.state.breakpoints = {
+    "7": { id: 7, event: "dc.sh4.cpu.pc", address: 0x1000, kind: "code", enabled: true },
+    "8": { id: 8, event: "dc.aica.dsp.step", address: 5, kind: "code", enabled: true },
+  };
   server.state.callstacks = { sh4: [{ index: 0, pc: 0x8c001000, sp: 0x8cfff000, symbol: "_main+0x0" }], arm7: [] };
 
   await expectNoticesInEveryWorkspace(page, server, {
@@ -172,13 +177,15 @@ test("a describe result without `targets` lists none: every panel of a target sa
   await expect(page.getByRole("alert").filter({ hasText: "protocol" })).toHaveCount(0);
 
   // Its capabilities are read: the events panel has its box. A code breakpoint is of no
-  // target here: it is listed with the events, its address as plain hex.
+  // target here: it is listed with the events, its address as plain hex ("0x" and the digits).
   await gotoRoute(page, "/workspace/sh4-debugger");
   await addPanelFromSelector(page, 3, "Events: Breakpoints");
   const events = panel(page, "events-breakpoints");
   await expect(events.getByRole("note")).toHaveCount(0);
   await expect(events.getByRole("combobox")).toBeVisible();
-  await expect(events.getByRole("listitem")).toHaveText(/dc\.sh4\.cpu\.pc == 0x8C001000/);
+  await expect(events.getByRole("listitem")).toHaveText([/^dc\.sh4\.cpu\.pc == 0x1000code/, /^dc\.aica\.dsp\.step == 0x5code/]);
+  // and so does the stop it is in
+  await expect(page.getByRole("status", { name: "Execution state" })).toHaveText("Paused · breakpoint dc.sh4.cpu.pc == 0x1000 · stop 4");
   await expect(events.getByRole("heading", { name: "Events", exact: true })).toBeVisible();
   await expect(events.getByRole("heading", { name: "SH4", exact: true })).toHaveCount(0);
   expect(asked(server)).toEqual([]);
