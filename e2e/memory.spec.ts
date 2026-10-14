@@ -324,6 +324,8 @@ test("a panel that grows at the end of an address space stays full: the view com
   rpc,
 }) => {
   await openWorkspace(page, "sh4-debugger");
+  // (paused: the bytes are editors, see below)
+  await pauseFromToolbar(page);
   const view = panel(page, "sh4-memory");
   const box = view.getByRole("textbox");
   const first = memoryRows(view).first().locator("span").first();
@@ -340,6 +342,19 @@ test("a panel that grows at the end of an address space stays full: the view com
   await expect(memoryRows(view)).toHaveCount(20);
   expect(await wholeRows(view)).toBe(20);
   expect(rpc.requests("state.getMemorySlice").at(-1)?.params).toEqual({ target: "sh4", address: 0xfffffff0 - 19 * 16, length: 20 * 16 });
+  // The view stands where the panel's new size lets it, not where the box took it: a byte of
+  // the rows on screen opens its editor there, in the last row and in the middle of the listing,
+  // and the editor stays.
+  for (const address of [0xfffffff4, 0xfffffff0 - 10 * 16 + 2]) {
+    await dblclickByte(view, address);
+    await expect(byteEditor(view)).toHaveAccessibleName(`Bytes to write from ${hex8(address)}`);
+    await expect(byteEditor(view)).toBeFocused();
+    await page.waitForTimeout(300);
+    await expect(byteEditor(view), `the editor of ${hex8(address)} is still open`).toHaveCount(1);
+    await page.keyboard.press("Escape");
+    await expect(byteEditor(view)).toHaveCount(0);
+  }
+  expect(rpc.requests("state.writeMemory")).toEqual([]);
   // a notch of the wheel up moves the view six rows up from where it is now
   await memoryRows(view).first().hover();
   await page.mouse.wheel(0, -60);
