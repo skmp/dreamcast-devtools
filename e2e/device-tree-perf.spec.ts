@@ -66,6 +66,14 @@ test("device tree render and blocking cost on 100 nodes x 25 registers", async (
   const rows = treeRows(page);
   await expect(treeItem(page, "dc")).toBeVisible();
   await expect(treeItem(page, synthetic.nodePath(NODES - 1))).toBeVisible();
+  // What is measured is a page of a server the client supports: no banner and no notice on it.
+  // (Builds measured with E2E_MEASURE_ONLY may say something of the server: they are not held to it.)
+  const noAlert = async (when: string) => {
+    if (!MEASURE_ONLY) {
+      await expect(page.getByRole("alert"), `no alert on the measured page, ${when}`).toHaveCount(0);
+    }
+  };
+  await noAlert("at its start");
 
   /**
    * Waits until the tree has stopped rendering by itself: mounting thousands of rows takes
@@ -201,6 +209,7 @@ test("device tree render and blocking cost on 100 nodes x 25 registers", async (
   await page.waitForTimeout(500);
   const watchOptions = await page.getByRole("option").count();
   await watchInput.press("Escape");
+  await noAlert("at its end");
 
   const report = {
     label: process.env.E2E_MEASURE_LABEL ?? "working tree",
