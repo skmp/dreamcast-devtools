@@ -296,9 +296,15 @@ where it opens is the server's to say.
   step out, with F8 and Shift+F8 for F11 and Shift+F11. They work wherever the focus is — on
   the page, in an address box (where F5 would otherwise load the page again), on a value, in
   the editor of one — but for two places: in Monaco, and while a dialog is open, they are left
-  to the editor and to the browser. A dialog that is closing is not open: one that Escape
-  closed fades out for a moment, and a key right behind the Escape is the toolbar's (F5 runs,
-  and does not load the page). The Find box of an editor is a part of that editor, and no
+  to the editor and to the browser. A dialog that is closing is not open. One that Escape
+  closes is closed from that Escape on: a key right behind it is the toolbar's (F5 runs, and
+  does not load the page), also before the page has rendered the close (the About dialog is
+  closed by a change of the page's address, which the page renders as a transition, behind
+  the keys that come meanwhile). That holds for the dialog the Escape went to, the one with
+  the focus in it, for as long as it is in the document, and for half a second while it is on
+  screen as it was: in front of a dialog that Escape did not close the keys are left to the
+  browser again. A dialog closed by its button, or by a click beside it, is closed while it
+  fades out. The Find box of an editor is a part of that editor, and no
   dialog of the page: with the focus anywhere else the keys work, whether the box is open or
   was closed. A key that is held down is used once, and its repeats are taken from the browser
   all the same. A key does what its button does: nothing while the button is off. A key with
@@ -381,7 +387,11 @@ where it opens is the server's to say.
   The arrow keys move that place from byte to byte and from row to row, a click on a byte puts
   it there, and Enter, the space bar and F2 open the editor at its byte. At the first row, and
   at the last one that is whole on screen, an arrow moves the view by a row instead: an arrow
-  never takes the place to a row the panel cuts off. When an editor goes with the focus in its box (the
+  never takes the place to a row the panel cuts off. A panel that is made smaller takes the
+  place up with its edge, to the last row it shows (whole, or the one the edge cuts, where a
+  click can put the place as well), with the focus if the place had it, and the place stays
+  there when the panel grows again; an editor whose row is below the edge then is put away
+  with what was typed. When an editor goes with the focus in its box (the
   write was accepted, Escape, the target runs again) the focus is on the value, or the byte,
   it was opened from; a focus that left the box by itself stays where it went. While the
   target runs the values and the place keep the focus they have, say that they cannot be used
@@ -414,8 +424,13 @@ where it opens is the server's to say.
   as the panel is then full. An address typed into the box is shown with ten rows of context
   above it, or with as many as there is room for in a panel of ten rows or fewer, so that its
   row is on screen (the last whole one), and the box says the address of the row that many
-  rows below the first; a view opened with `?address=` in such a panel is placed the same way
-  once its panel has been measured. A panel that has room for sixty rows is as before.
+  rows below the first. A view opened with `?address=` is placed the same way once its panel
+  has been measured, in a panel of any size: its first view is placed for a whole slice and
+  ten rows of context, and moves then when the panel has no room for those ten rows, or when
+  the panel shows fewer rows than a slice and the address is near the end of the space. The
+  row of the URL is marked in the rows of the new place, and is the one row marked; where the
+  view does not move it is marked once, and no later read marks it again.
+  A panel that has room for sixty rows is as before.
 - **After a write.** When one of this client's writes is answered `{}`, the disassembly and
   memory views read again where they are (`reread` of the store, a counter beside `refresh`):
   a byte edit does not move a listing. No request moves a view to the program counter. That is
