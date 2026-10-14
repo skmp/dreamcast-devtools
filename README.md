@@ -384,6 +384,15 @@ where it opens is the server's to say.
   target runs the values and the place keep the focus they have, say that they cannot be used
   (`aria-disabled`) and open nothing. On a server without the capability, and for a register
   without a writer, there is no such stop.
+- **Renaming a watch.** The expression of a watch is renamed by a double click on it, or from
+  the keyboard: it is a stop of the Tab key in front of the value of its watch, and Enter, the
+  space bar and F2 open the box of its name (`state.modifyWatchExpression`; Enter sends,
+  Escape and leaving the box put it away, and a name the server refuses leaves the box open).
+  The rules of the editors are its rules: the focus is on the expression again when the box
+  goes with the focus in it, the box is offered while the target is paused, and one that is
+  open when the target runs again goes with what was typed; while the target runs the
+  expression keeps the focus it has, says why it cannot be used (`aria-disabled`, its title)
+  and opens nothing. Every server renames watches: the expression is a control on all of them.
 - **The memory listing is not scrolled.** It is sixty rows, cut at the edge of its panel
   (`overflow: clip`): the rows below the edge are reached by moving the view through its
   addresses, and nothing the browser does for a focus or a search in the page scrolls the
