@@ -8,7 +8,8 @@ import { bundleInfoPlugin } from "./bundle-info";
 // The UI is called "Dreamcast DevTools": the document title, the home page, the About dialog,
 // the status bar, the documentation, the README, and the `client` of debugger.describe (from
 // the UI and from the contract runner). The emulator it talks to is nullDC, and where the UI
-// names the emulator it says so ("... for nullDC 3.0.0", "nullDC @ <host>", "nullDC (mock)").
+// names the emulator it says so ("... for nullDC 3.0.0", "nullDC (mock)"), or gives the name
+// the emulator reports ("<emulator name> @ <host>" in the connection picker).
 // Identifiers that no one reads keep their nulldc spelling, since a rename would lose saved
 // state or break a protocol: the localStorage keys nulldc-debugger-* and nulldc-theme-mode, the
 // BroadcastChannel names nulldc-debugger-announce and nulldc-debugger-<id>, the

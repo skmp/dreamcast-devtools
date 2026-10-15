@@ -219,9 +219,10 @@ The status bar reads `Dreamcast DevTools <version>`. The version shown there and
 dialog is the `package.json` version, followed by `+<git describe --tags --always --dirty>` when
 the build runs inside a git checkout.
 
-The UI is called Dreamcast DevTools; the emulator it talks to is nullDC, and where the UI names the
-emulator it says so (`nullDC @ <host>` in the connection picker, the emulator's own name in the
-About dialog). `scripts/uiName.test.ts` (part of `npm run check`) fails when a file of the
+The UI is called Dreamcast DevTools; the emulator it talks to is nullDC. Where the UI names the
+emulator, it gives the name the emulator reports in `debugger.describe` (`nullDC`, the mock
+`nullDC (mock)`): `<emulator name> @ <host>` in the connection picker, and the name in the About
+dialog. `scripts/uiName.test.ts` (part of `npm run check`) fails when a file of the
 repository calls the UI by an old name again, and `e2e/ui-name.spec.ts` reads the names on the
 rendered pages. The identifiers no one reads keep their `nulldc` spelling: the localStorage keys
 (`nulldc-debugger-*`, `nulldc-theme-mode`), the BroadcastChannel names, the `nulldc:crash-test`
@@ -248,7 +249,11 @@ event. A renamed key would drop every saved layout, program, endpoint and theme;
 
 The status bar of a workspace shows the connection state and the endpoint. The endpoint is a
 button (a click, or Enter or Space on it) that opens the connection picker: the endpoints above
-with where each comes from, and a box for any other `ws://` or `wss://` URL. Picking the build default or the page's own endpoint from
+with where each comes from, and a box for any other `ws://` or `wss://` URL. An endpoint is
+named by its host (`127.0.0.1:55543`), and by `<emulator name> @ <host>` once the emulator there
+has answered `debugger.describe` on the session's connection; before that (connecting, a failed
+connection, an endpoint the session is not connected to) by its host alone. No name is stored.
+Picking the build default or the page's own endpoint from
 the list puts a remembered manual entry away, so that the next load of the page uses that
 endpoint again.
 
