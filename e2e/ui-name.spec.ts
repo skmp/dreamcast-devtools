@@ -112,10 +112,22 @@ test("the UI is called Dreamcast DevTools: the document title, the home page, th
   }
 });
 
-test("the documentation names the UI and the emulator it is for", async ({ page }) => {
+test("the documentation names the UI and the emulator it is for; no page of a tool calls the UI by an old name", async ({ page }) => {
   await gotoRoute(page, "/docs");
   await expect(page.getByRole("main")).toContainText("Dreamcast DevTools is the web debugger UI for nullDC 3.0.0, the Dreamcast emulator.");
   await expectNoOldName(page);
+
+  for (const [route, shown] of [
+    ["/tool/sh4-sim", page.locator(".monaco-editor").first()],
+    ["/tool/dsp-playground", page.getByRole("button", { name: "Start DSP" })],
+    ["/tool/holly-core-log-analyzer", page.getByText("Drop your refsw2 log here")],
+    ["/tool/holly-ta-log-analyzer", page.getByText("This view is under consideration.")],
+  ] as const) {
+    await gotoRoute(page, route);
+    await expect(shown, route).toBeVisible();
+    await expect(page, route).toHaveTitle("Dreamcast DevTools");
+    await expectNoOldName(page);
+  }
 });
 
 test("where the UI names the emulator it says nullDC", async ({ page }) => {
