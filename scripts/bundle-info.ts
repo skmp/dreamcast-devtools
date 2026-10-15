@@ -82,7 +82,7 @@ export const writeBundleInfo = (directory: string, meta: BundleMeta): BundleInfo
 export const bundleInfoPlugin = (meta: BundleMeta): Plugin => {
   let outDir = "";
   return {
-    name: "nulldc-bundle-info",
+    name: "dreamcast-devtools-bundle-info",
     apply: "build",
     configResolved(config) {
       outDir = resolve(config.root, config.build.outDir);
