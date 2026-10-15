@@ -219,6 +219,15 @@ The status bar reads `Dreamcast DevTools <version>`. The version shown there and
 dialog is the `package.json` version, followed by `+<git describe --tags --always --dirty>` when
 the build runs inside a git checkout.
 
+The UI is called Dreamcast DevTools; the emulator it talks to is nullDC, and where the UI names the
+emulator it says so (`nullDC @ <host>` in the connection picker, the emulator's own name in the
+About dialog). `scripts/uiName.test.ts` (part of `npm run check`) fails when a file of the
+repository calls the UI by an old name again, and `e2e/ui-name.spec.ts` reads the names on the
+rendered pages. The identifiers no one reads keep their `nulldc` spelling: the localStorage keys
+(`nulldc-debugger-*`, `nulldc-theme-mode`), the BroadcastChannel names, the `nulldc:crash-test`
+event. A renamed key would drop every saved layout, program, endpoint and theme;
+`e2e/saved-state.spec.ts` starts the build with the state an earlier build saved.
+
 ## Connecting
 
 - `native` builds open one WebSocket. The endpoint is the first of these that is a `ws://` or
