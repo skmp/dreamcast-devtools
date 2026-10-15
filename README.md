@@ -225,9 +225,10 @@ emulator, it gives the name the emulator reports in `debugger.describe` (`nullDC
 dialog. `scripts/uiName.test.ts` (part of `npm run check`) fails when a file of the
 repository calls the UI by an old name again, and `e2e/ui-name.spec.ts` reads the names on the
 rendered pages. The identifiers no one reads keep their `nulldc` spelling: the localStorage keys
-(`nulldc-debugger-*`, `nulldc-theme-mode`), the BroadcastChannel names, the `nulldc:crash-test`
-event. A renamed key would drop every saved layout, program, endpoint and theme;
-`e2e/saved-state.spec.ts` starts the build with the state an earlier build saved.
+(`nulldc-debugger-*`, `nulldc-theme-mode`) and the `nulldc:crash-test` event. A renamed key would
+drop every saved layout, program, endpoint and theme; `e2e/saved-state.spec.ts` starts the build
+with the state an earlier build saved. The BroadcastChannels of a `wasm` build are named after the
+UI (see Connecting); no emulator spoke their earlier names, and the UI does not listen on them.
 
 ## Connecting
 
@@ -241,9 +242,9 @@ event. A renamed key would drop every saved layout, program, endpoint and theme;
   4. `/ws` on the host that served the page (`wss:` when the page was loaded over https).
 
   Served by the emulator, there is nothing to configure: the fourth applies.
-- `wasm` builds use BroadcastChannel. The UI listens on `nulldc-debugger-announce` for
+- `wasm` builds use BroadcastChannel. The UI listens on `dreamcast-devtools-announce` for
   `{ id, name, timestamp }` announcements and talks to the selected emulator on
-  `nulldc-debugger-<id>`. It posts `ping` every second and treats three seconds without a `pong`
+  `dreamcast-devtools-<id>`. It posts `ping` every second and treats three seconds without a `pong`
   as a lost connection. With exactly one announced emulator the UI connects on its own;
   otherwise it shows the connection picker.
 
