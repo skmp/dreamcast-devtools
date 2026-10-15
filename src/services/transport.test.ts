@@ -261,11 +261,15 @@ describe("BroadcastChannelTransport", () => {
       channel.addEventListener("message", (event) => resolve((event as MessageEvent).data), { once: true });
     });
 
-  it("talks JSON strings and ArrayBuffers on nulldc-debugger-<id>, pings, and closes when the pongs stop", async () => {
+  it("talks JSON strings and ArrayBuffers on dreamcast-devtools-<id>, pings, and closes when the pongs stop", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const id = `test-${process.pid}-${Date.now()}`;
-    const emulator = new BroadcastChannel(`nulldc-debugger-${id}`);
+    const emulator = new BroadcastChannel(`dreamcast-devtools-${id}`);
+    // the name the channel had before the UI was called Dreamcast DevTools: nothing is said there
+    const before = new BroadcastChannel(`nulldc-debugger-${id}`);
+    const saidBefore: unknown[] = [];
+    before.addEventListener("message", (event) => saidBefore.push((event as MessageEvent).data));
     const transport = new BroadcastChannelTransport();
     const states: TransportState[] = [];
     const texts: string[] = [];
@@ -324,9 +328,11 @@ describe("BroadcastChannelTransport", () => {
       expect(states).toEqual(["open", "closed"]);
       expect(vi.getTimerCount()).toBe(0);
       expect(() => transport.send("x")).toThrow("Not Connected");
+      expect(saidBefore).toEqual([]);
     } finally {
       transport.disconnect();
       emulator.close();
+      before.close();
     }
   });
 });
@@ -334,6 +340,43 @@ describe("BroadcastChannelTransport", () => {
 describe("ConnectionDiscovery", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  /**
+   * Resolves when a message posted now on `name` has reached every other channel of that name
+   * (a message without an id, which discovery leaves alone).
+   */
+  const delivered = (name: string) =>
+    new Promise<void>((resolve) => {
+      const listener = new BroadcastChannel(name);
+      const poster = new BroadcastChannel(name);
+      listener.addEventListener("message", () => {
+        listener.close();
+        poster.close();
+        resolve();
+      });
+      poster.postMessage({ delivered: true });
+    });
+
+  it("in a wasm build hears the emulators that announce themselves on dreamcast-devtools-announce, and on no other channel", async () => {
+    const discovery = new ConnectionDiscovery("wasm");
+    discovery.start();
+    const emulator = new BroadcastChannel("dreamcast-devtools-announce");
+    // the name the channel had before the UI was called Dreamcast DevTools
+    const before = new BroadcastChannel("nulldc-debugger-announce");
+    try {
+      before.postMessage({ id: "guid-old", name: "an emulator of the old name", timestamp: Date.now() });
+      await delivered("nulldc-debugger-announce");
+      expect(discovery.getAvailableConnections()).toEqual([]);
+
+      emulator.postMessage(JSON.stringify({ id: "guid-1", name: "nullDC", timestamp: Date.now() }));
+      await delivered("dreamcast-devtools-announce");
+      expect(discovery.getAvailableConnections()).toEqual([{ id: "guid-1", name: "nullDC", mode: "wasm", lastSeen: expect.any(Number) }]);
+    } finally {
+      discovery.stop();
+      emulator.close();
+      before.close();
+    }
   });
 
   it("in a native build lists /ws of the page, named by its host alone: nobody has said yet who is there", () => {

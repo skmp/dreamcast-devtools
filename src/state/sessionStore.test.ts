@@ -134,8 +134,8 @@ class PageChannel {
  * being closed: from then on it says nothing.
  */
 const emulator = (id: string) => {
-  const announcements = new PageChannel("nulldc-debugger-announce");
-  const channel = new PageChannel(`nulldc-debugger-${id}`);
+  const announcements = new PageChannel("dreamcast-devtools-announce");
+  const channel = new PageChannel(`dreamcast-devtools-${id}`);
   const requests: string[] = [];
   channel.addEventListener("message", ({ data }) => {
     if (data === "ping") {
@@ -454,7 +454,7 @@ describe("a session whose server is gone", () => {
     expect(store.getState().connectionState).toBe("reconnecting");
     await vi.advanceTimersByTimeAsync(20_000);
     expect(store.getState()).toMatchObject({ connectionState: "reconnecting", retry: { attempt: 1, waitingForAnnouncement: true } });
-    expect(channels.get("nulldc-debugger-guid-1")?.size ?? 0).toBe(0);
+    expect(channels.get("dreamcast-devtools-guid-1")?.size ?? 0).toBe(0);
 
     // The emulator is started again in a new tab, with a new id: the session goes there, and
     // the new server is described.
@@ -464,6 +464,9 @@ describe("a session whose server is gone", () => {
     expect(store.getState().retry).toBeUndefined();
     expect(second.requests).toEqual(["debugger.describe"]);
     expect(first.requests).toEqual(["debugger.describe"]);
+
+    // the page has listened and talked on the channels of Dreamcast DevTools, and on no other
+    expect([...channels.keys()].sort()).toEqual(["dreamcast-devtools-announce", "dreamcast-devtools-guid-1", "dreamcast-devtools-guid-2"]);
 
     store.getState().disconnect();
     store.getState().stopDiscovery();

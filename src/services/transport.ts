@@ -332,7 +332,7 @@ export class BroadcastChannelTransport extends BaseTransport {
 
     this.state = "connecting";
     // endpoint is the GUID for broadcast channel mode
-    const channelName = `nulldc-debugger-${endpoint}`;
+    const channelName = `dreamcast-devtools-${endpoint}`;
     const channel = new BroadcastChannel(channelName);
     this.channel = channel;
 
@@ -470,7 +470,7 @@ export class ConnectionDiscovery {
     }
 
     // Listen for announcements
-    this.announcementChannel = new BroadcastChannel("nulldc-debugger-announce");
+    this.announcementChannel = new BroadcastChannel("dreamcast-devtools-announce");
     this.announcementChannel.addEventListener("message", (event) => {
       try {
         // Handle both JSON string and object formats
