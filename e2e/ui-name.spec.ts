@@ -130,7 +130,7 @@ test("the documentation names the UI and the emulator it is for; no page of a to
   }
 });
 
-test("where the UI names the emulator it says nullDC", async ({ page }) => {
+test("where the UI names the emulator it says what the emulator calls itself: nullDC (mock)", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
   await page.getByRole("button", { name: "About", exact: true }).click();
   const dialog = page.getByRole("dialog");
@@ -141,5 +141,5 @@ test("where the UI names the emulator it says nullDC", async ({ page }) => {
 
   await statusBar(page).getByText(/^Endpoint:/).click();
   const picker = page.getByRole("dialog");
-  await expect(picker.getByRole("radio", { name: /nullDC @ 127\.0\.0\.1:\d+/ })).toBeChecked();
+  await expect(picker.getByRole("radio", { name: /^nullDC \(mock\) @ 127\.0\.0\.1:\d+/ })).toBeChecked();
 });

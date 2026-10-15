@@ -19,6 +19,14 @@ import { defaultAnswer, serveScriptedDebugger } from "./support/scriptedDebugger
 const connectButton = (page: Page) => page.getByRole("button", { name: "Connect", exact: true });
 const disconnectButton = (page: Page) => page.getByRole("button", { name: "Disconnect", exact: true });
 
+/**
+ * The entry of the connection picker that is labelled `label`: the host of the endpoint, or
+ * "<emulator> @ <host>" once the emulator there has described itself. The URL of the endpoint,
+ * and where it comes from, follow the label in the name of the entry.
+ */
+const pickerEntry = (dialog: Locator, label: string) =>
+  dialog.getByRole("radio", { name: new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\d.:])`) });
+
 test("a workspace connects by itself to /ws on the origin that served the page", async ({ page, mock, rpc }) => {
   await gotoRoute(page, "/workspace/sh4-debugger");
 
@@ -637,12 +645,66 @@ test("the endpoint in the status bar opens the connection picker with the same-o
 
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Select Connection" })).toBeVisible();
-  await expect(dialog.getByRole("radio", { name: new RegExp(`nullDC @ 127\\.0\\.0\\.1:${mock.port}`) })).toBeChecked();
+  // the emulator there has described itself: the entry has the name it gave, in front of the host
+  await expect(pickerEntry(dialog, `nullDC (mock) @ 127.0.0.1:${mock.port}`)).toBeChecked();
   await expect(dialog).toContainText(mock.wsURL);
 
   await dialog.getByRole("button", { name: "Connect", exact: true }).click();
   await expect(dialog).toBeHidden();
   await expect(statusBar(page)).toContainText("Connection: connected");
+});
+
+test("an endpoint in the picker is its host until the emulator there has described itself, then <the name it gave> @ <host>", async ({
+  page,
+  mock,
+}) => {
+  // an emulator that is not called nullDC, and answers debugger.describe when the test says so
+  const server = await serveScriptedDebugger(page);
+  const describedAs = (name: string) => {
+    server.shape = { ...server.shape, emulator: { name, version: "e2e", build: "native" } };
+  };
+  describedAs("Other Emu");
+  const held: Array<() => void> = [];
+  server.answer("debugger.describe", () => new Promise((resolve) => held.push(() => resolve(server.shape))));
+  const host = `127.0.0.1:${mock.port}`;
+
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await expect.poll(() => held.length).toBe(1);
+  await statusBar(page).getByText(/^Endpoint:/).click();
+  const dialog = page.getByRole("dialog");
+  // connected, and the emulator has not answered yet: the host alone
+  await expect(pickerEntry(dialog, host)).toBeChecked();
+  await expect(dialog.getByRole("radiogroup").getByRole("radio")).toHaveCount(1);
+  await expect(dialog).not.toContainText("Other Emu");
+
+  // its answer names it, in the picker that is open
+  held.shift()?.();
+  await expect(pickerEntry(dialog, `Other Emu @ ${host}`)).toBeChecked();
+  await expect(dialog.getByRole("radiogroup").getByRole("radio")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+
+  // The connection is lost, and the page is back on its own. The server there now is another
+  // one: until it has answered, the name of the one before is not shown.
+  describedAs("Another Emu");
+  server.drop();
+  await expect.poll(() => held.length).toBe(1);
+  expect(server.connections()).toBe(2);
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await statusBar(page).getByText(/^Endpoint:/).click();
+  await expect(pickerEntry(dialog, host)).toBeChecked();
+  await expect(dialog).not.toContainText(" @ ");
+  held.shift()?.();
+  await expect(pickerEntry(dialog, `Another Emu @ ${host}`)).toBeChecked();
+  await page.keyboard.press("Escape");
+
+  // disconnected: nobody is known to be there
+  await disconnectButton(page).click();
+  await expect(statusBar(page)).toContainText("Connection: idle");
+  await statusBar(page).getByText(/^Endpoint:/).click();
+  await expect(pickerEntry(dialog, host)).toBeChecked();
+  await expect(dialog).not.toContainText(" @ ");
 });
 
 test("the endpoint in the status bar is a button: the connection picker opens from the keyboard", async ({ page, mock }) => {
@@ -702,11 +764,15 @@ test("a manually entered WebSocket URL connects", async ({ page, mock, rpc }) =>
     await expect(panel(page, "watches")).toContainText("dc.aica.arm7.pc = 0x002000");
     // the picker lists both, best first
     await statusBar(page).getByText(/^Endpoint:/).click();
+    // the one the session is connected to has the emulator's name; the page's own, where the
+    // session is not connected, its host alone
+    await expect(pickerEntry(dialog, `nullDC (mock) @ 127.0.0.1:${other.port}`)).toBeChecked();
     await expect(dialog.getByRole("radio", { name: /Last manual entry/ })).toBeChecked();
+    await expect(pickerEntry(dialog, `127.0.0.1:${mock.port}`)).not.toBeChecked();
     await expect(dialog.getByRole("radiogroup").getByRole("radio")).toHaveCount(2);
 
     // picking the endpoint of the page puts the manual entry away
-    await dialog.getByRole("radio", { name: new RegExp(`nullDC @ 127\\.0\\.0\\.1:${mock.port}`) }).check();
+    await pickerEntry(dialog, `127.0.0.1:${mock.port}`).check();
     await connect.click();
     await expect(statusBar(page)).toContainText(`Endpoint: ${mock.wsURL}`);
     await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
@@ -741,7 +807,8 @@ test("?ws= in front of the # selects the endpoint, and survives what the panels 
     await statusBar(page).getByText(/^Endpoint:/).click();
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByRole("radio", { name: /From the address bar \(\?ws=\)/ })).toBeChecked();
-    await expect(dialog.getByRole("radio", { name: new RegExp(`nullDC @ 127\\.0\\.0\\.1:${mock.port}`) })).not.toBeChecked();
+    await expect(pickerEntry(dialog, `nullDC (mock) @ 127.0.0.1:${other.port}`)).toBeChecked();
+    await expect(pickerEntry(dialog, `127.0.0.1:${mock.port}`)).not.toBeChecked();
     await expect(dialog.getByRole("radiogroup").getByRole("radio")).toHaveCount(2);
 
     // something that is not a WebSocket URL is not an endpoint: the page's own is used
@@ -803,11 +870,22 @@ test("an endpoint named by ?ws= that does not answer is tried again, and the pag
   // the page's own endpoint is there to be picked, by the user
   await statusBar(page).getByText(/^Endpoint:/).click();
   const dialog = page.getByRole("dialog");
+  // nothing has answered at either endpoint: each entry is its host alone
+  const namedHost = new URL(named).host;
   await expect(dialog.getByRole("radio", { name: /From the address bar \(\?ws=\)/ })).toBeChecked();
-  await dialog.getByRole("radio", { name: new RegExp(`nullDC @ 127\\.0\\.0\\.1:${mock.port}`) }).check();
+  await expect(pickerEntry(dialog, namedHost)).toBeChecked();
+  await expect(pickerEntry(dialog, `127.0.0.1:${mock.port}`)).not.toBeChecked();
+  await expect(dialog).not.toContainText(" @ ");
+  await pickerEntry(dialog, `127.0.0.1:${mock.port}`).check();
   await dialog.getByRole("button", { name: "Connect", exact: true }).click();
   await expect(statusBar(page)).toContainText("Connection: connected");
   await expect(statusBar(page)).toContainText(`Endpoint: ${mock.wsURL}`);
+  // now the page's own has answered, and the one of ?ws= still has not
+  await statusBar(page).getByText(/^Endpoint:/).click();
+  await expect(pickerEntry(dialog, `nullDC (mock) @ 127.0.0.1:${mock.port}`)).toBeChecked();
+  await expect(pickerEntry(dialog, namedHost)).not.toBeChecked();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
 
   // with a server the views open where it says, and their toolbars are there to be used
   await expect(disassemblyRows(disassembly)).toHaveCount(64);
