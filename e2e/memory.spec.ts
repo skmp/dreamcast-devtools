@@ -231,8 +231,9 @@ test("bytes the debugger cannot read are shown as ??, not as the zeros they are 
   await expect(memoryRows(view)).toHaveCount(60);
   await saveScreenshot(page, testInfo, "memory-unreadable");
   // that is what the server said: 960 bytes, and the run that could not be read
-  const answer = rpc.received.find((frame) => frame.id === rpc.sent.findLast((sent) => sent.method === "state.getMemorySlice")?.id);
-  expect(answer?.result).toMatchObject({ baseAddress: 0x0021ff60, unreadable: [[160, 800]] });
+  const lastAnswer = () => rpc.received.find((frame) => frame.id === rpc.sent.findLast((sent) => sent.method === "state.getMemorySlice")?.id);
+  await expect.poll(() => lastAnswer()?.result).toMatchObject({ baseAddress: 0x0021ff60, unreadable: [[160, 800]] });
+  const answer = lastAnswer();
   expect((answer?.result as { data: number[] }).data.slice(160)).toEqual(new Array(800).fill(0));
 
   // a range of which nothing can be read is refused by the server (-32010): the view shows that, and stays a view

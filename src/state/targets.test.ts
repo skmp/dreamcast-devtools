@@ -174,6 +174,12 @@ describe("register values", () => {
     }
   });
 
+  it("are no number when the 0x and its digits are not the whole value", () => {
+    for (const value of ["0x10zz", "0x200MHz", "R0=0x10", "x10"]) {
+      expect(registerNumber(value), value).toBeUndefined();
+    }
+  });
+
   it("the program counter is the register the target names, where the target says it is", () => {
     const registers = { "dc.aica.arm7": [{ name: "R0", value: "0x1", width: 32 }, { name: "PC", value: "0x00200010", width: 32 }] };
     expect(programCounter(registers, arm7)).toBe(0x200010);
