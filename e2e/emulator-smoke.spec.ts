@@ -196,7 +196,10 @@ test.describe("the UI the emulator serves, against that emulator", () => {
       note(`${EMULATOR_URL}: ${described.emulator.name} ${described.emulator.version} (${described.emulator.build}), protocol ${described.protocol}, ui ${described.ui}`);
       expect(described.protocol).toBe(3);
       expect(described.ui).not.toBe("none");
-      await expect(statusBar(page)).toContainText(`nullDC Debugger ${described.ui}`);
+      await expect(statusBar(page)).toContainText(`Dreamcast DevTools ${described.ui}`);
+      // the page the emulator serves is the UI of this name, and names the emulator nullDC
+      await expect(page).toHaveTitle("Dreamcast DevTools");
+      expect(described.emulator.name).toMatch(/^nullDC\b/);
       // And that bundle is the build of this checkout: the one in dist-native/, which the
       // set-up of the suite has just made the build of this tree. `ui` is its version, and
       // what the emulator serves is its files, byte for byte (a tree with changes keeps one

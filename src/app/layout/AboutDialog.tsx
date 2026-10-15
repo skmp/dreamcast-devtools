@@ -91,7 +91,7 @@ export const AboutDialog = ({ open, onClose }: AboutDialogProps) => {
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
-      <DialogTitle>About nullDC DevTools</DialogTitle>
+      <DialogTitle>About Dreamcast DevTools</DialogTitle>
       <DialogContent dividers>
         <Stack spacing={1.5}>
           <Typography variant="body2" color="text.secondary">

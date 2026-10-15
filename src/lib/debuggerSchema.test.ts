@@ -544,7 +544,7 @@ describe("request parameters carry the bounds of the protocol", () => {
     expect(accepts("state.getTable", { id: "sq" })).toBe(true);
     expect(accepts("state.getTable", { id: "vram" })).toBe(false);
     expect(accepts("state.captureHolly", { what: "ta" })).toBe(true);
-    expect(accepts("debugger.describe", { protocol: 3, client: "nullDC DevTools" })).toBe(true);
+    expect(accepts("debugger.describe", { protocol: 3, client: "Dreamcast DevTools" })).toBe(true);
     expect(accepts("debugger.describe", {})).toBe(true);
   });
 });

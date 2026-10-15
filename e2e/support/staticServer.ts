@@ -17,7 +17,7 @@ export interface StaticServer {
  * sub-path, so anything in it that uses an absolute URL breaks.
  */
 export const startStaticServer = async (mount = "ui"): Promise<StaticServer> => {
-  const root = mkdtempSync(join(tmpdir(), "nulldc-devtools-static-"));
+  const root = mkdtempSync(join(tmpdir(), "dreamcast-devtools-static-"));
   symlinkSync(DIST_DIR, join(root, mount), "dir");
   let origin = "";
   let log = "";

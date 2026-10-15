@@ -47,6 +47,25 @@ describe("DebuggerClient", () => {
     expect(client.serverProtocol).toBeUndefined();
   });
 
+  it("describe names the UI Dreamcast DevTools, with the version of the build when it has one", async () => {
+    const clientOf = async () => {
+      const transport = new FakeTransport();
+      const described = new DebuggerClient({ mode: "native", endpoint: "ws://test/ws", transport }).describe();
+      const client = (transport.sent[0] as { params: { client: string } }).params.client;
+      transport.respond(v3Describe);
+      await described;
+      return client;
+    };
+    try {
+      // the build defines __APP_VERSION__ (vite.config.ts); the unit tests do not
+      expect(await clientOf()).toBe("Dreamcast DevTools");
+      vi.stubGlobal("__APP_VERSION__", "3.0.0-pre+d59336b");
+      expect(await clientOf()).toBe("Dreamcast DevTools 3.0.0-pre+d59336b");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("delivers ticks to handlers that were registered before describe, in the same turn as the response", async () => {
     const { transport, client } = setup();
     const ticks: number[] = [];

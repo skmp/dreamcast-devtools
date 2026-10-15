@@ -41,7 +41,7 @@ test("the first request is debugger.describe and the tick that follows populates
     jsonrpc: "2.0",
     id: 1,
     method: "debugger.describe",
-    params: { protocol: 3, client: expect.stringMatching(/^nullDC DevTools 3\.\d+\.\d+/) },
+    params: { protocol: 3, client: expect.stringMatching(/^Dreamcast DevTools 3\.\d+\.\d+/) },
   });
   // A running server sends its periodic tick to every connection, so one can arrive before
   // the response. The tick that follows the response is the one for this client, a full one.

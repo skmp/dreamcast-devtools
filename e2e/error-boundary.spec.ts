@@ -161,7 +161,7 @@ test("a failed page does not block navigation", async ({ page, diagnostics }) =>
   await page.evaluate(() => {
     window.location.hash = "#/";
   });
-  await expect(page.getByRole("heading", { name: "Welcome to the nullDC DevTools" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Welcome to Dreamcast DevTools" })).toBeVisible();
   await expect(failure(page)).toHaveCount(0);
 
   await page.getByRole("button", { name: /^Documentation\b/ }).click();

@@ -93,7 +93,7 @@ export const HomePage = () => {
         <Stack spacing={6} alignItems="center">
           <Stack spacing={2} alignItems="center" textAlign="center">
             <Typography variant="h3" fontWeight={700} sx={{ color: "text.primary" }}>
-              Welcome to the nullDC DevTools
+              Welcome to Dreamcast DevTools
             </Typography>
             <Typography variant="h6" sx={{ color: "text.secondary", maxWidth: 720 }}>
               Dive into Dreamcast with curated workspaces for CPU, GPU, and audio debugging, as well as sh4 simulator and dsp authoring tools.

@@ -32,7 +32,7 @@ export interface DebuggerClientConfig {
 const BINARY_FRAME_TIMEOUT_MS = 10_000;
 
 const defaultClientName = (): string =>
-  typeof __APP_VERSION__ === "string" ? `nullDC DevTools ${__APP_VERSION__}` : "nullDC DevTools";
+  typeof __APP_VERSION__ === "string" ? `Dreamcast DevTools ${__APP_VERSION__}` : "Dreamcast DevTools";
 
 /** What a binary request's JSON result says about the frame that follows it. */
 interface BinaryAnnouncement {

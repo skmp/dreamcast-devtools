@@ -635,7 +635,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
           </Link>
         </Tooltip>
         <Box sx={{ flexGrow: 1 }} />
-        <Typography variant="caption">nullDC Debugger {DEBUGGER_VERSION}</Typography>
+        <Typography variant="caption">Dreamcast DevTools {DEBUGGER_VERSION}</Typography>
       </Box>
       <AboutDialog open={aboutOpen} onClose={hideAbout} />
       <ConnectionModal open={showConnectionModal} onClose={() => setShowConnectionModal(false)} />

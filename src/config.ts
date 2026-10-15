@@ -17,7 +17,7 @@ export const appConfig: TransportConfig = {
   mode: TRANSPORT_MODE,
   websocketPath: import.meta.env.VITE_WS_PATH ?? "/ws",
   broadcastChannel: import.meta.env.VITE_BROADCAST_CHANNEL ?? "nulldc-debugger",
-  clientName: "nullDC DevTools",
+  clientName: "Dreamcast DevTools",
   clientVersion: "0.1.0",
 };
 

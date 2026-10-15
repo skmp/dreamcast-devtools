@@ -5,7 +5,7 @@ import { test, expect, gotoRoute, openWorkspace, panel, saveScreenshot, statusBa
 
 test("/ lists the four workspaces, the four tools, documentation and about", async ({ page }) => {
   await gotoRoute(page, "/");
-  await expect(page.getByRole("heading", { name: "Welcome to the nullDC DevTools" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Welcome to Dreamcast DevTools" })).toBeVisible();
   for (const title of [
     "SH4 Debugger",
     "ARM7 Debugger",
@@ -56,7 +56,7 @@ for (const workspace of WORKSPACES) {
       diagnostics.allow(...KNOWN.sgcNoData);
     }
     await openWorkspace(page, workspace);
-    await expect(statusBar(page)).toContainText(/nullDC Debugger 3\.0\.0/);
+    await expect(statusBar(page)).toContainText(/Dreamcast DevTools 3\.0\.0/);
     await expect(panel(page, "device-tree")).toBeVisible();
     await expect(panel(page, "watches")).toBeVisible();
     await page.waitForLoadState("networkidle");
@@ -98,7 +98,7 @@ test("/tool/holly-ta-log-analyzer is a placeholder", async ({ page }) => {
 test("an unknown route redirects to the home page", async ({ page }) => {
   await gotoRoute(page, "/no/such/route");
   await expect(page).toHaveURL(/#\/$/);
-  await expect(page.getByRole("heading", { name: "Welcome to the nullDC DevTools" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Welcome to Dreamcast DevTools" })).toBeVisible();
 });
 
 test("the navigation dropdown switches between workspaces, tools and pages", async ({ page }) => {

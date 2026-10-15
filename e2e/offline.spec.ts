@@ -118,7 +118,7 @@ test.describe("with every other origin unreachable", () => {
     const attempted = await blockOtherOrigins(page);
 
     await gotoRoute(page, "/");
-    await expect(page.getByRole("heading", { name: "Welcome to the nullDC DevTools" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Welcome to Dreamcast DevTools" })).toBeVisible();
     await gotoRoute(page, "/docs");
     await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
     for (const workspace of WORKSPACES) {
@@ -150,7 +150,7 @@ test("the home page loads without the workspace, tool and editor code", async ({
     }
   });
   await gotoRoute(page, "/");
-  await expect(page.getByRole("heading", { name: "Welcome to the nullDC DevTools" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Welcome to Dreamcast DevTools" })).toBeVisible();
   await page.waitForLoadState("networkidle");
 
   const names = [...scripts.keys()];
@@ -198,7 +198,7 @@ test.describe("served as plain files from a sub-path (python3 -m http.server)", 
     });
     try {
       await page.goto(server.url);
-      await expect(page.getByRole("heading", { name: "Welcome to the nullDC DevTools" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Welcome to Dreamcast DevTools" })).toBeVisible();
 
       await page.goto(`${server.url}#/docs`);
       await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();

@@ -22,7 +22,7 @@ import { expectMonacoReady, monacoEditor, monacoTokenClasses } from "./support/m
 
 const failure = (scope: Page | Locator): Locator => scope.locator("[data-error-boundary]");
 const reloadPage = (scope: Page | Locator): Locator => scope.getByRole("button", { name: "Reload page" });
-const homeHeading = (page: Page) => page.getByRole("heading", { name: "Welcome to the nullDC DevTools" });
+const homeHeading = (page: Page) => page.getByRole("heading", { name: "Welcome to Dreamcast DevTools" });
 const NO_ANSWER = "The server does not answer, so the page was not reloaded.";
 
 interface Marked {
@@ -181,7 +181,7 @@ for (const { route, shows } of [
     await expect(notice).toHaveCount(0);
     await about.click();
     const dialog = page.getByRole("dialog");
-    await expect(dialog.getByRole("heading", { name: "About nullDC DevTools" })).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "About Dreamcast DevTools" })).toBeVisible();
     await expect(page).toHaveURL(/\?about=1$/);
     await dialog.getByRole("button", { name: "Close" }).click();
     await expect(dialog).toBeHidden();

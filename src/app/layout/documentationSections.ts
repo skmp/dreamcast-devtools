@@ -22,7 +22,7 @@ export const documentationSections: DocumentationSection[] = [
     title: "Overview",
     level: 1,
     content: [
-      "nullDC DevTools is the web debugger UI for nullDC 3.0.0, the Dreamcast emulator.",
+      "Dreamcast DevTools is the web debugger UI for nullDC 3.0.0, the Dreamcast emulator.",
       "It talks JSON-RPC 2.0 to the emulator, or to the mock server that ships in the DevTools repository.",
     ],
   },

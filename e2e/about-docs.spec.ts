@@ -5,7 +5,7 @@ test("About on the home page shows the DevTools version and asks for a connectio
   await page.getByRole("button", { name: /^About\b/ }).click();
 
   const dialog = page.getByRole("dialog");
-  await expect(dialog.getByRole("heading", { name: "About nullDC DevTools" })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "About Dreamcast DevTools" })).toBeVisible();
   await expect(dialog).toContainText(/DevTools\s*3\.0\.0/);
   await expect(dialog).toContainText("Connect to the debugger to view emulator details.");
   await expect(dialog).toContainText("Connection state: idle");
@@ -50,7 +50,7 @@ test("the About button exists on every tool page and on the docs page", async ({
   ]) {
     await gotoRoute(page, route);
     await page.getByRole("button", { name: "About", exact: true }).click();
-    await expect(page.getByRole("dialog").getByRole("heading", { name: "About nullDC DevTools" })).toBeVisible();
+    await expect(page.getByRole("dialog").getByRole("heading", { name: "About Dreamcast DevTools" })).toBeVisible();
     await page.getByRole("dialog").getByRole("button", { name: "Close" }).click();
     await expect(page.getByRole("dialog")).toBeHidden();
   }
