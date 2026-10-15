@@ -520,9 +520,11 @@ export class ConnectionDiscovery {
     const { host } = globalThis.location;
     const url = sameOriginWebSocketUrl(globalThis.location);
 
+    // the host alone: who is there is known when the emulator has described itself
+    // (the session store names an endpoint after that, sessionStore.ts endpointLabel)
     const connection: AvailableConnection = {
       id: url,
-      name: `nullDC @ ${host}`,
+      name: host,
       mode: "native",
       lastSeen: Date.now(),
     };

@@ -38,6 +38,65 @@ class RefusedSocket extends SilentSocket {
   }
 }
 
+/**
+ * The server behind DescribingSocket: the name it describes itself with, whether it holds its
+ * answer to debugger.describe back (`held` sends what it holds), and whether it answers
+ * "emulator busy" instead.
+ */
+const server = { name: "Other Emu", hold: false, busy: false, held: [] as Array<() => void>, sockets: [] as DescribingSocket[] };
+
+/** A socket to a server that is there: it opens, and debugger.describe is answered with `server.name`. */
+class DescribingSocket extends SilentSocket {
+  private listeners = new Map<string, Array<(event: unknown) => void>>();
+
+  constructor(url: string) {
+    super(url);
+    server.sockets.push(this);
+    queueMicrotask(() => {
+      this.readyState = 1;
+      this.emit("open", {});
+    });
+  }
+
+  addEventListener(type?: string, listener?: (event: unknown) => void) {
+    if (type && listener) {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+  }
+
+  send(payload?: string) {
+    const request = JSON.parse(String(payload)) as { id: number; method: string };
+    if (request.method !== "debugger.describe") {
+      return;
+    }
+    const result = {
+      emulator: { name: server.name, version: "test", build: "native" },
+      protocol: 3,
+      ui: "none",
+      capabilities: [],
+      targets: [],
+      deviceTree: [],
+    };
+    const response = server.busy ? { error: { code: -32000, message: "emulator busy" } } : { result };
+    const answer = () => this.emit("message", { data: JSON.stringify({ jsonrpc: "2.0", id: request.id, ...response }) });
+    if (server.hold) {
+      server.held.push(answer);
+    } else {
+      queueMicrotask(answer);
+    }
+  }
+
+  /** The server goes away. */
+  drop() {
+    this.readyState = 3;
+    this.emit("close", { code: 1006 });
+  }
+
+  private emit(type: string, event: unknown) {
+    this.listeners.get(type)?.forEach((listener) => listener(event));
+  }
+}
+
 /** The BroadcastChannel of one page: what one channel posts, the others of its name get. */
 const channels = new Map<string, Set<PageChannel>>();
 
@@ -125,6 +184,7 @@ beforeEach(() => {
   storage.clear();
   sockets.length = 0;
   channels.clear();
+  Object.assign(server, { name: "Other Emu", hold: false, busy: false, held: [], sockets: [] });
   vi.resetModules();
   vi.stubGlobal("WebSocket", SilentSocket);
 });
@@ -140,12 +200,13 @@ describe("the endpoint of a native build", () => {
     storage.set(LAST_MANUAL_ENDPOINT_KEY, "ws://typed:3/ws");
     const store = await load("?ws=ws%3A%2F%2Ffrom-query%3A2%2Fws&other=1");
 
+    // no emulator has answered yet: each is named by its host, and says where it comes from
     store.getState().startDiscovery();
-    expect(store.getState().availableConnections.map(({ id, source, name, mode }) => ({ id, source, name, mode }))).toEqual([
-      { id: "ws://from-query:2/ws", source: "query", name: "From the address bar (?ws=)", mode: "native" },
-      { id: "ws://typed:3/ws", source: "manual", name: "Last manual entry", mode: "native" },
-      { id: "ws://build-default:1/ws", source: "env", name: "Build default (VITE_WS_URL)", mode: "native" },
-      { id: PAGE_ENDPOINT, source: "same-origin", name: "nullDC @ 127.0.0.1:55543", mode: "native" },
+    expect(store.getState().availableConnections.map(({ id, source, name, sourceText, mode }) => ({ id, source, name, sourceText, mode }))).toEqual([
+      { id: "ws://from-query:2/ws", source: "query", name: "from-query:2", sourceText: "From the address bar (?ws=)", mode: "native" },
+      { id: "ws://typed:3/ws", source: "manual", name: "typed:3", sourceText: "Last manual entry", mode: "native" },
+      { id: "ws://build-default:1/ws", source: "env", name: "build-default:1", sourceText: "Build default (VITE_WS_URL)", mode: "native" },
+      { id: PAGE_ENDPOINT, source: "same-origin", name: "127.0.0.1:55543", sourceText: undefined, mode: "native" },
     ]);
 
     // without being told anything, the page connects to the first
@@ -208,6 +269,82 @@ describe("the endpoint of a native build", () => {
     void store.getState().connect();
     void store.getState().connect();
     expect(sockets).toEqual([PAGE_ENDPOINT]);
+    store.getState().disconnect();
+  });
+});
+
+describe("the name of an endpoint in the picker", () => {
+  const names = (store: Awaited<ReturnType<typeof load>>) => store.getState().availableConnections.map((candidate) => candidate.name);
+
+  it("is its host until the emulator there has answered debugger.describe, then <the name it gave> @ <host>", async () => {
+    vi.stubGlobal("WebSocket", DescribingSocket);
+    server.hold = true;
+    const store = await load("?ws=ws%3A%2F%2Ffrom-query%3A2%2Fws");
+    store.getState().startDiscovery();
+    expect(names(store)).toEqual(["from-query:2", "127.0.0.1:55543"]);
+
+    // connecting, and connected while the answer to debugger.describe is still on its way
+    void store.getState().connect({ connectionId: PAGE_ENDPOINT, force: true });
+    expect(store.getState().connectionState).toBe("connecting");
+    expect(names(store)).toEqual(["from-query:2", "127.0.0.1:55543"]);
+    await vi.waitFor(() => expect(server.held).toHaveLength(1));
+    expect(store.getState().connectionState).toBe("connected");
+    expect(names(store)).toEqual(["from-query:2", "127.0.0.1:55543"]);
+
+    // the answer names the emulator; the endpoint the session is not connected to stays its host
+    server.held.shift()?.();
+    await vi.waitFor(() => expect(names(store)).toEqual(["from-query:2", "Other Emu @ 127.0.0.1:55543"]));
+
+    // the server goes away: nobody is known to be there any more
+    server.sockets.at(-1)?.drop();
+    expect(store.getState().connectionState).toBe("reconnecting");
+    expect(names(store)).toEqual(["from-query:2", "127.0.0.1:55543"]);
+
+    // Another emulator on that endpoint. Until it has answered, the name the one before gave is
+    // not shown (the data store still has what that one said about itself); then its own.
+    server.name = "nullDC";
+    void store.getState().connect({ force: true });
+    await vi.waitFor(() => expect(server.held).toHaveLength(1));
+    expect(store.getState().connectionState).toBe("connected");
+    expect(names(store)).toEqual(["from-query:2", "127.0.0.1:55543"]);
+    server.held.shift()?.();
+    await vi.waitFor(() => expect(names(store)).toEqual(["from-query:2", "nullDC @ 127.0.0.1:55543"]));
+    // a page loaded again starts from the host: no name is stored
+    expect([...storage.values()].join()).not.toContain("nullDC");
+
+    store.getState().disconnect();
+    expect(names(store)).toEqual(["from-query:2", "127.0.0.1:55543"]);
+  });
+
+  it("is its host after a failed connection, and while the server does not describe itself", async () => {
+    vi.stubGlobal("WebSocket", RefusedSocket);
+    const refused = await load();
+    void refused.getState().connect();
+    await vi.waitFor(() => expect(refused.getState().connectionState).toBe("reconnecting"));
+    expect(names(refused)).toEqual(["127.0.0.1:55543"]);
+    refused.getState().disconnect();
+
+    // connected, but debugger.describe fails ("emulator busy"): nothing says who is there
+    vi.resetModules();
+    vi.stubGlobal("WebSocket", DescribingSocket);
+    server.busy = true;
+    const failure = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const store = await load();
+    const { useDebuggerDataStore } = await import("./debuggerDataStore");
+    void store.getState().connect();
+    await vi.waitFor(() => expect(useDebuggerDataStore.getState().initError).toMatch(/^debugger\.describe failed/));
+    expect(store.getState().connectionState).toBe("connected");
+    expect(names(store)).toEqual(["127.0.0.1:55543"]);
+    store.getState().disconnect();
+    expect(failure).toHaveBeenCalledWith("Failed to initialize debugger data", expect.anything());
+    failure.mockRestore();
+
+    // described, with no name: there is nothing to put in front of the host
+    server.busy = false;
+    server.name = " ";
+    void store.getState().connect({ force: true });
+    await vi.waitFor(() => expect(useDebuggerDataStore.getState().initialized).toBe(true));
+    expect(names(store)).toEqual(["127.0.0.1:55543"]);
     store.getState().disconnect();
   });
 });
@@ -293,6 +430,8 @@ describe("a session whose server is gone", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(store.getState()).toMatchObject({ mode: "wasm", connectionState: "connected", endpoint: "guid-1" });
     expect(first.requests).toEqual(["debugger.describe"]);
+    // an emulator that announced itself keeps the name it announced
+    expect(store.getState().availableConnections.map((candidate) => candidate.name)).toEqual(["emulator guid-1"]);
     await vi.advanceTimersByTimeAsync(1900);
     expect(store.getState().connectionState).toBe("connected");
 

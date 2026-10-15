@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BroadcastChannelTransport,
+  ConnectionDiscovery,
   WebSocketTransport,
   connectFailureMessage,
   isWebSocketUrl,
@@ -327,5 +328,24 @@ describe("BroadcastChannelTransport", () => {
       transport.disconnect();
       emulator.close();
     }
+  });
+});
+
+describe("ConnectionDiscovery", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("in a native build lists /ws of the page, named by its host alone: nobody has said yet who is there", () => {
+    vi.stubGlobal("location", { protocol: "http:", host: "127.0.0.1:55543" });
+    const discovery = new ConnectionDiscovery("native");
+    const seen: string[][] = [];
+    discovery.onConnectionsChanged((connections) => seen.push(connections.map((connection) => connection.name)));
+    discovery.start();
+    expect(discovery.getAvailableConnections()).toEqual([
+      { id: "ws://127.0.0.1:55543/ws", name: "127.0.0.1:55543", mode: "native", lastSeen: expect.any(Number) },
+    ]);
+    expect(seen).toEqual([["127.0.0.1:55543"]]);
+    discovery.stop();
   });
 });

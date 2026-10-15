@@ -14,9 +14,13 @@ import { SessionController, announcedEndpoint, type ConnectionState, type RetryI
 
 export type { ConnectionState };
 
-/** An endpoint the connection picker offers. `source` says where a WebSocket endpoint comes from. */
+/**
+ * An endpoint the connection picker offers. `source` says where a WebSocket endpoint comes
+ * from, and `sourceText` says it in words (the picker shows it under the URL).
+ */
 export interface ConnectionCandidate extends AvailableConnection {
   source?: EndpointSource;
+  sourceText?: string;
 }
 
 interface ConnectOptions {
@@ -47,12 +51,53 @@ interface SessionStore {
   setSelectedConnectionId: (id?: string) => void;
 }
 
-const SOURCE_NAMES: Record<EndpointSource, (host: string) => string> = {
-  query: () => "From the address bar (?ws=)",
-  manual: () => "Last manual entry",
-  env: () => "Build default (VITE_WS_URL)",
-  "same-origin": (host) => `nullDC @ ${host}`,
+/** Where an endpoint comes from, in words; the page's own `/ws` needs none. */
+const SOURCE_TEXTS: Record<EndpointSource, string | undefined> = {
+  query: "From the address bar (?ws=)",
+  manual: "Last manual entry",
+  env: "Build default (VITE_WS_URL)",
+  "same-origin": undefined,
 };
+
+/** The emulator that answered debugger.describe on the connection of the session: where, and the name it gave. */
+export interface DescribedEmulator {
+  endpoint: string;
+  name: string;
+}
+
+/**
+ * Who answered on the connection of the session, if anyone has: debugger.describe of this
+ * connection has been answered with a name. (`initialized` is of the current connection only:
+ * the session controller resets the data store when a connection ends, and every connection
+ * that opens describes its server again. `shape` alone is still what the server before said.)
+ */
+const describedEmulator = (session: { endpoint?: string }) => {
+  const data = useDebuggerDataStore.getState();
+  const name = data.shape?.emulator.name.trim();
+  if (!session.endpoint || !data.initialized || !name) {
+    return undefined;
+  }
+  return { endpoint: session.endpoint, name } satisfies DescribedEmulator;
+};
+
+/** The host of a WebSocket endpoint, with its port: "127.0.0.1:55543". */
+const hostOf = (url: string): string => {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
+};
+
+/**
+ * The name of a WebSocket endpoint in the picker: `<emulator> @ <host>` once the emulator there
+ * has answered debugger.describe on the connection of the session, with the name it gave (the
+ * emulator says "nullDC", the mock "nullDC (mock)"); the host alone before that (not connected,
+ * connecting, a failed connection) and for every endpoint the session is not connected to. The
+ * name is never kept from a connection before, and never stored.
+ */
+export const endpointLabel = (url: string, described?: DescribedEmulator): string =>
+  described?.endpoint === url ? `${described.name} @ ${hostOf(url)}` : hostOf(url);
 
 const readLastManual = (): string | null => {
   try {
@@ -77,9 +122,10 @@ const writeLastManual = (url: string | undefined) => {
 /**
  * The WebSocket endpoints of this page, best first: `?ws=` of the URL (the part before the
  * `#`: the routes and the memory panel own what comes after it), the last endpoint entered
- * by hand, `VITE_WS_URL` of the build, and `/ws` on the host that served the page.
+ * by hand, `VITE_WS_URL` of the build, and `/ws` on the host that served the page. Each is
+ * named by `endpointLabel`.
  */
-const webSocketCandidates = (): ConnectionCandidate[] =>
+const webSocketCandidates = (described: DescribedEmulator | undefined): ConnectionCandidate[] =>
   resolveWebSocketEndpoints({
     search: window.location.search,
     lastManual: readLastManual(),
@@ -87,13 +133,42 @@ const webSocketCandidates = (): ConnectionCandidate[] =>
     location: window.location,
   }).map(({ url, source }) => ({
     id: url,
-    name: SOURCE_NAMES[source](window.location.host),
+    name: endpointLabel(url, described),
     mode: "native" as const,
     lastSeen: Date.now(),
     source,
+    ...(SOURCE_TEXTS[source] ? { sourceText: SOURCE_TEXTS[source] } : {}),
   }));
 
 export const useSessionStore = create<SessionStore>()((set, get) => {
+  /**
+   * Names the WebSocket endpoints of the picker again (`endpointLabel`) when the description of
+   * the session's server changed. A connection that ends resets the data store, so this runs at
+   * the end of a connection too. An endpoint an emulator announced (wasm) keeps the name it gave
+   * there.
+   */
+  const relabel = () => {
+    const described = describedEmulator(get());
+    const current = get().availableConnections;
+    const next = current.map((candidate) => {
+      if (candidate.source === undefined) {
+        return candidate;
+      }
+      const name = endpointLabel(candidate.id, described);
+      return name === candidate.name ? candidate : { ...candidate, name };
+    });
+    if (next.some((candidate, index) => candidate !== current[index])) {
+      set({ availableConnections: next });
+    }
+  };
+
+  // what the server said about itself: only the description, not every tick, can change a name
+  useDebuggerDataStore.subscribe((data, before) => {
+    if (data.initialized !== before.initialized || data.shape !== before.shape) {
+      relabel();
+    }
+  });
+
   const controller = new SessionController<DebuggerClient>({
     createClient: (endpoint) =>
       new DebuggerClient({
@@ -128,7 +203,7 @@ export const useSessionStore = create<SessionStore>()((set, get) => {
     showConnectionModal: false,
     startDiscovery() {
       if (appConfig.mode === "native") {
-        set({ availableConnections: webSocketCandidates() });
+        set({ availableConnections: webSocketCandidates(describedEmulator(get())) });
         return;
       }
       const current = get();
@@ -163,7 +238,7 @@ export const useSessionStore = create<SessionStore>()((set, get) => {
       }
 
       const native = appConfig.mode === "native";
-      const candidates = native ? webSocketCandidates() : current.availableConnections;
+      const candidates = native ? webSocketCandidates(describedEmulator(current)) : current.availableConnections;
       let target: SessionEndpoint | undefined;
 
       const wanted = connectionId?.trim() || current.selectedConnectionId;
@@ -204,7 +279,7 @@ export const useSessionStore = create<SessionStore>()((set, get) => {
       set({
         selectedConnectionId: target.id,
         showConnectionModal: false,
-        ...(native ? { availableConnections: webSocketCandidates() } : {}),
+        ...(native ? { availableConnections: webSocketCandidates(describedEmulator(get())) } : {}),
       });
       await controller.start(target);
     },

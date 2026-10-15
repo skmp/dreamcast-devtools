@@ -106,7 +106,11 @@ export const ConnectionModal = ({ open, onClose }: ConnectionModalProps) => {
                       <Box>
                         <Typography variant="body2">{conn.name}</Typography>
                         <Typography variant="caption" color="text.secondary">
-                          {conn.mode === "wasm" ? `GUID: ${conn.id.substring(0, 8)}... • ${formatLastSeen(conn.lastSeen)}` : conn.id}
+                          {conn.mode === "wasm"
+                            ? `GUID: ${conn.id.substring(0, 8)}... • ${formatLastSeen(conn.lastSeen)}`
+                            : conn.sourceText
+                              ? `${conn.id} • ${conn.sourceText}`
+                              : conn.id}
                         </Typography>
                       </Box>
                     }
