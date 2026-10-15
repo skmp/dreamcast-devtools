@@ -196,15 +196,15 @@ describe("whether the ARM7 is held in reset", () => {
 
   it("is what ENABLED of its node says", () => {
     expect(arm7Held(registers("0x0"), arm7)).toBe(true);
-    expect(arm7Held(registers("0"), arm7)).toBe(true);
     expect(arm7Held(registers("0x00000000"), arm7)).toBe(true);
     expect(arm7Held(registers("0x1"), arm7)).toBe(false);
-    expect(arm7Held(registers("1"), arm7)).toBe(false);
   });
 
   it("is not assumed: no value, and a value that is no number, hold nothing", () => {
     expect(arm7Held(registers(undefined), arm7)).toBe(false);
     expect(arm7Held(registers("n/a"), arm7)).toBe(false);
+    // digits without "0x" are no value of a server of protocol v3
+    expect(arm7Held(registers("0"), arm7)).toBe(false);
     expect(arm7Held({}, arm7)).toBe(false);
   });
 

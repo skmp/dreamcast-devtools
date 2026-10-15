@@ -138,15 +138,15 @@ export const parseAddress = (target: Pick<DebuggerTarget, "addressRadix">, input
 
 /**
  * The number a register value stands for: hex digits after "0x", which is how every server of
- * protocol v3 sends a value, and hex digits without "0x" as well, which no server of protocol
- * v3 sends (the mock of protocol v2 did). "n/a" (the value cannot be read) and free text are
+ * protocol v3 sends a value. "n/a" (the value cannot be read), free text and digits without
+ * "0x" (which only the mock of protocol v2 sent; "01" among them, a 0 alone is no prefix) are
  * undefined.
  */
 export const registerNumber = (value: string | undefined): number | undefined => {
   if (value === undefined) {
     return undefined;
   }
-  const digits = /^(?:0x)?([0-9a-f]+)$/i.exec(value.trim());
+  const digits = /^0x([0-9a-f]+)$/i.exec(value.trim());
   if (!digits) {
     return undefined;
   }

@@ -156,15 +156,21 @@ describe("addresses", () => {
 });
 
 describe("register values", () => {
-  it("are hex numbers, with or without 0x", () => {
+  it("are hex numbers after 0x, as a server of protocol v3 sends them", () => {
     expect(registerNumber("0x8C0000A0")).toBe(0x8c0000a0);
     expect(registerNumber("0x004")).toBe(4);
-    expect(registerNumber("8c0000a0")).toBe(0x8c0000a0);
+    expect(registerNumber(" 0x10 ")).toBe(0x10);
   });
 
-  it("are no number when they cannot be read or are text", () => {
-    for (const value of [undefined, "n/a", "", "200MHz", "fast", "0x", "0xFFFFFFFFFFFFFFFFFFFF"]) {
+  it("are no number when they cannot be read or are text, or are digits without 0x", () => {
+    for (const value of [undefined, "n/a", "", "200MHz", "fast", "0x", "0xFFFFFFFFFFFFFFFFFFFF", "8c0000a0", "0", "1", "10"]) {
       expect(registerNumber(value), String(value)).toBeUndefined();
+    }
+  });
+
+  it("are no number when they are digits with a leading 0 and no x: a 0 alone is no prefix", () => {
+    for (const value of ["01", "00", "08c0000a0"]) {
+      expect(registerNumber(value), value).toBeUndefined();
     }
   });
 
