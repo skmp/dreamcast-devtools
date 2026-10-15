@@ -1,6 +1,7 @@
-# nullDC DevTools
+# Dreamcast DevTools
 
-Web debugger UI for nullDC 3.0.0, the Dreamcast emulator. React 19, TypeScript, Vite.
+Dreamcast DevTools is the web debugger UI for nullDC 3.0.0, the Dreamcast emulator. React 19,
+TypeScript, Vite.
 
 The emulator serves the built UI and speaks the protocol described below. This repository also
 contains a mock server that implements the same protocol, so the UI can be developed without an
@@ -214,8 +215,9 @@ Mock server, on the command line (`npm run mock:serve -- --start-paused`):
 | `--m2` | Implement what the emulator does in milestone M2 and nothing more: the SH4 and the ARM7 step, the DSP does not; memory writes and reset; register writes of `dc.sh4.cpu` and of `dc.aica.arm7` (but `ENABLED`) alone, every other register answers -32013 and carries no `flags.writable`; no SGC capture. |
 | `--arm7-held` | Start with the ARM7 held in reset, as behind a reset: `ENABLED` reads 0, and the machine releases it when it has run for 8 emulation steps. |
 
-The version shown in the status bar and the About dialog is the `package.json` version, followed by
-`+<git describe --tags --always --dirty>` when the build runs inside a git checkout.
+The status bar reads `Dreamcast DevTools <version>`. The version shown there and in the About
+dialog is the `package.json` version, followed by `+<git describe --tags --always --dirty>` when
+the build runs inside a git checkout.
 
 ## Connecting
 
@@ -494,7 +496,9 @@ Protocol version 3: JSON-RPC 2.0, one message per text frame over that single co
 batches, no subscribe/unsubscribe. The zod schemas in `src/lib/debuggerSchema.ts` are the
 reference for every parameter, result, error code and bound; what follows is the outline.
 
-- The client's first request is `debugger.describe` with `{ protocol: 3, client }`. The result
+- The client's first request is `debugger.describe` with `{ protocol: 3, client }`; `client` is
+  free text the server may log (`Dreamcast DevTools <version>` from the UI, `Dreamcast DevTools
+  contract runner` from the contract runner), and no server acts on it. The result
   has `emulator` (`name`, `version`, `build`), `protocol`, `ui` (the version of the UI bundle the
   server embeds, or `"none"`), `capabilities`, `targets` and `deviceTree`. A server says what it
   implements through `capabilities` and `targets`, and answers everything else with the error
