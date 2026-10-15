@@ -82,14 +82,18 @@ test("the UI is called Dreamcast DevTools: the document title, the home page, th
       const title = dialog.getByRole("heading", { name: "About Dreamcast DevTools", exact: true });
       await expect(title).toBeVisible();
       await expect(dialog).toContainText(/DevTools\s*3\.0\.0/);
-      await expectOneLineInside(title, dialog.locator(".MuiDialog-paper"), `the About dialog's title at ${size.width} px`);
+      await expectOneLineInside(title, dialog, `the About dialog's title at ${size.width} px`);
       await expectNoOldName(page);
+      // (the screenshot when the dialog has faded in)
+      await expect(page.locator(".MuiDialog-container")).toHaveCSS("opacity", "1");
       await saveScreenshot(page, testInfo, `ui-name-about-${size.width}`);
       await dialog.getByRole("button", { name: "Close" }).click();
       await expect(dialog).toBeHidden();
 
-      // the status bar of a workspace, beside the connection and the endpoint
-      await openWorkspace(page, "sh4-debugger");
+      // the status bar of a workspace, beside the connection and the endpoint (below 1200 px
+      // the side docks, and with them the device tree, are hidden)
+      await gotoRoute(page, "/workspace/sh4-debugger");
+      await expect(statusBar(page)).toContainText("Connection: connected");
       const name = statusBar(page).getByText(/^Dreamcast DevTools 3\.0\.0/);
       await expect(name).toBeVisible();
       await expect(statusBar(page)).toContainText(/Connection: connected.*Endpoint: ws:\/\/.*Dreamcast DevTools 3\.0\.0/);
