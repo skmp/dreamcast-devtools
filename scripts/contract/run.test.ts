@@ -968,8 +968,8 @@ describe("the contract runner against a server that breaks the protocol", () => 
     });
     const noDescribe = await runContract({ url: refused.url, profile: "mock", only: new Set(["S01", "S02"]), say: (line) => lines.push(line) });
     expect(reportOf(noDescribe)).toEqual([
-      'S01 failed debugger.describe {"protocol":3,"client":"nullDC contract runner"}: JSON-RPC error -32601 "method not found: debugger.describe"',
-      'S02 failed not run: debugger.describe {"protocol":3,"client":"nullDC contract runner"}: JSON-RPC error -32601 "method not found: debugger.describe"',
+      'S01 failed debugger.describe {"protocol":3,"client":"Dreamcast DevTools contract runner"}: JSON-RPC error -32601 "method not found: debugger.describe"',
+      'S02 failed not run: debugger.describe {"protocol":3,"client":"Dreamcast DevTools contract runner"}: JSON-RPC error -32601 "method not found: debugger.describe"',
     ]);
     expect(noDescribe).toMatchObject({ ok: false, passed: 0, failed: 2, cleanUpProblems: [] });
     // (the mock runs, and its ticks arrive whatever the proxy made of the describe response)
@@ -2477,7 +2477,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       { startPaused: true },
     );
     expect(statusOf(describe, "S19")).toBe("failed");
-    expect(detailsOf(describe, "S19")).toMatch(/^debugger\.describe \{"protocol":3,"client":"nullDC contract runner"\}: JSON-RPC error -32000 "emulator busy"$/m);
+    expect(detailsOf(describe, "S19")).toMatch(/^debugger\.describe \{"protocol":3,"client":"Dreamcast DevTools contract runner"\}: JSON-RPC error -32000 "emulator busy"$/m);
 
     // a read that stops the target, and a describe whose tick is not full while the target runs
     const mock = new MockDebugger();
@@ -2936,7 +2936,7 @@ describe("a server that stops answering", () => {
       "S01 passed ",
       // the request of the scenario, and the clean-up behind it, which reads the server first
       'S02 failed control.pause {"target":"sh4"}: Request timed out: control.pause | ' +
-        'clean-up: reading the state of the server: debugger.describe {"protocol":3,"client":"nullDC contract runner"}: Request timed out: debugger.describe',
+        'clean-up: reading the state of the server: debugger.describe {"protocol":3,"client":"Dreamcast DevTools contract runner"}: Request timed out: debugger.describe',
       // the third one in a row
       `S03 failed control.pause {}: Request timed out: control.pause | clean-up: nothing could be put back: ${stopped("control.pause")}`,
       `S04 failed not run: ${stopped("control.pause")}`,
@@ -2960,8 +2960,8 @@ describe("a server that stops answering", () => {
     // a server that answers nothing at all, not even the first debugger.describe, is S01 failed and the rest not run, after one timeout
     const mute = await runContract({ url: (await startServer({ lose: () => true })).url, profile: "mock", timeoutFactor, only: new Set(["S01", "S02"]) });
     expect(reportOf(mute)).toEqual([
-      'S01 failed debugger.describe {"protocol":3,"client":"nullDC contract runner"}: Request timed out: debugger.describe',
-      'S02 failed not run: debugger.describe {"protocol":3,"client":"nullDC contract runner"}: Request timed out: debugger.describe',
+      'S01 failed debugger.describe {"protocol":3,"client":"Dreamcast DevTools contract runner"}: Request timed out: debugger.describe',
+      'S02 failed not run: debugger.describe {"protocol":3,"client":"Dreamcast DevTools contract runner"}: Request timed out: debugger.describe',
     ]);
   }, 60_000);
 

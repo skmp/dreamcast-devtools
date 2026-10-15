@@ -145,7 +145,7 @@ const prepare = async (options: ContractOptions) => {
   const openSession = async (): Promise<ContractSession> => {
     const session = new ContractSession(target, {
       timeoutFactor,
-      clientName: "nullDC contract runner",
+      clientName: "Dreamcast DevTools contract runner",
       trace: options.verbose ? (line) => say(`    ${line}`) : undefined,
       onTick,
       answers,
