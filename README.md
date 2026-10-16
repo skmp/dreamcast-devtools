@@ -1,54 +1,798 @@
-﻿# nullDC DevTools
+# Dreamcast DevTools
 
-A web UI that connects to nullDC and exposes emulator hardware in an inspectable way.
+Dreamcast DevTools is the web debugger UI for nullDC 3.0.0, the Dreamcast emulator. React 19,
+TypeScript, Vite.
 
-## Development
+The emulator serves the built UI and speaks the protocol described below. This repository also
+contains a mock server that implements the same protocol, so the UI can be developed without an
+emulator.
 
-- `npm install` installs dependencies.
-- `npm run dev` launches the stock Vite dev server for the UI only.
-- `npm run dev:mock` boots an Express-based mock debugger server that embeds Vite middleware, serves the UI, and exposes a JSON-RPC/WebSocket endpoint at `ws://localhost:5173/ws`.
+## Requirements
 
-The mock server watches source changes via `tsx` and Vite HMR, so front-end edits reload automatically and stub responses refresh without restarting.
+- Node.js 22.13 or newer (the locked dependencies do not support earlier 22.x releases).
+- Rust (with the `wasm32-unknown-unknown` target) and `wasm-pack` only if you change
+  `crates/aica-dsp` (see [Generated DSP module](#generated-dsp-module)).
 
-### Runtime configuration
+## Scripts
 
-All transport choices are build-time options driven by Vite env vars:
+Run `npm ci` once, then:
+
+| Script | What it does |
+| --- | --- |
+| `npm run dev` | Mock server with the UI on http://localhost:5173 (Vite middleware, hot reload). `tsx watch` restarts it when the server sources change. |
+| `npm run mock:serve` | Same server, without the restart-on-change watcher. |
+| `npm run mock:dev` | `build:dspsim`, then `mock:serve`. Needs Rust and `wasm-pack`. |
+| `npm run mock:prod` | `build:native`, then the mock server in production mode (serves `dist-native/`). |
+| `npm run build` | Alias of `build:native`. |
+| `npm run build:native` | Type-check and build the WebSocket variant into `dist-native/`. |
+| `npm run build:wasm` | Type-check and build the BroadcastChannel variant into `dist-wasm/`. |
+| `npm run build:dspsim` | Regenerate `src/wasm/aica-dsp/` from `crates/aica-dsp`. |
+| `npm run lint` | ESLint. |
+| `npm run typecheck` | `tsc -b`: the app, the Vite/Vitest configs, the mock server, the scripts and the tests. |
+| `npm test` | Vitest in watch mode. |
+| `npm run test:run` | Vitest, single run. |
+| `npm run test:ui` | Vitest with its browser UI. |
+| `npm run test:e2e` | Playwright smoke suite in headless Chromium (see [End-to-end tests](#end-to-end-tests)). Not part of `check`. |
+| `npm run contract` | The contract runner: holds a debugger server to the protocol (see [Contract runner](#contract-runner)). Without arguments it tests the mock, in-process. |
+| `npm run check` | `lint`, `typecheck`, `test:run`, the contract gate of milestone M2 on the mock, twice (`contract -- --milestone M2 --require-note "arm7: bl stepped over and out"`, on the mock as it is and with `--mock-support m2`), `build:native`, `build:wasm`; stops at the first failure. CI runs this. |
+
+## Serving the build
+
+`dist-native/` (and `dist-wasm/`) is self-contained and can be served by any file server, from
+any path:
+
+- Nothing is loaded from another origin. The Monaco editor used by the SH4 Simulator and the DSP
+  Playground is bundled (`src/app/monaco/monacoSetup.ts`: editor core and the features the three
+  editors use, no built-in languages), together with its worker and its icon font.
+- `index.html` and every chunk reference their files relatively, and the routes live in the URL
+  hash (`#/workspace/sh4-debugger`), so no rewrite or fallback rule is needed.
+- The code is split: `index.html` loads one entry chunk (about 380 kB); each workspace, tool page
+  and large panel, and Monaco (about 3 MB), is a separate file under `assets/` that is fetched when
+  first needed. The server has to serve every file of `assets/`.
+- Content types that matter: `.js` as JavaScript (also for the worker, `assets/editor.worker-*.js`)
+  and `.wasm` as `application/wasm` (the DSP module is compiled from a streamed response).
+  `.css`, `.html`, `.png` and `.ttf` as usual.
+- A native build then opens its WebSocket at `/ws` on the same host and port (see
+  [Connecting](#connecting)).
+- Every build ends by writing `bundle-info.json` into its output directory:
+  `{ "version", "protocol", "gitRev", "files": [{ "path", "bytes", "sha256" }] }`
+  (`scripts/bundle-info.ts`). The emulator's build reads it before it embeds `dist-native/`: a
+  bundle built for another protocol version is refused, `version` is what the emulator reports
+  as `ui` in `debugger.describe`, and every listed file is checked against its hash.
+
+`python3 -m http.server --directory dist-native` is enough to look at everything that does not
+need a debugger connection; `e2e/offline.spec.ts` checks exactly that setup, with every other
+origin blocked.
+
+## Generated DSP module
+
+`src/wasm/aica-dsp/` (JavaScript glue, type declarations and the `.wasm` file used by the DSP
+Playground) is generated by `wasm-pack` from `crates/aica-dsp`. It is committed, so a fresh clone
+type-checks, builds and runs without a Rust toolchain.
+
+`npm run build:dspsim` is the explicit regeneration step. `dev`, `build:native` and `build:wasm` do
+not run it. After changing the crate, run it and commit the regenerated files. It remaps the cargo
+registry's path (`scripts/build-dspsim.ts`), so the wasm does not carry the builder's home directory and
+is the same whoever builds it with the same toolchain.
+
+## End-to-end tests
+
+`npm run test:e2e` drives the production build in headless Chromium. It needs nothing running:
+
+- `dist-native/` is built first when it is missing or older than the sources.
+- Every test starts its own mock server (production mode, free port) and kills it afterwards,
+  because the mock keeps one state for all clients. A port that another worker took in the
+  meantime is noticed and the next one is tried (`e2e/support/mockServer.ts`;
+  `e2e/support.spec.ts` tests that, without a browser).
+- A test fails on any `console.error`, uncaught exception, failed request, HTTP status >= 400 or
+  request to another origin, unless the test allows that message and says why
+  (`diagnostics.allow` in `e2e/support/fixtures.ts`).
+- `test.fixme` marks behaviour that is known to be broken; the comment in the test says where.
+- A test that needs a server the default mock is not sets `test.use({ mockOptions: { ... } })`:
+  the mock then runs inside the test's process with those options (`supports`, `protocol`,
+  `startPaused`, `sliceContext`, ...), and the `machine` fixture is the mock itself, for what
+  the emulator's own window does (`machine.setLifetime("no-machine")`).
+- A test that needs exact ticks, a refused request, a message that breaks the schema or a
+  server that leaves out what protocol v3 always sends answers the page's WebSocket itself
+  (`e2e/support/scriptedDebugger.ts`). `e2e/v2-server.spec.ts` has the one server of the suite
+  whose `debugger.describe` result has no `protocol`, and a server for each field the client
+  does without.
+- Loading the page with `?crashTest` (before the `#route`) enables a hook that makes an error
+  boundary's child throw on a `nulldc:crash-test` window event; `e2e/error-boundary.spec.ts`
+  uses it. Without the flag the hook does not exist (`src/app/components/CrashProbe.tsx`).
+- The window of the suite is 1600x1000, where the default layouts have their views side by
+  side. `e2e/layout.spec.ts` opens every workspace in the window of a laptop (1366x768,
+  1280x720, 1440x900) and holds the default layouts to being readable there.
+- `e2e/emulator-smoke.spec.ts` is the one spec that is not run against the mock, and is
+  skipped unless `E2E_EMULATOR_URL` is set: see [The UI against the emulator](#the-ui-against-the-emulator).
+
+Install the browser once with `npx playwright install chromium` (add `--with-deps` on a fresh
+Linux machine). Useful variations:
+
+```
+npx playwright test e2e/disassembly.spec.ts     # one file
+npx playwright test -g "Reset layout"           # by title
+npx playwright test --headed --workers=1        # watch it
+E2E_SCREENSHOT_DIR=/tmp/shots npm run test:e2e  # also save the per-workspace screenshots there
+E2E_CPU_THROTTLE=4 npx playwright test e2e/docking.spec.ts  # the page gets a quarter of the CPU
+```
+
+### The UI against the emulator
+
+`e2e/emulator-smoke.spec.ts` drives the page an emulator serves: the UI bundle that emulator
+embeds, against its debugger server. It is not part of `check` and starts nothing by itself;
+it is skipped unless `E2E_EMULATOR_URL` is the page URL the emulator prints
+(`Debugger: http://127.0.0.1:<port>/`). The emulator is one that carries this UI
+(`npm run build:native`, then the emulator's own configure with
+`-DNULLDC_DEVTOOLS_DIST=<this checkout>/dist-native`, and its build), started headless and
+paused on the sounding guest of its tree, as the emulator's own tests start one
+(`tests/debugger/contract/contract.py`): with a home, a configuration and a data directory of
+its own, three directories made for the run.
+
+```
+mkdir -p <run dir>/home <run dir>/cfg <run dir>/data
+HOME=<run dir>/home XDG_CONFIG_HOME=<run dir>/cfg XDG_DATA_HOME=<run dir>/data \
+<emulator> -config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 , \
+                   Debugger:Enabled=yes , Debugger:Port=0 , Debugger:Required=yes , Debugger:StartPaused=yes \
+           <emulator tree>/tests/debugger/guest/dsptest/dsptest.elf &
+E2E_EMULATOR_URL=http://127.0.0.1:<port>/ npx playwright test e2e/emulator-smoke.spec.ts --workers=1
+kill <pid of the emulator>
+```
+
+- The commas are arguments of their own. `Debugger:Enabled=yes` is needed: a headless run has
+  the server off by default, and `StartPaused` without a server ends the process with exit code
+  2. `Port=0` takes a free port.
+- The three variables are needed too. Without them the emulator reads the `emu.cfg` of the
+  user, and takes from it what the command line does not give: an address to listen on that
+  may not be the loopback one (`Debugger:Bind`, `Debugger:AllowedHosts`), a directory to serve
+  in place of the bundle it embeds (`Debugger:WebRoot`). And it opens the memory cards in the
+  data directory of the user, which an emulator the user has running has open. With the
+  variables the run reads no `emu.cfg` but its own, an empty one, and its memory cards are
+  new files of its data directory.
+- The emulator is ended by its pid when Playwright has returned (`SIGTERM`; it ends within
+  seconds). The spec leaves the machine paused, and that lasts as long as its page: ten
+  seconds after the last client has gone the server releases the stop, and the guest runs
+  from there, as fast as one core goes, until the process is ended.
+
+The spec connects at the start stop, runs to the entry of the program (a breakpoint at
+`0x8C010000`), steps the SH4 from the toolbar, writes `R0` in the register panel and sees it in
+the tick, writes a byte of memory and reads it back, resets, and after a resume steps the ARM7.
+One run per emulator process: it expects the machine in its start stop.
+
+What it holds the run to, beyond those steps:
+
+- **The page is this checkout's.** `ui` of `debugger.describe` is the version in
+  `dist-native/bundle-info.json`, and every file listed there is served by the emulator byte
+  for byte (the set-up of the suite builds `dist-native/` again when a source is newer, so
+  that directory is the build of this tree). An emulator that was built before the sources
+  changed fails the first step: build the bundle, then the emulator, then run the spec.
+- **A step is one instruction.** The two steps of the SH4 end at `0x8C010002` and
+  `0x8C010004` (the guest starts with two instructions that are no branch). A step of the ARM7
+  ends at the next instruction, at the target of the branch it stands on, where `lr` says for
+  the two ways its program goes back, or at `0x1C`, the vector of the timer interrupt its
+  program gets every 13 samples.
+
+## Error boundaries
+
+Every dock panel and every route is wrapped in an error boundary
+(`src/app/components/ErrorBoundary.tsx`). An exception thrown while a panel renders or in one of
+its effects replaces that panel with the error message, the component stack and a `Reload panel`
+button; the other panels, the connection and the rest of the page keep running. An exception
+outside the panels replaces the page of that route with the same report and a `Reload page`
+button, and is dismissed by navigating elsewhere. Exceptions in event handlers and in promises
+are not caught by error boundaries.
+
+A page, panel or dialog whose file under `assets/` could not be downloaded (the emulator was
+closed after the tab was opened) fails the same way. The browser does not ask again for a module
+that failed to load, so the button of such a report is always `Reload page` and reloads the
+document; while the server does not answer it says so and leaves the page as it is. A failed
+About dialog is reported in a notice with the same button and does not replace the page
+(`src/app/components/lazyImport.ts`, `ReloadPageButton.tsx`).
+
+## Configuration
+
+Build time:
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `VITE_TRANSPORT_MODE` | `native` (WebSocket) or `wasm` (BroadcastChannel) | `native` |
-| `VITE_WS_PATH` | Relative WebSocket path served by the host | `/ws` |
-| `VITE_BROADCAST_CHANNEL` | Channel name used for WASM builds | `nulldc-debugger` |
+| `VITE_TRANSPORT_MODE` | `native` (WebSocket) or `wasm` (BroadcastChannel). `build:wasm` sets it to `wasm`. | `native` |
+| `VITE_WS_URL` | WebSocket endpoint of a native build that is not served by the emulator, e.g. `ws://localhost:55543/ws` (see [Connecting](#connecting)). | unset |
 
-The UI automatically connects to the host that served it. For WebSocket builds the URL is inferred from `window.location`; for WASM builds the BroadcastChannel is opened immediately so emulator-hosted tabs can communicate without extra UI toggles.
+Mock server, at run time:
 
-## Features
+| Variable | Description | Default |
+| --- | --- | --- |
+| `PORT` | HTTP and WebSocket port. | `5173` |
+| `NODE_ENV` | `production` serves the static build from `dist-native/`. Anything else serves the sources through Vite middleware (which also opens Vite's hot-reload socket on port 24678). | unset |
+| `DEBUGGER_WS_PATH` | WebSocket path of the mock server. The UI always connects to `/ws`, so keep the default. | `/ws` |
 
-### Breakpoints
+Mock server, on the command line (`npm run mock:serve -- --start-paused`):
 
-The debugger UI provides multiple ways to manage breakpoints:
+| Option | Description |
+| --- | --- |
+| `--start-paused` | Start in the `StartPaused` stop (`reason: "start"`) instead of running. |
+| `--force-fallback` | Behave like an SH4 backend without native breakpoints: `notice` in the ticks while SH4 breakpoints are active, `dc.timing.SH4_DEBUG_ENGINE` reads `interpreter-fallback`, capability `sh4-debug-fallback`. |
+| `--stale-registers` | Behave like a backend whose running ticks cannot carry `dc.sh4.cpu`: they omit it and say `registersStale`, and watches on `dc.sh4.cpu.*` read `n/a` until the target is paused. |
+| `--m1` | Implement what the emulator does in milestone M1 and nothing more: no ARM7 or DSP stepping and code breakpoints, no memory or register writes, no reset, no SGC capture (`targets[].stepping`, `capabilities`; the requests answer -32004), and the device tree without the rows and the two register panels of M2. |
+| `--m2` | Implement what the emulator does in milestone M2 and nothing more: the SH4 and the ARM7 step, the DSP does not; memory writes and reset; register writes of `dc.sh4.cpu` and of `dc.aica.arm7` (but `ENABLED`) alone, every other register answers -32013 and carries no `flags.writable`; no SGC capture. |
+| `--arm7-held` | Start with the ARM7 held in reset, as behind a reset: `ENABLED` reads 0, and the machine releases it when it has run for 8 emulation steps. |
 
-#### Disassembly View
-- **Click gutter**: Add or remove breakpoint at that address
-- **Ctrl+Click gutter** (or Cmd+Click on Mac): Toggle breakpoint enabled/disabled
-- **Visual indicators**:
-  - Red filled circle (●): Active breakpoint
-  - Red outlined circle (○): Disabled breakpoint
-  - Hover over empty gutter to see where you can add breakpoints
+The status bar reads `Dreamcast DevTools <version>`. The version shown there and in the About
+dialog is the `package.json` version, followed by `+<git describe --tags --always --dirty>` when
+the build runs inside a git checkout.
 
-#### Breakpoints Panels
-- **Events: Breakpoints**: Add event breakpoints using free-form event names (e.g., `dc.aica.channel[0].step`)
-- **SH4: Breakpoints**: Add code breakpoints using hex addresses (e.g., `0x8C0000A0`)
-- **ARM7: Breakpoints**: Add code breakpoints using hex addresses (e.g., `0x00200000`)
+The UI is called Dreamcast DevTools; the emulator it talks to is nullDC. Where the UI names the
+emulator, it gives the name the emulator reports in `debugger.describe` (`nullDC`, the mock
+`nullDC (mock)`): `<emulator name> @ <host>` in the connection picker, and the name in the About
+dialog. `scripts/uiName.test.ts` (part of `npm run check`) fails when a file of the
+repository calls the UI by an old name again, and `e2e/ui-name.spec.ts` reads the names on the
+rendered pages. The identifiers no one reads keep their `nulldc` spelling: the localStorage keys
+(`nulldc-debugger-*`, `nulldc-theme-mode`) and the `nulldc:crash-test` event. A renamed key would
+drop every saved layout, program, endpoint and theme; `e2e/saved-state.spec.ts` starts the build
+with the state an earlier build saved. The BroadcastChannels of a `wasm` build are named after the
+UI (see Connecting); no emulator spoke their earlier names, and the UI does not listen on them.
 
-All breakpoints are persisted on the server and synchronized across all connected clients in real-time.
+## Connecting
 
-## Mock debugger protocol
+- `native` builds open one WebSocket. The endpoint is the first of these that is a `ws://` or
+  `wss://` URL:
+  1. `?ws=ws://host:port/ws` in the address bar, in front of the `#`
+     (`http://localhost:5173/?ws=ws://localhost:55543/ws#/workspace/sh4-debugger`: a dev server
+     attached to an emulator). The routes and the memory panel only rewrite what follows the `#`.
+  2. the last endpoint entered by hand in the connection picker (kept in localStorage, per origin);
+  3. `VITE_WS_URL` of the build;
+  4. `/ws` on the host that served the page (`wss:` when the page was loaded over https).
 
-The mock endpoint implements a subset of the planned JSON-RPC schema:
+  Served by the emulator, there is nothing to configure: the fourth applies.
+- `wasm` builds use BroadcastChannel. The UI listens on `dreamcast-devtools-announce` for
+  `{ id, name, timestamp }` announcements and talks to the selected emulator on
+  `dreamcast-devtools-<id>`. It posts `ping` every second and treats three seconds without a `pong`
+  as a lost connection. With exactly one announced emulator the UI connects on its own;
+  otherwise it shows the connection picker.
 
-- Handshake, describe, subscribe/unsubscribe.
-- Register/memory/disassembly fetches plus watch management.
-- Breakpoint CRUD (add, remove, toggle), basic stepping commands, event log, waveform, and log streaming topics.
+The status bar of a workspace shows the connection state and the endpoint. The endpoint is a
+button (a click, or Enter or Space on it) that opens the connection picker: the endpoints above
+with where each comes from, and a box for any other `ws://` or `wss://` URL. An endpoint is
+named by its host (`127.0.0.1:55543`), and by `<emulator name> @ <host>` once the emulator there
+has answered `debugger.describe` on the session's connection; before that (connecting, a failed
+connection, an endpoint the session is not connected to) by its host alone. No name is stored.
+Picking the build default or the page's own endpoint from
+the list puts a remembered manual entry away, so that the next load of the page uses that
+endpoint again.
 
-It periodically emits fake register, waveform, watch, and event log updates so panels demonstrate live updates while the real emulator backend is under construction.
+When a connection is lost, or cannot be made, the state is `reconnecting`: the page says why,
+drops the data of the connection, and tries again 1, 2, 5 and then every 10 seconds after each
+failure. It tries the endpoint of the session: the list above is a priority, and an endpoint
+that does not answer is not replaced by the next one. `Stop` ends that, `Connect` and
+`Retry now` try at once. A `wasm` build waits for an announcement instead of a clock, because
+an emulator tab that was reloaded has a new id. Every connection that opens is described again
+(`debugger.describe`). A browser tells a page nothing about why a WebSocket did not open, so
+the text lists what it can be; a refusal by the emulator's Host/Origin check is one of them.
+
+Without a connection the panels keep their frame. Only the data goes: where it was, every
+panel says `Not connected`. The boxes stay with what is in them (what is typed into the box of
+the watches or of a breakpoint panel is not sent and not thrown away), the toolbars stay, and
+so do the notices of what the server cannot do: what a server said about itself is kept until
+the next server has described itself. The keyboard focus is where it was when the connection
+is back, also in a row of the breakpoint or the watch list; a focus that was moved while the
+connection was away stays where it was put. The disassembly and memory views are where they
+were, unless the new connection starts in a stop. Their address boxes say where the views
+are, and are written over when a view moves or when a server writes its addresses in another
+way (`addressRadix`, `addressDigits`), and not otherwise: what is typed into one and not sent
+is still there when the connection is back. A page that has not had a server yet shows the
+same frames; a disassembly or memory view then has its toolbar with an empty box, because
+where it opens is the server's to say.
+
+## What the UI does with a session
+
+- **Run state.** Next to the run controls: `Running`, or `Paused`, why (`reason` of the tick)
+  and which stop it is (`stopId`), and below it the `notice` of the server when it has one. The
+  line wraps where the toolbar has little room, and a window narrower than 1440 px shows both
+  in lines of their own under the toolbar; the title of each has all of its text. In the stops
+  of the emulator's own window (`host-stopped`, `guest-exit`, `no-game`) the run controls are
+  off, because the server refuses them there. A run control that is off (also
+  while the target runs, and without a connection) keeps the keyboard focus, so that stepping
+  with the keyboard goes on from the same button; so do `Refresh` of a view while the view
+  reads and `Go to current PC` without a connection. Each of these buttons is named by what
+  it does (`Run`, `Step In`, `Go to current PC`, ...), in every state. The answer of every
+  `control.*` request is checked, and a refusal is shown; one that is repeated while its notice
+  is on screen is counted in that notice (`×n`) instead of shown again.
+- **Run controls.** The toolbar of a workspace (`src/app/layout/RunControls.tsx`) has `Run`,
+  `Pause`, `Step Into`, `Step Over`, `Step Out` and `Reset`, in the line of the toolbar from a
+  window of 1200 px on and in a line of their own below that. `Run to next breakpoint` is
+  gone: it did what `Run` does. Run, Pause and Reset are the machine's. The three steps act
+  on the **focused target**, which the toolbar names in front of them: the target of the
+  panel of a target that last had the focus — a disassembly, memory, breakpoints, callstack or
+  registers panel, the ten of the SH4's on-chip modules included; a click in it or on its tab,
+  or the keyboard focus moving into it — and until one of them had it the target the
+  workspace is for: `sh4` for the SH4 and the Mixed Mode Debugger, `arm7` for the ARM7
+  Debugger, `dsp` for the Audio Debugger (`src/state/focusedTarget.ts`). A panel of no target
+  (device tree, watches, events) leaves it as it is, and every workspace page starts with its
+  own. The views keep their own step buttons, for their own target. `Pause` names the focused
+  target in its request when the server lists it, and no target otherwise (a server ignores
+  it either way): nothing is asked of a server about a target it does not have.
+- **Keys.** On a workspace page: F5 run, F6 pause, F10 step over, F11 step into, Shift+F11
+  step out, with F8 and Shift+F8 for F11 and Shift+F11. They work wherever the focus is — on
+  the page, in an address box (where F5 would otherwise load the page again), on a value, in
+  the editor of one — but for two places: in Monaco, and while a dialog is open, they are left
+  to the editor and to the browser. A dialog that is closing is not open. One that Escape
+  closes is closed from that Escape on: a key right behind it is the toolbar's (F5 runs, and
+  does not load the page), also before the page has rendered the close (the About dialog is
+  closed by a change of the page's address, which the page renders as a transition, behind
+  the keys that come meanwhile). That holds for the dialog the Escape went to, the one with
+  the focus in it, for as long as it is in the document, and for half a second while it is on
+  screen as it was: in front of a dialog that Escape did not close the keys are left to the
+  browser again. A dialog closed by its button, or by a click beside it, is closed while it
+  fades out. The Find box of an editor is a part of that editor, and no
+  dialog of the page: with the focus anywhere else the keys work, whether the box is open or
+  was closed. A key that is held down is used once, and its repeats are taken from the browser
+  all the same. A key does what its button does: nothing while the button is off. A key with
+  Ctrl, Alt or Meta is not one of them: Ctrl+R and Ctrl+F5 load the page again, which F5 no
+  longer does on these pages.
+- **What is off, and why.** A run control whose request could only be refused is off, by
+  button and by key, and its tooltip (which is also its description) says why behind its name:
+  `not connected`; `the target is running` (Run and the steps) or `the target is paused`
+  (Pause); in a stop of the emulator's own window the reason of that stop, for all six;
+  `this server cannot step the ARM7` (`targets[].stepping`) or `this server does not support
+  the DSP target` for the steps; `the DSP has no calls to step over or out of` for those two,
+  on every server; `this server cannot reset the machine` without the capability `reset`
+  (the button is shown all the same); and `the ARM7 is held in reset`. So no request is sent
+  that the server answers with -32003, -32004, -32012 or, for a stop of the host, -32001 or
+  -32002 (`src/state/runControls.ts` has the rules; the toolbar, the keys and the step buttons
+  of the views go by them).
+- **An ARM7 that is held in reset.** While `ENABLED` of the ARM7's node (`targets[].pcPath`)
+  reads 0 — behind a reset, and until the guest releases it — the three steps of the toolbar
+  are off when the ARM7 is the focused target, and so are the step buttons of its disassembly
+  view. The steps of another target, Run, Pause and Reset are as they were.
+- **Reset.** `control.reset`, one click and no question. Paused, the machine is in a new stop
+  with the reason `reset`, which the views follow like any stop. Running, it runs on and no
+  tick says anything: the answer `{}` is all there is, and on it the disassembly and memory
+  views read again where they are (`reread`, the counter the writes advance).
+- **What a write can do.** A program counter, or bytes of code, written so that the guest
+  reaches what is no instruction ends the emulator in its default build, as it does for a
+  guest that gets there by itself. The emulator checks one thing about a program counter: one
+  of the SH4 with bit 0 set is refused (-32013), because nothing executes at an odd address;
+  the ARM7's is stored aligned. Whether there is code where it points is the user's to know,
+  and the in-app documentation says so.
+- **Stops.** A stop is a paused tick whose `stopId` the client has not acted on; a paused
+  tick without a `stopId` is no stop. On a stop the disassembly views scroll to the
+  program counter if its line is not on screen, the disassembly and memory views read again,
+  and a breakpoint that caused it is announced. The views also read again after their own
+  actions, and when a game is loaded where there was none. One more tick moves the views as a
+  stop does (and announces nothing): a paused tick of the same stop in which the program
+  counter of a listed target (`targets[].pcPath` / `pcRegister`) is another one, because
+  somebody wrote it. No other tick does any of that.
+  The stop a page connects into, or a view is opened in, is followed like any other: the line
+  of the program counter is on screen, with ten instructions above it or as many as fit.
+  A disassembly view that is a dock tab behind another has no lines on screen to look at: it
+  scrolls to the program counter of the last stop, if need be, when its tab is shown.
+  When stops arrive faster than the page renders them (a script stepping through another
+  client), their ticks are all applied, and the views move and read for the latest only.
+- **Registers.** `registers` of a tick is merged per path (`src/state/tickState.ts`); nothing
+  of a connection is kept for the next. `dc.sh4.cpu` is dimmed while `registersStale` is set.
+- **Register panels.** One table (`src/app/panels/RegisterPanel.tsx`) is bound to twelve panel
+  ids: `sh4-registers`, `arm7-registers` and the ten of the on-chip modules of the SH4
+  (`bsc-registers` ... `ubc-registers`). A panel shows the node of the device tree that offers
+  its id in `actions`: nothing in the UI says which node that is. When several nodes offer the
+  id it is the first in the order of the describe tree (a node before its children); when none
+  does, the panel says "This server has no <title>." and asks for nothing. A row is a register
+  with its name, its value, its width in bits and a `+` that adds it to the watches. Names,
+  widths and whether a register can be written are those of `debugger.describe`; only the
+  values are the ticks', which carry no `flags`. With no game loaded every value is `n/a`. The
+  panels of the two processors are part of the default layout of their workspace (SH4 Debugger,
+  ARM7 Debugger), as a tab behind the breakpoints; a saved layout gets them with `Reset layout`.
+- **Writes.** A register is written by a double click on its value, in a register panel or in
+  the watches (`state.setRegister`, `state.editWatch`), and memory by a double click on a byte
+  of the hex column: the run of bytes typed into the box that opens is one
+  `state.writeMemory`, from that byte on (`DE AD BE EF`, `deadbeef`; hex, two digits a byte).
+  Enter sends, Escape and leaving the box put it away; for the box of a byte, which is in a row
+  of the listing, a view that moves (the wheel) is leaving the box, and so are rows that give
+  way to an error; and no box opens while the bytes of a move are being read, when the rows on
+  screen are still those of the place the view has left (an editor opened there would follow
+  its byte into another row when the new rows are in). The three editors are offered while the
+  target is paused, on a server with the capability (`register-write`, `memory-write`), and
+  for a register only when it carries `flags.writable` in `debugger.describe` (a watch finds
+  its register by its expression: `<path>.<name>` without regard to case, split at the last
+  dot). So nothing is sent that the server refuses by rule (-32004, or -32013 for a register
+  without a writer). The value of a register is sent as it was typed (`0x` hex or decimal):
+  the server reads it. What it refuses is shown, and the editor stays open with what was
+  typed, marked, with the reason as its title; so does a run that is no bytes or would pass the
+  last address of the target, which is not sent. While a request is out the editor waits and
+  sends nothing more; it closes when the server has accepted the write, and what is then on
+  screen is what the server says: the value of the tick, the bytes that are read again.
+- **Writes with the keyboard.** The value of a register the server writes is a stop of the Tab
+  key, in a register panel and in the watches: Enter, the space bar and F2 open its editor. In
+  a memory view the hex column of one row is the stop, and names the byte the keyboard is on.
+  The arrow keys move that place from byte to byte and from row to row, a click on a byte puts
+  it there, and Enter, the space bar and F2 open the editor at its byte. At the first row, and
+  at the last one that is whole on screen, an arrow moves the view by a row instead: an arrow
+  never takes the place to a row the panel cuts off. A panel that is made smaller takes the
+  place up with its edge, to the last row it shows (whole, or the one the edge cuts, where a
+  click can put the place as well), with the focus if the place had it, and the place stays
+  there when the panel grows again; an editor whose row is below the edge then is put away
+  with what was typed. When an editor goes with the focus in its box (the
+  write was accepted, Escape, the target runs again) the focus is on the value, or the byte,
+  it was opened from; a focus that left the box by itself stays where it went. While the
+  target runs the values and the place keep the focus they have, say that they cannot be used
+  (`aria-disabled`) and open nothing. On a server without the capability, and for a register
+  without a writer, there is no such stop.
+- **Renaming a watch.** The expression of a watch is renamed by a double click on it, or from
+  the keyboard: it is a stop of the Tab key in front of the value of its watch, and Enter, the
+  space bar and F2 open the box of its name (`state.modifyWatchExpression`; Enter sends,
+  Escape and leaving the box put it away, and a name the server refuses leaves the box open,
+  marked, with the reason as its title). The rules of the editors are its rules: while a
+  request is out the box waits and sends nothing more, an answer for a box that was put away
+  closes no box opened since, the focus is on the expression again when the box
+  goes with the focus in it, the box is offered while the target is paused, and one that is
+  open when the target runs again goes with what was typed; while the target runs the
+  expression keeps the focus it has, says why it cannot be used (`aria-disabled`, its title)
+  and opens nothing. Every server renames watches: the expression is a control on all of them.
+- **The memory listing is not scrolled.** It is sixty rows, cut at the edge of its panel
+  (`overflow: clip`): the rows below the edge are reached by moving the view through its
+  addresses, and nothing the browser does for a focus or a search in the page scrolls the
+  listing, which would have no way back. In a panel narrower than a row it is scrolled to the
+  side, by its scroll bar, the wheel and the place of the keyboard.
+- **The end of an address space, in a small panel.** A panel that shows fewer rows than the
+  sixty of a slice would never show the last rows of the address space if the view stopped
+  where sixty rows end with the last one. So the view goes further: as far as the place at
+  which the last row of the target (`0xFFFFFFF0` of the SH4, the row of `addressMax`) is the
+  panel's last whole row, by the wheel, by the arrow keys and for an address typed into the
+  box. What is read there is as many rows as the panel shows, and ends at the last address.
+  The view measures how many rows its panel shows whole, and measures again when the panel
+  changes size; a panel that has grown at the end of the space takes the view back up as far
+  as the panel is then full. An address typed into the box is shown with ten rows of context
+  above it, or with as many as there is room for in a panel of ten rows or fewer, so that its
+  row is on screen (the last whole one), and the box says the address of the row that many
+  rows below the first. A view opened with `?address=` is placed the same way once its panel
+  has been measured, in a panel of any size: its first view is placed for a whole slice and
+  ten rows of context, and moves then when the panel has no room for those ten rows, or when
+  the panel shows fewer rows than a slice and the address is near the end of the space. The
+  row of the URL is marked in the rows of the new place, and is the one row marked; where the
+  view does not move it is marked once, and no later read marks it again.
+  A panel that has room for sixty rows is as before.
+- **After a write.** When one of this client's writes is answered `{}`, the disassembly and
+  memory views read again where they are (`reread` of the store, a counter beside `refresh`):
+  a byte edit does not move a listing. No request moves a view to the program counter. That is
+  the tick's to say, as above, in front of the answer to the write or behind it, and the same
+  for a PC written through a watch or by another client.
+- **Targets.** Instruction size, address format, default addresses and what works come from
+  `targets` of `debugger.describe` (`src/state/targets.ts`), and nothing is built in for a
+  server that leaves them out. A target the server does not list, stepping or
+  memory it does not have, and a capability it lacks (`event-breakpoints`, `callstack`,
+  `sgc-capture`) are said in the panel concerned, in place of its controls; without
+  `register-write` or `memory-write` the values and the bytes are no editors, and say so when
+  the pointer rests on them.
+  The values the UI has of its own serve two things only: the frames of a page that has had no
+  server yet, and the label in the notice of a target that is not listed ("This server does not
+  support the ARM7 target").
+  A memory view opens at `defaultMemoryAddress` of the first server that reads that memory,
+  also when servers before it only had such a notice to show.
+- **Listings.** A disassembly view shows each address of an answer once; when a server lists
+  an address twice it says so. A click on the gutter is one request: while it is unanswered
+  the gutter of that address takes no further click (the server makes a breakpoint for every
+  `breakpoints.add`).
+- **Window size.** The default layout of a workspace is made for the room its centre dock has
+  when it is made. From a window of 1600 px on, the views are side by side. Below that (a
+  laptop, with both side docks open) the first view is over the whole width and the others
+  are tabs of one group below it; the mixed-mode workspace has its two listings one above the
+  other. In a listing the instruction column keeps at least twelve characters, the toolbar
+  takes a second line where one is not enough, and the font of the memory listing follows the
+  width of its panel (down to 10 px) so that a row of sixteen bytes and their text fits from
+  520 px on. A saved layout is not touched; `Reset layout` makes the default for the window as
+  it is then. A layout is not made again when the window gets narrower either, so two views
+  that were side by side at 1600 px still are at 1366 px, in 315 px each. A listing whose
+  panel is narrower than its columns (about 360 px for the SH4) is scrolled to the side, by its
+  scroll bar or a turn of the wheel to the side: no column is squeezed or cut off for it. Its
+  toolbar takes a line for each of its three groups when it has to: the step buttons at the
+  left, the rest at the right. The memory view has the same rule below the 520 px at which its
+  font is at its smallest: its rows keep their three columns and are scrolled to the side, and
+  what it says about them ("Updating") stays in the panel.
+- **What a server leaves out.** The client does not serve protocol v2 any more, and reads
+  nothing into a field that is absent. A `debugger.describe` result without `targets` lists no
+  target, and one without `capabilities` has none: every panel concerned shows its notice and
+  asks the server for nothing; a code breakpoint whose event is of no listed target is listed
+  with the events, its address in plain hex. A result without `protocol` gets the banner of
+  another protocol version and is treated as a server that lists neither, whatever it carries
+  under those names. A paused tick without `stopId` is no stop (none is made from "running, then
+  paused"): no view is moved and no breakpoint is announced. A tick without `callstacks` has no
+  frames (none are kept from the stop before), one without `watches` no watches, and one without
+  `categories` leaves the mute and solo states as they are, as a key it does not carry does. A
+  binary frame without the header is not taken, and its request ends in the error of the frame
+  that did not arrive. An event-log entry without `metadata` is a row without the event name and
+  the cycle count.
+- **Problems.** A server of another protocol version, a `debugger.describe` that failed and
+  every message that was dropped because it does not match the schema (with the path of what
+  is wrong) are shown in a bar under the toolbar. A `debugger.describe` that failed (the
+  emulator was busy, or did not answer) is sent again on the same connection 1, 2, 5 and then
+  every 10 seconds after each failure, and `Retry now` in its bar sends it at once; until it is
+  answered the panels show `No Data`.
+
+## Protocol
+
+Protocol version 3: JSON-RPC 2.0, one message per text frame over that single connection. No
+batches, no subscribe/unsubscribe. The zod schemas in `src/lib/debuggerSchema.ts` are the
+reference for every parameter, result, error code and bound; what follows is the outline.
+
+- The client's first request is `debugger.describe` with `{ protocol: 3, client }`; `client` is
+  free text the server may log (`Dreamcast DevTools <version>` from the UI, `Dreamcast DevTools
+  contract runner` from the contract runner), and no server acts on it. The result
+  has `emulator` (`name`, `version`, `build`), `protocol`, `ui` (the version of the UI bundle the
+  server embeds, or `"none"`), `capabilities`, `targets` and `deviceTree`. A server says what it
+  implements through `capabilities` and `targets`, and answers everything else with the error
+  -32004 `not supported: ...`. A result without `protocol` is no server of this protocol: the
+  UI shows the version banner and treats it as a server that lists no target and no capability.
+- The server pushes one kind of notification, `event.tick`: `tickId`, `timestamp`,
+  `executionState` (`state`, `stopId`, and for a stop its `reason` and `breakpointId`; `notice`,
+  `registersStale`), `registers`, `breakpoints`, `eventLog`, `watches`, `callstacks`,
+  `categories`. A tick follows the `debugger.describe` response, every successful request that
+  changes something and every change of the run state; while the target runs there is one every
+  200 ms. Everything in a tick is a complete snapshot except `registers`: a paused tick, the tick
+  after `debugger.describe` and every fifth periodic tick carry every node, the other running
+  ticks only `dc.sh4.cpu`, `dc.aica.arm7`, `dc.aica.dsp` and `dc.timing`. `stopId` counts stops;
+  a client acts on a stop (follow the PC, refetch, announce a breakpoint) when it changes.
+- Requests:
+  - `state.getMemorySlice`, `state.getDisassembly`, `state.getCallstack`
+  - `state.watch`, `state.unwatch`, `state.modifyWatchExpression`
+  - `control.pause`, `control.runUntil`, `control.step`, `control.stepOver`, `control.stepOut`
+  - `breakpoints.add`, `breakpoints.remove`, `breakpoints.toggle`, `breakpoints.setCategoryStates`
+  - with a capability: `state.setRegister`, `state.editWatch` (`register-write`),
+    `state.writeMemory` (`memory-write`), `control.reset` (`reset`), `state.recordSgcFrames`,
+    `state.getSgcFrameData` (`sgc-capture`), `state.getMemoryBinary` (`memory-binary`),
+    `state.getTable` (`tables`), `state.captureHolly` (`holly-capture`)
+- Milestone M2 (writes, reset, the ARM7 as a target that steps):
+  - `state.writeMemory {target, address, data}` writes 1 to 65536 bytes of main memory, video
+    memory or wave memory, all of the range or nothing: a range with a byte that is not such
+    memory, or that would pass the end of the address space, is refused with -32013. `target`
+    is required and is `sh4`, `arm7` or `dsp`; `dsp` has no memory, which is the method's own
+    -32004 (in-band, decided behind the lifetime), not an invalid parameter.
+  - `state.setRegister {path, name, value}` matches `path` and `name` without regard to case.
+    Its answers, in this order: unknown path or name -32602; a register of width 0 or without a
+    writer -32013; a value that is no number -32602; a value the device refuses -32013 (a PC of
+    the SH4 with bit 0 set, a CPSR of the ARM7 whose mode bits are no mode). The value is `0x`
+    or `0X` and hex digits, or decimal digits, with ASCII blanks around it dropped and nothing
+    else (no sign, no empty text), of any length: the low `width` bits count. A register reads
+    back what was stored (the ARM7's PC aligned; SR, FPSCR and CPSR under their masks).
+    `state.editWatch` is the same on the watched register; an unknown `watchId` is -32602.
+  - A register that `state.setRegister` can write says so in `debugger.describe`:
+    `flags: { "writable": true }`. A tick never carries `flags`.
+  - `control.reset {}`: a paused target stays paused, in a new stop with `reason: "reset"` and no
+    running tick in between; a running one runs on, with an entry `dc.system.reset` in the event
+    log and nothing published. Breakpoints, watches and categories are kept. The machine comes
+    out of a reset with its ARM7 held: `ENABLED` 0, no ARM7 callstack.
+  - Writes and a reset are served while the target runs; none of them answers -32003.
+  - `control.step`, `control.stepOver` and `control.stepOut` for `arm7` answer -32012 while the
+    ARM7 is held in reset. A code breakpoint on `dc.aica.arm7.pc` is accepted in every state; its
+    address is a multiple of 4 up to `0x00FFFFFF` and is compared under the mask of the wave
+    memory, and a stop reports the PC as it is.
+  - The device tree has the nodes of the system bus (`dc.holly.sb` with `.g1`, `.g2`, `.pvr`,
+    `.misc`), `dc.holly.spg`, `dc.aica.common`, `dc.aica.rtc` and the 64 channels
+    `dc.aica.sgc.0` to `.63`, registers on `dc.gdrom` and `dc.maple`, and the panels
+    `sh4-registers` on `dc.sh4.cpu` and `arm7-registers` on `dc.aica.arm7`.
+- Errors: the methods whose result is `{}` (`control.*`, `breakpoints.*`, the watch methods,
+  the writes, `state.recordSgcFrames`) report a failure in-band, as the result
+  `{ "error": { "code", "message" } }`. Every other method answers with a JSON-RPC error.
+- Binary frames (`state.getSgcFrameData`, `state.getMemoryBinary`, `state.captureHolly`): the
+  JSON result announces `totalBytes` and a `binaryId`, and one binary frame follows with a
+  16-byte little-endian header (`"NDB3"`, kind, `binaryId`, payload size) in front of the
+  payload (`src/lib/binaryFrame.ts`).
+
+The mock (`server/mockDebugger.ts`, hosted with the page by `server/mockServer.ts`) implements
+milestone M2 of this protocol around a fabricated machine, keeps one state for all clients, and
+also steps the DSP, records SGC frames and writes the registers of every node (`--m2` takes
+that away: what the emulator of M2 does, and no more). What its machine is:
+
+- Its SH4 walks a loop of eight instructions at `0x8C0000A0` and, like a program with
+  interrupts enabled, takes an interrupt at every vertical blank: the PC leaves the loop for
+  the handler at `VBR + 0x600` (`0x8C000600`: two instructions, `rte` and its delay slot) and
+  comes back, so between two frames it is in the loop, and a breakpoint in the handler stops it
+  there. The handler runs in the other register bank: a change of `SR.RB` in privileged mode,
+  by the entry, by `rte` or by a write of `SR`, exchanges `R0..R7` with `R0_BANK..R7_BANK`.
+  From a PC outside the loop and the handler a step goes two bytes on, and when
+  `state.writeMemory` has put `mov #imm, Rn` at the PC, that is what the step executes.
+- Its ARM7 walks a loop of eight instructions at `0x00200010` whose sixth is a call: `bl` at
+  `0x00200024` to a leaf of two instructions and the return (`mov pc, lr`) at `0x00200030`,
+  with `R14` the link register. `control.stepOver` on the call and `control.stepOut` are a
+  temporary breakpoint (behind the call; at `R14`) and a resume, anywhere else step over is a
+  step. The temporary breakpoint goes at the stop it makes and at any other stop, one of the
+  host among them. A step of the ARM7 moves nothing of the SH4.
+- The ARM7 is held in reset behind a reset, with the option `arm7Held` (`--arm7-held`) and when
+  the machine is told to (`holdArm7()`, as a guest does it): `ENABLED` of `dc.aica.arm7` (one
+  bit: 1, the ARM7 is clocked; 0, it is held) reads 0, the ARM7 has no callstack and executes
+  nothing, and its steps answer -32012. The machine releases it when it has run for 8 emulation
+  steps. `ENABLED` is not the debugger's to write: it has no writer (-32013).
+- Memory is three stores, each seen through every address that maps it: main memory (16 MiB:
+  area 3 through P0, P1 and P2), wave memory (8 MiB: the SH4's `0x00800000 + X` is the ARM7's
+  `X`) and video memory (8 MiB in each of its two views, `0x04..` with `0x06..` and `0x05..`
+  with `0x07..`; the mock does not alias one view onto the other). A byte is a hash of where
+  it is until it is written. ARM7 breakpoints are compared under `0x007FFFFC`.
+- The rows of milestone M2 are short lists of the mock's own (at most eight registers a node:
+  104 nodes, about 900 rows). Under `--m1` the tree is that of M1.
+
+## Contract runner
+
+`npm run contract` holds a debugger server to the protocol. Two servers implement it, the mock
+of this repository and the emulator's own, and the runner is what both are measured with. It
+connects with the UI's own `JsonRpcClient` and `WebSocketTransport`, validates every response
+and every tick with the strict copy of the schema (unknown keys fail, the v3 fields are
+required, `null` is an error), checks the tick invariants I1 to I8 on every tick of every
+connection, and runs the scenarios S00 to S21 (`scripts/contract/scenarios.ts`; `--list` names
+them). An error is its code and a message that is not empty: the wording of a message is the
+server's, and nothing is matched against it. Beside I1 to I8 two things are held in every tick:
+no register of a tick carries `flags` (they are `debugger.describe`'s), and the ARM7 callstack
+of a paused tick follows `ENABLED` of `dc.aica.arm7` in that tick (no frames while it reads 0;
+frame 0 at the PC and frame 1 at `R14` with location `lr` while it reads 1), for a server that
+lists the ARM7 and has the capability `callstack`, in every stop that is not the host's.
+
+It leaves the server with the breakpoints, watches, breakpoint categories and run state it
+found: after a failed scenario and at the end of the run it removes every breakpoint and watch
+that was not there when it connected (so nobody else should add any while it runs), and it
+reports what it could not put back. Whatever a connected server answers is a result, with the
+summary of `--json`: a `debugger.describe` result that does not follow the schema is S01 failed,
+with every issue, and the run goes on with what the client reads from it. A server that stops
+answering is a result too: after three request timeouts in a row (an answered request ends the
+row, an answered `debugger.describe` does not) nothing more is sent to it, the scenarios that
+are left are failed as "not run", and the clean-up reports that nothing could be put back.
+
+```
+npm run contract                                  # look at the mock, started in the same process
+npm run contract -- --milestone M2                # the gate of milestone M2 on the mock (part of `npm run check`)
+npm run contract -- --milestone M2 --mock-support m2   # the same on the mock as what the emulator of M2 does
+npm run contract -- --url ws://127.0.0.1:<port>/ws --profile emulator --elf <path> --milestone M1   # the gate of M1 on an emulator
+npm run contract -- --only S16 --parts S16:arm7+tree   # two parts of S16 by themselves
+npm run contract -- --url ws://127.0.0.1:5173/ws --profile mock      # a mock server that is already running
+npm run contract -- --only S05,S06 --verbose      # some scenarios, with every frame
+npm run contract -- --json                        # the summary as JSON on stdout
+npm run contract -- --list                        # the scenarios
+```
+
+Each scenario ends as `passed`, `FAILED`, `not applicable` (the server does not advertise the
+capability or target the scenario needs, or the scenario belongs to the other profile) or
+`partial` (some of its parts passed and the rest could not be shown: a capability that is not
+advertised, a program that takes no interrupt). Only `passed` is a pass. S07 and S20 show that
+a breakpoint that is enabled again, or added while the target runs, is hit where every program
+with interrupts enabled comes at each vertical blank: at the interrupt entry `VBR + 0x600`, with
+`VBR` read at a stop the target has run up to. The mock passes them the way a program does,
+through its interrupt handler. S11 reads the ARM7 callstack against the register `ENABLED` of
+`dc.aica.arm7` in the same paused tick: no frames while it reads 0, the PC and `R14` (and what
+the stack scan finds) while it reads 1, and `state.getCallstack` agrees. S09 also reads across
+the last address of the SH4: the bytes behind it are unreadable and 0, or nothing is readable
+there (-32010); a read does not wrap. S13 also writes a register (with the value it reads) on
+one connection and wants the tick of that on the other.
+
+**S16, the scenario of milestone M2,** has five parts, each for what the server says it has:
+
+- `arm7` (`targets[arm7].stepping`). The start: when `ENABLED` reads 0 the three ARM7 steps are
+  probed for -32012, a breakpoint is added and removed, and the part settles: it resumes and
+  waits until `ENABLED` has read 1 in every running tick of one second, at least two of them
+  (it has to read 1 within 5 s), pauses, and wants `ENABLED` 1 and a PC of the ARM7 no higher
+  than `addressMax` in that tick, else once more, five times at most. (A guest may hold and
+  release its ARM7 more than once while it starts, and run it through the top of the address
+  space in between.) Until its first breakpoint is added the part starts over from a settling,
+  once, when a step answers -32012 or a stop shows the ARM7 held or out of reach. Then: a step
+  is its stop, ends at the next instruction or at a vector from a line that is no control flow,
+  never lets `dc.timing.SH4_CYCLES` go back and lets it grow by two periods of the AICA callback
+  (2 x 145124 cycles) at most; a breakpoint behind two plain lines is hit; a step from that
+  stop executes its instruction, is no breakpoint stop again, and leaves `SH4_CYCLES` and the
+  PC of the SH4 as they were; the breakpoint disabled is not hit, enabled again it is, with the
+  category `arm7` muted it is not; a twin on its address: the lower id is reported; a breakpoint
+  at its address + `0x00800000` is hit, with the PC as it is; removed and added again while the
+  target runs, it is hit within 2 s; an ARM7 step while running is -32003; `control.stepOver` on
+  a line that is no call is a step; `control.stepOut` is followed by a running tick or by its
+  stop. A call: two arrivals at a `bl` line are looked for by single steps, each with 96 steps
+  of its own; at the first the call is stepped over (the stop is behind it), at the second it
+  is stepped into and, from its first line, out of (the stop is where `R14` pointed), and behind
+  that stop the target keeps running. A step on the call that ends at a vector is not the step
+  into the callee.
+- `writeMemory` (`memory-write`): 16 bytes below the stack pointer written, read back through
+  the other two regions that map main memory, and restored; a range across the end of main
+  memory refused whole; 65536 bytes read at the SH4's `defaultMemoryAddress` and written back as
+  they are, one more and a byte of 256 refused; a missing target -32602 and `dsp` -32004; a byte
+  of wave memory through both targets; 16 bytes of video memory through three addresses of one
+  view; the boot ROM, the flash, a register window, P4 and a store queue refused; a refusal while
+  the target runs that is -32013 and not -32003; the tick of every accepted write, of the stop
+  it was made in (the first tick since the request was sent: a server sends it in front of the
+  response or behind it). With `register-write`: `mov #0x5A, r0` written at that scratch
+  address, the PC put there, one step, the PC two further and R0 `0x5A`, and everything put
+  back. (A step that ends at an exception vector with `SPC` at the scratch address executed
+  nothing: the probe is made once more from the vector.) Nothing of the part writes over memory
+  it did not save, and the PC is never moved onto a line of the program.
+- `setRegister` (`register-write`): the round trip of `R0`, the case of `path` and `name`, the
+  grammar of the value, `flags.writable` (on `R0`, not on `ENABLED`, on no register of width 0),
+  in every node a write of the first writable register with the value it reads and a refusal of
+  the first that is not; `R1` and the aligned PC of the ARM7, the odd PC of the SH4 (both PCs
+  with `flags.writable`), a CPSR that names no mode; the exchange of the register banks by a
+  write of `SR.RB`, with `R0` first given a value `R0_BANK` does not have (the two banks of a
+  machine that has not run yet read the same); `state.editWatch`.
+- `reset` (`reset`): while running (`{}`, no stop, the entry in the event log); while paused,
+  with a disabled breakpoint, a watch and a flipped category of its own that the tick of the
+  reset stop still lists; `ENABLED` 0 and no ARM7 frames there, and `R1` of the held ARM7
+  written; then a resume and a pause behind the reset.
+- `tree` (`dc.sh4.cpu` offers the action `sh4-registers`: a server claims the M2 tree by
+  offering the M2 panel): the nodes of M2 under their parents, the two actions, at least one
+  register where M2 has tables, and each of the twelve register panels offered by one node.
+
+The part `arm7` says in notes what it met: `arm7: held at the start` or
+`arm7: clocked at the start`, and `arm7: bl stepped over and out` when it stepped over a call
+and out of one. These three texts are an interface: the emulator's contract targets require
+them with `--require-note`, so they do not change.
+
+**What a gate is.** A gate is a run that names a milestone.
+
+- `--milestone Mx` selects the scenarios of that milestone, i.e. those whose milestone is Mx or
+  earlier, without those of the other profile, and requires each of them to pass: `partial` and
+  `not applicable` fail a gate, and so does a scenario that was not run. M1 is S00 to S15, S19
+  and S20 (S00 and S15 in the emulator profile only); M2 adds S16, M3 adds S17 (and S21, below),
+  M4 adds S18. Under a gate S01 also wants `sh4`, `arm7` and `dsp` listed and the capabilities
+  of the milestone advertised.
+- Without `--milestone` the runner looks at a server: a scenario the server does not claim to
+  support is not applicable, and that is no failure. But a run in which no scenario passed has
+  verified nothing, and fails.
+- `--only <ids>` narrows the selection, also inside a gate, and never turns an empty result into
+  a success: a selection that leaves nothing to pass is a failed run. `--require <ids>` names
+  further scenarios that are run and have to pass.
+- `--parts <scenario>:<part>[+<part>...]` runs only the named parts of a scenario that has
+  parts (S16: `arm7`, `writeMemory`, `setRegister`, `reset`, `tree`; `--list` names them). The
+  scenario has to pass, and it passes when each named part passed: a named part that is not
+  applicable fails. It is for a server that has a part of a milestone, where the scenario as a
+  whole would be `partial`; with `--milestone` it is an error, a gate is whole.
+- `--require-note <text>` (may be repeated, also with `--milestone`): the run is no pass unless
+  a selected scenario noted exactly that text. A gate asks with it for what it has to show and
+  a run could pass without: `--require-note "arm7: bl stepped over and out"`.
+- `--mock-support m1|m2`: the mock the runner starts itself is the mock as a server of that
+  milestone (`--m1`, `--m2` of the mock server). Not with `--url`.
+- Exit codes: 0, every selected scenario that had to pass passed, no invariant was violated and
+  the server was put back; 1, anything else that is a result; 2, there was no run (a wrong
+  option, or a server that could not be connected to).
+
+The gate of a milestone for the emulator is
+
+```
+npm run contract -- --url ws://127.0.0.1:<port>/ws --profile emulator --elf <path> --milestone M1
+```
+
+and likewise for M2, M3 and M4, against one emulator per run that was started headless with its
+test program and is at its `StartPaused` stop: `Debugger:Enabled=yes`, `Debugger:Port=0`,
+`Debugger:Required=yes`, `Debugger:StartPaused=yes`, with the port taken from the
+`Debugger: http://127.0.0.1:<port>/` line the emulator prints. The emulator profile waits for
+that stop, runs S00 (the anchor at the entry point of `--elf`) and S15 as well, and multiplies
+every timeout by 5. The gate of M3 is two runs: that one with the test program of M1, which
+selects everything of M3 but S21, and a second one against an emulator started with the DSP
+test program, `--elf <dsptest.elf> --milestone M3 --dsp-program`, which selects S00 and S21
+alone. The gate of M2 on an emulator is two runs as well: the one with the test program of M1,
+and `--elf <dsptest.elf> --milestone M2 --only S00,S16` against an emulator started with the
+sounding guest, which requires the notes `arm7: held at the start` and
+`arm7: bl stepped over and out` (the first program has no call in the loop its ARM7 waits in,
+and its ARM7 takes no interrupt). The mock's gate is `npm run contract -- --milestone M2`
+(in-process, profile mock): 17 scenarios, S16 with its five parts. `npm run check` runs it
+twice, on the mock as it is and with `--mock-support m2` on the mock as what the emulator of
+M2 does, both with `--require-note "arm7: bl stepped over and out"`. The gates are run against
+a server with the default tick period (200 ms, every fifth periodic tick full): the time bounds
+of the scenarios are written for it. The runner measures them on the monotonic clock: setting
+the wall clock while a run is under way neither ends a wait early nor makes it longer.
+
+`--idle-breakpoint <address|symbol>` is not a test run: it mutes the `sh4` category, adds one
+breakpoint, resumes and stays connected until the server closes the connection.
+
+## Breakpoints
+
+Disassembly views:
+
+- Click the gutter to add or remove a breakpoint at that address.
+- Ctrl, Cmd or Shift + click an existing breakpoint to enable or disable it.
+- A filled red circle is an enabled breakpoint, an outlined one is disabled.
+
+Breakpoint panels:
+
+- **Events: Breakpoints**: event breakpoints by name, for example `dc.holly.core.vblank`. The
+  names are the `events` of the device tree; the server refuses an event it does not raise.
+- **SH4: Breakpoints**, **ARM7: Breakpoints**: code breakpoints by hex address, for example
+  `0x8C0000A0`.
+
+Breakpoints live on the server. Every `event.tick` carries the full list, so all connected clients
+show the same set.
+
+## CI
+
+`.github/workflows/ci.yml` has two jobs on Node 22 (latest 22.x) for pull requests (not for pushes): `check` runs
+`npm ci` and `npm run check`; `e2e` installs Chromium (`npx playwright install --with-deps
+chromium`) and runs `npm run test:e2e`.

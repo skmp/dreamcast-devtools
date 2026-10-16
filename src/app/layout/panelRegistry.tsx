@@ -57,6 +57,11 @@ export const PANEL_REGISTRY: Record<PanelId, PanelRegistryEntry> = {
     name: "SH4: Breakpoints",
     icon: <CodeIcon fontSize="small" />,
   },
+  [PANEL_IDS.SH4_REGISTERS]: {
+    id: PANEL_IDS.SH4_REGISTERS,
+    name: "SH4: Registers",
+    icon: <DeveloperBoardIcon fontSize="small" />,
+  },
   [PANEL_IDS.SH4_BSC_REGISTERS]: {
     id: PANEL_IDS.SH4_BSC_REGISTERS,
     name: "SH4: BSC Registers",
@@ -146,6 +151,11 @@ export const PANEL_REGISTRY: Record<PanelId, PanelRegistryEntry> = {
     id: PANEL_IDS.ARM7_BREAKPOINTS,
     name: "ARM7: Breakpoints",
     icon: <CodeIcon fontSize="small" />,
+  },
+  [PANEL_IDS.ARM7_REGISTERS]: {
+    id: PANEL_IDS.ARM7_REGISTERS,
+    name: "ARM7: Registers",
+    icon: <DeveloperBoardIcon fontSize="small" />,
   },
   [PANEL_IDS.CLX2_TA]: {
     id: PANEL_IDS.CLX2_TA,

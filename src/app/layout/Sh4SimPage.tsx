@@ -1,6 +1,6 @@
 import { AppBar, Box } from "@mui/material";
 import { TopNav } from "./TopNav";
-import { AboutDialog } from "./AboutDialog";
+import { LazyAboutDialog } from "./LazyAboutDialog";
 import { useAboutModal } from "./useAboutModal";
 import { Sh4SimPanel } from "../panels/Sh4SimPanel";
 
@@ -18,7 +18,7 @@ export const Sh4SimPage = () => {
       <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <Sh4SimPanel />
       </Box>
-      <AboutDialog open={aboutOpen} onClose={hideAbout} />
+      <LazyAboutDialog open={aboutOpen} onClose={hideAbout} />
     </Box>
   );
 };

@@ -7,6 +7,9 @@ import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord';
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { SgcFrameData } from "../../lib/sgcChannelData";
+import { CAPABILITIES, type RpcError } from "../../lib/debuggerSchema";
+import { useCapability, useNoDataText } from "../../state/debuggerSelectors";
+import { PanelNotice } from "../components/PanelNotice";
 
 export const AudioPanel = () => {
   const [showFilter, setShowFilter] = useState<'all' | 'active'>('active');
@@ -25,6 +28,10 @@ export const AudioPanel = () => {
 
   const client = useSessionStore((state) => state.client);
   const initialized = useDebuggerDataStore((state) => state.initialized);
+  const showError = useDebuggerDataStore((state) => state.showError);
+  // a server without the SGC capture (before milestone M3) is not asked for one
+  const canCapture = useCapability(CAPABILITIES.SGC_CAPTURE);
+  const noDataText = useNoDataText();
   const channelListRef = useRef<HTMLDivElement>(null);
   const dragStartXRef = useRef<number>(0);
   const dragStartScrollRef = useRef<number>(0);
@@ -33,9 +40,9 @@ export const AudioPanel = () => {
   // Fetch SGC frame data when debugger is initialized
   useEffect(() => {
     const fetchData = async () => {
-      if (!client || !initialized) return;
+      if (!client || !initialized || !canCapture) return;
       try {
-        const arrayBuffer = await client.fetchSgcFrameData();
+        const { data: arrayBuffer } = await client.fetchSgcFrameData();
         setSgcBinaryData(arrayBuffer);
         setNoDataAvailable(false);
 
@@ -64,7 +71,7 @@ export const AudioPanel = () => {
       }
     };
     fetchData();
-  }, [client, initialized]);
+  }, [client, initialized, canCapture]);
 
   // Initialize WebGL renderer
   useEffect(() => {
@@ -91,11 +98,15 @@ export const AudioPanel = () => {
     if (!client) return;
 
     try {
-      // Request recording from server
-      await client.recordSgcFrames();
+      // Request recording from server; it answers when the capture is complete, or says why not
+      const recorded = (await client.recordSgcFrames()) as RpcError;
+      if (recorded.error) {
+        showError(`Record: ${recorded.error.message}`);
+        return;
+      }
 
       // Fetch the new data
-      const arrayBuffer = await client.fetchSgcFrameData();
+      const { data: arrayBuffer } = await client.fetchSgcFrameData();
       setSgcBinaryData(arrayBuffer);
       setNoDataAvailable(false);
 
@@ -121,8 +132,9 @@ export const AudioPanel = () => {
       console.log(`Detected active channels: ${Array.from(detectedActiveChannels).sort((a, b) => a - b).join(', ')}`);
     } catch (error) {
       console.error("Failed to record SGC frame data:", error);
+      showError(`Record: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }, [client]);
+  }, [client, showError]);
 
   const handleFilterChange = useCallback(
     (_event: React.MouseEvent<HTMLElement>, newFilter: 'all' | 'active' | null) => {
@@ -243,6 +255,15 @@ export const AudioPanel = () => {
     });
   }, [hoverPosition, playbackPosition]);
 
+  // said for as long as that server is the one of this page, connected or not
+  if (!canCapture) {
+    return (
+      <Panel>
+        <PanelNotice>This server cannot capture SGC frames.</PanelNotice>
+      </Panel>
+    );
+  }
+
   return (
     <Panel>
       <Box
@@ -337,6 +358,20 @@ export const AudioPanel = () => {
             >
               <div>WebGL Initialization Failed</div>
               <div style={{ fontSize: '0.9rem', color: 'text.secondary' }}>{webglError}</div>
+            </Box>
+          ) : !initialized ? (
+            // a capture is the server's: without a connection there is none to show
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                height: '100%',
+                color: 'text.secondary',
+                fontSize: '1.2rem',
+              }}
+            >
+              {noDataText}
             </Box>
           ) : noDataAvailable ? (
             <Box

@@ -465,10 +465,13 @@ export const CoreInspectorPanel = () => {
 
   const handleCanvasClick = useCallback(
     (event: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!canvasRef.current) return;
-      const rect = canvasRef.current.getBoundingClientRect();
-      const x = Math.floor(event.clientX - rect.left);
-      const y = Math.floor(event.clientY - rect.top);
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      // The bounding rect is the border box: without subtracting the 1px border
+      // (clientLeft/clientTop) a click selects the pixel next to the one under the cursor.
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.floor(event.clientX - rect.left - canvas.clientLeft);
+      const y = Math.floor(event.clientY - rect.top - canvas.clientTop);
       const tileX = Math.floor(x / 32);
       const tileY = Math.floor(y / 32);
       const tileId = tileX + tileY * 64;

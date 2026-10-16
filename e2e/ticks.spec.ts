@@ -1,0 +1,653 @@
+import {
+  test,
+  expect,
+  addPanelFromSelector,
+  breakpointGutter,
+  dockTab,
+  disassemblyRow,
+  disassemblyRows,
+  gotoRoute,
+  panel,
+  recordAlerts,
+  recordText,
+  registerRow,
+  saveScreenshot,
+  statusBar,
+  tooltipButton,
+  treeItemRow,
+  type WorkspaceId,
+} from "./support/fixtures";
+import type { Page } from "@playwright/test";
+import { defaultAnswer, inBandError, jsonRpcError, serveScriptedDebugger, type Json, type ScriptedDebugger } from "./support/scriptedDebugger";
+
+// What the client does with a tick, against a server that sends exactly the ticks the test
+// asks for (the mock sends its own): registers are merged per path, a stop is acted on once,
+// the category state is the server's, and a message the client cannot use is reported.
+
+/** Opens a workspace on the scripted server. `prepare` changes the server before the page connects. */
+const open = async (page: Page, workspace: WorkspaceId, prepare?: (server: ScriptedDebugger) => void | Promise<void>) => {
+  const server = await serveScriptedDebugger(page);
+  await prepare?.(server);
+  await gotoRoute(page, `/workspace/${workspace}`);
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  await server.described();
+  return server;
+};
+
+/**
+ * Sends a tick and waits until the page has applied it: every tick sent this way changes a
+ * text register of the root node, which the device tree shows.
+ */
+let marker = 0;
+const tickAndWait = async (page: Page, server: ScriptedDebugger, options?: Parameters<ScriptedDebugger["tick"]>[0]) => {
+  const value = `mark-${++marker}`;
+  server.setRegister("dc", "SYSCLK", value);
+  server.tick(options ? { ...options, paths: options.paths ? [...options.paths, "dc"] : undefined } : undefined);
+  await expect(registerRow(page, "dc.reg.SYSCLK")).toHaveText(`SYSCLK = ${value}`);
+};
+
+const hex8 = (address: number) => `0x${address.toString(16).toUpperCase().padStart(8, "0")}`;
+
+test("registers are merged per path: a path a tick does not carry keeps what it had", async ({ page }) => {
+  const server = await open(page, "sh4-debugger");
+  await treeItemRow(page, "dc.sh4.cpu").click();
+  await treeItemRow(page, "dc.sh4.tmu").click();
+  const pc = registerRow(page, "dc.sh4.cpu.reg.PC");
+  const tcnt = registerRow(page, "dc.sh4.tmu.reg.TCNT0");
+  await expect(pc).toHaveText("PC = 0x8C001000");
+  await expect(tcnt).toHaveText("TCNT0 = 0xFFFFFFFF");
+
+  // a running tick carries the processors and the time, and nothing else
+  server.state.execution = { state: "running", stopId: 1 };
+  server.setRegister("dc.sh4.cpu", "PC", "0x8C001002");
+  server.setRegister("dc.sh4.tmu", "TCNT0", "0x00001234");
+  await tickAndWait(page, server, { paths: ["dc.sh4.cpu", "dc.aica.arm7", "dc.aica.dsp", "dc.timing"] });
+  await expect(pc).toHaveText("PC = 0x8C001002");
+  // the timer was not in that tick: it shows what the last tick that carried it said
+  await expect(tcnt).toHaveText("TCNT0 = 0xFFFFFFFF");
+
+  // a tick with only the timer: the processor keeps its value in turn
+  server.setRegister("dc.sh4.cpu", "PC", "0x8C001004");
+  await tickAndWait(page, server, { paths: ["dc.sh4.tmu"] });
+  await expect(tcnt).toHaveText("TCNT0 = 0x00001234");
+  await expect(pc).toHaveText("PC = 0x8C001002");
+
+  // a path that is present replaces its list: a full tick updates everything
+  await tickAndWait(page, server);
+  await expect(pc).toHaveText("PC = 0x8C001004");
+  await expect(tcnt).toHaveText("TCNT0 = 0x00001234");
+});
+
+test("nothing of a connection is left in the next one: registers and callstack start empty", async ({ page }) => {
+  const server = await open(page, "sh4-debugger", (scripted) => {
+    scripted.state.callstacks = { sh4: [{ index: 0, pc: 0x8c001000, symbol: "_first_session+0x0" }], arm7: [] };
+  });
+  await treeItemRow(page, "dc.sh4.tmu").click();
+  server.setRegister("dc.sh4.tmu", "TCNT0", "0x11111111");
+  await tickAndWait(page, server);
+  await expect(registerRow(page, "dc.sh4.tmu.reg.TCNT0")).toHaveText("TCNT0 = 0x11111111");
+  await expect(panel(page, "sh4-callstack")).toContainText("_first_session+0x0");
+
+  // The next connection is to a server that describes the timer with another value and then
+  // sends a tick without the timer and without callstacks. What the client shows for both is
+  // what this connection said, not what the last one left behind.
+  server.setRegister("dc.sh4.tmu", "TCNT0", "0x22222222");
+  server.describeAgain();
+  server.afterDescribe = { paths: ["dc", "dc.sh4.cpu"], patch: { callstacks: undefined } };
+  server.drop();
+  // the page is back by itself a second later
+  await expect.poll(() => server.connections()).toBe(2);
+  await server.described();
+  await expect(statusBar(page)).toContainText("Connection: connected");
+
+  await expect(registerRow(page, "dc.sh4.tmu.reg.TCNT0")).toHaveText("TCNT0 = 0x22222222");
+  await expect(panel(page, "sh4-callstack")).toContainText("Empty callstack.");
+  await expect(panel(page, "sh4-callstack")).not.toContainText("_first_session");
+});
+
+test("a stop is acted on once: the views follow it, read again and announce its breakpoint; other ticks do none of that", async ({
+  page,
+}) => {
+  let alerts: () => Promise<string[]> = async () => [];
+  const server = await open(page, "sh4-debugger", async (scripted) => {
+    // the server is stopped at a breakpoint when the page connects
+    scripted.state.execution = { state: "paused", stopId: 4, reason: "breakpoint", breakpointId: 7 };
+    scripted.state.breakpoints = { "7": { id: 7, event: "dc.sh4.cpu.pc", address: 0x8c001000, kind: "code", enabled: true } };
+    alerts = await recordAlerts(page);
+  });
+  /** every announcement of a breakpoint the page has made so far (a notice leaves the screen after five seconds) */
+  const announced = async () => (await alerts()).filter((text) => text.startsWith("Breakpoint hit:"));
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const fetches = () => ({
+    disassembly: server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4").length,
+    memory: server.requestsOf("state.getMemorySlice").length,
+  });
+
+  // the first paused tick of a connection counts as a stop: the client learns why the target is stopped
+  await expect.poll(announced).toEqual(["Breakpoint hit: dc.sh4.cpu.pc == 0x8C001000"]);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+  expect(fetches()).toEqual({ disassembly: 1, memory: 1 });
+
+  // paused ticks of the same stop: what follows a breakpoint or a watch being added, by anyone
+  await tickAndWait(page, server);
+  await tickAndWait(page, server);
+  expect(await announced()).toHaveLength(1);
+  expect(fetches()).toEqual({ disassembly: 1, memory: 1 });
+
+  // the user looks at something else; a tick of the same stop does not take the view back
+  await view.getByRole("textbox").fill("0x8C004000");
+  await view.getByRole("textbox").press("Enter");
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c004000 - 20));
+  expect(fetches()).toEqual({ disassembly: 2, memory: 1 });
+  await tickAndWait(page, server);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c004000 - 20));
+  expect(fetches()).toEqual({ disassembly: 2, memory: 1 });
+
+  // a new stop (a step): the view goes to the program counter, and both views read again
+  server.state.execution = { state: "paused", stopId: 5, reason: "step" };
+  server.setRegister("dc.sh4.cpu", "PC", "0x8C002000");
+  await tickAndWait(page, server);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c002000 - 20));
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c002000));
+  await expect.poll(fetches).toEqual({ disassembly: 3, memory: 2 });
+  // a step is not a breakpoint: nothing is announced
+  expect(await announced()).toHaveLength(1);
+
+  // the next stop is on a line that is on screen: the view stays where it is, and reads again
+  server.state.execution = { state: "paused", stopId: 6, reason: "breakpoint", breakpointId: 8 };
+  server.state.breakpoints = {
+    ...server.state.breakpoints,
+    "8": { id: 8, event: "dc.sh4.cpu.pc", address: 0x8c002002, kind: "code", enabled: true },
+  };
+  server.setRegister("dc.sh4.cpu", "PC", "0x8C002002");
+  await tickAndWait(page, server);
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c002002));
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c002000 - 20));
+  await expect.poll(fetches).toEqual({ disassembly: 4, memory: 3 });
+  await expect.poll(async () => (await announced()).length).toBe(2);
+  // the stop is repeated in every paused tick of it, and announced once
+  await tickAndWait(page, server);
+  await tickAndWait(page, server);
+  expect(await announced()).toEqual([
+    "Breakpoint hit: dc.sh4.cpu.pc == 0x8C001000",
+    "Breakpoint hit: dc.sh4.cpu.pc == 0x8C002002",
+  ]);
+  expect(fetches()).toEqual({ disassembly: 4, memory: 3 });
+
+  // running: five ticks, each with another program counter, and nothing is fetched or marked
+  server.state.execution = { state: "running", stopId: 6 };
+  for (let step = 1; step <= 5; step++) {
+    server.setRegister("dc.sh4.cpu", "PC", hex8(0x8c002002 + 2 * step));
+    await tickAndWait(page, server);
+  }
+  await expect(view.locator(".current-instruction")).toHaveCount(0);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c002000 - 20));
+  expect(fetches()).toEqual({ disassembly: 4, memory: 3 });
+
+  // stopped again, somewhere else
+  server.state.execution = { state: "paused", stopId: 7, reason: "pause" };
+  server.setRegister("dc.sh4.cpu", "PC", "0x8C008000");
+  await tickAndWait(page, server);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c008000 - 20));
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c008000));
+  await expect.poll(fetches).toEqual({ disassembly: 5, memory: 4 });
+  expect(await announced()).toHaveLength(2);
+});
+
+test("two stops close together: the second is followed from where the view is going, not from what is still on screen", async ({
+  page,
+}) => {
+  const server = await open(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const marked = view.locator(".current-instruction");
+  await expect(marked).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  const listings = () => server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4");
+
+  // A server that takes its time over the lines of one address: they are held back until `release`.
+  const hold = (address: number) => {
+    const held: Array<() => void> = [];
+    let holding = true;
+    server.answer("state.getDisassembly", (params: Json) =>
+      holding && params.address === address
+        ? new Promise((resolve) => held.push(() => resolve(defaultAnswer("state.getDisassembly", params))))
+        : defaultAnswer("state.getDisassembly", params),
+    );
+    return {
+      held: () => held.length,
+      release: () => {
+        holding = false;
+        held.splice(0).forEach((answer) => answer());
+      },
+    };
+  };
+  let stopId = 1;
+  /** A new stop at `pc`. It has been applied when the toolbar names it. */
+  const stopAt = async (pc: number) => {
+    server.state.execution = { state: "paused", stopId: ++stopId, reason: "step" };
+    server.setRegister("dc.sh4.cpu", "PC", hex8(pc));
+    server.tick();
+    await expect(page.getByRole("status", { name: "Execution state" })).toContainText(`stop ${stopId}`);
+  };
+
+  // 1. A stop far away, and before its lines are in, a stop back on a line that is still on
+  //    screen. That line is about to be replaced: the view has to go back for it.
+  const far = 0x8c200000;
+  let lines = hold(far - 20);
+  await stopAt(far);
+  await expect.poll(lines.held).toBe(1);
+  const back = 0x8c001002;
+  await expect(disassemblyRow(view, back)).toBeInViewport();
+  await stopAt(back);
+  // without waiting for the lines of the first stop
+  await expect.poll(() => listings().at(-1)).toEqual({ target: "sh4", address: back - 20, count: 64 });
+  await expect(marked).toHaveAttribute("data-address", String(back));
+  lines.release();
+  // the late answer changes nothing (the tick is behind it on the connection)
+  await tickAndWait(page, server);
+  await expect(rows.first()).toHaveAttribute("data-address", String(back - 20));
+  await expect(marked).toHaveAttribute("data-address", String(back));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await expect(view.getByRole("textbox")).toHaveValue(hex8(back));
+
+  // 2. The second stop is on a line of the lines that are on their way, near their top: the
+  //    view reads them again (they were asked for before this stop) and stays.
+  const second = 0x8c300000;
+  lines = hold(second - 20);
+  await stopAt(second);
+  await expect.poll(lines.held).toBe(1);
+  await stopAt(second + 2);
+  await expect.poll(lines.held).toBe(2);
+  expect(listings().at(-1)).toEqual({ target: "sh4", address: second - 20, count: 64 });
+  lines.release();
+  await expect(marked).toHaveAttribute("data-address", String(second + 2));
+  await expect(rows.first()).toHaveAttribute("data-address", String(second - 20));
+
+  // 3. The second stop is among the lines that are on their way, but below what the panel
+  //    shows of them. That is seen when they are in, and then the view goes there.
+  const third = 0x8c400000;
+  const below = third - 20 + 2 * 60;
+  lines = hold(third - 20);
+  await stopAt(third);
+  await expect.poll(lines.held).toBe(1);
+  await stopAt(below);
+  await expect.poll(lines.held).toBe(2);
+  expect(listings().at(-1)).toEqual({ target: "sh4", address: third - 20, count: 64 });
+  lines.release();
+  await expect.poll(() => listings().at(-1)).toEqual({ target: "sh4", address: below - 20, count: 64 });
+  await expect(marked).toHaveAttribute("data-address", String(below));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(below - 20));
+});
+
+test("a stop while the disassembly view is a tab behind another: its program counter is on screen when the tab is shown", async ({
+  page,
+}) => {
+  const server = await open(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  const marked = view.locator(".current-instruction");
+  await expect(marked).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  // the panel shows fewer than fifty lines: the fiftieth after the program counter is below it
+  await expect(disassemblyRow(view, 0x8c001000 + 2 * 50)).not.toBeInViewport();
+
+  let stopId = 1;
+  /** Another panel comes to the front of the group, and the target stops at `pc` behind it. */
+  const stopBehindTheTab = async (pc: number) => {
+    await dockTab(page, "Events: Log").click();
+    await expect(panel(page, "events")).toBeVisible();
+    // the dock takes a panel that is not in front out of the document: nothing in it has a place
+    await expect(view).toHaveCount(0);
+    server.state.execution = { state: "paused", stopId: ++stopId, reason: "step" };
+    server.setRegister("dc.sh4.cpu", "PC", hex8(pc));
+    await tickAndWait(page, server);
+    await expect(page.getByRole("status", { name: "Execution state" })).toContainText(`stop ${stopId}`);
+    // what the view does for a stop it does from a timer: give it the time
+    await page.waitForTimeout(300);
+    await dockTab(page, "SH4: Disassembly").click();
+    await expect(view).toBeVisible();
+  };
+  await addPanelFromSelector(page, 1, "Events: Log");
+
+  // 1. Fifty instructions on: among the 64 lines the view has, and below what it showed.
+  //    (A panel that is not in the document measures as nothing, and a line of nothing
+  //    "is inside" its container of nothing: the view took the line for one on screen.)
+  const below = 0x8c001000 + 2 * 50;
+  await stopBehindTheTab(below);
+  await expect(marked).toHaveAttribute("data-address", String(below));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(below - 20));
+  await expect(view.getByRole("textbox")).toHaveValue(hex8(below));
+
+  // 2. A stop on a line the view shows: as in a view that is in front, it stays where it is.
+  await stopBehindTheTab(below + 4);
+  await expect(marked).toHaveAttribute("data-address", String(below + 4));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await page.waitForTimeout(300);
+  await expect(rows.first()).toHaveAttribute("data-address", String(below - 20));
+
+  // 3. A stop outside the lines the view has: it goes there without having been seen.
+  const far = 0x8c004000;
+  await stopBehindTheTab(far);
+  await expect(marked).toHaveAttribute("data-address", String(far));
+  await expect(marked).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(far - 20));
+  expect(server.requestsOf("state.getDisassembly").at(-1)).toEqual({ target: "sh4", address: far - 20, count: 64 });
+});
+
+test("a stop while the view has an error to show in place of its lines: it goes to the program counter, with one request", async ({
+  page,
+}) => {
+  const server = await open(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  const listings = () => server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4");
+
+  // the emulator is busy when the view reads for a stop: the view shows that instead of lines
+  let busy = true;
+  server.answer("state.getDisassembly", (params) =>
+    busy ? jsonRpcError(-32000, "emulator busy") : defaultAnswer("state.getDisassembly", params),
+  );
+  server.state.execution = { state: "paused", stopId: 2, reason: "step" };
+  await tickAndWait(page, server);
+  await expect(view).toContainText("emulator busy");
+  await expect(rows).toHaveCount(0);
+
+  // The next stop is forty instructions on: among the 64 lines the view had, none of which is
+  // on screen. That is not a view behind a tab, which has to wait to see: it is there to be
+  // seen and has no lines, so it goes to the program counter at once.
+  busy = false;
+  const before = listings().length;
+  const pc = 0x8c001000 + 2 * 40;
+  server.state.execution = { state: "paused", stopId: 3, reason: "step" };
+  server.setRegister("dc.sh4.cpu", "PC", hex8(pc));
+  await tickAndWait(page, server);
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(pc));
+  await expect(view.locator(".current-instruction")).toBeInViewport({ ratio: 1 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(pc - 20));
+  await page.waitForTimeout(300);
+  expect(listings().slice(before)).toEqual([{ target: "sh4", address: pc - 20, count: 64 }]);
+});
+
+test("stops that arrive faster than the page renders them: everything ends at the last, and the views read for the latest only", async ({
+  page,
+}) => {
+  const server = await open(page, "sh4-debugger", (scripted) => {
+    scripted.state.watches = [{ id: 1, expression: "dc.sh4.cpu.pc", value: "0x8C001000" }];
+  });
+  const view = panel(page, "sh4-disassembly");
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+  const requests = () => ({
+    listings: server.requestsOf("state.getDisassembly").length,
+    slices: server.requestsOf("state.getMemorySlice").length,
+  });
+  const before = requests();
+
+  // Three hundred stops without a pause between them, each far from the one before: what a
+  // script that steps through another client does to this page. The ticks queue up in it.
+  const STOPS = 300;
+  let pc = 0x8c001000;
+  let stopId = 1;
+  for (let index = 0; index < STOPS; index++) {
+    pc += 0x1000;
+    stopId++;
+    server.state.execution = { state: "paused", stopId, reason: "step" };
+    server.setRegister("dc.sh4.cpu", "PC", hex8(pc));
+    server.setRegister("dc", "SYSCLK", `tick-${stopId}`);
+    server.state.watches = [{ id: 1, expression: "dc.sh4.cpu.pc", value: hex8(pc) }];
+    server.state.callstacks = { sh4: [{ index: 0, pc, symbol: `_at_stop_${stopId}` }], arm7: [] };
+    server.tick();
+  }
+
+  // Every part of the page is of the last tick. (React refuses a fifty-first render in a row
+  // with an exception; the page fixture fails the test on any error of the page.)
+  await expect(page.getByRole("status", { name: "Execution state" })).toHaveText(`Paused · step completed · stop ${stopId}`);
+  await expect(registerRow(page, "dc.reg.SYSCLK")).toHaveText(`SYSCLK = tick-${stopId}`);
+  await expect(panel(page, "watches")).toContainText(`dc.sh4.cpu.pc = ${hex8(pc)}`);
+  await expect(panel(page, "sh4-callstack")).toContainText(`_at_stop_${stopId}`);
+  await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", String(pc));
+  await expect(disassemblyRows(view).first()).toHaveAttribute("data-address", String(pc - 20));
+  await expect(view.getByRole("textbox")).toHaveValue(hex8(pc));
+  // a tick of the same stop goes through the whole page: nothing is left behind that failed
+  await tickAndWait(page, server);
+  await expect(page.locator("[data-error-boundary]")).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+
+  // The views did not read for stops that were overtaken while their ticks were queued: the
+  // last one is read for, and few of those before it.
+  const after = requests();
+  expect(server.requestsOf("state.getDisassembly").at(-1)).toEqual({ target: "sh4", address: pc - 20, count: 64 });
+  expect(after.listings - before.listings).toBeGreaterThan(0);
+  expect(after.slices - before.slices).toBeGreaterThan(0);
+  expect(after.listings - before.listings).toBeLessThan(STOPS / 4);
+  expect(after.slices - before.slices).toBeLessThan(STOPS / 4);
+  console.log(`[burst of ${STOPS} stops] state.getDisassembly ${after.listings - before.listings}, state.getMemorySlice ${after.slices - before.slices}`);
+});
+
+test("a breakpoint set or removed in a disassembly view makes it read again, where it is", async ({ page }) => {
+  const server = await open(page, "sh4-debugger");
+  const view = panel(page, "sh4-disassembly");
+  const rows = disassemblyRows(view);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+  const fetches = () => server.requestsOf("state.getDisassembly").filter((params) => params.target === "sh4").length;
+  expect(fetches()).toBe(1);
+
+  // the server lists the breakpoint in the tick that follows the request, like a real one
+  server.answer("breakpoints.add", (params) => {
+    server.state.breakpoints = { "1": { id: 1, event: params.event, address: params.address, kind: "code", enabled: true } };
+    setTimeout(() => server.tick(), 0);
+    return {};
+  });
+  server.answer("breakpoints.remove", () => {
+    server.state.breakpoints = {};
+    setTimeout(() => server.tick(), 0);
+    return {};
+  });
+
+  const row = disassemblyRow(view, 0x8c001008);
+  await row.hover();
+  await breakpointGutter(row).click();
+  await expect(breakpointGutter(row)).toHaveAttribute("data-breakpoint", "enabled");
+  await expect.poll(fetches).toBe(2);
+  expect(server.requestsOf("state.getDisassembly").at(-1)).toEqual({ target: "sh4", address: 0x8c001000 - 20, count: 64 });
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+
+  await breakpointGutter(row).click();
+  await expect(breakpointGutter(row)).toHaveAttribute("data-breakpoint", "none");
+  await expect.poll(fetches).toBe(3);
+  await expect(rows.first()).toHaveAttribute("data-address", String(0x8c001000 - 20));
+});
+
+test("mute and solo are the server's state: the buttons show what the ticks say, whoever changed it", async ({ page }) => {
+  const server = await open(page, "mixed-mode-debugger", (scripted) => {
+    // somebody muted the SH4 category before this page connected
+    (scripted.state.categories as Record<string, unknown>).sh4 = { muted: true, soloed: false };
+  });
+  const sh4 = panel(page, "sh4-disassembly");
+  const arm7 = panel(page, "arm7-disassembly");
+  await expect(sh4.getByRole("button", { name: "Unmute category" })).toBeVisible();
+  await expect(arm7.getByRole("button", { name: "Mute category" })).toBeVisible();
+
+  // another client solos ARM7 (which unmutes nothing): a tick says so, and both views follow
+  server.state.categories = {
+    events: { muted: false, soloed: false },
+    sh4: { muted: true, soloed: false },
+    arm7: { muted: false, soloed: true },
+    dsp: { muted: false, soloed: false },
+    // a key this client does not know is not its business
+    netplay: { muted: true, soloed: false },
+  };
+  server.tick();
+  await expect(arm7.getByRole("button", { name: "Unsolo category" })).toBeVisible();
+  await expect(sh4.getByRole("button", { name: "Unmute category" })).toBeVisible();
+
+  // a click sends the state the button asks for, for all four categories; the tick confirms it
+  server.answer("breakpoints.setCategoryStates", (params) => {
+    server.state.categories = params.categories as Record<string, unknown>;
+    setTimeout(() => server.tick(), 0);
+    return {};
+  });
+  await sh4.getByRole("button", { name: "Unmute category" }).click();
+  await expect(sh4.getByRole("button", { name: "Mute category" })).toBeVisible();
+  expect(server.requestsOf("breakpoints.setCategoryStates").at(-1)).toEqual({
+    categories: {
+      events: { muted: false, soloed: false },
+      sh4: { muted: false, soloed: false },
+      arm7: { muted: false, soloed: true },
+      dsp: { muted: false, soloed: false },
+    },
+  });
+
+  // a refusal is shown, and the button goes back to what the server has
+  server.answer("breakpoints.setCategoryStates", () => inBandError(-32000, "emulator busy"));
+  await sh4.getByRole("button", { name: "Solo category" }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "emulator busy" })).toBeVisible();
+  await expect(sh4.getByRole("button", { name: "Solo category" })).toBeVisible();
+  await expect(arm7.getByRole("button", { name: "Unsolo category" })).toBeVisible();
+});
+
+test("a tick the client cannot use is dropped, and the page says so with the place that is wrong", async ({
+  page,
+  diagnostics,
+}, testInfo) => {
+  diagnostics.allow(/^console\.error: Notification validation failed for event\.tick/, "the client logs the tick it drops");
+  const server = await open(page, "sh4-debugger");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  const dropped = page.getByRole("alert").filter({ hasText: "could not use" });
+
+  // a subsystem has to be a string; this entry has a number
+  server.setRegister("dc", "SYSCLK", "from the bad tick");
+  server.tick({ patch: { eventLog: [{ eventId: "1", timestamp: 1, subsystem: 5, severity: "info", message: "x" }] } });
+  await expect(dropped).toContainText("The server sent a message this UI could not use, and it was dropped");
+  await expect(dropped).toContainText("event.tick: eventLog.0.subsystem:");
+  // nothing of that tick was applied
+  await expect(registerRow(page, "dc.reg.SYSCLK")).toHaveText("SYSCLK = 200MHz");
+
+  // the next one is counted, and the place is that of the last one
+  server.tick({ patch: { executionState: { state: "halted" } } });
+  await expect(dropped).toContainText("The server sent 2 messages this UI could not use, and they were dropped");
+  await expect(dropped).toContainText("event.tick: executionState.state:");
+  await saveScreenshot(page, testInfo, "dropped-ticks");
+
+  // the connection is fine, and a tick that is right is applied
+  await tickAndWait(page, server);
+  await expect(statusBar(page)).toContainText("Connection: connected");
+
+  // the notice can be put away; the next dropped message brings it back, counting from one
+  await dropped.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  server.tick({ patch: { tickId: "seven" } });
+  await expect(dropped).toContainText("The server sent a message this UI could not use");
+  await expect(dropped).toContainText("event.tick: tickId:");
+});
+
+test("a debugger.describe the client cannot use, or that the server refuses, is reported instead of an empty page", async ({
+  page,
+  diagnostics,
+}) => {
+  diagnostics.allow(/^console\.error: Failed to initialize debugger data/, "the store logs the failed initialisation");
+  const server = await serveScriptedDebugger(page);
+  // no version, and no device tree
+  server.shape = { emulator: { name: "half a server", build: "native" } };
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  await expect(statusBar(page)).toContainText("Connection: connected");
+
+  const failed = page.getByRole("alert").filter({ hasText: "debugger.describe failed" });
+  await expect(failed).toContainText("debugger.describe failed: Response validation failed for debugger.describe: emulator.version:");
+  await expect(failed).toContainText("deviceTree:");
+  for (const id of ["device-tree", "sh4-disassembly", "sh4-memory", "watches"]) {
+    await expect(panel(page, id), id).toContainText("No Data");
+  }
+  await expect(tooltipButton(page, "Run")).toBeDisabled();
+  await expect(tooltipButton(page, "Pause")).toBeDisabled();
+
+  // the next attempt is refused by the server
+  server.answer("debugger.describe", () => jsonRpcError(-32603, "internal error"));
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "debugger.describe failed: internal error" })).toBeVisible();
+  await expect(panel(page, "device-tree")).toContainText("No Data");
+});
+
+test("a debugger.describe that failed is asked again: the session comes back when the server can answer", async ({ page, diagnostics }) => {
+  diagnostics.allow(/^console\.error: Failed to initialize debugger data/, "the store logs the failed initialisation");
+  const server = await serveScriptedDebugger(page);
+  // The emulator thread did not get to the request within two seconds: every method can be
+  // answered with -32000 then (design 3.3), and a moment later the server is fine again.
+  let busy = true;
+  server.answer("debugger.describe", () => {
+    if (busy) {
+      return jsonRpcError(-32000, "emulator busy");
+    }
+    // the response first, then a full tick to this client
+    queueMicrotask(() => server.tick());
+    return server.shape;
+  });
+  // what the notice says changes within a second: it is recorded, not looked for
+  const said = await recordText(page, '[role="alert"]');
+  const announced = async () =>
+    (await said()).flatMap(({ at, text }) => {
+      const attempt = /^debugger\.describe failed: emulator busy\. Asking again in (\d+) s \(attempt (\d+)\)\./.exec(text);
+      return attempt ? [{ at, wait: Number(attempt[1]), attempt: Number(attempt[2]) }] : [];
+    });
+  const execution = page.getByRole("status", { name: "Execution state" });
+  const failed = page.getByRole("alert").filter({ hasText: "debugger.describe failed: emulator busy" });
+  const describes = () => server.requestsOf("debugger.describe").length;
+
+  await gotoRoute(page, "/workspace/sh4-debugger");
+  // the third debugger.describe is refused like the two before it; the fourth is five seconds away
+  await expect(failed).toContainText("Asking again in 5 s (attempt 3).");
+  expect(describes()).toBe(3);
+  const attempts = await announced();
+  expect(attempts.map(({ wait, attempt }) => ({ wait, attempt }))).toEqual([
+    { wait: 1, attempt: 1 },
+    { wait: 2, attempt: 2 },
+    { wait: 5, attempt: 3 },
+  ]);
+  expect(attempts[1].at - attempts[0].at).toBeGreaterThanOrEqual(900);
+  expect(attempts[2].at - attempts[1].at).toBeGreaterThanOrEqual(1900);
+  // all of it on the one connection, which is there: nothing reconnects
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  expect(server.connections()).toBe(1);
+  for (const id of ["device-tree", "sh4-disassembly", "sh4-memory", "watches"]) {
+    await expect(panel(page, id), id).toContainText("No Data");
+  }
+  await expect(execution).toHaveCount(0);
+
+  // "Retry now" does not wait for the five seconds, and the server can answer by now
+  busy = false;
+  await failed.getByRole("button", { name: "Retry now" }).click();
+  await expect(execution).toContainText("Paused", { timeout: 3000 });
+  expect(describes()).toBe(4);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(panel(page, "sh4-disassembly").locator(".current-instruction")).toHaveAttribute("data-address", String(0x8c001000));
+  await expect(panel(page, "sh4-memory")).toContainText("0x8C010000");
+  // a session like any other: the next tick is applied
+  await tickAndWait(page, server);
+
+  // The same on the next connection, and nobody clicks: a second after the refusal the page
+  // asks again by itself.
+  busy = true;
+  server.drop();
+  await expect.poll(() => server.connections()).toBe(2);
+  await expect(failed).toBeVisible();
+  await expect(panel(page, "device-tree")).toContainText("No Data");
+  busy = false;
+  await expect(execution).toContainText("Paused");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(statusBar(page)).toContainText("Connection: connected");
+  expect(server.connections()).toBe(2);
+  await tickAndWait(page, server);
+  // nothing is asked again once the server is described
+  const settled = describes();
+  await page.waitForTimeout(2500);
+  expect(describes()).toBe(settled);
+});

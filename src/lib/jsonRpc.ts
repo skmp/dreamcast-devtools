@@ -1,4 +1,4 @@
-﻿export const JSON_RPC_VERSION = "2.0" as const;
+export const JSON_RPC_VERSION = "2.0" as const;
 
 export type JsonRpcId = number | string | null;
 

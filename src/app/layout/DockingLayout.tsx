@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, useMemo, useState, type ReactElement, type FunctionComponent } from "react";
+import { Suspense, useEffect, useRef, useCallback, useMemo, useState, type ReactElement, type FunctionComponent, type SyntheticEvent } from "react";
 import {
   DockviewReact,
   type DockviewReadyEvent,
@@ -8,9 +8,15 @@ import {
 } from "dockview";
 import { Box, IconButton } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
+import { ErrorBoundary } from "../components/ErrorBoundary";
+import { LoadingPlaceholder } from "../components/LoadingPlaceholder";
+import { useLazyImportArrivals } from "../components/lazyImport";
 import AddIcon from "@mui/icons-material/Add";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { PanelSelectorModal } from "./PanelSelectorModal";
+import { loadLayout, saveLayout, withKnownPanels } from "./dockingLayoutStorage";
+import { isCompactDock, type DefaultLayoutMode } from "./defaultLayout";
+import { useFocusedTargetStore } from "../../state/focusedTarget";
 import "dockview/dist/styles/dockview.css";
 
 export type PanelDefinition = {
@@ -24,20 +30,37 @@ type DockingLayoutProps = {
   allPanels?: PanelDefinition[]; // All available panels for cross-instance drag and drop
   onReady?: (api: DockviewApi) => void;
   workspaceId?: string;
-  defaultLayoutMode?: 'tabs' | 'vertical-stack' | 'sh4-layout' | 'mixed-mode-debugger-layout'; // How to layout initial panels
+  defaultLayoutMode?: DefaultLayoutMode; // How to layout initial panels
   onAddPanelRequest?: (panelId: string) => void;
 };
-
-const getDockingLayoutStorageKey = (workspaceId?: string) =>
-  workspaceId ? `nulldc-debugger-docking-layout-${workspaceId}` : "nulldc-debugger-docking-layout";
 
 // Store panel components and metadata in Maps
 const panelComponentsMap = new Map<string, ReactElement>();
 const panelDefinitionsMap = new Map<string, PanelDefinition>();
 const dockviewApisMap = new Map<string, DockviewApi>();
 
+/** What every dock panel is rendered in: its id for the tests, an error boundary and the loading state. */
+const PanelFrame = ({ panel }: { panel: PanelDefinition }) => {
+  // rendered again when the code of a lazily loaded panel has arrived (see lazyImport)
+  useLazyImportArrivals();
+  return (
+    <Box
+      data-panel-id={panel.id}
+      sx={{ height: "100%", width: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}
+    >
+      {/* an exception in one panel must not take the workspace down */}
+      <ErrorBoundary scope="panel" name={panel.title} testId={`panel:${panel.id}`}>
+        {/* some panels are loaded on first use */}
+        <Suspense fallback={<LoadingPlaceholder scope="panel" />}>{panel.component}</Suspense>
+      </ErrorBoundary>
+    </Box>
+  );
+};
+
 export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, defaultLayoutMode = 'tabs' }: DockingLayoutProps) => {
   const apiRef = useRef<DockviewApi | null>(null);
+  // the element the dock fills: what room a default layout has is measured on it
+  const dockRef = useRef<HTMLDivElement | null>(null);
   const { mode } = useThemeMode();
   const isDarkMode = mode === "dark";
   const [modalOpen, setModalOpen] = useState(false);
@@ -60,11 +83,7 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
     const comps: Record<string, FunctionComponent<IDockviewPanelProps>> = {};
 
     availablePanels.forEach((panel) => {
-      comps[panel.id] = () => (
-        <Box sx={{ height: "100%", width: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}>
-          {panel.component}
-        </Box>
-      );
+      comps[panel.id] = () => <PanelFrame panel={panel} />;
     });
 
     return comps;
@@ -78,18 +97,24 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
       dockviewApisMap.set(event.api.id, event.api);
       console.log('[DockingLayout] Registered API with id:', event.api.id, 'workspace:', workspaceId);
 
-      // Try to load saved layout
-      const savedLayout = loadLayout(workspaceId);
+      // Try to load saved layout. It can name panels this build does not have (it was saved by
+      // another version of the UI): those are left out, the rest is kept.
+      const stored = loadLayout(workspaceId);
+      const savedLayout = stored ? withKnownPanels(stored, (allPanels ?? panels).map((panel) => panel.id)) : null;
 
+      // A default layout is made for the room the dock has when it is made (a saved layout is
+      // the user's, whatever the window is now; "Reset layout" makes the default again).
+      const room = dockRef.current?.getBoundingClientRect();
+      const size = { width: room?.width ?? 0, height: room?.height ?? 0 };
       if (savedLayout) {
         try {
           event.api.fromJSON(savedLayout);
         } catch (error) {
           console.warn("Failed to restore docking layout, using default", error);
-          createDefaultLayout(event.api, panels, defaultLayoutMode);
+          createDefaultLayout(event.api, panels, defaultLayoutMode, size);
         }
       } else {
-        createDefaultLayout(event.api, panels, defaultLayoutMode);
+        createDefaultLayout(event.api, panels, defaultLayoutMode, size);
       }
 
       // Save layout on changes
@@ -183,7 +208,7 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
         dockviewApisMap.delete(event.api.id);
       };
     },
-    [panels, workspaceId]
+    [panels, allPanels, workspaceId, defaultLayoutMode]
   );
 
   useEffect(() => {
@@ -214,6 +239,7 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
     return () => {
       disposables.forEach((d) => d.dispose());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- apiRef.current as a dep re-subscribes on the first render after onDockviewReady assigns it; dropping it changes when the listeners attach
   }, [apiRef.current]);
 
   const handlePanelSelect = useCallback((panelId: string) => {
@@ -261,6 +287,27 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
     setModalOpen(true);
   }, []);
 
+  // Which panel has the focus, for the toolbar of the page: its step buttons and the function
+  // keys act on the target of the panel of a target that had it last (`focusedTarget`). A panel
+  // has the focus when the pointer goes down in it or the keyboard focus moves into it: that
+  // panel is the one the event is in. On the header of a group, which is in no panel, it is
+  // the panel that group shows: for a click on a tab the one of that tab, which the dock has
+  // made the group's panel by now (its own listeners are on the elements below this one, and
+  // have run). An event that is in neither (a menu a panel opened elsewhere in the page) says
+  // nothing.
+  const reportFocus = useCallback((event: SyntheticEvent) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const panelId =
+      target.closest("[data-panel-id]")?.getAttribute("data-panel-id") ??
+      apiRef.current?.groups.find((group) => group.element.contains(target))?.activePanel?.id;
+    if (panelId) {
+      useFocusedTargetStore.getState().panelFocused(panelId);
+    }
+  }, []);
+
   // Custom header actions component that shows the "+" button for each group
   const RightHeaderActionsComponent: FunctionComponent<IDockviewHeaderActionsProps> = useCallback(
     ({ api }) => {
@@ -292,6 +339,9 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
   return (
     <>
       <Box
+        ref={dockRef}
+        onPointerDown={reportFocus}
+        onFocus={reportFocus}
         sx={{
           height: "100%",
           width: "100%",
@@ -334,10 +384,52 @@ export const DockingLayout = ({ panels, allPanels, onReady, workspaceId, default
 };
 
 // Helper functions
-function createDefaultLayout(api: DockviewApi, panels: PanelDefinition[], mode: 'tabs' | 'vertical-stack' | 'sh4-layout' | 'mixed-mode-debugger-layout' = 'tabs') {
+
+/**
+ * The default of a centre dock that has no room for two views side by side (a laptop screen
+ * with both side docks open): the first panel above, over the whole width, and the others as
+ * tabs of one group below it. `topShare` is the part of the height the first panel gets.
+ */
+function createStackedLayout(api: DockviewApi, panels: PanelDefinition[], height: number, topShare: number) {
+  const firstPanel = api.addPanel({
+    id: panels[0].id,
+    component: panels[0].id,
+    title: panels[0].title,
+  });
+  if (panels.length > 1) {
+    api.addPanel({
+      id: panels[1].id,
+      component: panels[1].id,
+      title: panels[1].title,
+      position: { referencePanel: firstPanel, direction: 'below' },
+      ...(height > 0 ? { initialHeight: Math.round(height * (1 - topShare)) } : {}),
+    });
+  }
+  for (let i = 2; i < panels.length; i++) {
+    api.addPanel({
+      id: panels[i].id,
+      component: panels[i].id,
+      title: panels[i].title,
+      position: { referencePanel: panels[1].id, direction: 'within' },
+      // the second panel stays the one its group shows
+      inactive: true,
+    });
+  }
+  firstPanel.api.setActive();
+}
+
+function createDefaultLayout(
+  api: DockviewApi,
+  panels: PanelDefinition[],
+  mode: DefaultLayoutMode = 'tabs',
+  size: { width: number; height: number } = { width: 0, height: 0 },
+) {
   if (panels.length === 0) return;
 
-  if (mode === 'mixed-mode-debugger-layout') {
+  if (isCompactDock(mode, size.width)) {
+    // two views one above the other in the mixed-mode workspace; a view above its memory and breakpoints in the others
+    createStackedLayout(api, panels, size.height, mode === 'mixed-mode-debugger-layout' ? 0.5 : 0.6);
+  } else if (mode === 'mixed-mode-debugger-layout') {
     // Custom debugger layout: SH4 Disassembly (left) | ARM7 Disassembly (right)
     if (panels.length === 0) return;
 
@@ -377,7 +469,8 @@ function createDefaultLayout(api: DockviewApi, panels: PanelDefinition[], mode: 
     // Focus the first panel in the left group
     firstPanel.api.setActive();
   } else if (mode === 'sh4-layout') {
-    // SH4 layout: First panel on left, remaining panels vertically stacked on right
+    // SH4 layout: first panel on the left, the second and third stacked on the right, and
+    // the rest (the register panel of the processor) as tabs behind the third
     if (panels.length === 0) return;
 
     // Add first panel (SH4 Disassembly)
@@ -413,7 +506,7 @@ function createDefaultLayout(api: DockviewApi, panels: PanelDefinition[], mode: 
       });
     }
 
-    // Any additional panels go as tabs in the last group
+    // Any additional panels go as tabs in the last group, behind its first panel
     for (let i = 3; i < panels.length; i++) {
       api.addPanel({
         id: panels[i].id,
@@ -423,6 +516,8 @@ function createDefaultLayout(api: DockviewApi, panels: PanelDefinition[], mode: 
           referencePanel: panels[2].id,
           direction: 'within',
         },
+        // the third panel stays the one its group shows
+        inactive: true,
       });
     }
 
@@ -519,37 +614,5 @@ function createDefaultLayout(api: DockviewApi, panels: PanelDefinition[], mode: 
 
     // Focus the first panel
     firstPanel.api.setActive();
-  }
-}
-
-function saveLayout(layout: any, workspaceId?: string) {
-  if (typeof window === "undefined") return;
-
-  try {
-    window.localStorage.setItem(getDockingLayoutStorageKey(workspaceId), JSON.stringify(layout));
-  } catch (error) {
-    console.warn("Failed to save docking layout", error);
-  }
-}
-
-function loadLayout(workspaceId?: string): any | null {
-  if (typeof window === "undefined") return null;
-
-  try {
-    const raw = window.localStorage.getItem(getDockingLayoutStorageKey(workspaceId));
-    return raw ? JSON.parse(raw) : null;
-  } catch (error) {
-    console.warn("Failed to load docking layout", error);
-    return null;
-  }
-}
-
-export function clearDockingLayout(workspaceId?: string) {
-  if (typeof window === "undefined") return;
-
-  try {
-    window.localStorage.removeItem(getDockingLayoutStorageKey(workspaceId));
-  } catch (error) {
-    console.warn("Failed to clear docking layout", error);
   }
 }

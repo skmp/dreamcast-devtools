@@ -92,6 +92,7 @@ export const PanelSelectorModal = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- handleSelect/onClose are new closures every render; listing them would re-subscribe the listener on each render
   }, [open, filteredPanels, selectedIndex]);
 
   // Reset selected index when filtered list changes

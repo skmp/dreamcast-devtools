@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { Box, Card, CardActionArea, CardContent, Container, Stack, Typography } from "@mui/material";
 import { useNavigate } from "react-router-dom";
-import { AboutDialog } from "./AboutDialog";
+import { LazyAboutDialog } from "./LazyAboutDialog";
 import { useAboutModal } from "./useAboutModal";
 
 export const HomePage = () => {
@@ -93,7 +93,7 @@ export const HomePage = () => {
         <Stack spacing={6} alignItems="center">
           <Stack spacing={2} alignItems="center" textAlign="center">
             <Typography variant="h3" fontWeight={700} sx={{ color: "text.primary" }}>
-              Welcome to the nullDC DevTools
+              Welcome to Dreamcast DevTools
             </Typography>
             <Typography variant="h6" sx={{ color: "text.secondary", maxWidth: 720 }}>
               Dive into Dreamcast with curated workspaces for CPU, GPU, and audio debugging, as well as sh4 simulator and dsp authoring tools.
@@ -221,7 +221,7 @@ export const HomePage = () => {
           </Stack>
         </Stack>
       </Container>
-      <AboutDialog open={aboutOpen} onClose={hideAbout} />
+      <LazyAboutDialog open={aboutOpen} onClose={hideAbout} />
     </Box>
   );
 };

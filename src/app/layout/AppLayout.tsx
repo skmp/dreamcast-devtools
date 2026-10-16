@@ -1,6 +1,7 @@
-﻿import { useEffect, useCallback, useMemo, useState, useRef } from "react";
-import { AppBar, Box, Button, Divider, IconButton, Stack, Switch, Typography, Alert } from "@mui/material";
+import { useEffect, useLayoutEffect, useCallback, useMemo, useState, useRef } from "react";
+import { AppBar, Box, Button, Divider, IconButton, Link, Stack, Switch, Typography, Alert } from "@mui/material";
 import { HideOnHoverTooltip as Tooltip } from "../components";
+import { lazyImport } from "../components/lazyImport";
 import PowerSettingsNewIcon from "@mui/icons-material/PowerSettingsNew";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudOffIcon from "@mui/icons-material/CloudOff";
@@ -9,24 +10,18 @@ import ChevronLeftIcon from "@mui/icons-material/ChevronLeft";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import DarkModeIcon from "@mui/icons-material/DarkMode";
 import LightModeIcon from "@mui/icons-material/LightMode";
-import PlayArrowIcon from "@mui/icons-material/PlayArrow";
-import PauseIcon from "@mui/icons-material/Pause";
-import SkipNextIcon from "@mui/icons-material/SkipNext";
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
+import { useFocusedTargetStore } from "../../state/focusedTarget";
 import { DeviceTreePanel } from "../panels/DeviceTreePanel";
 import { WatchesPanel } from "../panels/WatchesPanel";
 import { EventLogPanel } from "../panels/EventLogPanel";
 import { Sh4DisassemblyPanel, Arm7DisassemblyPanel, DspDisassemblyPanel } from "../panels/DisassemblyPanel";
 import { Sh4MemoryPanel, Arm7MemoryPanel } from "../panels/MemoryPanel";
 import CallstackPanel from "../panels/CallstackPanel";
-import { AudioPanel } from "../panels/AudioPanel";
 import { TaInspectorPanel } from "../panels/TaInspectorPanel";
-import { CoreInspectorPanel } from "../panels/CoreInspectorPanel";
 import { EventsBreakpointsPanel, Sh4BreakpointsPanel, Arm7BreakpointsPanel, DspBreakpointsPanel } from "../panels/BreakpointsPanel";
 import { DocumentationPanel } from "../panels/DocumentationPanel";
-import { Sh4SimPanel } from "../panels/Sh4SimPanel";
-import { DspPlaygroundPanel } from "../panels/DspPlaygroundPanel";
 import {
   BscRegistersPanel,
   CcnRegistersPanel,
@@ -38,6 +33,8 @@ import {
   ScifRegistersPanel,
   TmuRegistersPanel,
   UbcRegistersPanel,
+  Sh4RegistersPanel,
+  Arm7RegistersPanel,
 } from "../panels/Sh4RegisterPanels";
 import {
   SqContentsPanel,
@@ -52,9 +49,25 @@ import { useAboutModal } from "./useAboutModal";
 import { TopNav } from "./TopNav";
 import { useThemeMode } from "../../theme/ThemeModeProvider";
 import { DEBUGGER_VERSION } from "./aboutVersion";
-import { DockingLayout, clearDockingLayout, type PanelDefinition } from "./DockingLayout";
+import { DockingLayout, type PanelDefinition } from "./DockingLayout";
+import { clearDockingLayout } from "./dockingLayoutStorage";
 import type { DockviewApi } from "dockview";
-import { PANEL_IDS, type PanelId } from "../../lib/debuggerSchema";
+import { PANEL_IDS, PROTOCOL_VERSION, type PanelId } from "../../lib/debuggerSchema";
+import { ExecutionStatus } from "./ExecutionStatus";
+import { RunControls } from "./RunControls";
+
+// Panels that are large or bring a large dependency (Monaco, the DSP WebAssembly module,
+// the WebGL waveform renderer) are fetched when they are first shown. DockingLayout shows a
+// placeholder in the panel meanwhile, and the error with a button that reloads the page when
+// the download fails.
+const AudioPanel = lazyImport(() => import("../panels/AudioPanel").then((module) => ({ default: module.AudioPanel })));
+const CoreInspectorPanel = lazyImport(() =>
+  import("../panels/CoreInspectorPanel").then((module) => ({ default: module.CoreInspectorPanel })),
+);
+const Sh4SimPanel = lazyImport(() => import("../panels/Sh4SimPanel").then((module) => ({ default: module.Sh4SimPanel })));
+const DspPlaygroundPanel = lazyImport(() =>
+  import("../panels/DspPlaygroundPanel").then((module) => ({ default: module.DspPlaygroundPanel })),
+);
 
 type StoredLayoutPrefs = {
   leftPanelOpen: boolean;
@@ -101,6 +114,7 @@ const mainTabs: PanelDefinition[] = [
   { id: PANEL_IDS.SH4_DISASSEMBLY, title: "SH4: Disassembly", component: <Sh4DisassemblyPanel /> },
   { id: PANEL_IDS.SH4_MEMORY, title: "SH4: Memory", component: <Sh4MemoryPanel /> },
   { id: PANEL_IDS.SH4_BREAKPOINTS, title: "SH4: Breakpoints", component: <Sh4BreakpointsPanel /> },
+  { id: PANEL_IDS.SH4_REGISTERS, title: "SH4: Registers", component: <Sh4RegistersPanel /> },
   { id: PANEL_IDS.SH4_BSC_REGISTERS, title: "SH4: BSC Registers", component: <BscRegistersPanel /> },
   { id: PANEL_IDS.SH4_CCN_REGISTERS, title: "SH4: CCN Registers", component: <CcnRegistersPanel /> },
   { id: PANEL_IDS.SH4_CPG_REGISTERS, title: "SH4: CPG Registers", component: <CpgRegistersPanel /> },
@@ -119,6 +133,7 @@ const mainTabs: PanelDefinition[] = [
   { id: PANEL_IDS.ARM7_DISASSEMBLY, title: "ARM7: Disassembly", component: <Arm7DisassemblyPanel /> },
   { id: PANEL_IDS.ARM7_MEMORY, title: "ARM7: Memory", component: <Arm7MemoryPanel /> },
   { id: PANEL_IDS.ARM7_BREAKPOINTS, title: "ARM7: Breakpoints", component: <Arm7BreakpointsPanel /> },
+  { id: PANEL_IDS.ARM7_REGISTERS, title: "ARM7: Registers", component: <Arm7RegistersPanel /> },
   { id: PANEL_IDS.CLX2_TA, title: "CLX2: TA", component: <TaInspectorPanel /> },
   { id: PANEL_IDS.CLX2_CORE, title: "CLX2: CORE", component: <CoreInspectorPanel /> },
   { id: PANEL_IDS.SGC, title: "SGC", component: <AudioPanel /> },
@@ -137,15 +152,17 @@ const connectionIcons = {
   idle: <CloudOffIcon fontSize="small" />,
   error: <CloudOffIcon fontSize="small" />,
   connecting: <SyncIcon fontSize="small" className="spin" />,
+  reconnecting: <SyncIcon fontSize="small" className="spin" />,
   connected: <CloudDoneIcon fontSize="small" />,
 };
 
-type Notification = {
-  id: string;
-  type: "error" | "warning";
-  message: string;
-  timestamp: number;
-};
+/** What the server's `protocol` means for this build, when it is not the build's own. */
+const protocolMismatch = (protocol: number | undefined): string =>
+  protocol === undefined
+    ? `This server reports no debugger protocol version; this UI is built for protocol ${PROTOCOL_VERSION}. ` +
+      "It is treated as a server that lists no target and no capability: the panels say what is missing. Use the UI that belongs to the emulator."
+    : `This server speaks debugger protocol ${protocol}; this UI is built for protocol ${PROTOCOL_VERSION}. ` +
+      "Parts of it may not work. Use the UI that belongs to the emulator.";
 
 interface AppLayoutProps {
   workspaceId: string;
@@ -159,21 +176,27 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const connectionState = useSessionStore((state) => state.connectionState);
   const connectionError = useSessionStore((state) => state.connectionError);
   const endpoint = useSessionStore((state) => state.endpoint);
-  const client = useSessionStore((state) => state.client);
-  const executionState = useSessionStore((state) => state.executionState);
+  const retry = useSessionStore((state) => state.retry);
   const showConnectionModal = useSessionStore((state) => state.showConnectionModal);
   const setShowConnectionModal = useSessionStore((state) => state.setShowConnectionModal);
-  const initializeData = useDebuggerDataStore((state) => state.initialize);
-  const breakpointHit = useDebuggerDataStore((state) => state.breakpointHit);
-  const errorMessage = useDebuggerDataStore((state) => state.errorMessage);
-  const clearError = useDebuggerDataStore((state) => state.clearError);
+  const toasts = useDebuggerDataStore((state) => state.toasts);
+  const dismissToast = useDebuggerDataStore((state) => state.dismissToast);
+  const initError = useDebuggerDataStore((state) => state.initError);
+  const describeRetry = useDebuggerDataStore((state) => state.describeRetry);
+  const retryDescribe = useDebuggerDataStore((state) => state.retryDescribe);
+  const invalidMessages = useDebuggerDataStore((state) => state.invalidMessages);
+  const dismissInvalidMessages = useDebuggerDataStore((state) => state.dismissInvalidMessages);
+  const epoch = useDebuggerDataStore((state) => state.epoch);
+  const initialized = useDebuggerDataStore((state) => state.initialized);
+  const serverProtocol = useDebuggerDataStore((state) => state.shape?.protocol);
   const [leftPanelOpen, setLeftPanelOpen] = useState(() => loadLayoutPrefs(workspaceId).leftPanelOpen);
   const [rightPanelOpen, setRightPanelOpen] = useState(() => loadLayoutPrefs(workspaceId).rightPanelOpen);
   const [isNarrow, setIsNarrow] = useState(window.innerWidth < 1200);
   const { open: aboutOpen, show: showAbout, hide: hideAbout } = useAboutModal();
   const { mode, toggleMode } = useThemeMode();
   const isDarkMode = mode === "dark";
-  const [notifications, setNotifications] = useState<Notification[]>([]);
+  // the protocol notice of a connection can be put away; the next connection shows its own
+  const [protocolNoticeDismissed, setProtocolNoticeDismissed] = useState<number | null>(null);
   const [mainPanelApiState, setMainPanelApiState] = useState<DockviewApi | null>(null);
 
   // Use a ref to avoid stale closures
@@ -239,6 +262,8 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
         { id: PANEL_IDS.SH4_DISASSEMBLY, title: "SH4: Disassembly", component: <Sh4DisassemblyPanel /> },
         { id: PANEL_IDS.SH4_MEMORY, title: "SH4: Memory", component: <Sh4MemoryPanel /> },
         { id: PANEL_IDS.SH4_BREAKPOINTS, title: "SH4: Breakpoints", component: <Sh4BreakpointsPanel /> },
+        // a tab behind the breakpoints, which stay the panel their group shows
+        { id: PANEL_IDS.SH4_REGISTERS, title: "SH4: Registers", component: <Sh4RegistersPanel /> },
       ];
     }
 
@@ -247,6 +272,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
         { id: PANEL_IDS.ARM7_DISASSEMBLY, title: "ARM7: Disassembly", component: <Arm7DisassemblyPanel /> },
         { id: PANEL_IDS.ARM7_MEMORY, title: "ARM7: Memory", component: <Arm7MemoryPanel /> },
         { id: PANEL_IDS.ARM7_BREAKPOINTS, title: "ARM7: Breakpoints", component: <Arm7BreakpointsPanel /> },
+        { id: PANEL_IDS.ARM7_REGISTERS, title: "ARM7: Registers", component: <Arm7RegistersPanel /> },
       ];
     }
 
@@ -301,6 +327,14 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
   const showLeftToggle = !isNarrow;
   const showRightToggle = !isNarrow;
 
+  // The focused target of a workspace page is the workspace's own until one of its panels has
+  // had the focus: what had it on the page before is not this page's. Before the page is
+  // painted, so that the toolbar never names the target of another page.
+  const workspaceOpened = useFocusedTargetStore((state) => state.workspaceOpened);
+  useLayoutEffect(() => {
+    workspaceOpened();
+  }, [workspaceId, workspaceOpened]);
+
   // Load layout preferences when workspaceId changes
   useEffect(() => {
     const prefs = loadLayoutPrefs(workspaceId);
@@ -341,60 +375,11 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
     };
   }, [startDiscovery, stopDiscovery]);
 
-  // Auto-connect once discovery is ready
+  // Connect to the endpoint of this page: ?ws=, the last manual entry, VITE_WS_URL, same-origin
+  // /ws. The session store describes the server whenever a connection opens.
   useEffect(() => {
     void connect();
   }, [connect]);
-
-  useEffect(() => {
-    if (connectionState === "connected" && client) {
-      void initializeData(client);
-    }
-  }, [client, connectionState, initializeData]);
-
-
-  // Add error messages to notification stack
-  useEffect(() => {
-    if (errorMessage) {
-      const notification: Notification = {
-        id: `error-${Date.now()}`,
-        type: "error",
-        message: errorMessage,
-        timestamp: Date.now(),
-      };
-      setNotifications((prev) => [...prev, notification]);
-
-      // Auto-remove after 5 seconds
-      setTimeout(() => {
-        setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
-      }, 5000);
-
-      // Clear the error from the store
-      clearError();
-    }
-  }, [errorMessage, clearError]);
-
-  // Add breakpoint hits to notification stack
-  useEffect(() => {
-    if (breakpointHit) {
-      const bpDisplay = breakpointHit.breakpoint.kind === "event"
-        ? breakpointHit.breakpoint.event
-        : `${breakpointHit.breakpoint.event} == 0x${(breakpointHit.breakpoint.address ?? 0).toString(16).toUpperCase().padStart(8, "0")}`;
-      const notification: Notification = {
-        id: `breakpoint-${Date.now()}`,
-        type: "warning",
-        message: `Breakpoint hit: ${bpDisplay}`,
-        timestamp: Date.now(),
-      };
-      setNotifications((prev) => [...prev, notification]);
-
-      // Auto-remove after 5 seconds
-      setTimeout(() => {
-        setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
-      }, 5000);
-    }
-  }, [breakpointHit]);
-
 
   const handleToggleConnection = useCallback(() => {
     if (connectionState === "connected") {
@@ -432,42 +417,7 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
     }
   }, [workspaceId]);
 
-  const handleRun = useCallback(async () => {
-    if (!client || connectionState !== "connected") {
-      return;
-    }
-    try {
-      await client.runUntil();
-      // State will be updated via notification from server
-    } catch (error) {
-      console.error("Failed to run", error);
-    }
-  }, [client, connectionState]);
-
-  const handlePause = useCallback(async () => {
-    if (!client || connectionState !== "connected") {
-      return;
-    }
-    try {
-      await client.pause("sh4");
-      // State will be updated via notification from server
-    } catch (error) {
-      console.error("Failed to pause", error);
-    }
-  }, [client, connectionState]);
-
-  const handleRunToBreakpoint = useCallback(async () => {
-    if (!client || connectionState !== "connected") {
-      return;
-    }
-    try {
-      // Run until breakpoint
-      await client.runUntil();
-      // State will be updated via notification from server
-    } catch (error) {
-      console.error("Failed to run to breakpoint", error);
-    }
-  }, [client, connectionState]);
+  const connected = connectionState === "connected";
 
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
@@ -477,44 +427,11 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
           onResetLayout={handleResetLayout}
           currentPage={workspaceId}
           centerSection={
-            <Stack direction="row" spacing={1} alignItems="center">
-              <Tooltip title="Run">
-                <span>
-                  <IconButton
-                    size="small"
-                    color={connectionState === "connected" && executionState === "paused" ? "success" : "default"}
-                    disabled={connectionState !== "connected" || executionState === "running"}
-                    onClick={handleRun}
-                  >
-                    <PlayArrowIcon />
-                  </IconButton>
-                </span>
-              </Tooltip>
-              <Tooltip title="Pause">
-                <span>
-                  <IconButton
-                    size="small"
-                    color={connectionState === "connected" && executionState === "running" ? "warning" : "default"}
-                    disabled={connectionState !== "connected" || executionState === "paused"}
-                    onClick={handlePause}
-                  >
-                    <PauseIcon />
-                  </IconButton>
-                </span>
-              </Tooltip>
-              <Tooltip title="Run to next breakpoint">
-                <span>
-                  <IconButton
-                    size="small"
-                    color={connectionState === "connected" && executionState === "paused" ? "primary" : "default"}
-                    disabled={connectionState !== "connected" || executionState === "running"}
-                    onClick={handleRunToBreakpoint}
-                  >
-                    <SkipNextIcon />
-                  </IconButton>
-                </span>
-              </Tooltip>
-            </Stack>
+            <>
+              <RunControls workspaceId={workspaceId} />
+              {/* next to the run controls: why the target is stopped, and what the server has to say */}
+              {connected && initialized && <ExecutionStatus placement="beside" />}
+            </>
           }
           rightSection={
             <Stack direction="row" spacing={1.5} alignItems="center">
@@ -529,12 +446,14 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                     size="small"
                     checked={isDarkMode}
                     onChange={handleToggleTheme}
-                    inputProps={{ "aria-label": "Toggle dark mode" }}
+                    // MUI 7 replaces its own { role: "switch" } with slotProps.input and
+                    // drops the deprecated inputProps, so both have to be given here
+                    slotProps={{ input: { role: "switch", "aria-label": "Toggle dark mode" } }}
                   />
                 </Tooltip>
               </Stack>
               <Tooltip title={`Connection: ${connectionState}`}>
-                <IconButton color={connectionState === "connected" ? "primary" : "inherit"}>
+                <IconButton color={connected ? "primary" : "inherit"}>
                   {connectionIcons[connectionState]}
                 </IconButton>
               </Tooltip>
@@ -544,15 +463,73 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
                 onClick={handleToggleConnection}
                 startIcon={<PowerSettingsNewIcon fontSize="small" />}
               >
-                {connectionState === "connected" ? "Disconnect" : "Connect"}
+                {connected ? "Disconnect" : "Connect"}
               </Button>
             </Stack>
           }
         />
+        {/* the same, for a window in which the toolbar has no room for it */}
+        {connected && initialized && <ExecutionStatus placement="below" />}
       </AppBar>
-      {connectionError && (
-        <Alert severity="error" sx={{ borderRadius: 0 }}>
-          {connectionError}
+      {connectionState === "reconnecting" ? (
+        <Alert
+          severity="warning"
+          sx={{ borderRadius: 0 }}
+          action={
+            <>
+              <Button color="inherit" size="small" onClick={() => void connect({ force: true })}>
+                Retry now
+              </Button>
+              <Button color="inherit" size="small" onClick={disconnect}>
+                Stop
+              </Button>
+            </>
+          }
+        >
+          {connectionError ?? "Connection lost"}.{" "}
+          {retry?.waitingForAnnouncement
+            ? "Waiting for the emulator to announce itself."
+            : retry?.delayMs !== undefined
+              ? `Reconnecting to ${endpoint ?? "the server"} in ${retry.delayMs / 1000} s (attempt ${retry.attempt}).`
+              : `Reconnecting to ${endpoint ?? "the server"} (attempt ${retry?.attempt ?? 1}).`}
+        </Alert>
+      ) : (
+        connectionError && (
+          <Alert severity="error" sx={{ borderRadius: 0 }}>
+            {connectionError}
+          </Alert>
+        )
+      )}
+      {initError && (
+        // the connection is there and the server could not be described: it is asked again
+        <Alert
+          severity="error"
+          sx={{ borderRadius: 0 }}
+          action={
+            describeRetry && (
+              <Button color="inherit" size="small" onClick={retryDescribe}>
+                Retry now
+              </Button>
+            )
+          }
+        >
+          {initError}.{" "}
+          {describeRetry
+            ? `Asking again in ${describeRetry.delayMs / 1000} s (attempt ${describeRetry.attempt}).`
+            : "Asking again."}
+        </Alert>
+      )}
+      {connected && initialized && serverProtocol !== PROTOCOL_VERSION && protocolNoticeDismissed !== epoch && (
+        <Alert severity="warning" sx={{ borderRadius: 0 }} onClose={() => setProtocolNoticeDismissed(epoch)}>
+          {protocolMismatch(serverProtocol)}
+        </Alert>
+      )}
+      {invalidMessages && (
+        <Alert severity="warning" sx={{ borderRadius: 0 }} onClose={dismissInvalidMessages}>
+          {invalidMessages.count === 1
+            ? "The server sent a message this UI could not use, and it was dropped"
+            : `The server sent ${invalidMessages.count} messages this UI could not use, and they were dropped`}
+          : {invalidMessages.last.message}
         </Alert>
       )}
       <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -642,22 +619,23 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
       >
         <Typography variant="caption">Connection: {connectionState}</Typography>
         <Divider orientation="vertical" flexItem />
-        <Tooltip title="Click to change connection">
-          <Typography
+        {/* A button: the connection picker behind it is the only way to the box for another
+            endpoint, and has to open from the keyboard too. The tooltip describes it; its name
+            is what it shows. */}
+        <Tooltip title="Click to change connection" describeChild>
+          <Link
+            component="button"
+            type="button"
             variant="caption"
-            sx={{
-              cursor: "pointer",
-              "&:hover": {
-                textDecoration: "underline",
-              },
-            }}
+            color="inherit"
+            underline="hover"
             onClick={() => setShowConnectionModal(true)}
           >
             Endpoint: {endpoint ?? "-"}
-          </Typography>
+          </Link>
         </Tooltip>
         <Box sx={{ flexGrow: 1 }} />
-        <Typography variant="caption">nullDC Debugger {DEBUGGER_VERSION}</Typography>
+        <Typography variant="caption">Dreamcast DevTools {DEBUGGER_VERSION}</Typography>
       </Box>
       <AboutDialog open={aboutOpen} onClose={hideAbout} />
       <ConnectionModal open={showConnectionModal} onClose={() => setShowConnectionModal(false)} />
@@ -673,15 +651,17 @@ export const AppLayout = ({ workspaceId }: AppLayoutProps) => {
           pointerEvents: "none",
         }}
       >
-        {notifications.map((notification) => (
+        {toasts.map((toast) => (
           <Alert
-            key={notification.id}
-            severity={notification.type}
+            key={toast.id}
+            severity={toast.type}
             variant="filled"
-            onClose={() => setNotifications((prev) => prev.filter((n) => n.id !== notification.id))}
+            onClose={() => dismissToast(toast.id)}
             sx={{ pointerEvents: "auto" }}
           >
-            {notification.message}
+            {toast.message}
+            {/* raised again while it was up: counted here instead of shown again */}
+            {toast.count > 1 && ` (×${toast.count})`}
           </Alert>
         ))}
       </Box>

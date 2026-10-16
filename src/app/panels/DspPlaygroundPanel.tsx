@@ -45,6 +45,13 @@ import { compileDspSource, CompilationError } from "../dsp/dspCompiler";
 import { DSP_DEFAULT_SOURCE } from "../dsp/defaultSource";
 import { DEFAULT_DSP_SOURCE } from "../dsp/defaultDspSource";
 
+declare global {
+  interface Window {
+    // Prefixed constructor still exposed by older Safari/WebKit
+    webkitAudioContext?: typeof AudioContext;
+  }
+}
+
 const DSP_SOURCE_STORAGE_KEY = "nulldc-debugger-dsp-source";
 const DSP_ASSEMBLY_STORAGE_KEY = "nulldc-debugger-dsp-assembly";
 const DSP_TAB_STORAGE_KEY = "nulldc-debugger-dsp-active-tab";
@@ -222,6 +229,10 @@ export const DspPlaygroundPanel = () => {
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const scriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  // True from the moment the DSP is paused (button or breakpoint). AudioContext.suspend()
+  // is asynchronous: audio callbacks that are already queued still arrive afterwards and
+  // must not advance the DSP behind the debugger's back.
+  const dspHaltedRef = useRef(false);
   const filePlaybackContextRef = useRef<AudioContext | null>(null);
   const filePlaybackSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const tappedChannelRef = useRef<number | null>(null);
@@ -469,6 +480,7 @@ export const DspPlaygroundPanel = () => {
       }
       updateShareToken();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot initial compile when wasm and the editors become ready; tab switches are handled by the next effect
   }, [wasmInitialized, editorsReady]);
 
   // Re-compile/re-assemble when switching tabs
@@ -615,13 +627,18 @@ export const DspPlaygroundPanel = () => {
     aicaDsp.resetCounters();
     setCurrentDspStep(0);
 
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)({
       sampleRate: 44100,
     });
     const scriptNode = audioContext.createScriptProcessor(1024, 0, 1);
 
+    dspHaltedRef.current = false;
     scriptNode.onaudioprocess = (event) => {
       const outputBuffer = event.outputBuffer.getChannelData(0);
+      if (dspHaltedRef.current) {
+        outputBuffer.fill(0);
+        return;
+      }
       const sampleRate = 44100;
       const TWO_PI = Math.PI * 2;
 
@@ -692,6 +709,7 @@ export const DspPlaygroundPanel = () => {
         // If we hit a breakpoint, pause audio and don't continue processing this buffer
         if (hitBreakpoint) {
           // Pause audio immediately
+          dspHaltedRef.current = true;
           if (audioContextRef.current) {
             void audioContextRef.current.suspend();
           }
@@ -796,6 +814,7 @@ export const DspPlaygroundPanel = () => {
     }
     audioContextRef.current = null;
     scriptNodeRef.current = null;
+    dspHaltedRef.current = false;
     setAudioPlaying(false);
     setAudioPaused(false);
   }, []);
@@ -807,6 +826,7 @@ export const DspPlaygroundPanel = () => {
 
     // Only handle cases where state changed outside of the pause button
     // (e.g., when stopping playback)
+    dspHaltedRef.current = audioPaused;
     if (audioPaused) {
       void audioContextRef.current.suspend();
     } else {
@@ -1217,7 +1237,7 @@ export const DspPlaygroundPanel = () => {
       // Mark channel as loading
       setLoadingChannels((prev) => new Set(prev).add(channel));
 
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       const fileId = `${Date.now()}-${Math.random()}`;
 
       // Add file immediately with loading state
@@ -1322,7 +1342,7 @@ export const DspPlaygroundPanel = () => {
     event.preventDefault();
 
     const files = Array.from(event.dataTransfer.files);
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
     for (const file of files) {
       const fileId = `${Date.now()}-${Math.random()}`;
@@ -1415,7 +1435,7 @@ export const DspPlaygroundPanel = () => {
     if (!file) return;
 
     // Create new audio context and play the file
-    const context = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const context = new (window.AudioContext || window.webkitAudioContext)();
     const source = context.createBufferSource();
     source.buffer = file.audioBuffer;
     source.connect(context.destination);
@@ -1461,7 +1481,7 @@ export const DspPlaygroundPanel = () => {
     input.multiple = true;
     input.onchange = async (e) => {
       const files = Array.from((e.target as HTMLInputElement).files || []);
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
       for (const file of files) {
         const fileId = `${Date.now()}-${Math.random()}`;
@@ -1546,7 +1566,7 @@ export const DspPlaygroundPanel = () => {
     const startStep = aicaDsp.getCurrentStep();
 
     // Always step at least once, then continue until we reach step 0
-    do {
+    for (;;) {
       aicaDsp.doDspStep();
       const currentStep = aicaDsp.getCurrentStep();
 
@@ -1559,7 +1579,7 @@ export const DspPlaygroundPanel = () => {
       if (currentStep === 0) {
         break;
       }
-    } while (true);
+    }
 
     // Update current step and sample for the disassembly view
     const newStep = aicaDsp.getCurrentStep();
@@ -1608,7 +1628,7 @@ export const DspPlaygroundPanel = () => {
       // Run one full sample (128 DSP steps) or until breakpoint hit
       let completedSample = false;
 
-      do {
+      for (;;) {
         aicaDsp.doDspStep();
         const currentStep = aicaDsp.getCurrentStep();
 
@@ -1625,7 +1645,7 @@ export const DspPlaygroundPanel = () => {
           completedSample = true;
           break;
         }
-      } while (true);
+      }
 
       // Only read outputs and update plotters if we completed the full sample
       if (completedSample) {
@@ -1820,6 +1840,7 @@ export const DspPlaygroundPanel = () => {
       // Pause audio first if playing (to avoid hitting the breakpoint immediately)
       if (audioPlaying && !audioPaused && audioContextRef.current) {
         audioWasPaused = true;
+        dspHaltedRef.current = true;
         await void audioContextRef.current.suspend();
         setAudioPaused(true);
 
@@ -1872,6 +1893,7 @@ export const DspPlaygroundPanel = () => {
 
       if (audioPaused) {
         // Resume - update state first, then resume audio in microtask
+        dspHaltedRef.current = false;
         setAudioPaused(false);
         queueMicrotask(() => {
           if (audioContextRef.current) {
@@ -1880,6 +1902,7 @@ export const DspPlaygroundPanel = () => {
         });
       } else {
         // Pause - first suspend audio immediately, then update state in microtask
+        dspHaltedRef.current = true;
         if (audioContextRef.current) {
           void audioContextRef.current.suspend();
         }
@@ -1894,6 +1917,7 @@ export const DspPlaygroundPanel = () => {
         });
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- dropping breakpoints would stop DisassemblyView refetching on breakpoint changes (it refetches when callbacks changes identity)
   }), [wasmInitialized, audioPlaying, audioPaused, breakpoints]);
 
   if (!wasmInitialized) {

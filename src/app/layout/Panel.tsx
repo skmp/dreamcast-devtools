@@ -1,4 +1,4 @@
-﻿import type { PropsWithChildren, ReactNode } from "react";
+import type { PropsWithChildren, ReactNode } from "react";
 import { Box, Paper, Typography } from "@mui/material";
 
 type PanelProps = PropsWithChildren<{

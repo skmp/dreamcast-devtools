@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Box } from "@mui/material";
 
 export interface WaveformPlotterProps {
@@ -25,7 +25,7 @@ export const WaveformPlotter = forwardRef<WaveformPlotterRef, WaveformPlotterPro
     const [actualWidth, setActualWidth] = useState(width);
     const maxAmplitudeRef = useRef(maxAmplitude);
 
-    const draw = () => {
+    const draw = useCallback(() => {
       const canvas = canvasRef.current;
       if (!canvas) return;
 
@@ -56,7 +56,7 @@ export const WaveformPlotter = forwardRef<WaveformPlotterRef, WaveformPlotterPro
       }
 
       ctx.stroke();
-    };
+    }, [height, maxSamples, width, actualWidth, fillWidth]);
 
     useImperativeHandle(ref, () => ({
       appendSample: (sample: number) => {
@@ -79,17 +79,19 @@ export const WaveformPlotter = forwardRef<WaveformPlotterRef, WaveformPlotterPro
     }, [maxAmplitude]);
 
     useEffect(() => {
+      // animationFrameRef is never assigned after creation, so reading it here or in the cleanup is equivalent
+      const animationFrame = animationFrameRef.current;
       const interval = setInterval(() => {
         draw();
       }, 50);
 
       return () => {
         clearInterval(interval);
-        if (animationFrameRef.current !== null) {
-          cancelAnimationFrame(animationFrameRef.current);
+        if (animationFrame !== null) {
+          cancelAnimationFrame(animationFrame);
         }
       };
-    }, [height, maxSamples, width, actualWidth, fillWidth]);
+    }, [draw]);
 
     useEffect(() => {
       if (!fillWidth) return;

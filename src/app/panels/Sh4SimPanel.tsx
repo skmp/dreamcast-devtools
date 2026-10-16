@@ -19,6 +19,7 @@ import { Panel } from "../layout/Panel";
 import { SH4_SIM_DEFAULT_SOURCE } from "../sh4Sim/defaultSource";
 import { getAssembleError, simulate, SH4_MNEMONICS, SH4_REGISTERS } from "../sh4Sim/sim";
 import type { SimBlock, SimCell, SimRow, SimulateResult } from "../sh4Sim/sim";
+import "../monaco/monacoSetup";
 import Editor from "@monaco-editor/react";
 import type { Monaco } from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";
@@ -498,9 +499,9 @@ export const Sh4SimPanel = () => {
       try {
         await navigator.clipboard.writeText(url);
         setCopiedTarget(target);
-        if (typeof window !== "undefined") {
-          window.location.hash = hash ? `#${hash}` : "";
-        }
+        // Do not mirror the fragment into window.location.hash: the app runs under a
+        // HashRouter, where the hash is the route. Writing "" or "#<block id>" there
+        // navigates away from the simulator.
         if (copyTimeoutRef.current !== null) {
           window.clearTimeout(copyTimeoutRef.current);
         }

@@ -430,6 +430,7 @@ export const SgcWaveformCanvas = memo(forwardRef<SgcWaveformCanvasHandle, SgcWav
 
     // Trigger initial render
     renderCanvas();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- adding sgcBinaryData.byteLength would add an immediate redraw whenever the capture length changes; data changes redraw through queueGraphRerender
   }, [renderer, viewMode, hoverPosition, playbackPosition]);
 
 

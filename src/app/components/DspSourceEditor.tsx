@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import { Box } from "@mui/material";
+import "../monaco/monacoSetup";
 import Editor from "@monaco-editor/react";
 import type { Monaco } from "@monaco-editor/react";
 import type { editor } from "monaco-editor";
@@ -63,12 +64,12 @@ const registerDspSourceLanguage = (monaco: Monaco) => {
         [/\d+/, "number"],
 
         // Operators
-        [/[=:\[\]+\/\-]/, "operator"],
+        [/[=:[\]+/-]/, "operator"],
       ],
       comment: [
-        [/[^\/*]+/, 'comment'],
+        [/[^/*]+/, 'comment'],
         [/\*\//, 'comment', '@pop'],
-        [/[\/*]/, 'comment']
+        [/[/*]/, 'comment']
       ],
     },
     keywords: ['INPUT', 'OUTPUT', 'MAC', 'SMODE', 'ST', 'STF', 'LD', 'LDF', 'MADRS'],

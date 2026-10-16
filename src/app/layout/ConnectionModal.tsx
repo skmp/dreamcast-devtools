@@ -15,6 +15,7 @@ import {
   Stack,
 } from "@mui/material";
 import { useSessionStore } from "../../state/sessionStore";
+import { isWebSocketUrl } from "../../services/transport";
 
 interface ConnectionModalProps {
   open: boolean;
@@ -39,13 +40,18 @@ export const ConnectionModal = ({ open, onClose }: ConnectionModalProps) => {
     }
   }, [open]);
 
-  const handleConnect = async () => {
-    if (useManual && manualEntry.trim()) {
+  // A WebSocket endpoint is any ws:// or wss:// URL; the session store remembers the last one
+  // entered here, and it is preferred to the endpoint of the page from then on.
+  const manualValid = mode === "wasm" ? manualEntry.trim().length > 0 : isWebSocketUrl(manualEntry);
+
+  const handleConnect = () => {
+    // the dialog closes at once; the toolbar and the status bar show how the attempt goes
+    if (useManual && manualValid) {
       // Manual connection
-      await connect({ connectionId: manualEntry.trim(), force: true });
+      void connect({ connectionId: manualEntry.trim(), force: true });
     } else if (selectedConnectionId) {
       // Selected from list
-      await connect({ connectionId: selectedConnectionId, force: true });
+      void connect({ connectionId: selectedConnectionId, force: true });
     }
     onClose();
   };
@@ -67,7 +73,7 @@ export const ConnectionModal = ({ open, onClose }: ConnectionModalProps) => {
     return `${Math.floor(seconds / 60)}m ago`;
   };
 
-  const canConnect = useManual ? manualEntry.trim().length > 0 : !!selectedConnectionId;
+  const canConnect = useManual ? manualValid : !!selectedConnectionId;
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
@@ -100,8 +106,11 @@ export const ConnectionModal = ({ open, onClose }: ConnectionModalProps) => {
                       <Box>
                         <Typography variant="body2">{conn.name}</Typography>
                         <Typography variant="caption" color="text.secondary">
-                          {conn.mode === "wasm" ? `GUID: ${conn.id.substring(0, 8)}...` : conn.id} •{" "}
-                          {formatLastSeen(conn.lastSeen)}
+                          {conn.mode === "wasm"
+                            ? `GUID: ${conn.id.substring(0, 8)}... • ${formatLastSeen(conn.lastSeen)}`
+                            : conn.sourceText
+                              ? `${conn.id} • ${conn.sourceText}`
+                              : conn.id}
                         </Typography>
                       </Box>
                     }
@@ -128,6 +137,20 @@ export const ConnectionModal = ({ open, onClose }: ConnectionModalProps) => {
                 }
                 value={manualEntry}
                 onChange={(e) => setManualEntry(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && manualValid) {
+                    e.preventDefault();
+                    handleConnect();
+                  }
+                }}
+                error={manualEntry.trim().length > 0 && !manualValid}
+                helperText={
+                  mode === "wasm"
+                    ? undefined
+                    : manualEntry.trim().length > 0 && !manualValid
+                      ? "Not a ws:// or wss:// URL"
+                      : "The URL of a debugger server, e.g. ws://localhost:55543/ws. It is remembered for this page."
+                }
                 sx={{ mt: 1 }}
                 autoFocus
               />
