@@ -2609,6 +2609,80 @@ describe("milestone M3", () => {
     });
   });
 
+  describe("a step of the SH4 or of the ARM7 from a stop of the DSP", () => {
+    /** the default mock at the stop of a DSP breakpoint on step 5 (and on `more`), in the first sample of a burst */
+    const atBreakpoint = async (more: number[] = []) => {
+      const machine = setup();
+      for (const address of [5, ...more]) {
+        machine.session.ok("breakpoints.add", { event: "dc.aica.dsp.step", address });
+      }
+      machine.session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(STEP_MS);
+      expect(machine.session.lastTick().executionState).toMatchObject({ state: "paused", reason: "breakpoint", breakpointId: 1 });
+      expect(machine.step()).toBe(5);
+      return machine;
+    };
+
+    it("the SH4's: the suspended burst runs on first; when it meets the breakpoint again that is the stop and the step is dropped, else the burst ends and the SH4 steps", async () => {
+      const { session, step, mdecCt, cycles, stopId, statesSince } = await atBreakpoint();
+      const hit = session.lastTick();
+      const from = session.ticks().length;
+      session.ok("control.step", { target: "sh4" });
+      expect(statesSince(from)).toEqual(["paused"]);
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId(hit) + 1, reason: "breakpoint", breakpointId: 1 });
+      expect(step()).toBe(5);
+      expect(mdecCt()).toBe((mdecCt(hit) - 1) & 0xffff);
+      expect(session.pc()).toBe(session.pc(hit));
+      expect(cycles()).toBe(cycles(hit));
+      // disabled: the 31 samples left of the burst, then the SH4's instruction
+      session.ok("breakpoints.toggle", { id: 1, enabled: false });
+      const before = session.lastTick();
+      session.ok("control.step", { target: "sh4" });
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId(before) + 1, reason: "step" });
+      expect(step()).toBe(0);
+      expect(mdecCt()).toBe((mdecCt(before) - 31) & 0xffff);
+      expect(session.pc()).not.toBe(session.pc(before));
+      expect(cycles()).toBe(cycles(before) + 1n);
+    });
+
+    it("the ARM7's: the rest of the sample runs first; a breakpoint behind the step in that sample is the stop and the step is dropped, else the step is in the next sample", async () => {
+      const { session, number, step, mdecCt, stopId, statesSince } = await atBreakpoint([9]);
+      const arm7Pc = (at?: DebuggerTick) => number("dc.aica.arm7", "PC", at);
+      const hit = session.lastTick();
+      session.ok("control.step", { target: "arm7" });
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId(hit) + 1, reason: "breakpoint", breakpointId: 2 });
+      expect(step()).toBe(9);
+      expect(mdecCt()).toBe(mdecCt(hit));
+      expect(arm7Pc()).toBe(arm7Pc(hit));
+      // from step 9: the sample ends (STEP 0, MDEC_CT one less) and the ARM7 executes its instruction
+      const at9 = session.lastTick();
+      session.ok("control.step", { target: "arm7" });
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId(at9) + 1, reason: "step" });
+      expect(step()).toBe(0);
+      expect(mdecCt()).toBe((mdecCt(at9) - 1) & 0xffff);
+      expect(arm7Pc()).not.toBe(arm7Pc(at9));
+      // the burst is suspended in front of the DSP of the next sample: a resume meets step 5 there
+      const from = session.ticks().length;
+      session.ok("control.runUntil");
+      expect(statesSince(from)).toEqual(["paused"]);
+      expect(session.lastTick().executionState).toMatchObject({ reason: "breakpoint", breakpointId: 1 });
+      expect(mdecCt()).toBe((mdecCt(at9) - 1) & 0xffff);
+    });
+
+    it("a step-out of the ARM7 that the run-on ends at the DSP breakpoint again leaves no temporary breakpoint behind", async () => {
+      const { session, stopId, statesSince } = await atBreakpoint();
+      const hit = session.lastTick();
+      session.ok("control.stepOut", { target: "arm7" });
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stopId(hit) + 1, reason: "breakpoint", breakpointId: 1 });
+      // the breakpoint removed, a resume runs, and nothing stops it
+      session.ok("breakpoints.remove", { id: 1 });
+      const from = session.ticks().length;
+      session.ok("control.runUntil");
+      await vi.advanceTimersByTimeAsync(40 * STEP_MS);
+      expect(statesSince(from).filter((state) => state !== "running")).toEqual([]);
+    });
+  });
+
   describe("the capture", () => {
     it("armed at a stop advances SH4_CYCLES by exactly ceil(frames / 32) periods of the AICA; armed while running it stops nothing", async () => {
       const { session, cycles } = setup();
@@ -2653,9 +2727,14 @@ describe("milestone M3", () => {
       expect(held()).toBeUndefined();
       session.fail("state.recordSgcFrames", { frames: 16 }, -32003);
       expect((session.ok("state.getSgcFrameData") as { frameCount: number }).frameCount).toBe(64);
-      // a step of the DSP and one of the SH4 keep it recording
+      // a step of the DSP keeps it recording, and so does one of the SH4: the burst suspended
+      // there runs on first and meets the breakpoint, still active, one sample later, which drops
+      // the step (M3-D22)
       session.ok("control.step", { target: "dsp" });
+      const stepped = session.lastTick();
       session.ok("control.step", { target: "sh4" });
+      expect(session.lastTick().executionState).toEqual({ state: "paused", stopId: stepped.executionState.stopId! + 1, reason: "breakpoint", breakpointId: 1 });
+      expect(session.pc()).toBe(session.pc(stepped));
       expect(held()).toBeUndefined();
 
       session.ok("breakpoints.remove", { id: 1 });
@@ -2697,6 +2776,30 @@ describe("milestone M3", () => {
   });
 
   describe("the sound clock", () => {
+    it("never goes back: a step of the SH4 from the stop of a capture at a burst's time, then a step of the DSP or a DSP breakpoint", async () => {
+      for (const then of ["a step of the DSP", "a DSP breakpoint"] as const) {
+        const { session, cycles } = setup({ startPaused: true });
+        session.call("state.recordSgcFrames", { frames: 64 });
+        await vi.advanceTimersByTimeAsync(STEP_MS);
+        expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "capture" });
+        const captured = cycles();
+        // (the stop is at the time of a burst that has not run)
+        expect(captured).toBe(2n * PERIOD);
+        session.ok("control.step", { target: "sh4" });
+        expect(cycles()).toBe(captured + 1n);
+        if (then === "a step of the DSP") {
+          session.ok("control.step", { target: "dsp" });
+          expect(session.lastTick().executionState.reason).toBe("step");
+        } else {
+          session.ok("breakpoints.add", { event: "dc.aica.dsp.step", address: 3 });
+          session.ok("control.runUntil");
+          await vi.advanceTimersByTimeAsync(STEP_MS);
+          expect(session.lastTick().executionState).toMatchObject({ state: "paused", reason: "breakpoint" });
+        }
+        expect(cycles(), then).toBe(captured + 1n);
+      }
+    });
+
     it("MDEC_CT counts down once a sample, 32 samples a burst, a burst every 145124 cycles", async () => {
       const { session, mdecCt, cycles } = setup();
       const before = session.lastTick();

@@ -1721,7 +1721,8 @@ export class MockDebugger {
       if (this.nextBurst > until) {
         break;
       }
-      this.setCycles(this.nextBurst);
+      // (a step of the SH4 from a stop at a burst's time has gone past it: the time never goes back)
+      this.setCycles(this.nextBurst > this.cycles ? this.nextBurst : this.cycles);
       this.nextBurst += MOCK_AICA_PERIOD_CYCLES;
       if (!this.runBurst(0, 0, false)) {
         return false;
@@ -1753,14 +1754,16 @@ export class MockDebugger {
   }
 
   /**
-   * A sound burst from step `step` of its sample `sample` to its end: every sample of it, the
-   * DSP in front of each of its steps looking at its breakpoints (at the first one only when it
-   * is not `exempt`). Returns true when the burst ran to its end; false when it is suspended in
-   * front of a step with an active breakpoint, which is then a stop of that breakpoint.
+   * A sound burst from step `step` of its sample `sample` to its end, or to the end of its sample
+   * `last`: every sample of it, the DSP in front of each of its steps looking at its breakpoints
+   * (at the first one only when it is not `exempt`). Returns true when it ran that far (behind
+   * the last sample of the burst the burst has ended; behind another one it is suspended in front
+   * of the next sample); false when it is suspended in front of a step with an active
+   * breakpoint, which is then a stop of that breakpoint.
    */
-  private runBurst(sample: number, step: number, exempt: boolean): boolean {
+  private runBurst(sample: number, step: number, exempt: boolean, last = MOCK_SAMPLES_PER_BURST - 1): boolean {
     const active = this.activeDspBreakpoints();
-    for (; sample < MOCK_SAMPLES_PER_BURST; sample++, step = 0, exempt = false) {
+    for (; sample <= last; sample++, step = 0, exempt = false) {
       if (active.size > 0) {
         for (let next = step; next < DSP_STEPS; next++) {
           const id = active.get(next);
@@ -1774,7 +1777,7 @@ export class MockDebugger {
       }
       this.completeSample();
     }
-    this.suspended = undefined;
+    this.suspended = sample < MOCK_SAMPLES_PER_BURST ? { sample, step: 0, exempt: false } : undefined;
     this.refreshDsp();
     return true;
   }
@@ -1811,7 +1814,7 @@ export class MockDebugger {
         this.setCycles(this.recording.endAt > this.cycles ? this.recording.endAt : this.cycles);
         this.completeCapture(false);
       }
-      this.setCycles(at);
+      this.setCycles(at > this.cycles ? at : this.cycles);
       this.nextBurst += MOCK_AICA_PERIOD_CYCLES;
       this.suspended = { sample: 0, step: 0, exempt: true };
     }
@@ -2666,11 +2669,13 @@ export class MockDebugger {
     if (targetId === "arm7" && (kind === "stepOut" || (kind === "stepOver" && this.pc("arm7") === MOCK_ARM7_CALL))) {
       // Step-out of the ARM7, and its step-over of a call: a temporary breakpoint (at the link
       // register R14; behind the call) and a resume. Tick running now, tick paused with reason
-      // "step" when the ARM7 arrives there.
+      // "step" when the ARM7 arrives there. The breakpoint is set in front of the resume: a stop
+      // the resume makes at once (the run-on of a suspended burst that meets a DSP breakpoint)
+      // takes it away, as every stop does.
       context.afterResponse.push(() => {
         const address = kind === "stepOut" ? (this.register("dc.aica.arm7", "R14") as number) : this.pc("arm7") + MOCK_ARM7_RING.instructionSize;
-        this.leaveStop();
         this.arm7Temporary = address >>> 0;
+        this.leaveStop();
       });
       return {};
     }
@@ -2692,6 +2697,17 @@ export class MockDebugger {
       if (targetId === "dsp") {
         this.stepDsp();
       } else {
+        // A burst suspended at a stop of the DSP is run on in front of the instruction, its first
+        // step exempt (M3-D22): for the SH4 to its end (a suspended burst is complete before the
+        // SH4 executes anything), for the ARM7 to the end of the sample (its instruction is in the
+        // ARM phase of the next one). A DSP breakpoint it meets is a stop of its own, and the step
+        // is dropped.
+        if (this.suspended) {
+          const { sample, step, exempt } = this.suspended;
+          if (!this.runBurst(sample, step, exempt, targetId === "sh4" ? MOCK_SAMPLES_PER_BURST - 1 : sample)) {
+            return;
+          }
+        }
         this.advance(targetId);
       }
       if (targetId === "sh4") {
