@@ -1514,7 +1514,7 @@ describe("the gate of M2, and the options that came with it", () => {
       });
       expect(lines[0]).toMatch(mockSupport ? /^mock debugger started in this process at ws:\S+, as a server of milestone M2$/ : /^mock debugger started in this process at ws:\S+$/);
       expect(summary.server.capabilities).toEqual(
-        mockSupport ? ["event-breakpoints", "callstack", "memory-write", "register-write", "reset", "sh4-debug-native"] : ["event-breakpoints", "callstack", "memory-write", "register-write", "reset", "sgc-capture", "sh4-debug-native"],
+        mockSupport ? ["event-breakpoints", "callstack", "memory-write", "register-write", "reset", "sh4-debug-native"] : ["event-breakpoints", "callstack", "memory-write", "register-write", "reset", "sgc-capture", "memory-binary", "sh4-debug-native"],
       );
       expect(lines.at(-1)).toBe("contract: OK");
     }

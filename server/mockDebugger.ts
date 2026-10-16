@@ -29,6 +29,7 @@ import type {
 } from "../src/lib/debuggerSchema";
 import { JSON_RPC_VERSION } from "../src/lib/jsonRpc";
 import { BinaryFrameKind, SGC_BYTES_PER_CHANNEL, SGC_CHANNELS_PER_FRAME, encodeBinaryFrame } from "../src/lib/binaryFrame";
+import { assembleSource, decodeInst, disassembleDesc } from "../src/app/dsp/dspUtils";
 import { generateMockSgcCapture } from "./mockSgc";
 import type { MockSgcCapture } from "./mockSgc";
 
@@ -38,27 +39,43 @@ import type { MockSgcCapture } from "./mockSgc";
  * a test or the contract runner; `server/mockWebSocket.ts` puts it on a socket and
  * `server/mockServer.ts` adds the page.
  *
- * What it implements is milestone M2 of the protocol (ARM7 run control, memory and register
- * writes, reset, the M2 rows of the device tree), plus what the mock could do before protocol
- * v3: DSP stepping and code breakpoints, the SGC capture, and register writes on every node.
- * Everything else answers -32004. The option `supports` takes away from that: down to what
- * the emulator implements in milestone M2 (`MOCK_M2_SUPPORT`), or in M1 (`MOCK_M1_SUPPORT`).
+ * What it implements is milestone M3 of the protocol, as the emulator's M3 does it: the run
+ * control of the three targets (the DSP's steps and breakpoints included), memory and register
+ * writes, reset, the SGC capture, state.getMemoryBinary, and the rows of the device tree of M3;
+ * and register writes on every node, which the emulator does not have. Everything else answers
+ * -32004. The option `supports` takes away from that: down to what the emulator implements in
+ * milestone M3 (`MOCK_M3_SUPPORT`), in M2 (`MOCK_M2_SUPPORT`), or in M1 (`MOCK_M1_SUPPORT`).
  *
- * The machine: each target walks a ring of instructions, one instruction per emulation
- * step (16 ms). The last instruction of the SH4 and ARM7 rings is the branch back to the
- * first one, and the disassembly says so. An emulation step is also a frame, and at its
- * vertical blank the SH4 takes an interrupt, as a program with interrupts enabled does: its
- * PC leaves the loop for the handler at VBR + 0x600, which ends in `rte`, and comes back to
- * where it was. So between two steps the PC is in the loop, and a breakpoint in the handler
- * stops the SH4 there. The ring of the ARM7 has a call: one of its instructions is `bl` to a
- * leaf behind the ring, two instructions and the return, and R14 is the link register of it.
+ * The machine: the SH4 and the ARM7 each walk a ring of instructions, one instruction per
+ * emulation step (16 ms of real time, 3,200,064 cycles of `dc.timing.SH4_CYCLES`). The last
+ * instruction of each ring is the branch back to the first one, and the disassembly says so.
+ * An emulation step is also a frame, and at its vertical blank the SH4 takes an interrupt, as a
+ * program with interrupts enabled does: its PC leaves the loop for the handler at VBR + 0x600,
+ * which ends in `rte`, and comes back to where it was. So between two steps the PC is in the
+ * loop, and a breakpoint in the handler stops the SH4 there. The ring of the ARM7 has a call:
+ * one of its instructions is `bl` to a leaf behind the ring, two instructions and the return,
+ * and R14 is the link register of it.
+ *
+ * The sound chip has the emulator's clock: a sound burst every 145124 cycles of the SH4 (an
+ * AICA period), 32 samples in a burst, and in every sample the DSP executes its 128 steps and
+ * MDEC_CT counts down once. The bursts of an emulation step come before its SH4 and ARM7
+ * instructions, and a DSP breakpoint is reached in every sample: a burst is then suspended in
+ * front of that step, as the emulator suspends one, and a resume runs it on before the machine
+ * runs again. The AICA is clocked whatever the ARM7 does: a held ARM7 executes nothing, and the
+ * DSP, its breakpoints and the capture work as ever (the M3 round's M3-D7). The DSP runs one
+ * program (MOCK_DSP_PROGRAM), which is what the register file holds at 0x3400 and what
+ * state.getDisassembly {dsp} shows; it computes nothing, and the datapath registers of
+ * `dc.aica.dsp` are fabricated from where it stands.
  *
  * Memory is three stores, each seen through every address that maps it: main memory (16 MiB,
  * area 3 of the SH4 through P0, P1 and P2), wave memory (8 MiB, the SH4's 0x00800000 + X and
  * the ARM7's X), and video memory (8 MiB in each of its two views, 0x04.. with 0x06.. and
  * 0x05.. with 0x07..). A byte is a hash of where it is in its store until state.writeMemory
- * writes it. Everything else the debugger can read (ROM, flash, register windows) is a hash
- * of its address and cannot be written.
+ * writes it. The register file of the AICA is a fourth one, which cannot be written: the SH4's
+ * 0x00700000 + X and the ARM7's 0x00800000 + X, a word of 16 bits in the low half of four
+ * bytes, the DSP's program at 0x3400, and 0x2804 read as 0 (the DSP's RBPL, which a CPU reads
+ * as 0). Everything else the debugger can read (ROM, flash, the other register windows) is a
+ * hash of its address and cannot be written.
  */
 
 export interface MockDebuggerOptions {
@@ -100,8 +117,16 @@ export interface MockDebuggerOptions {
   /**
    * The ARM7 is held in reset when the machine starts, as behind a reset: `ENABLED` reads 0,
    * and it is released when the machine has run for 8 emulation steps (as a guest releases it).
+   * Only steps of a running machine count: with `startPaused` too, the ARM7 is held at the stop
+   * of the start however long the first client takes to come, as it is at the emulator's anchor.
    */
   arm7Held?: boolean;
+  /**
+   * TESTB0, bit 15 of the AICA's word 0x2804, is set: `dc.aica.common.TESTB0` reads 1, and the
+   * DSP is in the test mode of its MDEC_CT, which a sample then XORs with 0x8080 instead of
+   * counting it down (the DSP core's `RBPL`).
+   */
+  testb0?: boolean;
   /** called with one line per connection event and per request the mock refuses to parse */
   log?: (line: string) => void;
 }
@@ -118,21 +143,24 @@ export interface MockSupport {
    */
   stepping?: TargetProcessor[];
   /**
-   * The capabilities of optional methods (default: all six the mock has): "event-breakpoints",
-   * "callstack", "memory-write", "register-write", "reset", "sgc-capture". The methods behind a
-   * missing one answer -32004, and without "callstack" the ticks carry no frames.
+   * The capabilities of optional methods (default: all seven the mock has): "event-breakpoints",
+   * "callstack", "memory-write", "register-write", "reset", "sgc-capture", "memory-binary". The
+   * methods behind a missing one answer -32004, and without "callstack" the ticks carry no frames.
    */
   capabilities?: string[];
   /**
    * The nodes whose registers state.setRegister writes (default: every node). A register of
-   * another node has no writer: no `flags.writable` in debugger.describe, and -32013.
+   * another node has no writer: no `flags.writable` in debugger.describe, and -32013. The
+   * registers of `dc.aica.dsp`, `ENABLED` and a few others have none on any server.
    */
   writableNodes?: string[];
   /**
-   * The rows of the device tree: "m2" (the default) has the nodes and registers of milestone
-   * M2 and the actions `sh4-registers` and `arm7-registers`; "m1" is the tree without them.
+   * The rows of the device tree: "m3" (the default) has the nodes and registers of milestone
+   * M3, which are those of M2 and the nine datapath registers of `dc.aica.dsp`; "m2" is the tree
+   * of milestone M2, with the actions `sh4-registers` and `arm7-registers`; "m1" is the tree
+   * without what M2 added.
    */
-  deviceTree?: "m1" | "m2";
+  deviceTree?: "m1" | "m2" | "m3";
 }
 
 /** What the emulator implements in milestone M1: SH4 debugging, event breakpoints, callstack. */
@@ -161,6 +189,28 @@ export const MOCK_M2_SUPPORT: Readonly<Required<MockSupport>> = {
   ],
   writableNodes: ["dc.sh4.cpu", "dc.aica.arm7"],
   deviceTree: "m2",
+};
+
+/**
+ * What the emulator implements in milestone M3, and no more: the three targets step, the SGC
+ * capture and state.getMemoryBinary besides what M2 has, the thirteen registers of
+ * `dc.aica.dsp`, and register writes of the two processors alone (no device write: the M3
+ * round's M3-Q3).
+ */
+export const MOCK_M3_SUPPORT: Readonly<Required<MockSupport>> = {
+  targets: ["sh4", "arm7", "dsp"],
+  stepping: ["sh4", "arm7", "dsp"],
+  capabilities: [
+    CAPABILITIES.EVENT_BREAKPOINTS,
+    CAPABILITIES.CALLSTACK,
+    CAPABILITIES.MEMORY_WRITE,
+    CAPABILITIES.REGISTER_WRITE,
+    CAPABILITIES.RESET,
+    CAPABILITIES.SGC_CAPTURE,
+    CAPABILITIES.MEMORY_BINARY,
+  ],
+  writableNodes: ["dc.sh4.cpu", "dc.aica.arm7"],
+  deviceTree: "m3",
 };
 
 /** One client connection, as the host gives it to the mock. */
@@ -222,6 +272,15 @@ const ARM7_MODES = [0x10, 0x11, 0x12, 0x13, 0x17, 0x1b, 0x1f];
 /** The DSP executes its 128 steps once per sample. */
 export const MOCK_DSP_RING: Readonly<Ring> = { base: 0, length: 128, instructionSize: 1 };
 
+/**
+ * The DSP's RBPL, the word 0x2804 of the AICA: RBP 0x400 in bits 11:0, RBL 3 in bits 14:13,
+ * TESTB0 in bit 15 (set by the option `testb0`).
+ */
+const MOCK_RBPL = 0x0400 | (3 << 13);
+const TESTB0 = 0x8000;
+/** MDEC_CT at the start of the machine, and behind a reset. */
+const MOCK_MDEC_CT_START = 0x1fff;
+
 const RINGS: Record<TargetProcessor, Readonly<Ring>> = { sh4: MOCK_SH4_RING, arm7: MOCK_ARM7_RING, dsp: MOCK_DSP_RING };
 
 /**
@@ -253,6 +312,15 @@ const ARM7_CPSR_MASK = 0xf00000df;
 const SH4_SR_MD = 0x40000000;
 /** scheduler cycles of one emulation step (16 ms at 200 MHz, a multiple of the 448-cycle slice) */
 const CYCLES_PER_EMULATION_STEP = 448n * 7143n;
+/**
+ * One period of the AICA, as the emulator has it: the scheduler cycles from one sound burst to
+ * the next. A burst makes 32 samples, and the DSP executes its 128 steps in every sample.
+ */
+export const MOCK_AICA_PERIOD_CYCLES = 145124n;
+export const MOCK_SAMPLES_PER_BURST = 32;
+const DSP_STEPS = 128;
+/** The host time from a request of state.recordSgcFrames within which the capture has to be complete, else -32014 (the emulator's kCaptureTimeoutMs). */
+export const MOCK_CAPTURE_TIMEOUT_MS = 5000;
 const SH4_TIMESLICE = 448n;
 const SLOW_CLIENT_BYTES = 1048576;
 const FALLBACK_NOTICE =
@@ -402,8 +470,24 @@ const sgcChannelRegisters = (volume: number): RegisterSpec[] => [
 /** A register that cannot be read without a side effect, or that is write-only: it reads "n/a" and has no writer. */
 const unread = (name: string, width: number): RegisterSpec => reg(name, width, "n/a", false);
 
-/** The tree of a server: with the rows of milestone M2, or the M1 rows alone. */
-const deviceTree = (m2: boolean): NodeSpec[] => [
+/**
+ * The datapath registers of the DSP's core that `dc.aica.dsp` has from milestone M3 on, behind
+ * STEP, MDEC_CT, RBP and RBL, with their widths (the M3 round's M3-D25).
+ */
+export const DSP_DATAPATH_REGISTERS: ReadonlyArray<readonly [name: string, width: number]> = [
+  ["ACC", 26],
+  ["Y_REG", 24],
+  ["FRC_REG", 13],
+  ["ADRS_REG", 12],
+  ["LATCH", 16],
+  ["LATCH_COPY", 16],
+  ["MEMVAL", 16],
+  ["NOFL_PIPE", 2],
+  ["MIXS_BANK", 1],
+];
+
+/** The tree of a server: with the rows of milestone M3, of M2, or the M1 rows alone. */
+const deviceTree = (m2: boolean, m3: boolean): NodeSpec[] => [
   {
     path: "dc",
     label: "Dreamcast",
@@ -558,8 +642,16 @@ const deviceTree = (m2: boolean): NodeSpec[] => [
             path: "dc.aica.dsp",
             label: "DSP",
             description: "DSP VLIW Core",
-            // the widths of design 2.8: a step is 0..127
-            registers: [reg("STEP", 8, 0), reg("MDEC_CT", 16, 0x1fff), reg("RBP", 16, 0x0400), reg("RBL", 8, 0x03)],
+            // The widths of design 2.8 and of the M3 round's M3-D25. What the DSP has: none has a
+            // writer; STEP is the step the DSP executes next, RBP and RBL are the fields of its
+            // RBPL; behind them, from M3, the datapath of its core (fabricated by the mock).
+            registers: [
+              reg("STEP", 8, 0, false),
+              reg("MDEC_CT", 16, MOCK_MDEC_CT_START, false),
+              reg("RBP", 16, MOCK_RBPL & 0xfff, false),
+              reg("RBL", 8, (MOCK_RBPL >> 13) & 3, false),
+              ...(m3 ? DSP_DATAPATH_REGISTERS.map(([name, width]) => reg(name, width, 0, false)) : []),
+            ],
             actions: [PANEL_IDS.DSP_DISASSEMBLY],
           },
           ...(m2
@@ -569,7 +661,21 @@ const deviceTree = (m2: boolean): NodeSpec[] => [
                   label: "Common",
                   description: "Common registers",
                   // fields of the common block; the interrupt levels are write-only on the console
-                  registers: [reg("MVOL", 4, 0xf), reg("VER", 4, 0x1, false), reg("DMEA", 23, 0), reg("SCIEB", 11, 0x040), reg("SCIPD", 11, 0, false), unread("SCILV0", 8), reg("L", 3, 0, false), reg("M", 3, 0, false)],
+                  // RBP, RBL and TESTB0 are the fields of the word 0x2804, the DSP's RBPL, which a
+                  // CPU reads as 0: what dc.aica.dsp has of RBP and RBL is the same word
+                  registers: [
+                    reg("MVOL", 4, 0xf),
+                    reg("VER", 4, 0x1, false),
+                    reg("RBP", 12, MOCK_RBPL & 0xfff, false),
+                    reg("RBL", 2, (MOCK_RBPL >> 13) & 3, false),
+                    reg("TESTB0", 1, 0, false),
+                    reg("DMEA", 23, 0),
+                    reg("SCIEB", 11, 0x040),
+                    reg("SCIPD", 11, 0, false),
+                    unread("SCILV0", 8),
+                    reg("L", 3, 0, false),
+                    reg("M", 3, 0, false),
+                  ],
                 },
                 { path: "dc.aica.rtc", label: "RTC", description: "Real Time Clock", registers: [reg("SECONDS", 32, 0x5bfc8900), reg("WRITE_ENABLE", 1, 0)] },
               ]
@@ -667,7 +773,7 @@ const TARGETS: DebuggerTarget[] = [
 
 const targetById = (id: TargetProcessor): DebuggerTarget => TARGETS.find((target) => target.id === id)!;
 
-/** The capabilities of optional methods the mock has: those of M1 and of M2, and the SGC capture, which it could do before protocol v3. */
+/** The capabilities of optional methods the mock has: those of M1, of M2 and of M3. */
 const OPTIONAL_CAPABILITIES: string[] = [
   CAPABILITIES.EVENT_BREAKPOINTS,
   CAPABILITIES.CALLSTACK,
@@ -675,13 +781,39 @@ const OPTIONAL_CAPABILITIES: string[] = [
   CAPABILITIES.REGISTER_WRITE,
   CAPABILITIES.RESET,
   CAPABILITIES.SGC_CAPTURE,
+  CAPABILITIES.MEMORY_BINARY,
 ];
 
 // ---------------------------------------------------------------------------------------
 // Memory and disassembly
 // ---------------------------------------------------------------------------------------
 
+/** One byte of a sha256 digest: what picks the mock's instructions, one line of disassembly at a time. */
 const sha256Byte = (input: string): number => createHash("sha256").update(input).digest()[0];
+
+/** A 32-bit number of a text (FNV-1a): the seed of what the mock fabricates in one place. */
+const seedOf = (text: string): number => {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index++) {
+    hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193);
+  }
+  return hash >>> 0;
+};
+
+/**
+ * A byte of a hash of a seed and an offset (the finaliser of MurmurHash3): what the mock
+ * fabricates at a byte of memory. It is a few integer operations, so that a read of 16 MiB is
+ * answered within a second or so; a digest of every byte took tens of seconds.
+ */
+const hashByte = (seed: number, offset: number): number => {
+  let hash = (seed ^ Math.imul(offset | 0, 0x9e3779b1)) >>> 0;
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 0x85ebca6b);
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, 0xc2b2ae35);
+  hash ^= hash >>> 16;
+  return hash & 0xff;
+};
 
 /** Whether the debugger can read a byte of the SH4 address space (design 2.7). */
 export const mockSh4Readable = (address: number): boolean => {
@@ -752,21 +884,109 @@ export const mockStoreOf = (target: "sh4" | "arm7", address: number): { store: M
   }
 };
 
-/** What a byte reads before anything wrote it: a hash of where it is in its store, or of its address. */
+/**
+ * The DSP program of the mock's machine, in the syntax of the playground's assembler
+ * (src/app/dsp/dspUtils.ts): steps 0 to 23, the steps behind them empty. Each line is the
+ * playground's disassembly of the words it assembles to, so it is also what
+ * state.getDisassembly {dsp} shows of the step.
+ */
+export const MOCK_DSP_PROGRAM: readonly string[] = [
+  "MPRO[0] = XSEL YSEL:1 IRA:32 YRL ZERO",
+  "MPRO[1] = TRA:1 YSEL:1 MRD NOFL MASA:1",
+  "MPRO[2] = TWT TWA:2 XSEL YSEL:1 IRA:33 BSEL",
+  "MPRO[3] = YSEL:2 IWT IWA:1 FRCL SHIFT:1",
+  "MPRO[4] = TRA:2 XSEL YSEL:1 IRA:1 ZERO",
+  "MPRO[5] = TWT TWA:4 YSEL:1 MWT BSEL NOFL MASA:2",
+  "MPRO[6] = TRA:4 YSEL:3 ADRL SHIFT:3",
+  "MPRO[7] = XSEL YSEL:1 MRD BSEL MASA:3 ADREB",
+  "MPRO[8] = TWT TWA:6 YSEL:1 EWT ZERO",
+  "MPRO[9] = TRA:6 XSEL YSEL:1 IRA:2 IWT IWA:2 NEGB BSEL",
+  "MPRO[10] = TWT TWA:8 YSEL:2 TABLE MWT SHIFT:2 MASA:4 NXADR",
+  "MPRO[11] = TRA:8 YSEL:1 EWT EWA:1 ZERO",
+  "MPRO[12] = XSEL YSEL:1 IRA:48 BSEL",
+  "MPRO[13] = TWT TWA:10 YSEL:3 MRD SHIFT:1 MASA:5",
+  "MPRO[14] = TRA:10 YSEL:1 ZERO",
+  "MPRO[15] = XSEL YSEL:1 IRA:3 IWT IWA:3 BSEL",
+  "MPRO[16] = TWT TWA:12 YSEL:2 FRCL SHIFT:3",
+  "MPRO[17] = TRA:12 XSEL YSEL:1 IRA:34 EWT EWA:2 BSEL",
+  "MPRO[18] = YSEL:1 ADRL ZERO",
+  "MPRO[19] = TWT TWA:14 XSEL YSEL:1 IRA:4 MWT BSEL NOFL MASA:6",
+  "MPRO[20] = TRA:14 YSEL:3 YRL",
+  "MPRO[21] = XSEL YSEL:1 IRA:35 EWT EWA:3 NEGB BSEL",
+  "MPRO[22] = TWT TWA:16 YSEL:1 ZERO",
+  "MPRO[23] = TRA:16 YSEL:2 EWT EWA:4 SHIFT:2 BSEL",
+];
+
+/** The program as the register file holds it: four MPRO words for each of the 128 steps, from step 0. */
+export const MOCK_DSP_WORDS: Readonly<Uint16Array> = (() => {
+  const words = new Uint16Array(DSP_STEPS * 4);
+  for (const { index, encoded } of assembleSource([...MOCK_DSP_PROGRAM]).MPRO) {
+    encoded.forEach((word, position) => {
+      words[index * 4 + position] = word;
+    });
+  }
+  return words;
+})();
+
+/** The four MPRO words of a step of the mock's DSP. */
+export const mockDspWords = (step: number): number[] => Array.from(MOCK_DSP_WORDS.subarray(step * 4, step * 4 + 4));
+
+/** The AICA's register file: where MPRO starts and ends, and the word of RBP, RBL and TESTB0. */
+const MPRO_OFFSET = 0x3400;
+const MPRO_END = MPRO_OFFSET + DSP_STEPS * 16;
+const RBPL_OFFSET = 0x2804;
+
+/** The offset in the register file of the AICA (0 to 0x7FFF) that an address of a target is, if it is one. */
+export const mockRegisterFileOffset = (target: "sh4" | "arm7", address: number): number | undefined => {
+  if (target === "arm7") {
+    return address >= 0x00800000 && address <= 0x00807fff ? address - 0x00800000 : undefined;
+  }
+  if (address >= 0xe0000000) {
+    return undefined;
+  }
+  const masked = address & SH4_ADDRESS_MASK;
+  const offset = masked & 0x01ffffff;
+  return masked >>> 26 === 0 && offset >= 0x00700000 && offset <= 0x00707fff ? offset - 0x00700000 : undefined;
+};
+
+const STORE_SEEDS: Readonly<Record<MockStore, number>> = {
+  main: seedOf("main memory"),
+  wave: seedOf("wave memory"),
+  video64: seedOf("video memory, 64-bit view"),
+  video32: seedOf("video memory, 32-bit view"),
+};
+const REGISTER_FILE_SEED = seedOf("register file of the AICA");
+const ADDRESS_SEEDS = { sh4: seedOf("SH4"), arm7: seedOf("ARM7") } as const;
+
+/**
+ * A byte of the AICA's register file as a CPU reads it: a register is a word of 16 bits in the
+ * low half of four bytes; MPRO holds the DSP's program; RBPL reads 0; the rest is fabricated.
+ */
+const registerFileByte = (offset: number): number => {
+  if (offset & 2) {
+    return 0;
+  }
+  if (offset >= RBPL_OFFSET && offset < RBPL_OFFSET + 4) {
+    return 0;
+  }
+  if (offset >= MPRO_OFFSET && offset < MPRO_END) {
+    const word = MOCK_DSP_WORDS[(offset - MPRO_OFFSET) >> 2];
+    return offset & 1 ? word >> 8 : word & 0xff;
+  }
+  return hashByte(REGISTER_FILE_SEED, offset);
+};
+
+/**
+ * What a byte reads before anything wrote it: a hash of where it is in its store, or the
+ * register file's byte, or a hash of its address.
+ */
 const fabricatedByte = (target: "sh4" | "arm7", address: number): number => {
   const at = mockStoreOf(target, address);
-  switch (at?.store) {
-    case "main":
-      return sha256Byte(`SH4:${(0x8c000000 + at.offset).toString(16)}`);
-    case "wave":
-      return sha256Byte(`ARM7:${at.offset.toString(16)}`);
-    case "video64":
-      return sha256Byte(`SH4:${(0x04000000 + at.offset).toString(16)}`);
-    case "video32":
-      return sha256Byte(`SH4:${(0x05000000 + at.offset).toString(16)}`);
-    default:
-      return sha256Byte(`${target === "sh4" ? "SH4" : "ARM7"}:${address.toString(16)}`);
+  if (at) {
+    return hashByte(STORE_SEEDS[at.store], at.offset);
   }
+  const register = mockRegisterFileOffset(target, address);
+  return register === undefined ? hashByte(ADDRESS_SEEDS[target], address) : registerFileByte(register);
 };
 
 /** A byte of a target's memory as the machine has it now: what was written, else what is fabricated. */
@@ -799,70 +1019,16 @@ const arm7Instructions: Array<{ mnemonic: string; operands: Operands; branch?: b
   { mnemonic: "nop", operands: () => "" },
 ];
 
-const dspSampleProgram = [
-  "TWT TWA YSEL BSELXSEL YSEL IRA:2 ZERO NOFL MASA:6 NXADRTRA YSEL BSEL",
-  "YSEL IWT IWA:6 MWT BSEL NOFL",
-  "YSEL BSEL",
-  "YSEL MRD BSEL NOFL MASA:7",
-  "YSEL BSEL",
-  "YSEL IWT IWA:7 MRD BSEL NOFL MASA:8",
-  "YSEL BSEL",
-  "YSEL IWT IWA:8 MRD BSEL NOFL MASA:9",
-  "YSEL BSEL",
-  "YSEL IWT IWA:9 MRD BSEL NOFL MASA:10XSEL YSEL IRA:2 ZERO",
-  "TWT YSEL IWT IWA:10 MRD BSEL NOFL MASA:11XSEL YSEL IRA:3 NEGB BSELXSEL YSEL IRA:33 IWT IWA:11 MRD BSEL NOFL MASA:12",
-  "TWT TWA YSEL BSELXSEL YSEL IRA:2 IWT IWA:12 MRD ZERO NOFL MASA:13TRA YSEL BSEL",
-  "YSEL IWT IWA:13 MWT BSEL NOFL MASA:2",
-  "YSEL BSEL",
-  "YSEL MRD BSEL NOFL MASA:14",
-  "YSEL BSEL",
-  "YSEL IWT IWA:14 MRD BSEL NOFL MASA:15",
-  "YSEL BSEL",
-  "YSEL IWT IWA:15 MRD BSEL NOFL MASA:17",
-  "YSEL BSEL",
-  "YSEL IWT IWA:17 MRD BSEL NOFL MASA:19XSEL YSEL IRA:4 ZERO",
-  "TWT YSEL IWT IWA:19 MRD BSEL NOFL MASA:21XSEL YSEL IRA:5 NEGB BSELXSEL YSEL IRA:32 IWT IWA:21 MRD BSEL NOFL MASA:23",
-  "TWT TWA YSEL BSELXSEL YSEL IRA:4 IWT IWA:23 ZEROTRA YSEL BSEL",
-  "YSEL BSELXSEL YSEL IRA:6 ZERO",
-  "TWT YSEL BSELXSEL YSEL IRA:7 NEGB BSELXSEL YSEL IRA:33 BSEL",
-  "TWT TWA YSEL BSELXSEL YSEL IRA:6 ZEROTRA YSEL BSEL",
-  "YSEL BSELXSEL YSEL IRA:8 ZEROXSEL YSEL IRA:9 BSEL",
-  "XSEL YSEL IRA:10 BSEL",
-  "XSEL YSEL IRA:11 BSEL",
-  "TWT TWA:2 YSEL BSEL",
-  "YSEL BSELXSEL YSEL IRA:12 ZEROXSEL YSEL IRA:13 BSEL",
-  "XSEL YSEL IRA:14 BSEL",
-  "XSEL YSEL IRA:15 BSEL",
-  "TWT TWA:3 YSEL BSEL",
-  "YSEL BSELTRA:2 XSEL YSEL IRA:17",
-  "TWT TWA:2 YSEL BSEL",
-  "YSEL BSEL",
-  "YSEL MWT BSEL NOFL MASA:16XSEL YSEL IRA:17 ZEROTRA:2 YSEL BSEL",
-  "TWT TWA:2 YSEL BSEL",
-  "YSEL BSELTRA:3 XSEL YSEL IRA:19",
-  "TWT TWA:3 YSEL BSEL",
-  "YSEL BSEL",
-  "YSEL MWT BSEL NOFL MASA:18XSEL YSEL IRA:19 ZEROTRA:3 YSEL BSEL",
-  "TWT TWA:3 YSEL BSEL",
-  "YSEL BSELTRA:2 XSEL YSEL IRA:21",
-  "TWT TWA:2 YSEL BSEL",
-  "YSEL BSEL",
-  "YSEL MWT BSEL NOFL MASA:20XSEL YSEL IRA:21 ZEROTRA:2 YSEL BSEL",
-  "YSEL EWT BSEL",
-  "YSEL BSELTRA:3 XSEL YSEL IRA:23",
-  "TWT TWA:3 YSEL BSEL",
-  "YSEL BSEL",
-  "YSEL MWT BSEL NOFL MASA:22XSEL YSEL IRA:23 ZEROTRA:3 YSEL BSEL",
-  "YSEL EWT EWA BSEL",
-];
 
 const hexByte = (value: number) => value.toString(16).toUpperCase().padStart(2, "0");
 const hex8 = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8, "0")}`;
 
 const disassembleLine = (target: TargetProcessor, address: number, memoryByte: ReadByte, written?: string): DisassemblyLine => {
   if (target === "dsp") {
-    const bytes = Array.from({ length: 8 }, (_, index) => hexByte(sha256Byte(`dsp:${address}:${index}`))).join(" ");
-    return { address, bytes, disassembly: dspSampleProgram[address % dspSampleProgram.length] };
+    // the four MPRO words of the step, each high byte first, and the playground's line of them
+    const words = mockDspWords(address);
+    const bytes = words.map((word) => `${hexByte(word >> 8)} ${hexByte(word & 0xff)}`).join(" ");
+    return { address, bytes, disassembly: `MPRO[${address}] = ${disassembleDesc(decodeInst(words)) || "TRA:0"}` };
   }
 
   const ring = RINGS[target];
@@ -961,6 +1127,7 @@ const METHOD_CAPABILITY: Readonly<Record<string, string>> = {
   [RpcMethod.STATE_EDIT_WATCH]: CAPABILITIES.REGISTER_WRITE,
   [RpcMethod.STATE_RECORD_SGC_FRAMES]: CAPABILITIES.SGC_CAPTURE,
   [RpcMethod.STATE_GET_SGC_FRAME_DATA]: CAPABILITIES.SGC_CAPTURE,
+  [RpcMethod.STATE_GET_MEMORY_BINARY]: CAPABILITIES.MEMORY_BINARY,
 };
 
 interface ClientState {
@@ -1042,6 +1209,23 @@ export class MockDebugger {
   private readonly written = new Map<number, number>();
   private emulationSteps = 0;
   private cycles = 0n;
+  /** where the SH4 and the ARM7 execute the instructions of the emulation step under way: its end */
+  private spanEnd = CYCLES_PER_EMULATION_STEP;
+  /** the time of the next sound burst, a multiple of the AICA's period */
+  private nextBurst = MOCK_AICA_PERIOD_CYCLES;
+  /**
+   * The sound burst that is suspended, if one is: in front of `step` of its sample `sample` (0 to
+   * 31), at the time the burst has. `exempt`: the DSP stopped in front of that step itself (a
+   * breakpoint, a step of its own), so that it executes it without looking at its breakpoints
+   * once (the resume exemption, M3-D22). Not exempt at the end of a sample, in front of step 0 of
+   * the next one, where the step from 127 stops.
+   */
+  private suspended: { sample: number; step: number; exempt: boolean } | undefined;
+  /** the samples the sound chip has made: what the datapath registers of `dc.aica.dsp` are made from */
+  private samples = 0;
+  private mdecCt = MOCK_MDEC_CT_START;
+  /** the DSP's RBPL, the word 0x2804 of the AICA */
+  private readonly rbpl: number;
 
   private readonly breakpoints = new Map<number, BreakpointDescriptor>();
   private nextBreakpointId = 1;
@@ -1056,13 +1240,21 @@ export class MockDebugger {
   private periodicTicks = 0;
   private fallbackSelected = false;
 
+  /** the server's capture: the last one that was completed */
   private capture: MockSgcCapture | undefined;
   private captureSeed = 0;
+  /**
+   * The capture that records, with the request it answers: complete when the SH4's time has
+   * reached `endAt`, and then a stop of its own when it was armed at a stop (`stopAtEnd`).
+   * Answered -32014 when it is not complete at `deadline`.
+   */
+  private recording:
+    | { client: ClientState; id: number; frames: number; endAt: bigint; stopAtEnd: boolean; deadline: ReturnType<typeof setTimeout> }
+    | undefined;
 
   private emulationTimer: ReturnType<typeof setInterval> | undefined;
   private tickTimer: ReturnType<typeof setInterval> | undefined;
   private graceTimer: ReturnType<typeof setTimeout> | undefined;
-  private readonly captureTimers = new Set<ReturnType<typeof setTimeout>>();
   private graceExpired = false;
 
   private readonly handlers: Record<string, { cls: CallClass; run: Handler } | undefined>;
@@ -1079,8 +1271,10 @@ export class MockDebugger {
       ui: options.ui ?? "none",
       protocol: options.protocol ?? PROTOCOL_VERSION,
       arm7Held: options.arm7Held ?? false,
+      testb0: options.testb0 ?? false,
       log: options.log,
     };
+    this.rbpl = MOCK_RBPL | (this.options.testb0 ? TESTB0 : 0);
     const listed = options.supports?.targets;
     const stepping = options.supports?.stepping;
     this.targets = TARGETS.filter((target) => !listed || listed.includes(target.id)).map((target) => ({
@@ -1092,7 +1286,8 @@ export class MockDebugger {
     );
 
     this.writableNodes = options.supports?.writableNodes ? new Set(options.supports.writableNodes) : undefined;
-    this.deviceTree = deviceTree(options.supports?.deviceTree !== "m1");
+    const rows = options.supports?.deviceTree ?? "m3";
+    this.deviceTree = deviceTree(rows !== "m1", rows === "m3");
 
     const visit = (node: NodeSpec) => {
       this.nodes.set(node.path, node);
@@ -1105,6 +1300,8 @@ export class MockDebugger {
     if (this.options.forceFallback) {
       this.values.get("dc.timing")!.set("SH4_DEBUG_ENGINE", "interpreter-fallback");
     }
+    this.values.get("dc.aica.common")?.set("TESTB0", this.options.testb0 ? 1 : 0);
+    this.refreshDsp();
     if (this.options.arm7Held) {
       this.holdArm7();
     }
@@ -1137,8 +1334,8 @@ export class MockDebugger {
       [RpcMethod.STATE_GET_SGC_FRAME_DATA]: { cls: "read", run: (_params, context) => this.getSgcFrameData(context) },
       [RpcMethod.STATE_WRITE_MEMORY]: { cls: "write", run: (params, context) => this.writeMemory(params, context) },
       [RpcMethod.CONTROL_RESET]: { cls: "write", run: (_params, context) => this.reset(context) },
+      [RpcMethod.STATE_GET_MEMORY_BINARY]: { cls: "read", run: (params, context) => this.getMemoryBinary(params, context) },
       // later milestones, not implemented by the mock
-      [RpcMethod.STATE_GET_MEMORY_BINARY]: undefined,
       [RpcMethod.STATE_GET_TABLE]: undefined,
       [RpcMethod.STATE_CAPTURE_HOLLY]: undefined,
     };
@@ -1171,8 +1368,9 @@ export class MockDebugger {
       clearTimeout(this.graceTimer);
       this.graceTimer = undefined;
     }
-    this.captureTimers.forEach((timer) => clearTimeout(timer));
-    this.captureTimers.clear();
+    if (this.recording) {
+      clearTimeout(this.recording.deadline);
+    }
   }
 
   get clientCount(): number {
@@ -1215,6 +1413,12 @@ export class MockDebugger {
     }
     const gameStarts = lifetime === "running" && this.lifetime === "no-machine";
     this.lifetime = lifetime;
+    // a host stop or a guest exit ends a capture, and answers it by the lifetime
+    if (lifetime === "stopped") {
+      this.cancelCapture(DebuggerErrorCode.STOPPED_BY_HOST, "emulator stopped by host UI");
+    } else if (lifetime === "no-machine") {
+      this.cancelCapture(DebuggerErrorCode.NO_GAME, "no game loaded");
+    }
     // a stop of the host is a stop like any other: what a step-out, or the ARM7's step-over of a
     // call, was waiting for is not waited for behind it
     this.pendingStepOut = undefined;
@@ -1227,7 +1431,9 @@ export class MockDebugger {
       this.stopId++;
       this.reason = "start";
     } else if (lifetime === "running") {
-      // a debugger pause that was in force before the host stop is not re-applied
+      // a debugger pause that was in force before the host stop is not re-applied, and a burst
+      // that was suspended there runs to its end
+      this.finishBurst();
       this.running = true;
       this.reason = undefined;
     } else {
@@ -1408,13 +1614,20 @@ export class MockDebugger {
   }
 
   /**
-   * One emulation step, which is one frame: every target executes one instruction, what is due
-   * happens, and at the vertical blank the SH4 goes through its interrupt handler.
+   * One emulation step, which is one frame: the sound bursts of its time are made (a DSP
+   * breakpoint or the end of a capture can stop the machine in one of them: the rest of the
+   * step is then made when the machine runs again), then the SH4 and the ARM7 execute one
+   * instruction each, what is due happens, and at the vertical blank the SH4 goes through its
+   * interrupt handler.
    */
   private emulationStep(): void {
     if (this.lifetime !== "running" || !this.running) {
       return;
     }
+    if (!this.runSoundUntil(this.spanEnd)) {
+      return;
+    }
+    this.spanEnd = this.cycles + CYCLES_PER_EMULATION_STEP;
     this.emulationSteps++;
     const wrapped: Partial<Record<TargetProcessor, boolean>> = {};
     let returned = false;
@@ -1426,7 +1639,7 @@ export class MockDebugger {
       this.arm7HeldFor = undefined;
       this.setRegisterValue("dc.aica.arm7", "ENABLED", 1);
     }
-    for (const target of ["sh4", "arm7", "dsp"] as const) {
+    for (const target of ["sh4", "arm7"] as const) {
       if (target === "arm7" && held) {
         continue;
       }
@@ -1437,8 +1650,6 @@ export class MockDebugger {
     }
     this.setRegisterValue("dc.sh4.cpu", "PR", (((this.register("dc.sh4.cpu", "PR") as number) + 2) & 0xffffffff) >>> 0);
     this.setRegisterValue("dc.aica.sgc.0", "VOL", ((this.register("dc.aica.sgc.0", "VOL") as number) + 1) & 0xff);
-    this.setRegisterValue("dc.aica.dsp", "MDEC_CT", ((this.register("dc.aica.dsp", "MDEC_CT") as number) - 1) & 0xffff);
-    this.setCycles(this.cycles + CYCLES_PER_EMULATION_STEP);
 
     // event breakpoints: a hit requests a pause that is honoured at the end of the step
     let eventHit: number | undefined;
@@ -1465,12 +1676,10 @@ export class MockDebugger {
       returned ||= this.advance("sh4").returned === true;
       codeHit = this.codeBreakpointAtPc("sh4");
     }
-    for (const target of ["arm7", "dsp"] as const) {
-      // (the ARM7 is not where a breakpoint could stop it while it is held)
-      const hit = target === "arm7" && this.arm7Held ? undefined : this.codeBreakpointAtPc(target);
-      if (hit !== undefined && (codeHit === undefined || hit < codeHit)) {
-        codeHit = hit;
-      }
+    // (the ARM7 is not where a breakpoint could stop it while it is held; the DSP's are looked at in the bursts)
+    const arm7Hit = this.arm7Held ? undefined : this.codeBreakpointAtPc("arm7");
+    if (arm7Hit !== undefined && (codeHit === undefined || arm7Hit < codeHit)) {
+      codeHit = arm7Hit;
     }
 
     // if several causes coincide, the priority is breakpoint, event, step
@@ -1487,6 +1696,190 @@ export class MockDebugger {
       // the temporary breakpoint of a step-over or a step-out of the ARM7
       this.enterStop("step");
     }
+  }
+
+  // -------------------------------------------------------------------------------------
+  // The sound chip: bursts, samples, the DSP and the capture
+  // -------------------------------------------------------------------------------------
+
+  /**
+   * The machine's time runs to `until`: the end of a capture and the sound bursts that come
+   * before it are made, in the order of their time. Returns false when one of them stopped the
+   * machine, which is then at the time of that burst or of that end; true when the time is at
+   * `until`.
+   */
+  private runSoundUntil(until: bigint): boolean {
+    for (;;) {
+      const end = this.recording?.endAt;
+      if (end !== undefined && end <= this.nextBurst && end <= until) {
+        this.setCycles(end > this.cycles ? end : this.cycles);
+        if (this.completeCapture()) {
+          return false;
+        }
+        continue;
+      }
+      if (this.nextBurst > until) {
+        break;
+      }
+      this.setCycles(this.nextBurst);
+      this.nextBurst += MOCK_AICA_PERIOD_CYCLES;
+      if (!this.runBurst(0, 0, false)) {
+        return false;
+      }
+    }
+    if (until > this.cycles) {
+      this.setCycles(until);
+    }
+    return true;
+  }
+
+  /**
+   * The code breakpoints of the DSP that can stop it, by step: the lowest id on each. Those
+   * that are disabled, of a muted or not soloed category, or without a client behind the grace
+   * period, are not active.
+   */
+  private activeDspBreakpoints(): Map<number, number> {
+    const active = new Map<number, number>();
+    for (const breakpoint of this.breakpoints.values()) {
+      if (breakpoint.kind !== "code" || CODE_BREAKPOINT_EVENTS[breakpoint.event] !== "dsp" || !this.isActive(breakpoint)) {
+        continue;
+      }
+      const lowest = active.get(breakpoint.address!);
+      if (lowest === undefined || breakpoint.id < lowest) {
+        active.set(breakpoint.address!, breakpoint.id);
+      }
+    }
+    return active;
+  }
+
+  /**
+   * A sound burst from step `step` of its sample `sample` to its end: every sample of it, the
+   * DSP in front of each of its steps looking at its breakpoints (at the first one only when it
+   * is not `exempt`). Returns true when the burst ran to its end; false when it is suspended in
+   * front of a step with an active breakpoint, which is then a stop of that breakpoint.
+   */
+  private runBurst(sample: number, step: number, exempt: boolean): boolean {
+    const active = this.activeDspBreakpoints();
+    for (; sample < MOCK_SAMPLES_PER_BURST; sample++, step = 0, exempt = false) {
+      if (active.size > 0) {
+        for (let next = step; next < DSP_STEPS; next++) {
+          const id = active.get(next);
+          if (id !== undefined && !(exempt && next === step)) {
+            this.suspended = { sample, step: next, exempt: true };
+            this.refreshDsp();
+            this.enterStop("breakpoint", id);
+            return false;
+          }
+        }
+      }
+      this.completeSample();
+    }
+    this.suspended = undefined;
+    this.refreshDsp();
+    return true;
+  }
+
+  /** A burst that is suspended runs to its end, its DSP looking at no breakpoint. */
+  private finishBurst(): void {
+    if (!this.suspended) {
+      return;
+    }
+    for (let sample = this.suspended.sample; sample < MOCK_SAMPLES_PER_BURST; sample++) {
+      this.completeSample();
+    }
+    this.suspended = undefined;
+    this.refreshDsp();
+  }
+
+  /** The end of a sample: MDEC_CT counts down once (in TESTB0's test mode it is XORed with 0x8080). */
+  private completeSample(): void {
+    this.samples++;
+    this.mdecCt = this.rbpl & TESTB0 ? this.mdecCt ^ 0x8080 : (this.mdecCt - 1) & 0xffff;
+  }
+
+  /**
+   * One step of the DSP, as control.step {dsp} makes it: from a burst that is suspended, the
+   * step in front of which it is, in that burst (the SH4's time does not move); with none, the
+   * SH4 runs to the next burst first, and the step is step 0 of its first sample. The step from
+   * 127 is complete at the end of its sample: STEP is 0 then, and MDEC_CT one less.
+   */
+  private stepDsp(): void {
+    if (!this.suspended) {
+      const at = this.nextBurst;
+      // (a capture that ends on the way is complete, and its stop is the step's)
+      if (this.recording && this.recording.endAt <= at) {
+        this.setCycles(this.recording.endAt > this.cycles ? this.recording.endAt : this.cycles);
+        this.completeCapture(false);
+      }
+      this.setCycles(at);
+      this.nextBurst += MOCK_AICA_PERIOD_CYCLES;
+      this.suspended = { sample: 0, step: 0, exempt: true };
+    }
+    const { sample, step } = this.suspended;
+    if (step < DSP_STEPS - 1) {
+      this.suspended = { sample, step: step + 1, exempt: true };
+    } else {
+      this.completeSample();
+      // the end of the sample; behind the last one of the burst, the burst has ended
+      this.suspended = sample < MOCK_SAMPLES_PER_BURST - 1 ? { sample: sample + 1, step: 0, exempt: false } : undefined;
+    }
+    this.refreshDsp();
+  }
+
+  /**
+   * The registers of `dc.aica.dsp` as the DSP stands: STEP, MDEC_CT, RBP and RBL; and the
+   * datapath, fabricated from the sample and the step, so that a step changes it.
+   */
+  private refreshDsp(): void {
+    const dsp = this.values.get("dc.aica.dsp");
+    if (!dsp) {
+      return;
+    }
+    const step = this.suspended?.step ?? 0;
+    dsp.set("STEP", step);
+    dsp.set("MDEC_CT", this.mdecCt);
+    dsp.set("RBP", this.rbpl & 0xfff);
+    dsp.set("RBL", (this.rbpl >> 13) & 3);
+    const where = this.samples * DSP_STEPS + step;
+    for (const [name, width] of DSP_DATAPATH_REGISTERS) {
+      if (!dsp.has(name)) {
+        continue;
+      }
+      const value =
+        name === "MIXS_BANK"
+          ? this.samples & 1
+          : (hashByte(seedOf(name), where) | (hashByte(seedOf(name), where + 0x10000000) << 8) | (hashByte(seedOf(name), where + 0x20000000) << 16) | (hashByte(seedOf(name), where + 0x30000000) << 24)) >>> 0;
+      dsp.set(name, width >= 32 ? value : value & (2 ** width - 1));
+    }
+  }
+
+  /**
+   * The capture that records is complete: it replaces the server's, its request is answered,
+   * and when it was armed at a stop and `stop` allows it, the machine stops with reason
+   * "capture". Returns whether it stopped the machine.
+   */
+  private completeCapture(stop = true): boolean {
+    const recording = this.recording!;
+    this.recording = undefined;
+    clearTimeout(recording.deadline);
+    this.capture = generateMockSgcCapture(recording.frames, ++this.captureSeed);
+    this.send(recording.client, { jsonrpc: JSON_RPC_VERSION, id: recording.id, result: {} });
+    if (stop && recording.stopAtEnd && this.running && this.lifetime === "running") {
+      this.enterStop("capture");
+      return true;
+    }
+    return false;
+  }
+
+  /** The capture that records is cancelled, and its request answered with `code`. */
+  private cancelCapture(code: number, message: string): void {
+    const recording = this.recording;
+    if (!recording) {
+      return;
+    }
+    this.recording = undefined;
+    clearTimeout(recording.deadline);
+    this.send(recording.client, { jsonrpc: JSON_RPC_VERSION, id: recording.id, result: { error: { code, message } } });
   }
 
   private sameAddress(target: TargetProcessor, a: number, b: number): boolean {
@@ -1753,6 +2146,8 @@ export class MockDebugger {
         this.graceExpired = true;
         this.updateFallback();
         if (this.lifetime === "running" && !this.running) {
+          // (no breakpoint is active now: a burst that is suspended runs to its end)
+          this.finishBurst();
           this.running = true;
           this.reason = undefined;
           this.stopBreakpointId = undefined;
@@ -1920,28 +2315,58 @@ export class MockDebugger {
     return target;
   }
 
-  private getMemorySlice(params: Record<string, unknown>): MemorySlice {
-    const target = this.memoryTarget(params);
-    const address = params.address as number;
-    const length = params.length as number;
-    const data: number[] = new Array<number>(length);
+  /**
+   * `length` bytes of a target's memory from `address`: the bytes, 0 where nothing is readable,
+   * and the runs of those as [offset, length]; no wrap above the target's last address.
+   * -32010 when nothing of it is readable.
+   */
+  private readMemory(target: "sh4" | "arm7", address: number, length: number): { data: Uint8Array; unreadable: Array<[number, number]> } {
+    const data = new Uint8Array(length);
     const unreadable: Array<[number, number]> = [];
+    const last = targetById(target).addressMax;
+    const readable = target === "sh4" ? mockSh4Readable : mockArm7Readable;
+    let run: [number, number] | undefined;
     for (let offset = 0; offset < length; offset++) {
-      const readable = isReadable(target, address + offset);
-      data[offset] = readable ? this.memoryByte(target, address + offset) : 0;
-      if (!readable) {
-        const last = unreadable.at(-1);
-        if (last && last[0] + last[1] === offset) {
-          last[1]++;
-        } else {
-          unreadable.push([offset, 1]);
-        }
+      const at = address + offset;
+      if (at <= last && readable(at)) {
+        data[offset] = this.memoryByte(target, at);
+        run = undefined;
+      } else if (run) {
+        run[1]++;
+      } else {
+        run = [offset, 1];
+        unreadable.push(run);
       }
     }
     if (unreadable.length === 1 && unreadable[0][1] === length) {
       throw new MockRpcError(DebuggerErrorCode.NOT_READABLE, "address not readable");
     }
-    return { baseAddress: address, data, validity: "ok", ...(unreadable.length ? { unreadable } : {}) };
+    return { data, unreadable };
+  }
+
+  private getMemorySlice(params: Record<string, unknown>): MemorySlice {
+    const target = this.memoryTarget(params);
+    const address = params.address as number;
+    const { data, unreadable } = this.readMemory(target, address, params.length as number);
+    return { baseAddress: address, data: Array.from(data), validity: "ok", ...(unreadable.length ? { unreadable } : {}) };
+  }
+
+  /**
+   * state.getMemorySlice with the bound 16 MiB, and the bytes in a binary frame of kind 2 behind
+   * the response, to the requesting client only. Its binaryId is the connection's next one,
+   * which kind 1 counts too. No frame after an error.
+   */
+  private getMemoryBinary(params: Record<string, unknown>, context: RequestContext): unknown {
+    const target = this.memoryTarget(params);
+    const address = params.address as number;
+    const { data, unreadable } = this.readMemory(target, address, params.length as number);
+    const binaryId = ++context.client.binaryId;
+    context.afterResponse.push(() => {
+      if (this.clients.has(context.client.id)) {
+        context.client.connection.sendBinary(encodeBinaryFrame(BinaryFrameKind.MEMORY, binaryId, data));
+      }
+    });
+    return { baseAddress: address, totalBytes: data.byteLength, ...(unreadable.length ? { unreadable } : {}), binaryId };
   }
 
   private getDisassembly(params: Record<string, unknown>): { lines: DisassemblyLine[] } {
@@ -2152,6 +2577,12 @@ export class MockDebugger {
       }
       this.holdArm7();
       this.pendingStepOut = undefined;
+      // the sound chip: no burst is suspended any more, and the capture that recorded is ended
+      this.suspended = undefined;
+      this.mdecCt = MOCK_MDEC_CT_START;
+      this.values.get("dc.aica.common")?.set("TESTB0", this.rbpl & TESTB0 ? 1 : 0);
+      this.refreshDsp();
+      this.cancelCapture(DebuggerErrorCode.CAPTURE_TIMED_OUT, "capture timed out: ended by a reset");
       const hit = this.emitEvent("dc.system.reset", MOCK_EVENTS["dc.system.reset"].message(this.emulationSteps));
       if (!this.running) {
         // the reason of the stop is the reset, whatever it was before, and it names no breakpoint
@@ -2184,9 +2615,20 @@ export class MockDebugger {
     return {};
   }
 
+  /**
+   * The machine leaves its stop. A sound burst that is suspended there is run on first, as the
+   * emulator's park loop does, and a DSP breakpoint it reaches in it is a new stop with no
+   * running tick in between; else the machine runs, and says so.
+   */
   private leaveStop(): void {
     if (this.running || this.lifetime !== "running") {
       return;
+    }
+    if (this.suspended) {
+      const { sample, step, exempt } = this.suspended;
+      if (!this.runBurst(sample, step, exempt)) {
+        return;
+      }
     }
     this.running = true;
     this.reason = undefined;
@@ -2244,9 +2686,14 @@ export class MockDebugger {
 
     // Step, and step over on a line that is no call: one instruction, one paused tick, no
     // running tick. `rte` executes with its delay slot. No vertical blank falls into a step,
-    // and a step of one target moves nothing of another.
+    // and a step of one target moves nothing of another. A step of the DSP is one of its steps,
+    // whatever the ARM7 does: the AICA is clocked while the ARM7 is held.
     context.afterResponse.push(() => {
-      this.advance(targetId);
+      if (targetId === "dsp") {
+        this.stepDsp();
+      } else {
+        this.advance(targetId);
+      }
       if (targetId === "sh4") {
         this.setCycles(this.cycles + 1n);
       }
@@ -2344,28 +2791,33 @@ export class MockDebugger {
   }
 
   /**
-   * The capture is the next `frames` AICA samples; the answer is sent when it is complete.
-   * A running machine keeps running. A paused one runs for the capture and pauses again
-   * with reason "capture".
+   * The capture is the next `frames` AICA samples, and the answer is sent when it is complete:
+   * when the SH4's time has run on by ceil(frames / 32) periods of the AICA. A running machine
+   * keeps running; a paused one runs for the capture and stops again with reason "capture"
+   * (the response first, then the tick of that stop). It records whatever the ARM7 does. While
+   * it records a second request is -32003 and the first goes on, the server's capture is the
+   * one before it, and stops, pauses and steps keep it recording; a reset ends it with -32014
+   * at once, and so does the deadline, 5 s of host time from the request.
    */
   private recordSgcFrames(params: Record<string, unknown>, context: RequestContext): void {
+    if (this.recording) {
+      throw new MockRpcError(DebuggerErrorCode.NOT_PAUSED, "not paused: a capture records already");
+    }
     const frames = (params.frames as number | undefined) ?? PROTOCOL_BOUNDS.sgcFrames.default;
-    const wasPaused = !this.running;
+    const periods = BigInt(Math.ceil(frames / MOCK_SAMPLES_PER_BURST));
     context.deferred = true;
-    if (wasPaused) {
+    const deadline = setTimeout(() => this.cancelCapture(DebuggerErrorCode.CAPTURE_TIMED_OUT, "capture timed out"), MOCK_CAPTURE_TIMEOUT_MS);
+    this.recording = {
+      client: context.client,
+      id: context.id,
+      frames,
+      endAt: this.cycles + periods * MOCK_AICA_PERIOD_CYCLES,
+      stopAtEnd: !this.running,
+      deadline,
+    };
+    if (!this.running) {
       this.leaveStop();
     }
-    // 44100 samples per second, and never in the same turn as the request
-    const duration = Math.max(1, Math.ceil((frames * 1000) / 44100));
-    const timer = setTimeout(() => {
-      this.captureTimers.delete(timer);
-      this.capture = generateMockSgcCapture(frames, ++this.captureSeed);
-      this.send(context.client, { jsonrpc: JSON_RPC_VERSION, id: context.id, result: {} });
-      if (wasPaused && this.running && this.lifetime === "running") {
-        this.enterStop("capture");
-      }
-    }, duration);
-    this.captureTimers.add(timer);
   }
 
   private getSgcFrameData(context: RequestContext): unknown {

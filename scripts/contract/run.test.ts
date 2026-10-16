@@ -490,7 +490,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       },
       ["S01"],
     );
-    expect(shorter.invariantViolations.join("\n")).toMatch(/I4: registers\["dc\.aica\.dsp"\] carries \[STEP\], describe lists \[STEP MDEC_CT RBP RBL\]/);
+    expect(shorter.invariantViolations.join("\n")).toMatch(/I4: registers\["dc\.aica\.dsp"\] carries \[STEP\], describe lists \[STEP MDEC_CT RBP RBL ACC Y_REG FRC_REG ADRS_REG LATCH LATCH_COPY MEMVAL NOFL_PIPE MIXS_BANK\]/);
     expect(shorter.invariantViolations.join("\n")).toMatch(/I4: registers\["dc\.nowhere"\] is not a path of the describe tree/);
   });
 
@@ -955,7 +955,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
     expect(reportOf(anchorOnly)).toEqual(["S01 passed ", "S10 passed "]);
     const more = await run(
-      dsp((registers) => [...registers, { name: "ACC", value: "0x0000000", width: 26 }, { name: "MDEC_CT_RELOAD", value: "0x00002000", width: 32 }]),
+      dsp((registers) => [...registers, { name: "SHIFTED", value: "0x000000", width: 24 }, { name: "MDEC_CT_RELOAD", value: "0x00002000", width: 32 }]),
       ["S01"],
     );
     expect(reportOf(more)).toEqual(["S01 passed "]);
@@ -3314,7 +3314,7 @@ describe("the emulator profile", () => {
 
     // a server that selects its backend with the first Run(): neither capability at the StartPaused stop
     const { summary: late, lines } = await anchor((listed, hasRun) => (hasRun ? listed : withoutEngine(listed)));
-    expect(lines.find((line) => line.startsWith("server: "))).toMatch(/capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture; targets: /);
+    expect(lines.find((line) => line.startsWith("server: "))).toMatch(/capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, memory-binary; targets: /);
     expect(reportOf(late)).toEqual(["S00 passed SH4 debug engine: native"]);
     expect(late.ok).toBe(true);
     // (the summary names what the server said last)
@@ -3342,9 +3342,9 @@ describe("the emulator profile", () => {
 
     const summary = await running;
     expect(lines.filter((line) => /^server: |^waiting /.test(line)).map((line) => line.replace(/; targets: .*/, ""))).toEqual([
-      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture",
+      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, memory-binary",
       expect.stringMatching(/^waiting for the StartPaused stop \(the server is #\d+ paused stop 2 no-game\)$/),
-      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, sh4-debug-native",
+      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, memory-binary, sh4-debug-native",
     ]);
     expect(reportOf(summary)).toEqual(["S00 passed SH4 debug engine: native"]);
     expect(summary.server.capabilities).toContain("sh4-debug-native");
