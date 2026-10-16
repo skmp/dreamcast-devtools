@@ -2423,10 +2423,11 @@ describe("milestone M3", () => {
 
     it("reads 16 MiB of main memory within 2 s, and wave memory is one store behind both targets", () => {
       const { session } = setup();
-      const started = performance.now();
+      // in real time: the fake timers of this file stop performance.now() and process.hrtime()
+      const started = vi.getRealSystemTime();
       const result = session.ok("state.getMemoryBinary", { address: 0x0c000000, length: 16777216 }) as { totalBytes: number; unreadable?: unknown };
-      const elapsed = performance.now() - started;
-      expect(elapsed, `${elapsed.toFixed(0)} ms`).toBeLessThan(2000);
+      const elapsed = vi.getRealSystemTime() - started;
+      expect(elapsed, `${elapsed} ms`).toBeLessThan(2000);
       expect(result.totalBytes).toBe(16777216);
       expect(result.unreadable).toBeUndefined();
       const frame = parseBinaryFrame(session.binary[0]);
