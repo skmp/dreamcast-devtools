@@ -1555,7 +1555,7 @@ describe("the gate of M2, and the options that came with it", () => {
     // every scenario that has parts names them
     expect(SCENARIOS.filter((scenario) => scenario.parts).map((scenario) => [scenario.id, scenario.parts])).toEqual([
       ["S16", ["arm7", "writeMemory", "setRegister", "reset", "tree"]],
-      ["S17", ["sgcCapture"]],
+      ["S17", ["sgcCapture", "memoryBinary"]],
       ["S18", ["tables", "hollyCapture"]],
     ]);
     // a named part that is not applicable fails the scenario, where without --parts it would be partial
@@ -1627,7 +1627,7 @@ describe("the command line of milestone M2", () => {
       [["--milestone", "M2", "--parts", "S16:arm7"], /^contract: Error: --parts with --milestone: the gate of M2 is its scenarios whole; /m],
       [["--only", "S01", "--parts", "S16:arm7"], /^contract: Error: --parts S16: --only leaves that scenario out$/m],
       [["--require-note"], /^contract: Error: --require-note needs the text of a note$/m],
-      [["--mock-support", "m3"], /^contract: Error: --mock-support is m1 or m2, not "m3"$/m],
+      [["--mock-support", "m4"], /^contract: Error: --mock-support is m1, m2 or m3, not "m4"$/m],
       [["--mock-support", "m2", "--url", "ws://127.0.0.1:1/ws"], /^contract: Error: --mock-support is for the mock the runner starts itself: not with --url$/m],
     ] as const) {
       const wrong = await cli([...args]);

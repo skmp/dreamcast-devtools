@@ -148,6 +148,10 @@ export const REGISTER_PANEL_IDS: readonly string[] = ["sh4-registers", "arm7-reg
 
 /** One period of the AICA scheduler callback, in SH4 cycles: a sound burst of 32 samples. */
 export const AICA_CALLBACK_CYCLES = 145124n;
+/** The samples of one sound burst: a capture of n frames is ceil(n / 32) periods of the AICA. */
+export const SAMPLES_PER_BURST = 32;
+/** The SH4's time slice, in cycles: the rest of a slice is what the SH4 runs on behind a burst at most. */
+export const SH4_SLICE_CYCLES = 448n;
 
 /** The three registers the targets are anchored in: where the PC of each, or the step, is read. */
 export const ANCHOR_REGISTERS: ReadonlyArray<{ path: string; name: string }> = [
@@ -164,14 +168,33 @@ export const ANCHOR_REGISTERS: ReadonlyArray<{ path: string; name: string }> = [
 export const ARM7_ENABLED_REGISTER = { path: "dc.aica.arm7", name: "ENABLED", width: 1 } as const;
 
 /**
- * The widths of the registers of `dc.aica.dsp` (2.8), for every server that lists them: those
- * of the hardware. Only `STEP`, the anchor, has to be there.
+ * The datapath registers of the DSP's core that `dc.aica.dsp` has from milestone M3 on, behind
+ * the four of M1, with their widths (the M3 round's M3-D25). Under the gate of M3 S01 requires
+ * all nine.
+ */
+export const M3_DSP_REGISTERS: ReadonlyArray<readonly [name: string, width: number]> = [
+  ["ACC", 26],
+  ["Y_REG", 24],
+  ["FRC_REG", 13],
+  ["ADRS_REG", 12],
+  ["LATCH", 16],
+  ["LATCH_COPY", 16],
+  ["MEMVAL", 16],
+  ["NOFL_PIPE", 2],
+  ["MIXS_BANK", 1],
+];
+
+/**
+ * The widths of the registers of `dc.aica.dsp` (2.8 and M3-D25), for every server that lists
+ * one of them: those of the hardware and of the DSP's core. Only `STEP`, the anchor, has to be
+ * there, and from the gate of M3 on the nine of M3 too.
  */
 export const DSP_REGISTER_WIDTHS: ReadonlyMap<string, number> = new Map([
   ["STEP", 8],
   ["MDEC_CT", 16],
   ["RBP", 16],
   ["RBL", 8],
+  ...M3_DSP_REGISTERS,
 ]);
 
 const numbered = (prefix: string, count: number, suffix = ""): string[] => Array.from({ length: count }, (_, index) => `${prefix}${index}${suffix}`);

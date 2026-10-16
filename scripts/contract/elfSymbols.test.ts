@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { parseElfSymbols, readElfSymbols, resolveAddress } from "./elfSymbols";
+import { elfBytes, parseElfSymbols, readElfSymbols, resolveAddress } from "./elfSymbols";
 
 /** A minimal little-endian ELF32 file: header, .strtab, .symtab and three section headers. */
 const buildElf = (entry: number, symbols: Array<{ name: string; value: number; type: number; section: number }>): Uint8Array => {
@@ -94,7 +94,31 @@ describe("ELF32 symbol table reader", () => {
   it("accepts a file without section headers", () => {
     const stripped = image.slice(0, 52);
     new DataView(stripped.buffer).setUint32(32, 0, true);
-    expect(parseElfSymbols(stripped)).toEqual({ entry: 0x8c010000, symbols: new Map() });
+    expect(parseElfSymbols(stripped)).toEqual({ entry: 0x8c010000, symbols: new Map(), segments: [] });
+  });
+
+  it("reads what the loadable segments put in memory, by virtual address: what a program loads between two of its symbols", () => {
+    // the image above with one program header behind it: PT_LOAD of 8 bytes of the file at 0x8C010000
+    const data = [0x12, 0x34, 0x00, 0x00, 0xcd, 0xab, 0x00, 0x00];
+    const withSegment = new Uint8Array(image.length + 32 + data.length);
+    withSegment.set(image, 0);
+    const view = new DataView(withSegment.buffer);
+    const header = image.length;
+    view.setUint32(28, header, true); // e_phoff
+    view.setUint16(42, 32, true); // e_phentsize
+    view.setUint16(44, 1, true); // e_phnum
+    view.setUint32(header, 1, true); // PT_LOAD
+    view.setUint32(header + 4, header + 32, true); // p_offset
+    view.setUint32(header + 8, 0x8c010000, true); // p_vaddr
+    view.setUint32(header + 16, data.length, true); // p_filesz
+    withSegment.set(data, header + 32);
+    const elf = parseElfSymbols(withSegment);
+    expect(elf.segments).toEqual([{ address: 0x8c010000, data: new Uint8Array(data) }]);
+    expect(Array.from(elfBytes(elf, 0x8c010004, 4)!)).toEqual([0xcd, 0xab, 0x00, 0x00]);
+    // nothing outside of a segment, nor across its end
+    expect(elfBytes(elf, 0x8c010006, 4)).toBeUndefined();
+    expect(elfBytes(elf, 0x8c00fffc, 4)).toBeUndefined();
+    expect(elfBytes(parseElfSymbols(image), 0x8c010000, 4)).toBeUndefined();
   });
 
   // NULLDC_TEST_ELF=<path to 2ndmix.elf>, the program the emulator runs for the contract

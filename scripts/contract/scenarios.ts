@@ -24,10 +24,13 @@ import {
   M1_DEVICE_TREE,
   M2_DEVICE_TREE,
   M2_TREE_ACTION,
+  M3_DSP_REGISTERS,
   MILESTONES,
   REGISTER_PANEL_IDS,
+  SAMPLES_PER_BURST,
   SH4_CPU_REGISTERS,
   SH4_CPU_REGISTER_WIDTH,
+  SH4_SLICE_CYCLES,
   TARGET_IDS,
   TARGET_TABLE,
   VBLANK_EVENT,
@@ -35,6 +38,7 @@ import {
 } from "./design";
 import type { Milestone } from "./design";
 import { branchTarget, isArmControlFlow, isSh4ControlFlow, isSh4DelayedBranch, mnemonicOf } from "./disasm";
+import { dspLineProblem, dspProgramOfElf } from "./dspText";
 import { indexDescribe, registerValuePattern } from "./invariants";
 import { ContractFailure, ContractSession, check, describeState, fail, monotonicNow } from "./session";
 import type { BinaryRecord, TickRecord } from "./session";
@@ -109,8 +113,12 @@ type Scenario = {
   milestone?: Milestone;
   /** it applies to the emulator profile only */
   emulatorOnly?: boolean;
-  /** it needs a program that loads the DSP: it belongs to the run with the DSP test program, and to no other */
-  dspProgram?: boolean;
+  /**
+   * The run with the DSP test program (`--dsp-program`, the second run of the gate of M3):
+   * "only", it needs a program that loads the DSP and belongs to that run and to no other;
+   * "also", it is in that run and in the first one.
+   */
+  dspProgram?: "only" | "also";
   /** the keys of its parts, for a scenario that has parts: what `--parts` names */
   parts?: readonly string[];
   run: (context: RunContext) => Promise<Outcome>;
@@ -778,6 +786,23 @@ const s01: Scenario = {
         expectThat(
           targets.find((target) => target.id === "arm7")?.stepping === true,
           `the gate of ${context.milestone}: targets: arm7.stepping is not true; a server of milestone M2 steps the ARM7 and takes its code breakpoints (3.1)`,
+        );
+      }
+      // from M3 on the DSP steps (else S21 would only be "not applicable", in the second run), and
+      // dc.aica.dsp has the nine datapath registers of the DSP's core (the M3 round's M3-D25),
+      // under the widths that are normative for every server (above)
+      if (MILESTONES.indexOf(context.milestone) >= MILESTONES.indexOf("M3")) {
+        if (ids.includes("dsp")) {
+          expectThat(
+            targets.find((target) => target.id === "dsp")?.stepping === true,
+            `the gate of ${context.milestone}: targets: dsp.stepping is not true; a server of milestone M3 steps the DSP and takes its code breakpoints (3.1)`,
+          );
+        }
+        const listed = new Set((nodes.get("dc.aica.dsp")?.registers ?? []).map((register) => register.name));
+        const missing = M3_DSP_REGISTERS.map(([name]) => name).filter((name) => !listed.has(name));
+        expectThat(
+          missing.length === 0,
+          `the gate of ${context.milestone}: dc.aica.dsp lacks ${missing.join(" ")}; from milestone M3 it has the datapath registers of the DSP's core, ${M3_DSP_REGISTERS.map(([name]) => name).join(" ")} (M3-D25)`,
         );
       }
     }
@@ -1525,6 +1550,14 @@ const s10: Scenario = {
         }
         check((line.bytes === "??") === (line.disassembly === "<unreadable>"), `${target.id}: an unreadable word is bytes "??" and text "<unreadable>"`);
       });
+      // The text of a DSP line is the playground's line of its bytes (design 3.3): "MPRO[n] = " and
+      // the playground's disassembly of the four words, "TRA:0" for an empty step
+      if (target.id === "dsp") {
+        for (const line of lines) {
+          const problem = dspLineProblem(line);
+          check(problem === undefined, problem!);
+        }
+      }
       // `context` is ignored: the lines are those of the request without it
       const withContext = (await session.call("state.getDisassembly", { target: target.id, address: start, count: 16, context: 8 })).lines;
       check(
@@ -1535,6 +1568,12 @@ const s10: Scenario = {
       const last = target.addressMax - (target.addressMax % target.instructionSize);
       const tail = await disassemble(context, target.id, last - target.instructionSize, 16);
       check(tail.length === 2, `${target.id}: ${tail.length} lines for count 16 at the second-to-last address, expected 2`);
+      if (target.id === "dsp") {
+        for (const line of tail) {
+          const problem = dspLineProblem(line);
+          check(problem === undefined, problem!);
+        }
+      }
       if (target.instructionSize > 1) {
         await session.expectError("state.getDisassembly", { target: target.id, address: start + 1, count: 1 }, -32602);
       }
@@ -3386,89 +3425,6 @@ const s16: Scenario = {
     ]),
 };
 
-const s17: Scenario = {
-  id: "S17",
-  title: "M3: SGC capture",
-  milestone: "M3",
-  parts: ["sgcCapture"],
-  run: (context) =>
-    runParts(context, "S17", [
-      {
-        key: "sgcCapture",
-        name: "sgc capture",
-        applicable: hasCapability(context, CAPABILITIES.SGC_CAPTURE),
-        why: 'no capability "sgc-capture"',
-        async run() {
-          const { session } = context;
-          const paused = await ensurePaused(context);
-
-          // an error result is followed by no binary frame
-          const binaryBefore = session.binary.length;
-          let hadCapture = false;
-          try {
-            await session.expectError("state.getSgcFrameData", {}, -32011);
-          } catch (error) {
-            if (!(error instanceof ContractFailure) || !/got the result/.test(error.message)) {
-              throw error;
-            }
-            hadCapture = true;
-          }
-          if (hadCapture) {
-            context.note("a capture existed already, so \"no binary frame after an error\" was not exercised");
-            check((await session.waitForBinary(binaryBefore, session.scale(10_000))) !== undefined, "the binary frame of the existing capture");
-          } else {
-            check((await session.waitForBinary(binaryBefore, 500)) === undefined, "a binary frame followed the error -32011");
-          }
-
-          // from the paused state: the target runs for exactly the capture and pauses again
-          const mark = session.mark();
-          await session.call("state.recordSgcFrames", { frames: 64 });
-          const stopped = await session.waitForTick(
-            (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(paused.tick),
-            5000,
-            'a paused tick with reason "capture" after state.recordSgcFrames',
-            mark,
-          );
-          check(stopped.tick.executionState.reason === "capture", `the stop after the capture has reason "${stopped.tick.executionState.reason}", expected "capture"`);
-          check(session.ticksSince(mark).some((record) => record.seq < stopped.seq && isRunning(record.tick)), "a running tick while the capture runs");
-
-          const from = session.binary.length;
-          const request = session.mark();
-          const info = await session.call("state.getSgcFrameData", {});
-          if ("error" in info) {
-            return fail("state.getSgcFrameData answered with an in-band error object");
-          }
-          check(info.frameCount === 64, `frameCount is ${info.frameCount}, 64 frames were recorded`);
-          check(info.totalBytes === 64 * SGC_BYTES_PER_FRAME, `totalBytes is ${info.totalBytes}, expected ${64 * SGC_BYTES_PER_FRAME}`);
-          const binary = (await session.waitForBinary(from, session.scale(10_000))) ?? fail("no binary frame within 10 s of the state.getSgcFrameData response");
-          checkBinaryAfterResponse(session, request, binary, "state.getSgcFrameData");
-          const frame = binary.data;
-          check(frame.byteLength === BINARY_FRAME_HEADER_BYTES + info.totalBytes, `the binary frame has ${frame.byteLength} bytes, expected 16 + ${info.totalBytes}`);
-          const parsed = parseBinaryFrame(frame);
-          if (!parsed.ok) {
-            return fail(`the binary frame: ${parsed.reason}`);
-          }
-          check(parsed.header.kind === BinaryFrameKind.SGC_FRAMES, `kind is ${parsed.header.kind}, expected 1`);
-          check(parsed.header.binaryId === info.binaryId, `binaryId is ${parsed.header.binaryId} in the header and ${info.binaryId} in the result`);
-          check(parsed.header.payloadBytes === 64 * SGC_BYTES_PER_FRAME, `payloadBytes is ${parsed.header.payloadBytes}`);
-          check(info.binaryId! >= 1, "binaryId is allocated per connection from 1");
-
-          // the record layout: byte 109 is the flags byte, bytes 110..127 are zero, the level is at most 0x3FF
-          const bytes = new Uint8Array(parsed.payload);
-          const view = new DataView(parsed.payload);
-          for (let offset = 0; offset < bytes.length; offset += 128) {
-            check((bytes[offset + 109] & ~0x07) === 0, `record at ${offset}: flags byte ${bytes[offset + 109]} has bits above bit 2`);
-            check(view.getUint32(offset + 96, true) <= 0x3ff, `record at ${offset}: aeg_value ${view.getUint32(offset + 96, true)} is above 0x3FF`);
-            for (let pad = 110; pad < 128; pad++) {
-              check(bytes[offset + pad] === 0, `record at ${offset}: byte ${pad} is not zero`);
-            }
-          }
-          await session.expectError("state.recordSgcFrames", { frames: 4097 }, -32602);
-        },
-      },
-    ]),
-};
-
 const s18: Scenario = {
   id: "S18",
   title: "M4: tables, Holly capture",
@@ -3524,11 +3480,439 @@ const s18: Scenario = {
     ]),
 };
 
+/**
+ * What S17 and S21 note of what they met with the ARM7 held. The texts are an interface: the
+ * contract targets of the emulator require them of a run with `--require-note`, so they are
+ * verbatim. "Held" is ENABLED reading 0 when the request was made (the M3 round's M3-D44).
+ */
+export const M3_NOTES = {
+  /** S17's first capture was made at a stop where ENABLED read 0, and it completed */
+  sgcHeld: "sgc: captured with the arm7 held",
+  /** S21's first step of the DSP was made at a stop where ENABLED read 0 */
+  dspHeld: "dsp: stepped with the arm7 held",
+} as const;
+
+/**
+ * What the SH4 runs on at most for a step of the DSP from a pause, or for a resume from a stop of
+ * a DSP breakpoint: one period of the AICA to the next burst, and the rest of its slice.
+ */
+const DSP_RUN_ON_CYCLES = AICA_CALLBACK_CYCLES + SH4_SLICE_CYCLES;
+
+/** Why a request made with the ARM7 held is to work: what the M3 round fixes for it. */
+const CLOCKED_WHATEVER_ARMRST =
+  "the AICA is clocked whatever ARMRST says: the DSP, its breakpoints and the capture work while the ARM7 is held, and only the ARM7's three steps answer -32012 (the M3 round's M3-D7)";
+
+/** `dc.timing.SH4_CYCLES` of a tick, which the rules of the capture's length and of the DSP's run-on read. */
+const requireCycles = (tick: DebuggerTick, what: string): bigint =>
+  cyclesOf(tick) ?? fail(`${what}: the tick has no numeric dc.timing.SH4_CYCLES, which the rule reads`);
+
+/** A capture as `state.getSgcFrameData` gave it: the result's count and id, and the payload of its frame. */
+interface CaptureRead {
+  frameCount: number;
+  binaryId: number;
+  payload: Uint8Array;
+}
+
+/**
+ * `state.getSgcFrameData` and its frame: the frame within 10 s behind the response, its header
+ * (kind 1, the result's binaryId, `payloadBytes == totalBytes == frameCount * 8192`), and the
+ * layout of every record (the flags byte without bits above 2, the level at most 0x3FF, bytes
+ * 110..127 zero).
+ */
+const readCapture = async (session: ContractSession, what = "state.getSgcFrameData", noCapture?: string): Promise<CaptureRead> => {
+  const from = session.binary.length;
+  const request = session.mark();
+  const answer = await session.outcome("state.getSgcFrameData", {});
+  if ("error" in answer) {
+    return fail(
+      answer.error.code === -32011 && noCapture
+        ? `${what} answers -32011: ${noCapture}`
+        : `state.getSgcFrameData {}: ${answer.inBand ? "in-band" : "JSON-RPC"} error ${answer.error.code} "${answer.error.message}"`,
+    );
+  }
+  const info = answer.result as DebuggerRpcSchema["state.getSgcFrameData"]["result"];
+  if ("error" in info) {
+    return fail(`${what}: answered with an in-band error object`);
+  }
+  check(info.totalBytes === info.frameCount * SGC_BYTES_PER_FRAME, `${what}: totalBytes is ${info.totalBytes}, frameCount ${info.frameCount} x ${SGC_BYTES_PER_FRAME} is ${info.frameCount * SGC_BYTES_PER_FRAME}`);
+  check(info.binaryId! >= 1, `${what}: binaryId ${info.binaryId}; it is allocated per connection from 1`);
+  const binary = (await session.waitForBinary(from, session.scale(10_000))) ?? fail(`${what}: no binary frame within 10 s of the response`);
+  checkBinaryAfterResponse(session, request, binary, "state.getSgcFrameData");
+  check(binary.data.byteLength === BINARY_FRAME_HEADER_BYTES + info.totalBytes, `${what}: the binary frame has ${binary.data.byteLength} bytes, expected 16 + ${info.totalBytes}`);
+  const parsed = parseBinaryFrame(binary.data);
+  if (!parsed.ok) {
+    return fail(`${what}: the binary frame: ${parsed.reason}`);
+  }
+  check(parsed.header.kind === BinaryFrameKind.SGC_FRAMES, `${what}: kind is ${parsed.header.kind}, expected 1`);
+  check(parsed.header.binaryId === info.binaryId, `${what}: binaryId is ${parsed.header.binaryId} in the header and ${info.binaryId} in the result`);
+  check(parsed.header.payloadBytes === info.frameCount * SGC_BYTES_PER_FRAME, `${what}: payloadBytes is ${parsed.header.payloadBytes}`);
+  const bytes = new Uint8Array(parsed.payload);
+  const view = new DataView(parsed.payload);
+  for (let offset = 0; offset < bytes.length; offset += 128) {
+    check((bytes[offset + 109] & ~0x07) === 0, `${what}: record at ${offset}: flags byte ${bytes[offset + 109]} has bits above bit 2`);
+    check(view.getUint32(offset + 96, true) <= 0x3ff, `${what}: record at ${offset}: aeg_value ${view.getUint32(offset + 96, true)} is above 0x3FF`);
+    for (let pad = 110; pad < 128; pad++) {
+      check(bytes[offset + pad] === 0, `${what}: record at ${offset}: byte ${pad} is not zero`);
+    }
+  }
+  return { frameCount: info.frameCount, binaryId: info.binaryId!, payload: bytes };
+};
+
+/** Whether a capture has a record of a channel that sounds: flags bit 0 set, and a level above 0. */
+const sounds = (capture: CaptureRead): boolean => {
+  const view = new DataView(capture.payload.buffer, capture.payload.byteOffset, capture.payload.byteLength);
+  for (let offset = 0; offset < capture.payload.byteLength; offset += 128) {
+    if (capture.payload[offset + 109] & 1 && view.getUint32(offset + 96, true) > 0) {
+      return true;
+    }
+  }
+  return false;
+};
+
+/**
+ * A capture made at a stop (design 3.3, M3-D27): `{}` when it is complete, which `state.getSgcFrameData`
+ * asked right behind the response shows (its frame count, when the capture before had another);
+ * a running tick, then a paused tick with a new stopId and reason "capture", that tick and the
+ * response in either order; and `dc.timing.SH4_CYCLES` from the stop before to the capture's stop
+ * grown by ceil(frames / 32) periods of the AICA, one either way.
+ */
+const captureFromPaused = async (context: RunContext, frames: number | undefined, before: CaptureRead | undefined): Promise<CaptureRead> => {
+  const { session } = context;
+  const stop = session.latestTick().tick;
+  check(isPaused(stop), "a capture from a stop needs a paused target");
+  const asked = frames ?? PROTOCOL_BOUNDS.sgcFrames.default;
+  const params = frames === undefined ? {} : { frames };
+  const what = `state.recordSgcFrames ${JSON.stringify(params)}`;
+  const mark = session.mark();
+  await session.call("state.recordSgcFrames", params);
+  // the response is sent when the capture is complete, and the capture is then the server's
+  const read = await readCapture(
+    session,
+    `state.getSgcFrameData right behind the response of ${what}`,
+    "there is no capture; the response is sent when the capture is complete, and the capture is then the server's (design 3.3)",
+  );
+  check(
+    read.frameCount === asked,
+    `state.getSgcFrameData right behind the response of ${what} has frameCount ${read.frameCount}${before?.frameCount === read.frameCount ? ", that of the capture before" : ""}, ` +
+      `not ${asked}: the response is sent when the capture is complete, and the capture is then the server's (design 3.3)`,
+  );
+  const stopped = await session.waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(stop), 5000, `the paused tick with reason "capture" of ${what}`, mark);
+  check(stopped.tick.executionState.reason === "capture", `${what}: the stop has reason "${stopped.tick.executionState.reason}", expected "capture"`);
+  check(
+    session.ticksSince(mark).some((record) => record.seq < stopped.seq && isRunning(record.tick)),
+    `${what}: no running tick in front of the stop of the capture; from a stop the target runs for the capture and stops again`,
+  );
+  const periods = BigInt(Math.ceil(asked / SAMPLES_PER_BURST));
+  const grown = requireCycles(stopped.tick, what) - requireCycles(stop, what);
+  check(
+    grown >= (periods - 1n) * AICA_CALLBACK_CYCLES && grown <= (periods + 1n) * AICA_CALLBACK_CYCLES,
+    `${what}: dc.timing.SH4_CYCLES grew by ${grown} from the stop before to the stop of the capture; ${asked} frames are ${periods} periods of the AICA (${periods} x ${AICA_CALLBACK_CYCLES}), one either way`,
+  );
+  return read;
+};
+
+/** S17, part `sgcCapture` (`sgc-capture`; the M3 round's 3.1 item 3). */
+const sgcCapturePart = async (context: RunContext): Promise<void> => {
+  const { session } = context;
+  const paused = await ensurePaused(context);
+  const held = targetOf(session.shape, "arm7") !== undefined && !arm7Clocked(paused.tick);
+
+  // before the first capture: getSgcFrameData answers -32011 and no binary frame follows, or a
+  // capture exists already
+  const binaryBefore = session.binary.length;
+  let hadCapture = false;
+  try {
+    await session.expectError("state.getSgcFrameData", {}, -32011);
+  } catch (error) {
+    if (!(error instanceof ContractFailure) || !/got the result/.test(error.message)) {
+      throw error;
+    }
+    hadCapture = true;
+  }
+  if (hadCapture) {
+    context.note('a capture existed already, so "no binary frame after an error" was not exercised');
+    check((await session.waitForBinary(binaryBefore, session.scale(10_000))) !== undefined, "the binary frame of the existing capture");
+  } else {
+    check((await session.waitForBinary(binaryBefore, 500)) === undefined, "a binary frame followed the error -32011");
+  }
+  const captures: CaptureRead[] = [];
+
+  // The first capture is made at the first stop, as every capture from a stop; with the ARM7
+  // held there it records as ever.
+  let first: CaptureRead;
+  try {
+    first = await captureFromPaused(context, 64, undefined);
+  } catch (error) {
+    if (held && error instanceof ContractFailure) {
+      return fail(`with the ARM7 held (ENABLED reads 0) at the first stop of S17: ${error.message}; ${CLOCKED_WHATEVER_ARMRST}`, error.more);
+    }
+    throw error;
+  }
+  captures.push(first);
+  if (held) {
+    context.note(M3_NOTES.sgcHeld);
+  }
+
+  // the default is 1024 frames; the capture before had 64, so the count says whose capture the
+  // server has right behind the response
+  captures.push(await captureFromPaused(context, undefined, first));
+
+  // while running: no stop, the target still runs, and then the count as asked
+  const running = await ensureRunning(context);
+  const mark = session.mark();
+  await session.call("state.recordSgcFrames", { frames: 96 });
+  const whileRunning = await readCapture(session, "state.getSgcFrameData behind a capture while running");
+  check(whileRunning.frameCount === 96, `state.recordSgcFrames {frames: 96} while running: frameCount is ${whileRunning.frameCount}, 96 were recorded`);
+  const stopped = session.ticksSince(mark).find((record) => isPaused(record.tick) && stopIdOf(record.tick) > stopIdOf(running.tick));
+  check(!stopped, `state.recordSgcFrames while running stopped the target (${stopped ? describeState(stopped.tick) : ""}); a running target keeps running`);
+  check(isRunning(session.latestTick().tick), `the target does not run behind a capture while running: ${describeState(session.latestTick().tick)}`);
+  captures.push(whileRunning);
+  await ensurePaused(context);
+
+  // the bounds: 1 to 4096 frames (4096 is the capture held open, below)
+  await session.expectError("state.recordSgcFrames", { frames: 0 }, -32602);
+  await session.expectError("state.recordSgcFrames", { frames: 4097 }, -32602);
+
+  // the capture is the server's: a second connection reads the same one
+  const second = await context.openSession();
+  try {
+    const theirs = await readCapture(second, "state.getSgcFrameData of a second connection");
+    check(
+      theirs.frameCount === whileRunning.frameCount && Buffer.compare(Buffer.from(theirs.payload), Buffer.from(whileRunning.payload)) === 0,
+      `a second connection reads a capture of ${theirs.frameCount} frames${theirs.frameCount === whileRunning.frameCount ? " with other bytes" : ""}; the capture is the server's (design 3.3)`,
+    );
+  } finally {
+    second.close();
+  }
+
+  // Held open: a breakpoint on step 0 of the DSP stops the machine within a sample while a
+  // capture records, which keeps recording at that stop, so that the second request and the
+  // read of the capture before do not race the capture's end. The capture's response and its
+  // stop come when the target is resumed, in either order.
+  const dsp = targetOf(session.shape, "dsp");
+  if (dsp?.stepping) {
+    const original = categoriesOf(session.latestTick().tick);
+    let breakpoint: BreakpointDescriptor | undefined;
+    try {
+      await setCategories(context, Object.fromEntries(Object.entries(original).map(([key, state]) => [key, key === "dsp" ? NOT_MUTED : { muted: state.muted, soloed: false }])));
+      breakpoint = await addBreakpoint(context, { event: dsp.breakpointEvent, address: 0, kind: "code", enabled: true });
+      const armed = session.latestTick().tick;
+      const mark = session.mark();
+      /** what answered the request, once something has */
+      let answered: string | undefined;
+      const response = session.call("state.recordSgcFrames", { frames: PROTOCOL_BOUNDS.sgcFrames.max }).then(
+        (result) => {
+          answered = JSON.stringify(result);
+          return result;
+        },
+        (error: unknown) => {
+          answered = error instanceof Error ? error.message : String(error);
+          throw error;
+        },
+      );
+      // (a failure of the request is reported where it is awaited)
+      response.catch(() => undefined);
+      const hit = await session.waitForTick(
+        (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(armed),
+        2000,
+        `the stop of the DSP breakpoint on step 0 while state.recordSgcFrames {frames: ${PROTOCOL_BOUNDS.sgcFrames.max}} records`,
+        mark,
+      );
+      check(
+        hit.tick.executionState.breakpointId === breakpoint.id && hit.tick.executionState.reason === "breakpoint",
+        `a capture armed at a stop with a DSP breakpoint on step 0: the first stop is ${describeState(hit.tick)}, expected that breakpoint's; a stop keeps a capture recording (M3-D27)`,
+      );
+      // a second request, and a read of the capture before (their answers come behind anything
+      // the server sent about the first request, which is then known)
+      const again = await session.outcome("state.recordSgcFrames", { frames: 16 });
+      const during = await readCapture(
+        session,
+        "state.getSgcFrameData while a capture records",
+        `the server's capture is the one before (${whileRunning.frameCount} frames) until the new one is complete (M3-D27)`,
+      );
+      check(
+        answered === undefined,
+        `state.recordSgcFrames was answered before its capture was complete (${answered}): the response came while the capture is held open at a DSP breakpoint`,
+      );
+      check(
+        "error" in again && again.inBand && again.error.code === -32003,
+        `state.recordSgcFrames {"frames":16} while a capture records: expected the error -32003 (the first capture goes on, M3-D27), got ${"error" in again ? `${again.error.code} "${again.error.message}"` : `the result ${JSON.stringify(again.result)}`}`,
+      );
+      check(
+        during.frameCount === whileRunning.frameCount,
+        `state.getSgcFrameData while a capture records has frameCount ${during.frameCount}; the server's capture is the one before (${whileRunning.frameCount} frames) until the new one is complete (M3-D27)`,
+      );
+      await removeBreakpoint(context, breakpoint.id);
+      breakpoint = undefined;
+      await session.call("control.runUntil", {});
+      await response;
+      await session.waitForTick(
+        (tick) => isPaused(tick) && tick.executionState.reason === "capture" && stopIdOf(tick) > stopIdOf(hit.tick),
+        5000,
+        `the paused tick with reason "capture" of the capture that was held open`,
+        mark,
+      );
+      const held4096 = await readCapture(session, "state.getSgcFrameData behind the capture that was held open");
+      check(held4096.frameCount === PROTOCOL_BOUNDS.sgcFrames.max, `the capture that was held open has frameCount ${held4096.frameCount}, ${PROTOCOL_BOUNDS.sgcFrames.max} were recorded`);
+      captures.push(held4096);
+    } finally {
+      if (breakpoint) {
+        await session.call("breakpoints.remove", { id: breakpoint.id }).catch(() => undefined);
+      }
+      await session.call("breakpoints.setCategoryStates", { categories: original }).catch(() => undefined);
+      await ensurePaused(context).catch(() => undefined);
+    }
+  } else {
+    context.note(`the capture held open at a DSP breakpoint was not made: ${dsp ? "targets: dsp.stepping is false" : 'no target "dsp"'}`);
+  }
+
+  // the sounding guest keys two channels: a capture of it has a channel that sounds
+  if (context.dspProgram) {
+    check(
+      captures.some(sounds),
+      `no record of the ${captures.length} captures has a channel that sounds (flags bit 0 set and a level above 0): the DSP test program keys two channels`,
+    );
+  }
+};
+
+/** `state.getMemoryBinary` with its frame: the result, and the payload of the frame behind the response. */
+const readBinary = async (
+  session: ContractSession,
+  params: { target: "sh4" | "arm7"; address: number; length: number },
+): Promise<{ result: { baseAddress: number; totalBytes: number; unreadable?: Array<[number, number]>; binaryId: number }; payload: Uint8Array; response: number }> => {
+  const what = `state.getMemoryBinary ${JSON.stringify(params)}`;
+  const from = session.binary.length;
+  const request = session.mark();
+  const result = await session.call("state.getMemoryBinary", params);
+  const response = session.responseSince(request)?.seq ?? fail(`the ${what} response was not recorded`);
+  check(result.baseAddress === params.address, `${what}: baseAddress is ${hex(result.baseAddress)}; it is the address asked for`);
+  check(result.totalBytes === params.length, `${what}: totalBytes is ${result.totalBytes}, the length asked for is ${params.length}`);
+  check(result.binaryId >= 1, `${what}: binaryId ${result.binaryId}; it is allocated per connection from 1`);
+  const binary = (await session.waitForBinary(from, session.scale(10_000))) ?? fail(`${what}: no binary frame within 10 s of the response`);
+  checkBinaryAfterResponse(session, request, binary, "state.getMemoryBinary");
+  const parsed = parseBinaryFrame(binary.data);
+  if (!parsed.ok) {
+    return fail(`${what}: the binary frame: ${parsed.reason}`);
+  }
+  check(parsed.header.kind === BinaryFrameKind.MEMORY, `${what}: kind is ${parsed.header.kind}, expected 2`);
+  check(parsed.header.binaryId === result.binaryId, `${what}: binaryId is ${parsed.header.binaryId} in the header and ${result.binaryId} in the result`);
+  check(parsed.header.payloadBytes === params.length, `${what}: payloadBytes is ${parsed.header.payloadBytes}; payloadBytes == totalBytes == length`);
+  return { result: { ...result, unreadable: result.unreadable as Array<[number, number]> | undefined }, payload: new Uint8Array(parsed.payload), response };
+};
+
+/** The bytes of `state.getMemorySlice`, at most 65536 of them. */
+const sliceOf = async (context: RunContext, target: "sh4" | "arm7", address: number, length: number) =>
+  context.session.call("state.getMemorySlice", { target, address, length });
+
+const sameAsSlice = (payload: Uint8Array, slice: { data: number[] }, what: string): void => {
+  const differs = slice.data.findIndex((byte, offset) => payload[offset] !== byte);
+  check(
+    payload.byteLength === slice.data.length && differs === -1,
+    `${what}: ${payload.byteLength === slice.data.length ? `byte ${differs} is ${payload[differs]}, state.getMemorySlice reads ${slice.data[differs]} there` : `${payload.byteLength} bytes, state.getMemorySlice has ${slice.data.length}`}`,
+  );
+};
+
+/** S17, part `memoryBinary` (`memory-binary`; the M3 round's 3.1 item 3, M3-D36). */
+const memoryBinaryPart = async (context: RunContext): Promise<void> => {
+  const { session } = context;
+  const sh4 = requireTarget(context, "sh4");
+  await ensurePaused(context);
+  // a second connection, there before the first read: it receives no binary frame of it
+  const other = await context.openSession();
+  try {
+    const otherBefore = other.binary.length;
+    const address = sh4.defaultMemoryAddress ?? 0x8c010000;
+    const first = await readBinary(session, { target: "sh4", address, length: 64 });
+    check(first.result.unreadable === undefined, `state.getMemoryBinary at ${hex(address)}: unreadable ${JSON.stringify(first.result.unreadable)}; the 64 bytes are readable`);
+    sameAsSlice(first.payload, await sliceOf(context, "sh4", address, 64), `state.getMemoryBinary at ${hex(address)} for 64 bytes`);
+    const looked = await other.waitForBinary(otherBefore, 500);
+    check(looked === undefined, "a second connection received a binary frame of a state.getMemoryBinary it did not ask for; the frame goes to the requesting client only (M3-D36)");
+  } finally {
+    other.close();
+  }
+
+  // across the end of the flash: the second half unreadable and 0, as in state.getMemorySlice
+  const across = await readBinary(session, { target: "sh4", address: 0x0021fff0, length: 32 });
+  check(JSON.stringify(across.result.unreadable) === "[[16,16]]", `state.getMemoryBinary across 0x0021FFF0 for 32: unreadable is ${JSON.stringify(across.result.unreadable)}, expected [[16,16]]`);
+  check(across.payload.subarray(16).every((byte) => byte === 0), "state.getMemoryBinary across 0x0021FFF0: the unreadable bytes are not 0");
+  sameAsSlice(across.payload, await sliceOf(context, "sh4", 0x0021fff0, 32), "state.getMemoryBinary across 0x0021FFF0 for 32 bytes");
+
+  // nothing readable: -32010, and no frame
+  const before = session.binary.length;
+  await session.expectError("state.getMemoryBinary", { target: "sh4", address: 0x10000000, length: 16 }, -32010);
+  check((await session.waitForBinary(before, 500)) === undefined, "a binary frame followed the error -32010 of state.getMemoryBinary");
+  await session.expectError("state.getMemoryBinary", { target: "dsp", address: 0, length: 16 }, -32004);
+  await session.expectError("state.getMemoryBinary", { target: "sh4", address: 0x0c000000, length: PROTOCOL_BOUNDS.memoryBinaryLength.max + 1 }, -32602);
+  check((await session.waitForBinary(before, 200)) === undefined, "a binary frame followed an error of state.getMemoryBinary");
+
+  // the bound: 16 MiB of main memory, whose last 64 bytes are those of state.getMemorySlice
+  const most = PROTOCOL_BOUNDS.memoryBinaryLength.max;
+  const main = await readBinary(session, { target: "sh4", address: 0x0c000000, length: most });
+  sameAsSlice(main.payload.subarray(most - 64), await sliceOf(context, "sh4", 0x0c000000 + most - 64, 64), "the last 64 bytes of a read of 16 MiB from 0x0C000000");
+  check(main.result.unreadable === undefined, `16 MiB of main memory from 0x0C000000: unreadable is ${JSON.stringify(main.result.unreadable)}`);
+
+  // wave memory is one store behind both targets, over its 2 MiB
+  if (targetOf(session.shape, "arm7")?.memory) {
+    const wave = 0x200000;
+    const arm7 = await readBinary(session, { target: "arm7", address: 0, length: wave });
+    const viaSh4 = await readBinary(session, { target: "sh4", address: 0x00800000, length: wave });
+    const differs = arm7.payload.findIndex((byte, offset) => viaSh4.payload[offset] !== byte);
+    check(differs === -1, `wave memory: byte ${hex(differs)} reads ${arm7.payload[differs]} through the ARM7 and ${viaSh4.payload[differs]} through the SH4 at 0x00800000 + ${hex(differs)}`);
+    sameAsSlice(arm7.payload.subarray(wave - 64), await sliceOf(context, "arm7", wave - 64, 64), "the last 64 bytes of 2 MiB of wave memory through the ARM7");
+  }
+
+  // binaryId: per connection, one counter for the frames of every kind
+  const ids: number[] = [];
+  if (hasCapability(context, CAPABILITIES.SGC_CAPTURE)) {
+    const from = session.binary.length;
+    const capture = await session.outcome("state.getSgcFrameData", {});
+    if ("result" in capture) {
+      ids.push((capture.result as { binaryId: number }).binaryId);
+      // (its frame, so that the frames behind it are those of the reads)
+      await session.waitForBinary(from, session.scale(10_000));
+    }
+  }
+  ids.push((await readBinary(session, { target: "sh4", address: 0x8c010000, length: 16 })).result.binaryId);
+  ids.push((await readBinary(session, { target: "sh4", address: 0x8c010000, length: 16 })).result.binaryId);
+  check(
+    ids.every((id, position) => position === 0 || id > ids[position - 1]),
+    `binaryIds ${ids.join(", ")} of requests in a row do not increase; a connection has one counter for the binary frames of every kind (M3-D36)`,
+  );
+};
+
+const s17: Scenario = {
+  id: "S17",
+  title: "M3: SGC capture, memory",
+  milestone: "M3",
+  dspProgram: "also",
+  parts: ["sgcCapture", "memoryBinary"],
+  run: (context) =>
+    runParts(context, "S17", [
+      {
+        key: "sgcCapture",
+        name: "sgc capture",
+        applicable: hasCapability(context, CAPABILITIES.SGC_CAPTURE),
+        why: 'no capability "sgc-capture"',
+        run: () => sgcCapturePart(context),
+      },
+      {
+        key: "memoryBinary",
+        name: "memory binary",
+        applicable: hasCapability(context, CAPABILITIES.MEMORY_BINARY),
+        why: 'no capability "memory-binary"',
+        run: () => memoryBinaryPart(context),
+      },
+    ]),
+};
+
+/** The registers of `dc.aica.dsp` a tick has, by name. */
+const dspRowsOf = (tick: DebuggerTick): Map<string, string> => new Map((tick.registers["dc.aica.dsp"] ?? []).map((register) => [register.name, register.value]));
+
 const s21: Scenario = {
   id: "S21",
   title: "M3: DSP",
   milestone: "M3",
-  dspProgram: true,
+  dspProgram: "only",
   async run(context) {
     const { session } = context;
     if (!context.dspProgram) {
@@ -3538,53 +3922,238 @@ const s21: Scenario = {
     if (!dsp?.stepping) {
       return { notApplicable: dsp ? "targets: dsp.stepping is false" : 'targets: no "dsp"' };
     }
+    const sh4 = requireTarget(context, "sh4");
     const steps = dsp.addressMax + 1;
     const stepOf = (tick: DebuggerTick) => pcOf(tick, dsp);
+    const mdecCtOf = (tick: DebuggerTick) => numberOf(tick, dsp.pcPath, "MDEC_CT");
+    const latest = () => session.latestTick().tick;
+    // with --elf, the program is the block of the ELF between g_dsp_mpro and g_dsp_mpro_end
+    const fromElf = context.elf ? dspProgramOfElf(context.elf, steps) : undefined;
+    if (fromElf && "missing" in fromElf) {
+      return fail(`--elf: ${fromElf.missing}; the DSP test program has them around the words of its DSP program (the M3 round's 2.4)`);
+    }
+    const started = session.mark();
+    /** the paused ticks of the DSP steps the scenario makes */
+    const stepTicks: DebuggerTick[] = [];
 
-    // control.step {dsp} from a stop: a paused tick with reason "step", and STEP advanced by one
-    const before = await ensurePaused(context);
-    const stepped = await stepOnce(context, "dsp");
-    check(stepOf(stepped.tick) === (stepOf(before.tick) + 1) % steps, `a DSP step from ${stepOf(before.tick)} ended at ${stepOf(stepped.tick)}`);
+    /**
+     * One step of the DSP by its rule (M3-D20): `{}`, one paused tick with a new stopId and reason
+     * "step", no breakpointId, no running tick in between, and STEP + 1 mod 128. From a stop of the
+     * DSP the SH4 does not move; from another stop it runs to the next burst, at most one period of
+     * the AICA and the rest of a slice.
+     */
+    const stepDsp = async (fromDspStop: boolean, what = "control.step {dsp}"): Promise<DebuggerTick> => {
+      const before = latest();
+      const record = await stepOnce(context, "dsp");
+      const after = record.tick;
+      check(stepOf(after) === (stepOf(before) + 1) % steps, `${what}: from step ${stepOf(before)} it ended at step ${stepOf(after)}, expected ${(stepOf(before) + 1) % steps}`);
+      const grown = requireCycles(after, what) - requireCycles(before, what);
+      if (fromDspStop) {
+        check(grown === 0n, `${what}, from a stop of the DSP: dc.timing.SH4_CYCLES moved by ${grown}; the step stays in the sound burst suspended there, and the SH4 does not execute`);
+        check(pcOf(after, sh4) === pcOf(before, sh4), `${what}, from a stop of the DSP: the PC of the SH4 moved from ${hex(pcOf(before, sh4))} to ${hex(pcOf(after, sh4))}`);
+      } else {
+        check(
+          grown >= 0n && grown <= DSP_RUN_ON_CYCLES,
+          `${what}, from a stop that is not the DSP's: dc.timing.SH4_CYCLES grew by ${grown}; the SH4 runs to the next burst, at most one period of the AICA and the rest of a slice (${DSP_RUN_ON_CYCLES})`,
+        );
+      }
+      stepTicks.push(after);
+      return after;
+    };
 
-    // The program the test ELF loaded: every step has its four MPRO words (8 pairs) and its line,
-    // and they are not all empty. 16 lines at STEP, as the disassembly view asks for them.
-    const program = await disassemble(context, "dsp", 0, steps);
+    // The first act, at the first stop (under --dsp-program the anchor): with the ARM7 held a
+    // step of the DSP is a step all the same.
+    const first = await ensurePaused(context);
+    let atDspStop = false;
+    if (targetOf(session.shape, "arm7") !== undefined && !arm7Clocked(first.tick)) {
+      try {
+        await stepDsp(false, "control.step {dsp} with the ARM7 held");
+      } catch (error) {
+        if (error instanceof ContractFailure) {
+          return fail(`with the ARM7 held (ENABLED reads 0) at the first stop of S21: ${error.message}; ${CLOCKED_WHATEVER_ARMRST}`, error.more);
+        }
+        throw error;
+      }
+      atDspStop = true;
+      context.note(M3_NOTES.dspHeld);
+    }
+
+    // The program wait (M3-D44): the guest loads its DSP program behind the anchor. While the 128
+    // steps are not its program (with --elf, the ELF's block; without, while no step is loaded),
+    // the target runs for a second and is paused again, at most five times.
+    const loaded = (lines: DisassemblyLine[]) =>
+      fromElf ? lines.length === steps && lines.every((line, step) => line.bytes === fromElf.bytes[step]) : lines.some((line) => /[1-9A-F]/.test(line.bytes));
+    let program = await disassemble(context, "dsp", 0, steps);
+    for (let waits = 0; !loaded(program); waits++) {
+      if (waits === 5) {
+        return fail(
+          fromElf
+            ? "the DSP's program is not the block between g_dsp_mpro and g_dsp_mpro_end of the ELF after five times a second of running: " +
+                `the first step that differs is ${program.findIndex((line, step) => line.bytes !== fromElf.bytes[step])}`
+            : "every step of the DSP is empty (all MPRO words are zero) after five times a second of running: the DSP test program loads a DSP program",
+        );
+      }
+      await ensureRunning(context);
+      await sleep(session.scale(1000));
+      await ensurePaused(context);
+      atDspStop = false;
+      program = await disassemble(context, "dsp", 0, steps);
+    }
+
+    // a step by the rule
+    await stepDsp(atDspStop);
+    atDspStop = true;
+
+    // the 128 steps: the text of each is the playground's line of its bytes; with --elf the bytes
+    // are the ELF's; and 16 lines at STEP, as the disassembly view asks for them, are the same
+    program = await disassemble(context, "dsp", 0, steps);
     check(program.length === steps, `the DSP has ${steps} steps, state.getDisassembly {dsp} returned ${program.length} lines for them`);
-    const loaded = program.filter((line) => /[1-9A-F]/.test(line.bytes));
-    check(loaded.length > 0, "every step of the DSP is empty (all MPRO words are zero): the DSP test program loads a DSP program");
-    const from = Math.min(stepOf(stepped.tick), steps - 16);
+    program.forEach((line, step) => {
+      check(line.address === step, `dsp: line ${step} of the 128 is step ${line.address}`);
+      const problem = dspLineProblem(line);
+      check(problem === undefined, problem!);
+      if (fromElf) {
+        check(line.bytes === fromElf.bytes[step], `dsp: step ${step} is "${line.bytes}", the ELF's block between g_dsp_mpro and g_dsp_mpro_end has "${fromElf.bytes[step]}" there`);
+      }
+    });
+    const loadedSteps = program.filter((line) => /[1-9A-F]/.test(line.bytes));
+    check(loadedSteps.length > 0, "every step of the DSP is empty (all MPRO words are zero): the DSP test program loads a DSP program");
+    const from = Math.min(stepOf(latest()), steps - 16);
     const lines = await disassemble(context, "dsp", from, 16);
     check(lines.length === 16, `${lines.length} lines of DSP disassembly for count 16 at step ${from}`);
     lines.forEach((line, position) => {
       check(line.address === from + position, `dsp: line ${position} at step ${from} is step ${line.address}`);
-      check(/^[0-9A-F]{2}( [0-9A-F]{2}){7}$/.test(line.bytes), `dsp: the bytes of step ${line.address} are "${line.bytes}", expected the four MPRO words as 8 pairs`);
-      check(line.disassembly.length > 0, `dsp: step ${line.address} has no text`);
       check(JSON.stringify(line) === JSON.stringify(program[line.address]), `dsp: step ${line.address} reads differently in two requests while the target is paused`);
     });
 
-    // A code breakpoint on a step of the loaded program is hit, with STEP equal to its address;
-    // and one on the last step, from which a step wraps to step 0.
-    const hitAt = async (address: number): Promise<TickRecord> => {
-      const breakpoint = await addBreakpoint(context, { event: dsp.breakpointEvent, address });
-      const armed = session.latestTick().tick;
+    const original = categoriesOf(latest());
+    const open = Object.fromEntries(Object.entries(original).map(([key, state]) => [key, key === "dsp" ? NOT_MUTED : { muted: state.muted, soloed: false }]));
+    const mine = new Set<number>();
+    const add = async (address: number, enabled = true): Promise<BreakpointDescriptor> => {
+      const breakpoint = await addBreakpoint(context, { event: dsp.breakpointEvent, address, kind: "code", enabled });
+      mine.add(breakpoint.id);
+      return breakpoint;
+    };
+    const remove = async (id: number) => {
+      await removeBreakpoint(context, id);
+      mine.delete(id);
+    };
+    /** A resume to the stop of a DSP breakpoint: a paused tick with a new stopId, its id, reason "breakpoint", STEP its address. */
+    const resumeTo = async (id: number, address: number, what: string): Promise<TickRecord> => {
+      const before = latest();
       const mark = session.mark();
       await session.call("control.runUntil", {});
-      const hit = await session.waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(armed), 5000, `a paused tick at the dsp breakpoint on step ${address}`, mark);
-      check(hit.tick.executionState.breakpointId === breakpoint.id, `the stop reports breakpointId ${hit.tick.executionState.breakpointId}, expected ${breakpoint.id}`);
-      check(hit.tick.executionState.reason === "breakpoint", `the stop has reason "${hit.tick.executionState.reason}", expected "breakpoint"`);
-      check(stepOf(hit.tick) === address, `the stop is at step ${stepOf(hit.tick)}, the breakpoint at step ${address}`);
-      await removeBreakpoint(context, breakpoint.id);
+      const hit = await session.waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(before), 2000, `${what}: a paused tick at the DSP breakpoint on step ${address}`, mark);
+      check(hit.tick.executionState.breakpointId === id, `${what}: the stop reports breakpointId ${hit.tick.executionState.breakpointId}, expected ${id}`);
+      check(hit.tick.executionState.reason === "breakpoint", `${what}: the stop has reason "${hit.tick.executionState.reason}", expected "breakpoint"`);
+      check(stepOf(hit.tick) === address, `${what}: the stop is at step ${stepOf(hit.tick)}, the breakpoint at step ${address}`);
       return hit;
     };
-    const current = stepOf(session.latestTick().tick);
-    await hitAt((loaded.find((line) => line.address > current && line.address !== dsp.addressMax) ?? loaded[0]).address);
-    await hitAt(dsp.addressMax);
-    const wrapped = await stepOnce(context, "dsp");
-    check(stepOf(wrapped.tick) === 0, `a DSP step from step ${dsp.addressMax} ended at ${stepOf(wrapped.tick)}; the last step is followed by step 0`);
 
+    try {
+      await setCategories(context, open);
+      // A breakpoint on a loaded step behind STEP that is not the last one (else the first loaded
+      // step that is not): hit with its id, at its step.
+      const current = stepOf(latest());
+      const site = (loadedSteps.find((line) => line.address > current && line.address !== dsp.addressMax) ?? loadedSteps.find((line) => line.address !== dsp.addressMax))?.address;
+      if (site === undefined) {
+        return fail(`the program has no loaded step but step ${dsp.addressMax}, which is to be empty`);
+      }
+      const breakpoint = await add(site);
+      const hit = await resumeTo(breakpoint.id, site, "a resume");
+
+      // From that stop, the breakpoint still enabled and active: the resume executes the step it
+      // stands at once (the exemption) and stops in front of it one sample later, MDEC_CT one
+      // less; the SH4 runs at most to the next burst (none when the next sample is in the same
+      // burst, which the park loop runs on: a running tick or not).
+      const again = await resumeTo(breakpoint.id, site, "a resume from the stop of that breakpoint");
+      check(
+        mdecCtOf(again.tick) === ((mdecCtOf(hit.tick) - 1) & 0xffff),
+        `a resume from the stop of the DSP breakpoint on step ${site} stopped at it again with MDEC_CT ${hex(mdecCtOf(again.tick))}, it was ${hex(mdecCtOf(hit.tick))}: ` +
+          "expected one less, the same step one sample later (the step a resume stands at executes once, and the breakpoint is reached in every sample)",
+      );
+      const grown = requireCycles(again.tick, "a resume from a DSP breakpoint") - requireCycles(hit.tick, "a resume from a DSP breakpoint");
+      check(
+        grown >= 0n && grown <= DSP_RUN_ON_CYCLES,
+        `a resume from the stop of a DSP breakpoint to its stop one sample later grew dc.timing.SH4_CYCLES by ${grown}; at most one period of the AICA and the rest of a slice (${DSP_RUN_ON_CYCLES})`,
+      );
+      // a step of the DSP from that stop: the SH4 does not move
+      await stepDsp(true, `control.step {dsp} from the stop of the breakpoint on step ${site}`);
+      await remove(breakpoint.id);
+
+      // a breakpoint on the last step; the step from it ends at step 0 at the end of the sample
+      const last = await add(dsp.addressMax);
+      const atLast = await resumeTo(last.id, dsp.addressMax, "a resume");
+      await remove(last.id);
+      const wrapped = await stepDsp(true, `control.step {dsp} from step ${dsp.addressMax}`);
+      check(
+        mdecCtOf(wrapped) === ((mdecCtOf(atLast.tick) - 1) & 0xffff),
+        `control.step {dsp} from step ${dsp.addressMax} ended with MDEC_CT ${hex(mdecCtOf(wrapped))}, it was ${hex(mdecCtOf(atLast.tick))}: expected one less, the step completes the sample and no more`,
+      );
+
+      // Disabled, it is not reached; with the category dsp muted neither; two on one step stop
+      // with the lower id; one added while the target runs is reached. (From a pause: a resume
+      // from a stop of the DSP runs its burst on before it publishes that the target runs.)
+      await ensureRunning(context);
+      await ensurePaused(context);
+      const disabled = await add(site, false);
+      await expectToKeepRunning(context, `a disabled breakpoint on step ${site} of the DSP`);
+      await remove(disabled.id);
+      const muted = await add(site);
+      await setCategories(context, { ...open, dsp: { muted: true, soloed: false } });
+      await expectToKeepRunning(context, `a breakpoint on step ${site} of the DSP while the category dsp is muted`);
+      await remove(muted.id);
+      await setCategories(context, open);
+      const one = await add(site);
+      const twin = await add(site);
+      await resumeTo(Math.min(one.id, twin.id), site, "a resume to two breakpoints on one step");
+      await remove(twin.id);
+      await remove(one.id);
+      const running = await ensureRunning(context);
+      const adding = session.mark();
+      const late = await addBreakpointShown(context, { event: dsp.breakpointEvent, address: site, kind: "code", enabled: true });
+      mine.add(late.breakpoint.id);
+      const arrived = await session.waitForTick(
+        (tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(running.tick),
+        2000,
+        `a paused tick at the DSP breakpoint on step ${site} that was added while the target runs`,
+        adding,
+      );
+      check(
+        arrived.tick.executionState.breakpointId === late.breakpoint.id && stepOf(arrived.tick) === site,
+        `the breakpoint on step ${site} added while running: the stop is ${describeState(arrived.tick)} at step ${stepOf(arrived.tick)}`,
+      );
+      await remove(late.breakpoint.id);
+      await setCategories(context, original);
+    } finally {
+      for (const id of mine) {
+        await session.call("breakpoints.remove", { id }).catch(() => undefined);
+      }
+      await session.call("breakpoints.setCategoryStates", { categories: original }).catch(() => undefined);
+    }
+
+    // the bounds and the refusals
+    await session.expectError("breakpoints.add", { event: dsp.breakpointEvent, address: dsp.addressMax + 1 }, -32602);
+    await ensureRunning(context);
+    await session.expectError("control.step", { target: "dsp" }, -32003);
+    await ensurePaused(context);
     // there is nothing to step over or out of in a DSP program
     await session.expectError("control.stepOver", { target: "dsp" }, -32004);
     await session.expectError("control.stepOut", { target: "dsp" }, -32004);
+
+    // The nine datapath registers of M3-D25 are in every paused tick of the scenario, and at
+    // least one of them is another between two of the DSP's steps.
+    const nine = M3_DSP_REGISTERS.map(([name]) => name);
+    for (const record of session.ticksSince(started).filter((record) => isPaused(record.tick) && record.tick.executionState.reason !== "no-game")) {
+      const rows = dspRowsOf(record.tick);
+      const missing = nine.filter((name) => !rows.has(name));
+      check(missing.length === 0, `the paused tick ${describeState(record.tick)} has no ${missing.join(" ")} in dc.aica.dsp; from M3 every paused tick has the nine datapath registers (M3-D25)`);
+    }
+    const rowsOf = (tick: DebuggerTick) => nine.map((name) => dspRowsOf(tick).get(name)).join(" ");
+    check(
+      new Set(stepTicks.map(rowsOf)).size > 1,
+      `the nine datapath registers of dc.aica.dsp read the same in the paused ticks of all ${stepTicks.length} steps of the DSP S21 made (${rowsOf(stepTicks[0])}); a step of the DSP moves them`,
+    );
   },
 };
 
@@ -3595,15 +4164,15 @@ export const SCENARIOS: Scenario[] = [s00, s01, s02, s03, s04, s05, s06, s07, s0
  * The scenarios a server of `milestone` has to pass, i.e. the gate of that milestone: those
  * of the milestone and of the ones before it, without those of the other profile. A gate
  * from M3 on is two runs: this one, with the test program of M1, has everything but what
- * needs a program that loads the DSP; the second one (`dspProgram`), against a server started
- * with the DSP test program, has the anchor and those scenarios alone.
+ * needs a program that loads the DSP (S21); the second one (`dspProgram`), against a server
+ * started with the DSP test program, has the anchor, S17 and S21 (the M3 round's M3-D32).
  */
 export const scenariosOfMilestone = (milestone: Milestone, profile: Profile, dspProgram = false): string[] =>
   SCENARIOS.filter(
     (scenario) =>
       MILESTONES.indexOf(scenario.milestone ?? "M1") <= MILESTONES.indexOf(milestone) &&
       (profile === "emulator" || !scenario.emulatorOnly) &&
-      (dspProgram ? scenario.dspProgram === true || scenario.id === "S00" : scenario.dspProgram !== true),
+      (dspProgram ? scenario.dspProgram !== undefined || scenario.id === "S00" : scenario.dspProgram !== "only"),
   ).map((scenario) => scenario.id);
 
 export interface Selection {
@@ -3636,7 +4205,9 @@ export const selectScenarios = (options: {
   const require = new Set([...(options.require ?? []), ...(options.parts?.keys() ?? [])]);
   const order = SCENARIOS.map((scenario) => scenario.id);
   const gate = milestone ? scenariosOfMilestone(milestone, profile, dspProgram) : undefined;
-  const base = gate ?? (dspProgram ? SCENARIOS.filter((scenario) => scenario.dspProgram || (scenario.id === "S00" && profile === "emulator")).map((scenario) => scenario.id) : order);
+  const base =
+    gate ??
+    (dspProgram ? SCENARIOS.filter((scenario) => scenario.dspProgram !== undefined || (scenario.id === "S00" && profile === "emulator")).map((scenario) => scenario.id) : order);
   const kept = (id: string) => !only || only.has(id);
   return {
     selected: order.filter((id) => (base.includes(id) || require.has(id)) && kept(id)),

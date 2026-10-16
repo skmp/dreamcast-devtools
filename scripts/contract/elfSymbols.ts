@@ -2,17 +2,27 @@ import { readFileSync } from "node:fs";
 
 /**
  * A small reader for the symbol table of an ELF32 file (`.symtab`), for the test program
- * the emulator runs: the contract runner resolves names like `_snd_init` with it, and takes
- * the entry point from the header.
+ * the emulator runs: the contract runner resolves names like `_snd_init` with it, takes the
+ * entry point from the header, and reads what the program loads (the words of the DSP program
+ * of the sounding guest, between two of its symbols) from its segments.
  */
 export interface ElfSymbols {
   /** e_entry */
   entry: number;
   /** function and object symbols by name (the first definition wins) */
   symbols: Map<string, number>;
+  /** what the loadable segments put in memory (PT_LOAD, the bytes of the file), by their virtual address */
+  segments?: Array<{ address: number; data: Uint8Array }>;
 }
 
 const SHT_SYMTAB = 2;
+const PT_LOAD = 1;
+
+/** `length` bytes of what the ELF loads at `address`, if one segment has all of them. */
+export const elfBytes = (elf: ElfSymbols, address: number, length: number): Uint8Array | undefined => {
+  const segment = elf.segments?.find((candidate) => address >= candidate.address && address + length <= candidate.address + candidate.data.byteLength);
+  return segment?.data.subarray(address - segment.address, address - segment.address + length);
+};
 
 export const parseElfSymbols = (image: Uint8Array): ElfSymbols => {
   const view = new DataView(image.buffer, image.byteOffset, image.byteLength);
@@ -33,11 +43,26 @@ export const parseElfSymbols = (image: Uint8Array): ElfSymbols => {
   const u32 = (offset: number) => view.getUint32(offset, little);
 
   const entry = u32(24);
+  // the loadable segments: the bytes the file has of each (p_filesz), at its virtual address
+  const segments: Array<{ address: number; data: Uint8Array }> = [];
+  const programOffset = u32(28);
+  const programSize = u16(42);
+  const programCount = u16(44);
+  if (programOffset !== 0 && programCount > 0 && programSize >= 32 && programOffset + programCount * programSize <= image.byteLength) {
+    for (let index = 0; index < programCount; index++) {
+      const base = programOffset + index * programSize;
+      const offset = u32(base + 4);
+      const size = u32(base + 16);
+      if (u32(base) === PT_LOAD && size > 0 && offset + size <= image.byteLength) {
+        segments.push({ address: u32(base + 8), data: image.slice(offset, offset + size) });
+      }
+    }
+  }
   const sectionOffset = u32(32);
   const sectionSize = u16(46);
   const sectionCount = u16(48);
   if (sectionOffset === 0 || sectionCount === 0) {
-    return { entry, symbols: new Map() };
+    return { entry, symbols: new Map(), segments };
   }
   if (sectionSize < 40 || sectionOffset + sectionCount * sectionSize > image.byteLength) {
     fail("section headers outside of the file");
@@ -85,7 +110,7 @@ export const parseElfSymbols = (image: Uint8Array): ElfSymbols => {
       }
     }
   }
-  return { entry, symbols };
+  return { entry, symbols, segments };
 };
 
 export const readElfSymbols = (path: string): ElfSymbols => parseElfSymbols(readFileSync(path));
