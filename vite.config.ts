@@ -6,7 +6,7 @@ import { bundleInfoPlugin } from './scripts/bundle-info';
 import { PROTOCOL_VERSION } from './src/lib/protocolVersion';
 
 // package.json version, plus `git describe` when building from a git checkout,
-// e.g. "3.0.0-pre+6ef95de-dirty". Without git (tarball, Docker) it is the
+// e.g. "3.0.0-pre+6ef95de-dirty". Without git (a tarball) it is the
 // package.json version alone.
 function resolveVersion(): string {
   try {

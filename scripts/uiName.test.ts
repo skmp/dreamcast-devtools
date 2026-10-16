@@ -12,7 +12,7 @@ import { bundleInfoPlugin } from "./bundle-info";
 // the emulator reports ("<emulator name> @ <host>" in the connection picker).
 // Identifiers that no one reads keep their nulldc spelling, since a rename would lose saved
 // state: the localStorage keys nulldc-debugger-* and nulldc-theme-mode, the nulldc:crash-test
-// event, environment and CMake variable names (NULLDC_*), fly.toml's app name, and the logo file
+// event, environment and CMake variable names (NULLDC_*), and the logo file
 // public/nulldc_logo.png. None of them is an old name of the UI in the sense below, so none
 // needs an exception. The BroadcastChannels of a wasm build are not kept: they are
 // dreamcast-devtools-announce and dreamcast-devtools-<id>, and no file names the old ones

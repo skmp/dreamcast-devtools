@@ -791,13 +791,8 @@ Breakpoint panels:
 Breakpoints live on the server. Every `event.tick` carries the full list, so all connected clients
 show the same set.
 
-## Mock demo deployment
-
-`Dockerfile` builds `dist-native/` with `npm run build:native` and runs the mock server in
-production mode on port 8080. `fly.toml` deploys that image.
-
 ## CI
 
-`.github/workflows/ci.yml` has two jobs on Node 22 (latest 22.x) for pushes and pull requests: `check` runs
+`.github/workflows/ci.yml` has two jobs on Node 22 (latest 22.x) for pull requests (not for pushes): `check` runs
 `npm ci` and `npm run check`; `e2e` installs Chromium (`npx playwright install --with-deps
 chromium`) and runs `npm run test:e2e`.
