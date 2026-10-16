@@ -582,7 +582,10 @@ reference for every parameter, result, error code and bound; what follows is the
   - A code breakpoint on `dc.aica.dsp.step` (steps 0 to 127) is reached in every sample (a sound
     burst is 32 samples). A resume from its stop executes the step it stands at once and stops
     in front of it one sample later, `MDEC_CT` one less: with no running tick when that sample is
-    in the same burst, with one when it is in the next.
+    in the same burst, with one when it is in the next. A step of the SH4 from such a stop runs
+    the suspended burst on first, a step of the ARM7 the rest of the sample (its instruction is
+    in the next one), the step the DSP stands at executing once: a DSP breakpoint met there is
+    the stop, and the step is dropped.
   - `dc.aica.dsp` has `STEP` (8), `MDEC_CT` (16), `RBP` (16), `RBL` (8) and the datapath of the
     DSP's core, `ACC` (26), `Y_REG` (24), `FRC_REG` (13), `ADRS_REG` (12), `LATCH` (16),
     `LATCH_COPY` (16), `MEMVAL` (16), `NOFL_PIPE` (2), `MIXS_BANK` (1), none with a writer.
@@ -640,8 +643,9 @@ milestones before). What its machine is:
   emulation step of 16 ms is 3,200,064 cycles, some 22 bursts), 32 samples a burst, and in every
   sample the DSP's 128 steps and one count of `MDEC_CT`. The bursts of an emulation step come
   first; a DSP breakpoint stops the machine in one of them, in front of its step, and the rest of
-  that burst is run on when the machine leaves the stop (as the emulator's park loop does), so a
-  breakpoint is reached within one emulation step and in every sample. A capture is the next
+  that burst is run on when the machine leaves the stop by a resume or a step of the SH4 (as the
+  emulator's park loop does; a step of the ARM7 runs the rest of the sample), so a breakpoint is
+  reached within one emulation step and in every sample. A capture is the next
   ceil(frames / 32) periods of the AICA of the mock's time: armed at a stop it advances
   `SH4_CYCLES` by exactly that much and stops with reason `capture`. Its records are fabricated
   (`server/mockSgc.ts`: eight channels play, the level at 96, the flags at 109). The AICA is
@@ -810,14 +814,19 @@ disassembler to the same functions).
   `payloadBytes == totalBytes == length`, the bytes of `state.getMemorySlice`), and a second
   connection, there before the read, receives no frame of it within 500 ms; across
   `0x0021FFF0` for 32 bytes `unreadable: [[16, 16]]` and zeros there; `0x10000000` -32010 with
-  no frame behind it; `dsp` -32004; 16777216 bytes of main memory from `0x0C000000`, whose last
-  64 are those of `state.getMemorySlice`, and 16777217 -32602; the ARM7's wave memory at 0 equal
-  to the SH4's at `0x00800000` over 2 MiB; and `binaryId`s that increase from one request to the
-  next, for frames of kind 1 and kind 2 alike.
+  no frame behind it; `dsp` -32004; 16777216 bytes of main memory from `0x0C000000`, whose 64
+  bytes at `0x0C010000` (past the first 64 KiB: a program's entry code) and last 64 are those of
+  `state.getMemorySlice`, and 16777217 -32602; the ARM7's wave memory at 0 equal to the SH4's at
+  `0x00800000` over 2 MiB, and to the ARM7's `state.getMemorySlice` at `0x10000` and in its last
+  64 bytes (when every window past the first 64 KiB reads 0, the part notes that it could not
+  tell a read that is zeros there); and the `binaryId`s of a read, a read of a capture (with
+  none yet, the part makes one of a frame) and a read increasing, which they do only with one
+  counter for the frames of every kind (without `sgc-capture`: two reads, and a note).
 
 **S21, the scenario of the DSP,** is run with `--dsp-program` alone. At its first stop, when
-`ENABLED` reads 0, a step of the DSP is made with the ARM7 held and the scenario notes
-`dsp: stepped with the arm7 held` (a server that answers -32012 there fails). The guest loads
+`ENABLED` reads 0, step over and step out of the DSP are -32004 and a step of the DSP is made,
+with the ARM7 held, and the scenario notes `dsp: stepped with the arm7 held` (a server that
+answers -32012 there fails). The guest loads
 its DSP program behind the anchor: while the 128 steps of `state.getDisassembly {dsp}` are not
 its program (with `--elf`: while their `bytes` are not the words between the ELF's symbols
 `g_dsp_mpro` and `g_dsp_mpro_end`, the steps behind them empty; without it: while no step is
