@@ -473,6 +473,75 @@ describe("S17, part sgcCapture", () => {
       'state.recordSgcFrames {"frames":16} while a capture records: expected the error -32003 (the first capture goes on, M3-D27), got the result {}',
     );
   }, 60_000);
+
+  it("held open: a first stop that is not the breakpoint's, a capture that ends in a stop of another reason, a capture that ends with another count", async () => {
+    // the breakpoint's stop, while a capture records, published as a pause
+    const notTheBreakpoints = patched((machine) => {
+      const enterStop = machine.enterStop.bind(machine);
+      machine.enterStop = (reason, breakpointId, fallbackStep) => (reason === "breakpoint" && machine.recording ? enterStop("pause") : enterStop(reason, breakpointId, fallbackStep));
+    });
+    expect(partOf(await s17(notTheBreakpoints, undefined, {}, "sgcCapture"), "sgc capture")?.detail).toMatch(
+      /^a capture armed at a stop with a DSP breakpoint on step 0: the first stop is #\d+ paused stop \d+ pause, expected that breakpoint's; a stop keeps a capture recording \(M3-D27\)$/,
+    );
+    // the capture of 4096 frames ends in a stop with reason "pause"
+    const pauseAtTheEnd = patched((machine) => {
+      let ending: number | undefined;
+      const completeCapture = machine.completeCapture.bind(machine);
+      machine.completeCapture = (stop) => {
+        ending = machine.recording?.frames;
+        try {
+          return completeCapture(stop);
+        } finally {
+          ending = undefined;
+        }
+      };
+      const enterStop = machine.enterStop.bind(machine);
+      machine.enterStop = (reason, breakpointId, fallbackStep) => enterStop(reason === "capture" && ending === 4096 ? "pause" : reason, breakpointId, fallbackStep);
+    });
+    expect(partOf(await s17(pauseAtTheEnd, undefined, {}, "sgcCapture"), "sgc capture")?.detail).toMatch(
+      /^the paused tick with reason "capture" of the capture that was held open: not seen within 5000 ms; ticks since then: \d+ \(.*#\d+ paused stop \d+ pause\)$/,
+    );
+    // the capture of 4096 frames records 4095
+    const fewer = patched((machine) => {
+      const record = machine.recordSgcFrames.bind(machine);
+      machine.recordSgcFrames = (params, context) => {
+        record(params, context);
+        if (params.frames === 4096) machine.recording!.frames = 4095;
+      };
+    });
+    expect(partOf(await s17(fewer, undefined, {}, "sgcCapture"), "sgc capture")?.detail).toBe("the capture that was held open has frameCount 4095, 4096 were recorded");
+  }, 60_000);
+
+  it("a second connection that reads the capture with other bytes; records with flags above bit 2, a level above 0x3FF, a byte of 110..127 that is not zero", async () => {
+    // (the first call of a FaultSource is the proxy's own; then the scenario's connection, then the second one)
+    let connections = 0;
+    const otherBytes: FaultSource = () => {
+      const second = ++connections === 3;
+      return {
+        toClientBinary: (frame) => (second && frame.readUInt32LE(4) === BinaryFrameKind.SGC_FRAMES ? Buffer.concat([frame.subarray(0, 16), Buffer.from([frame[16] ^ 0x5a]), frame.subarray(17)]) : frame),
+      };
+    };
+    expect(partOf(await s17(undefined, otherBytes, {}, "sgcCapture"), "sgc capture")?.detail).toBe(
+      "a second connection reads a capture of 96 frames with other bytes; the capture is the server's (design 3.3)",
+    );
+    const first = 'state\\.getSgcFrameData right behind the response of state\\.recordSgcFrames \\{"frames":64\\}: record at 0: ';
+    for (const [change, message] of [
+      [(record: Buffer) => (record[109] |= 0x08), new RegExp(`^${first}flags byte \\d+ has bits above bit 2$`)],
+      [(record: Buffer) => record.writeUInt32LE(0x400, 96), new RegExp(`^${first}aeg_value 1024 is above 0x3FF$`)],
+      [(record: Buffer) => (record[110] = 1), new RegExp(`^${first}byte 110 is not zero$`)],
+    ] as const) {
+      // the first record of every capture read, changed
+      const faults: Faults = {
+        toClientBinary: (frame) => {
+          if (frame.readUInt32LE(4) !== BinaryFrameKind.SGC_FRAMES) return frame;
+          const copy = Buffer.from(frame);
+          change(copy.subarray(16, 16 + 128));
+          return copy;
+        },
+      };
+      expect(partOf(await s17(undefined, faults, {}, "sgcCapture"), "sgc capture")?.detail).toMatch(message);
+    }
+  }, 120_000);
 });
 
 describe("S17, part memoryBinary", () => {
@@ -488,6 +557,35 @@ describe("S17, part memoryBinary", () => {
     expect(partOf(noCapture, "memory binary")).toEqual({ name: "memory binary", status: "passed" });
     expect(noCapture.scenarios[0].notes).toEqual(['memory binary: no capability "sgc-capture", so the counter kind 1 shares with kind 2 was not exercised']);
   }, 60_000);
+
+  it("the result and the frame: baseAddress in another mirror, totalBytes one more, a payloadBytes of its own; bytes of the unreadable run that are not zero", async () => {
+    const result = (rewrite: (result: Json, params: Json) => Json) =>
+      patched((machine) => {
+        const binary = machine.getMemoryBinary.bind(machine);
+        machine.getMemoryBinary = (params, context) => rewrite(binary(params, context), params);
+      });
+    const first = 'state.getMemoryBinary {"target":"sh4","address":2348875776,"length":64}';
+    const mirror = await s17(result((answer, params) => ({ ...answer, baseAddress: (params.address as number) & 0x1fffffff })), undefined, {}, "memoryBinary");
+    expect(partOf(mirror, "memory binary")?.detail).toBe(`${first}: baseAddress is 0x0C010000; it is the address asked for`);
+    const more = await s17(result((answer) => ({ ...answer, totalBytes: (answer.totalBytes as number) + 1 })), undefined, {}, "memoryBinary");
+    expect(partOf(more, "memory binary")?.detail).toBe(`${first}: totalBytes is 65, the length asked for is 64`);
+    /** the frames of kind 2 whose payload has `length` bytes, rewritten */
+    const frames = (length: number, rewrite: (frame: Buffer) => Buffer): Faults => ({
+      toClientBinary: (frame) => (frame.readUInt32LE(4) === BinaryFrameKind.MEMORY && frame.length === 16 + length ? rewrite(Buffer.from(frame)) : frame),
+    });
+    // a frame of 48 bytes, whose header says so, for a read of 64
+    const shorter = frames(64, (frame) => {
+      frame.writeUInt32LE(48, 12);
+      return frame.subarray(0, 16 + 48);
+    });
+    expect(partOf(await s17(undefined, shorter, {}, "memoryBinary"), "memory binary")?.detail).toBe(`${first}: payloadBytes is 48; payloadBytes == totalBytes == length`);
+    // across the end of the flash: the last byte of the unreadable run is not 0 (the result's run is right)
+    const notZero = frames(32, (frame) => {
+      frame[16 + 31] = 0xa5;
+      return frame;
+    });
+    expect(partOf(await s17(undefined, notZero, {}, "memoryBinary"), "memory binary")?.detail).toBe("state.getMemoryBinary across 0x0021FFF0: the unreadable bytes are not 0");
+  }, 120_000);
 
   it("broken server 1: no method, a frame of another kind, another length or other bytes than the memory", async () => {
     const none = await run({ supports: { ...MOCK_M3_SUPPORT, capabilities: MOCK_M3_SUPPORT.capabilities.filter((capability) => capability !== "memory-binary") } }, undefined, {
@@ -515,7 +613,7 @@ describe("S17, part memoryBinary", () => {
     }
   }, 120_000);
 
-  it("a frame that goes to every client; large reads that are zeros past their first 64 KiB, their last 64 bytes kept or not, and a read of 16 MiB whose last 64 bytes alone differ", async () => {
+  it("a frame that goes to every client; large reads that are zeros past their first 64 KiB, their last 64 bytes kept or not, and large reads whose last 64 bytes alone differ", async () => {
     const broadcast = patched((machine) => {
       const binary = machine.getMemoryBinary.bind(machine);
       machine.getMemoryBinary = (params, context) => {
@@ -557,6 +655,8 @@ describe("S17, part memoryBinary", () => {
     // wave memory, both reads alike (so that they agree with each other)
     const wave = await s17(undefined, large(0x200000, "zeros, tail kept"), {}, "memoryBinary");
     expect(partOf(wave, "memory binary")?.detail).toMatch(/^2 MiB of wave memory through the ARM7, at 0x00010000 past its first 64 KiB: byte \d+ is 0, state\.getMemorySlice reads \d+ there$/);
+    const waveTail = await s17(undefined, large(0x200000, "last byte"), {}, "memoryBinary");
+    expect(partOf(waveTail, "memory binary")?.detail).toMatch(/^the last 64 bytes of 2 MiB of wave memory through the ARM7: byte 63 is \d+, state\.getMemorySlice reads \d+ there$/);
     // memory that reads 0 in every window past 64 KiB, in both methods: the part passes, and says that it could not tell
     const zeroWindows = patched((machine) => {
       const readMemory = machine.readMemory.bind(machine);
@@ -815,7 +915,7 @@ describe("S21", () => {
     expect(detailOf(never, "S21")).toMatch(/^a paused tick at the DSP breakpoint on step \d+ that was added while the target runs: not seen within 2000 ms/);
   }, 120_000);
 
-  it("the refusals: step 128 accepted, a step while running accepted, step over and step out of the DSP accepted", async () => {
+  it("the refusals: step 128 accepted, a step while running accepted, step over and step out of the DSP accepted (the ARM7 clocked: asked at the end)", async () => {
     const accepting = (matches: (request: Json, running: boolean) => boolean): FaultSource => () => {
       const watch = watchingEnabled();
       return { toClient: watch.toClient, answer: (request) => (matches(request, watch.state.running) ? { jsonrpc: "2.0", id: request.id, result: {} } : undefined) };
@@ -823,12 +923,109 @@ describe("S21", () => {
     for (const [matches, message] of [
       [(request: Json) => request.method === "breakpoints.add" && paramsOf(request).address === 128, /^breakpoints\.add \{"event":"dc\.aica\.dsp\.step","address":128\}: expected the error -32602, got the result \{\}/],
       [(request: Json, running: boolean) => request.method === "control.step" && paramsOf(request).target === "dsp" && running, /^control\.step \{"target":"dsp"\}: expected the error -32003, got the result \{\}/],
+      [(request: Json) => request.method === "control.stepOver" && paramsOf(request).target === "dsp", /^control\.stepOver \{"target":"dsp"\}: expected the error -32004, got the result \{\}/],
       [(request: Json) => request.method === "control.stepOut" && paramsOf(request).target === "dsp", /^control\.stepOut \{"target":"dsp"\}: expected the error -32004, got the result \{\}/],
     ] as const) {
       const summary = await s21(undefined, accepting(matches));
       expect(detailOf(summary, "S21")).toMatch(message);
     }
   }, 120_000);
+
+  it("a step of the DSP that makes two; 16 lines at STEP that are not the full read's, or 15 of them", async () => {
+    const two = patched((machine) => {
+      const stepDsp = machine.stepDsp.bind(machine);
+      machine.stepDsp = () => {
+        stepDsp();
+        stepDsp();
+      };
+    });
+    expect(firstOf(await s21(two), "S21")).toBe("control.step {dsp}: from step 0 it ended at step 2, expected 1");
+    /** the answers to state.getDisassembly {dsp} for 16 lines, rewritten */
+    const sixteen = (rewrite: (lines: Json[]) => Json[]): FaultSource => () => {
+      const asked = new Set<unknown>();
+      return {
+        toServer: (frame) => {
+          if (frame.method === "state.getDisassembly" && paramsOf(frame).target === "dsp" && paramsOf(frame).count === 16) asked.add(frame.id);
+          return frame;
+        },
+        toClient: (frame) => (frame.method === undefined && asked.has(frame.id) ? { ...frame, result: { lines: rewrite((frame.result as { lines: Json[] }).lines) } } : frame),
+      };
+    };
+    const emptied = sixteen((lines) => lines.map((line, position) => (position === 3 ? { ...line, bytes: "00 00 00 00 00 00 00 00", disassembly: `MPRO[${line.address as number}] = TRA:0` } : line)));
+    expect(firstOf(await s21(undefined, emptied), "S21")).toMatch(/^dsp: step \d+ reads differently in two requests while the target is paused$/);
+    const fifteen = sixteen((lines) => lines.slice(0, 15));
+    expect(firstOf(await s21(undefined, fifteen), "S21")).toMatch(/^15 lines of DSP disassembly for count 16 at step \d+$/);
+  }, 60_000);
+
+  it("the stop of a DSP breakpoint: with another reason, at another step; a resume from it that runs the SH4 two periods; one added while running that stops otherwise", async () => {
+    // reason "event" (a breakpointId may come with it: no invariant tells)
+    const reason = patched((machine) => {
+      const enterStop = machine.enterStop.bind(machine);
+      machine.enterStop = (stop, breakpointId, fallbackStep) => enterStop(stop === "breakpoint" && machine.suspended ? "event" : stop, breakpointId, fallbackStep);
+    });
+    expect(firstOf(await s21(reason), "S21")).toBe('a resume: the stop has reason "event", expected "breakpoint"');
+    // the paused ticks of a breakpoint's stop with STEP one on
+    const shifted: Faults = {
+      toClient: (frame) => {
+        if (!isTick(frame) || frame.params.executionState.reason !== "breakpoint" || !frame.params.registers["dc.aica.dsp"]) return frame;
+        const dsp = frame.params.registers["dc.aica.dsp"].map((register) =>
+          register.name === "STEP" ? { ...register, value: `0x${(Number.parseInt(String(register.value), 16) + 1).toString(16).toUpperCase().padStart(2, "0")}` } : register,
+        );
+        return { ...frame, params: { ...frame.params, registers: { ...frame.params.registers, "dc.aica.dsp": dsp } } };
+      },
+    };
+    const at = /^a resume: the stop is at step (\d+), the breakpoint at step (\d+)$/.exec(firstOf(await s21(undefined, shifted), "S21"));
+    expect(at).not.toBeNull();
+    expect(Number(at![1])).toBe(Number(at![2]) + 1);
+    // a resume from the stop of a DSP breakpoint, the breakpoint still active, that lets the SH4 run two periods more
+    const longer = patched((machine) => {
+      const leaveStop = machine.leaveStop.bind(machine);
+      machine.leaveStop = () => {
+        const suspended = machine.suspended;
+        if (!machine.running && suspended?.exempt && machine.stopBreakpointId !== undefined && machine.activeDspBreakpoints().get(suspended.step) === machine.stopBreakpointId) {
+          machine.setCycles(machine.cycles + 2n * PERIOD);
+          machine.nextBurst += 2n * PERIOD;
+        }
+        leaveStop();
+      };
+    });
+    expect(firstOf(await s21(longer), "S21")).toMatch(
+      /^a resume from the stop of a DSP breakpoint to its stop one sample later grew dc\.timing\.SH4_CYCLES by \d+; at most one period of the AICA and the rest of a slice \(145572\)$/,
+    );
+    // a breakpoint added while running: the server pauses at the add
+    const pausesAtTheAdd = patched((machine) => {
+      const addBreakpoint = machine.addBreakpoint.bind(machine);
+      machine.addBreakpoint = (params, context) => {
+        const running = machine.running;
+        const added = addBreakpoint(params, context);
+        if (running) context.afterResponse.push(() => machine.enterStop("pause"));
+        return added;
+      };
+    });
+    expect(firstOf(await s21(pausesAtTheAdd), "S21")).toMatch(/^the breakpoint on step \d+ added while running: the stop is #\d+ paused stop \d+ pause at step \d+$/);
+  }, 120_000);
+
+  it("the nine datapath registers missing from the paused ticks: from the tree and every tick alike, or from the ticks of a breakpoint's stop", async () => {
+    const nine = "ACC Y_REG FRC_REG ADRS_REG LATCH LATCH_COPY MEMVAL NOFL_PIPE MIXS_BANK";
+    const four = (registers: Json[]) => registers.slice(0, 4);
+    const everywhere = describing(
+      (result) => ({ ...result, deviceTree: mapNodes(result.deviceTree, (node) => (node.path === "dc.aica.dsp" ? { ...node, registers: four(node.registers as Json[]) } : node)) }),
+      (registers) => (registers["dc.aica.dsp"] ? { ...registers, "dc.aica.dsp": four(registers["dc.aica.dsp"]) } : registers),
+    );
+    const consistent = await s21(undefined, everywhere);
+    expect(firstOf(consistent, "S21")).toMatch(new RegExp(`^the paused tick #\\d+ paused stop \\d+ .+ has no ${nine} in dc\\.aica\\.dsp; from M3 every paused tick has the nine datapath registers \\(M3-D25\\)$`));
+    // (the tree and the ticks agree: only S21 tells)
+    expect(consistent.invariantViolations).toEqual([]);
+    const atBreakpoints: Faults = {
+      toClient: (frame) =>
+        isTick(frame) && frame.params.executionState.reason === "breakpoint" && frame.params.registers["dc.aica.dsp"]
+          ? { ...frame, params: { ...frame.params, registers: { ...frame.params.registers, "dc.aica.dsp": four(frame.params.registers["dc.aica.dsp"]) } } }
+          : frame,
+    };
+    expect(firstOf(await s21(undefined, atBreakpoints), "S21")).toMatch(
+      new RegExp(`^the paused tick #\\d+ paused stop \\d+ breakpoint bp \\d+ has no ${nine} in dc\\.aica\\.dsp; from M3 every paused tick has the nine datapath registers \\(M3-D25\\)$`),
+    );
+  }, 60_000);
 
   it("the text rule of S10 on the 128 steps, and the program wait taken as far as five times", async () => {
     const fabricated: Faults = {

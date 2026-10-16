@@ -2834,7 +2834,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(statusOf(summary, "S17")).toBe("failed");
     expect(detailsOf(summary, "S17")).toMatch(/sgc capture: state\.getSgcFrameData right behind the response of state\.recordSgcFrames \{"frames":64\}: binaryId is 99 in the header and 1 in the result/);
     expect(detailsOf(summary, "S17")).toMatch(/memory binary: state\.getMemoryBinary \{"target":"sh4","address":2348875776,"length":64\}: binaryId is 99 in the header and \d+ in the result/);
-  });
+  }, 60_000);
 
   it("S17: a binary frame that is sent before the response it belongs to", async () => {
     const summary = await run({ afterNextBinary: (frame) => typeof (frame.result as Json | undefined)?.frameCount === "number" }, ["S17"]);
@@ -2842,7 +2842,9 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(summary, "S17")).toMatch(
       /sgc capture: the binary frame of state\.getSgcFrameData arrived before its JSON response; the response is sent first, the binary frame second/,
     );
-  });
+    // (the part memoryBinary runs on to the capture it reads between its last two reads, a read of
+    // 16 MiB and two of 2 MiB on the way: some 2.5 s)
+  }, 60_000);
 });
 
 describe("what a failing run leaves behind", () => {
