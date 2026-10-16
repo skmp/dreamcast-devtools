@@ -19,7 +19,7 @@
     "test:ui": "vitest --ui",
     "test:e2e": "playwright test",
     "contract": "tsx --tsconfig tsconfig.scripts.json scripts/contract-test.ts",
-    "check": "npm run lint && npm run typecheck && npm run test:run && npm run contract -- --milestone M2 --require-note \"arm7: bl stepped over and out\" && npm run contract -- --milestone M2 --mock-support m2 --require-note \"arm7: bl stepped over and out\" && npm run build:native && npm run build:wasm"
+    "check": "npm run lint && npm run typecheck && npm run test:run && npm run contract -- --milestone M3 --require-note \"arm7: bl stepped over and out\" && npm run contract -- --milestone M3 --mock-support m3 --require-note \"arm7: bl stepped over and out\" && npm run contract -- --milestone M3 --dsp-program --require-note \"sgc: captured with the arm7 held\" && npm run contract -- --milestone M3 --dsp-program --only S00,S21 --require-note \"dsp: stepped with the arm7 held\" && npm run build:native && npm run build:wasm"
   },
   "engines": {
     "node": ">=22.13"

@@ -34,7 +34,7 @@ Run `npm ci` once, then:
 | `npm run test:ui` | Vitest with its browser UI. |
 | `npm run test:e2e` | Playwright smoke suite in headless Chromium (see [End-to-end tests](#end-to-end-tests)). Not part of `check`. |
 | `npm run contract` | The contract runner: holds a debugger server to the protocol (see [Contract runner](#contract-runner)). Without arguments it tests the mock, in-process. |
-| `npm run check` | `lint`, `typecheck`, `test:run`, the contract gate of milestone M2 on the mock, twice (`contract -- --milestone M2 --require-note "arm7: bl stepped over and out"`, on the mock as it is and with `--mock-support m2`), `build:native`, `build:wasm`; stops at the first failure. CI runs this. |
+| `npm run check` | `lint`, `typecheck`, `test:run`, the contract gate of milestone M3 on the mock in four runs (`contract -- --milestone M3 --require-note "arm7: bl stepped over and out"`, on the mock as it is and with `--mock-support m3`; `--milestone M3 --dsp-program --require-note "sgc: captured with the arm7 held"`; `--milestone M3 --dsp-program --only S00,S21 --require-note "dsp: stepped with the arm7 held"`), `build:native`, `build:wasm`; stops at the first failure. CI runs this. |
 
 ## Serving the build
 
@@ -213,9 +213,11 @@ Mock server, on the command line (`npm run mock:serve -- --start-paused`):
 | `--start-paused` | Start in the `StartPaused` stop (`reason: "start"`) instead of running. |
 | `--force-fallback` | Behave like an SH4 backend without native breakpoints: `notice` in the ticks while SH4 breakpoints are active, `dc.timing.SH4_DEBUG_ENGINE` reads `interpreter-fallback`, capability `sh4-debug-fallback`. |
 | `--stale-registers` | Behave like a backend whose running ticks cannot carry `dc.sh4.cpu`: they omit it and say `registersStale`, and watches on `dc.sh4.cpu.*` read `n/a` until the target is paused. |
-| `--m1` | Implement what the emulator does in milestone M1 and nothing more: no ARM7 or DSP stepping and code breakpoints, no memory or register writes, no reset, no SGC capture (`targets[].stepping`, `capabilities`; the requests answer -32004), and the device tree without the rows and the two register panels of M2. |
-| `--m2` | Implement what the emulator does in milestone M2 and nothing more: the SH4 and the ARM7 step, the DSP does not; memory writes and reset; register writes of `dc.sh4.cpu` and of `dc.aica.arm7` (but `ENABLED`) alone, every other register answers -32013 and carries no `flags.writable`; no SGC capture. |
-| `--arm7-held` | Start with the ARM7 held in reset, as behind a reset: `ENABLED` reads 0, and the machine releases it when it has run for 8 emulation steps. |
+| `--m1` | Implement what the emulator does in milestone M1 and nothing more: no ARM7 or DSP stepping and code breakpoints, no memory or register writes, no reset, no SGC capture, no `state.getMemoryBinary` (`targets[].stepping`, `capabilities`; the requests answer -32004), and the device tree without the rows and the two register panels of M2. |
+| `--m2` | Implement what the emulator does in milestone M2 and nothing more: the SH4 and the ARM7 step, the DSP does not; memory writes and reset; register writes of `dc.sh4.cpu` and of `dc.aica.arm7` (but `ENABLED`) alone, every other register answers -32013 and carries no `flags.writable`; no SGC capture, no `state.getMemoryBinary`; the tree of M2 (`dc.aica.dsp` with its four registers of M1). |
+| `--m3` | Implement what the emulator does in milestone M3 and nothing more: the three targets step; memory writes, reset, the SGC capture and `state.getMemoryBinary`; register writes of the two processors alone, as in M2 (no device has a writer in M3); the tree of M3. |
+| `--arm7-held` | Start with the ARM7 held in reset, as behind a reset: `ENABLED` reads 0, and the machine releases it when it has run for 8 emulation steps. With `--start-paused` it is held at the stop of the start however long the first client takes to come. |
+| `--testb0` | TESTB0 (bit 15 of the AICA's word 0x2804) set: `dc.aica.common.TESTB0` reads 1, and MDEC_CT is in the test mode of the DSP core, XORed with 0x8080 in every sample instead of counting down. |
 
 The status bar reads `Dreamcast DevTools <version>`. The version shown there and in the About
 dialog is the `package.json` version, followed by `+<git describe --tags --always --dirty>` when
@@ -568,6 +570,39 @@ reference for every parameter, result, error code and bound; what follows is the
     `.misc`), `dc.holly.spg`, `dc.aica.common`, `dc.aica.rtc` and the 64 channels
     `dc.aica.sgc.0` to `.63`, registers on `dc.gdrom` and `dc.maple`, and the panels
     `sh4-registers` on `dc.sh4.cpu` and `arm7-registers` on `dc.aica.arm7`.
+- Milestone M3 (the DSP as a target that steps, the SGC capture, memory in binary frames):
+  - The AICA is clocked whatever ARMRST says: while the guest holds the ARM7 (`ENABLED` 0) the
+    DSP steps, its breakpoints are reached and a capture records. Only `control.step`,
+    `stepOver` and `stepOut {arm7}` answer -32012 then.
+  - `control.step {dsp}` executes one step of the DSP and publishes no running tick: a paused
+    tick with a new `stopId`, `reason: "step"`, `STEP` one on (from 127 to 0, at the end of the
+    sample). From a stop with no sound burst suspended the SH4 first runs to the next burst (one
+    period of the AICA, 145124 cycles of `SH4_CYCLES`, at most); from a stop of the DSP it does
+    not run at all. `stepOver` and `stepOut` of the DSP are -32004; a step while running -32003.
+  - A code breakpoint on `dc.aica.dsp.step` (steps 0 to 127) is reached in every sample (a sound
+    burst is 32 samples). A resume from its stop executes the step it stands at once and stops
+    in front of it one sample later, `MDEC_CT` one less: with no running tick when that sample is
+    in the same burst, with one when it is in the next.
+  - `dc.aica.dsp` has `STEP` (8), `MDEC_CT` (16), `RBP` (16), `RBL` (8) and the datapath of the
+    DSP's core, `ACC` (26), `Y_REG` (24), `FRC_REG` (13), `ADRS_REG` (12), `LATCH` (16),
+    `LATCH_COPY` (16), `MEMVAL` (16), `NOFL_PIPE` (2), `MIXS_BANK` (1), none with a writer.
+    `dc.aica.common` has `RBP` (12), `RBL` (2) and `TESTB0` (1), the fields of the DSP's word
+    0x2804, which a CPU reads as 0.
+  - `state.getDisassembly {dsp}`: `address` is the step, `bytes` its four MPRO words, each high
+    byte first, and the text the line of the DSP playground's assembler for them:
+    `"MPRO[" + n + "] = " + disassembleDesc(decodeInst(words))` of `src/app/dsp/dspUtils.ts`,
+    `MPRO[n] = TRA:0` for an empty step.
+  - `state.recordSgcFrames {frames?}` (1 to 4096, 1024 by default) is answered when the capture is
+    complete. From a stop the target runs for the capture and stops again, `reason: "capture"`
+    (the response and that tick in either order); a running target keeps running. While a
+    capture records a second request is -32003, `state.getSgcFrameData` gives the capture before
+    (or -32011), and stops and steps keep it recording; a reset ends it with -32014, so does a
+    deadline of 5 s from the request, a host stop with -32001.
+  - `state.getMemoryBinary {target?, address, length}` is `state.getMemorySlice` (the same bytes,
+    0 and listed where nothing is readable, -32010 when nothing is, -32004 for `dsp`) with the
+    bound 16 MiB and the bytes in a binary frame of kind 2 behind the response, to the
+    requesting client only. A connection's `binaryId`s count from 1, one counter for the frames
+    of every kind.
 - Errors: the methods whose result is `{}` (`control.*`, `breakpoints.*`, the watch methods,
   the writes, `state.recordSgcFrames`) report a failure in-band, as the result
   `{ "error": { "code", "message" } }`. Every other method answers with a JSON-RPC error.
@@ -577,9 +612,10 @@ reference for every parameter, result, error code and bound; what follows is the
   payload (`src/lib/binaryFrame.ts`).
 
 The mock (`server/mockDebugger.ts`, hosted with the page by `server/mockServer.ts`) implements
-milestone M2 of this protocol around a fabricated machine, keeps one state for all clients, and
-also steps the DSP, records SGC frames and writes the registers of every node (`--m2` takes
-that away: what the emulator of M2 does, and no more). What its machine is:
+milestone M3 of this protocol around a fabricated machine, as the emulator's M3 does it, keeps
+one state for all clients, and also writes the registers of every node but the DSP's (`--m3`
+takes that away: what the emulator of M3 does, and no more; `--m2` and `--m1` those of the
+milestones before). What its machine is:
 
 - Its SH4 walks a loop of eight instructions at `0x8C0000A0` and, like a program with
   interrupts enabled, takes an interrupt at every vertical blank: the PC leaves the loop for
@@ -600,13 +636,34 @@ that away: what the emulator of M2 does, and no more). What its machine is:
   bit: 1, the ARM7 is clocked; 0, it is held) reads 0, the ARM7 has no callstack and executes
   nothing, and its steps answer -32012. The machine releases it when it has run for 8 emulation
   steps. `ENABLED` is not the debugger's to write: it has no writer (-32013).
+- Its sound chip has the emulator's clock: a sound burst every 145124 cycles of `SH4_CYCLES` (an
+  emulation step of 16 ms is 3,200,064 cycles, some 22 bursts), 32 samples a burst, and in every
+  sample the DSP's 128 steps and one count of `MDEC_CT`. The bursts of an emulation step come
+  first; a DSP breakpoint stops the machine in one of them, in front of its step, and the rest of
+  that burst is run on when the machine leaves the stop (as the emulator's park loop does), so a
+  breakpoint is reached within one emulation step and in every sample. A capture is the next
+  ceil(frames / 32) periods of the AICA of the mock's time: armed at a stop it advances
+  `SH4_CYCLES` by exactly that much and stops with reason `capture`. Its records are fabricated
+  (`server/mockSgc.ts`: eight channels play, the level at 96, the flags at 109). The AICA is
+  clocked whatever the ARM7 does.
+- Its DSP runs one program (`MOCK_DSP_PROGRAM`, steps 0 to 23 in the playground's syntax, the
+  steps behind them empty): its words are those of the register file at `0x00703400` (SH4) and
+  `0x00803400` (ARM7) and the `bytes` of `state.getDisassembly {dsp}`, and the text of a step is
+  the playground's line of them. The DSP computes nothing: the datapath registers of
+  `dc.aica.dsp` are fabricated from where it stands, and a step changes them. The option
+  `testb0` (`--testb0`) sets `TESTB0`.
 - Memory is three stores, each seen through every address that maps it: main memory (16 MiB:
   area 3 through P0, P1 and P2), wave memory (8 MiB: the SH4's `0x00800000 + X` is the ARM7's
   `X`) and video memory (8 MiB in each of its two views, `0x04..` with `0x06..` and `0x05..`
   with `0x07..`; the mock does not alias one view onto the other). A byte is a hash of where
-  it is until it is written. ARM7 breakpoints are compared under `0x007FFFFC`.
-- The rows of milestone M2 are short lists of the mock's own (at most eight registers a node:
-  104 nodes, about 900 rows). Under `--m1` the tree is that of M1.
+  it is until it is written: a few integer operations (a seed per store and the finaliser of
+  MurmurHash3), so that a read of 16 MiB is answered in well under 2 s. The register file of
+  the AICA is a fourth store that cannot be written (the SH4's `0x00700000 + X`, the ARM7's
+  `0x00800000 + X`): a word of 16 bits in the low half of four bytes, the DSP's program at
+  `0x3400`, and `0x2804` read as 0. ARM7 breakpoints are compared under `0x007FFFFC`.
+- The rows of milestone M3 are short lists of the mock's own (104 nodes, about 900 rows; at most
+  eight registers a node, but `dc.aica.common` with eleven and `dc.aica.dsp` with its thirteen).
+  Under `--m2` the tree is that of M2, under `--m1` that of M1.
 
 ## Contract runner
 
@@ -635,8 +692,9 @@ are left are failed as "not run", and the clean-up reports that nothing could be
 
 ```
 npm run contract                                  # look at the mock, started in the same process
-npm run contract -- --milestone M2                # the gate of milestone M2 on the mock (part of `npm run check`)
-npm run contract -- --milestone M2 --mock-support m2   # the same on the mock as what the emulator of M2 does
+npm run contract -- --milestone M3                # the gate of milestone M3 on the mock (part of `npm run check`)
+npm run contract -- --milestone M3 --mock-support m3   # the same on the mock as what the emulator of M3 does
+npm run contract -- --milestone M3 --dsp-program  # its second run, on the mock paused at its start with its ARM7 held
 npm run contract -- --url ws://127.0.0.1:<port>/ws --profile emulator --elf <path> --milestone M1   # the gate of M1 on an emulator
 npm run contract -- --only S16 --parts S16:arm7+tree   # two parts of S16 by themselves
 npm run contract -- --url ws://127.0.0.1:5173/ws --profile mock      # a mock server that is already running
@@ -716,6 +774,71 @@ The part `arm7` says in notes what it met: `arm7: held at the start` or
 and out of one. These three texts are an interface: the emulator's contract targets require
 them with `--require-note`, so they do not change.
 
+**Milestone M3.** Under the gate of M3 S01 also wants `targets[dsp].stepping` and the nine
+datapath registers of `dc.aica.dsp` (`ACC`, `Y_REG`, `FRC_REG`, `ADRS_REG`, `LATCH`,
+`LATCH_COPY`, `MEMVAL`, `NOFL_PIPE`, `MIXS_BANK`); their widths, like those of `STEP`,
+`MDEC_CT`, `RBP` and `RBL`, are held on every server that lists one of them (`DSP_REGISTER_WIDTHS`
+of `scripts/contract/design.ts`). S10, on every milestone, wants the text of each DSP line to be
+the playground's line of its own `bytes`: `"MPRO[" + n + "] = "` and
+`disassembleDesc(decodeInst(words))` of `src/app/dsp/dspUtils.ts`, `TRA:0` for an empty step
+(`scripts/contract/dspText.ts`; the emulator's `debugger.disasm.dsp_playground` holds its
+disassembler to the same functions).
+
+**S17, the scenario of the capture and of the binary memory reads,** has two parts:
+
+- `sgcCapture` (`sgc-capture`). At the first stop: `state.getSgcFrameData` is -32011 with no
+  frame behind it, or a capture exists already. The first capture is made there, from the stop,
+  as every capture from a stop: the response, a running tick and a paused tick with reason
+  `capture` (the response and that tick in either order), `state.getSgcFrameData` right behind
+  the response with the count asked, and `dc.timing.SH4_CYCLES` from the stop before to the stop
+  of the capture grown by ceil(frames / 32) periods of the AICA (145124 cycles), one either way.
+  When `ENABLED` of `dc.aica.arm7` reads 0 at that stop, the capture is made with the ARM7 held
+  and the part notes `sgc: captured with the arm7 held`; a server that answers -32012 there
+  fails. Then the default (no `frames`: 1024, a count the capture before does not have, so the
+  read right behind the response tells whose capture the server has); a capture while running
+  (no stop, the target still running, then the count asked); `frames` 0 and 4097 -32602; a
+  second connection reads the same capture. Then a capture held open: at a stop, with a DSP
+  breakpoint on step 0 and the category `dsp` active, a capture of 4096 frames; the
+  breakpoint's stop comes and no response; a second request is -32003, `state.getSgcFrameData`
+  gives the capture before; the breakpoint is removed and the target resumed: the response and
+  the stop with reason `capture` come, in either order, and the capture has 4096 frames. Every
+  record of every capture read has the layout of protocol v3 (the flags byte without bits above
+  2, the level at most 0x3FF, bytes 110 to 127 zero). With `--dsp-program` at least one record
+  of the captures has a channel that sounds (flags bit 0 set and a level above 0).
+- `memoryBinary` (`memory-binary`): 64 bytes at the SH4's `defaultMemoryAddress` (the result's
+  `baseAddress` and `totalBytes`, the frame behind the response with kind 2, its `binaryId` and
+  `payloadBytes == totalBytes == length`, the bytes of `state.getMemorySlice`), and a second
+  connection, there before the read, receives no frame of it within 500 ms; across
+  `0x0021FFF0` for 32 bytes `unreadable: [[16, 16]]` and zeros there; `0x10000000` -32010 with
+  no frame behind it; `dsp` -32004; 16777216 bytes of main memory from `0x0C000000`, whose last
+  64 are those of `state.getMemorySlice`, and 16777217 -32602; the ARM7's wave memory at 0 equal
+  to the SH4's at `0x00800000` over 2 MiB; and `binaryId`s that increase from one request to the
+  next, for frames of kind 1 and kind 2 alike.
+
+**S21, the scenario of the DSP,** is run with `--dsp-program` alone. At its first stop, when
+`ENABLED` reads 0, a step of the DSP is made with the ARM7 held and the scenario notes
+`dsp: stepped with the arm7 held` (a server that answers -32012 there fails). The guest loads
+its DSP program behind the anchor: while the 128 steps of `state.getDisassembly {dsp}` are not
+its program (with `--elf`: while their `bytes` are not the words between the ELF's symbols
+`g_dsp_mpro` and `g_dsp_mpro_end`, the steps behind them empty; without it: while no step is
+loaded), the target runs for a second and is paused again, five times at most. Then: a step of
+the DSP (a paused tick with a new `stopId`, reason `step`, no `breakpointId`, no running tick in
+between, `STEP` one on, and `SH4_CYCLES` grown by at most 145124 + 448 cycles from a stop that is
+not the DSP's, by nothing from one that is); the 128 steps by the text rule of S10, with
+`--elf` the ELF's words; 16 lines at `STEP` as in the full read; a breakpoint on a loaded step
+behind `STEP` that is not 127 hit with its id; from that stop, the breakpoint still enabled and
+active, `control.runUntil` stops at it again with a new `stopId`, `MDEC_CT` one less and
+`SH4_CYCLES` grown by at most 145124 + 448 cycles (with a running tick or without one); a step
+of the DSP from that stop leaves the PC of the SH4 and `SH4_CYCLES` as they were; a breakpoint on
+step 127 hit, and the step from it ends at 0 with `MDEC_CT` one less; a disabled breakpoint, or
+one of the muted category `dsp`, is not reached (600 ms of running ticks); two on one step stop
+with the lower id; one added while running is reached within 2 s; step 128 -32602; a step while
+running -32003; step over and step out -32004. The nine datapath registers are in every paused
+tick of the scenario, and at least one of them changes between the steps of the DSP it made.
+
+S17 and S21 note what they met with the ARM7 held; the two texts, `sgc: captured with the arm7
+held` and `dsp: stepped with the arm7 held`, are an interface as those of S16 are.
+
 **What a gate is.** A gate is a run that names a milestone.
 
 - `--milestone Mx` selects the scenarios of that milestone, i.e. those whose milestone is Mx or
@@ -723,7 +846,13 @@ them with `--require-note`, so they do not change.
   `not applicable` fail a gate, and so does a scenario that was not run. M1 is S00 to S15, S19
   and S20 (S00 and S15 in the emulator profile only); M2 adds S16, M3 adds S17 (and S21, below),
   M4 adds S18. Under a gate S01 also wants `sh4`, `arm7` and `dsp` listed and the capabilities
-  of the milestone advertised.
+  of the milestone advertised; from M2 on `targets[arm7].stepping`, from M3 on
+  `targets[dsp].stepping` and the nine datapath registers of `dc.aica.dsp`.
+- `--dsp-program`: the server runs the DSP test program, the second run of the gate of M3. It
+  selects S00, S17 and S21 (S21 is in no other run). The mock the runner starts for it is at its
+  stop of the start (reason `start`, its anchor, as S00's stop is the emulator's) with its ARM7
+  held, which only emulation steps of a running machine release: the first scenario meets it
+  held however long the session takes to open.
 - Without `--milestone` the runner looks at a server: a scenario the server does not claim to
   support is not applicable, and that is no failure. But a run in which no scenario passed has
   verified nothing, and fails.
@@ -731,15 +860,16 @@ them with `--require-note`, so they do not change.
   a success: a selection that leaves nothing to pass is a failed run. `--require <ids>` names
   further scenarios that are run and have to pass.
 - `--parts <scenario>:<part>[+<part>...]` runs only the named parts of a scenario that has
-  parts (S16: `arm7`, `writeMemory`, `setRegister`, `reset`, `tree`; `--list` names them). The
+  parts (S16: `arm7`, `writeMemory`, `setRegister`, `reset`, `tree`; S17: `sgcCapture`,
+  `memoryBinary`; `--list` names them). The
   scenario has to pass, and it passes when each named part passed: a named part that is not
   applicable fails. It is for a server that has a part of a milestone, where the scenario as a
   whole would be `partial`; with `--milestone` it is an error, a gate is whole.
 - `--require-note <text>` (may be repeated, also with `--milestone`): the run is no pass unless
   a selected scenario noted exactly that text. A gate asks with it for what it has to show and
   a run could pass without: `--require-note "arm7: bl stepped over and out"`.
-- `--mock-support m1|m2`: the mock the runner starts itself is the mock as a server of that
-  milestone (`--m1`, `--m2` of the mock server). Not with `--url`.
+- `--mock-support m1|m2|m3`: the mock the runner starts itself is the mock as a server of that
+  milestone (`--m1`, `--m2`, `--m3` of the mock server). Not with `--url`.
 - Exit codes: 0, every selected scenario that had to pass passed, no invariant was violated and
   the server was put back; 1, anything else that is a result; 2, there was no run (a wrong
   option, or a server that could not be connected to).
@@ -755,17 +885,20 @@ test program and is at its `StartPaused` stop: `Debugger:Enabled=yes`, `Debugger
 `Debugger:Required=yes`, `Debugger:StartPaused=yes`, with the port taken from the
 `Debugger: http://127.0.0.1:<port>/` line the emulator prints. The emulator profile waits for
 that stop, runs S00 (the anchor at the entry point of `--elf`) and S15 as well, and multiplies
-every timeout by 5. The gate of M3 is two runs: that one with the test program of M1, which
-selects everything of M3 but S21, and a second one against an emulator started with the DSP
-test program, `--elf <dsptest.elf> --milestone M3 --dsp-program`, which selects S00 and S21
-alone. The gate of M2 on an emulator is two runs as well: the one with the test program of M1,
-and `--elf <dsptest.elf> --milestone M2 --only S00,S16` against an emulator started with the
-sounding guest, which requires the notes `arm7: held at the start` and
+every timeout by 5. The gate of M3 is the run with the test program of M1, which selects
+everything of M3 but S21, and the run of the DSP test program, `--elf <dsptest.elf> --milestone
+M3 --dsp-program`, made twice on an emulator started with the sounding guest: whole (S00, S17,
+S21), with the note `sgc: captured with the arm7 held` required, and `--only S00,S21`, with the
+note `dsp: stepped with the arm7 held` (in the first, S17's captures let the guest release its
+ARM7 before S21 comes). The gate of M2 on an emulator is two runs as well: the one with the test
+program of M1, and `--elf <dsptest.elf> --milestone M2 --only S00,S16` against an emulator
+started with the sounding guest, which requires the notes `arm7: held at the start` and
 `arm7: bl stepped over and out` (the first program has no call in the loop its ARM7 waits in,
-and its ARM7 takes no interrupt). The mock's gate is `npm run contract -- --milestone M2`
-(in-process, profile mock): 17 scenarios, S16 with its five parts. `npm run check` runs it
-twice, on the mock as it is and with `--mock-support m2` on the mock as what the emulator of
-M2 does, both with `--require-note "arm7: bl stepped over and out"`. The gates are run against
+and its ARM7 takes no interrupt). The mock's gate is `npm run contract -- --milestone M3`
+(in-process, profile mock): 18 scenarios, S16 with its five parts and S17 with its two.
+`npm run check` runs it on the mock as it is and with `--mock-support m3` on the mock as what
+the emulator of M3 does, both with `--require-note "arm7: bl stepped over and out"`, and the
+two runs of `--dsp-program` on the mock with their notes. The gates are run against
 a server with the default tick period (200 ms, every fifth periodic tick full): the time bounds
 of the scenarios are written for it. The runner measures them on the monotonic clock: setting
 the wall clock while a run is under way neither ends a wait early nor makes it longer.
