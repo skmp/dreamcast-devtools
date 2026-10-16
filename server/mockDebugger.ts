@@ -409,7 +409,7 @@ const deviceTree = (m2: boolean): NodeSpec[] => [
     label: "Dreamcast",
     description: "beloved console",
     registers: [reg("SYSCLK", 0, "200MHz"), reg("BUILD", 0, "nullDC 3.0.0 mock")],
-    // a server lists the events it can raise: nothing raises dc.debugger.dsp_forced
+    // a server lists the events it can raise, and no other
     events: ["dc.system.reset", "dc.system.state", "dc.debugger.engine", "dc.debugger.note"],
     children: [
       {

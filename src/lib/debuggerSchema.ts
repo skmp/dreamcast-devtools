@@ -314,7 +314,6 @@ export const CAPABILITIES = {
   // the emulator at the moment of the call; the live form is the tick (`notice`, `dc.timing`)
   SH4_DEBUG_NATIVE: "sh4-debug-native",
   SH4_DEBUG_FALLBACK: "sh4-debug-fallback",
-  DSP_FORCED: "dsp-forced",
 } as const;
 
 export const TABLE_IDS = ["tlb", "sq", "icache", "ocache", "ocram"] as const;
