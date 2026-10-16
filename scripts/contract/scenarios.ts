@@ -3763,7 +3763,9 @@ const sgcCapturePart = async (context: RunContext): Promise<void> => {
       await ensurePaused(context).catch(() => undefined);
     }
   } else {
+    // (4096 frames all the same, from a stop: the bound is accepted, and the client takes its frame of 32 MiB)
     context.note(`the capture held open at a DSP breakpoint was not made: ${dsp ? "targets: dsp.stepping is false" : 'no target "dsp"'}`);
+    captures.push(await captureFromPaused(context, PROTOCOL_BOUNDS.sgcFrames.max, whileRunning));
   }
 
   // the sounding guest keys two channels: a capture of it has a channel that sounds

@@ -254,6 +254,13 @@ describe("S17, part sgcCapture", () => {
     expect(M3_NOTES).toEqual({ sgcHeld: "sgc: captured with the arm7 held", dspHeld: "dsp: stepped with the arm7 held" });
   }, 60_000);
 
+  it("a server whose DSP does not step: no capture is held open, and 4096 frames are captured from a stop", async () => {
+    const lines: string[] = [];
+    const summary = await s17({ supports: { stepping: ["sh4", "arm7"] } }, undefined, { say: (line) => lines.push(line) }, "sgcCapture");
+    expect(partOf(summary, "sgc capture")).toEqual({ name: "sgc capture", status: "passed" });
+    expect(summary.scenarios[0].notes).toEqual(["the capture held open at a DSP breakpoint was not made: targets: dsp.stepping is false"]);
+  }, 60_000);
+
   it("broken server 6, inverted: a capture that is answered -32012 while the ARM7 is held fails S17", async () => {
     const summary = await s17(ANCHORED, refusedWhileHeld((request) => request.method === "state.recordSgcFrames"), { dspProgram: true }, "sgcCapture");
     expect(statusOf(summary, "S17")).toBe("failed");
