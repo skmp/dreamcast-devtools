@@ -3814,6 +3814,9 @@ const sameAsSlice = (payload: Uint8Array, slice: { data: number[] }, what: strin
   );
 };
 
+/** Where the large reads of S17 are compared past their first 64 KiB: a read that is zeros there from a size on is told apart. */
+const PAST_FIRST_64_KIB = 0x10000;
+
 /** S17, part `memoryBinary` (`memory-binary`; the M3 round's 3.1 item 3, M3-D36). */
 const memoryBinaryPart = async (context: RunContext): Promise<void> => {
   const { session } = context;
@@ -3847,40 +3850,64 @@ const memoryBinaryPart = async (context: RunContext): Promise<void> => {
   await session.expectError("state.getMemoryBinary", { target: "sh4", address: 0x0c000000, length: PROTOCOL_BOUNDS.memoryBinaryLength.max + 1 }, -32602);
   check((await session.waitForBinary(before, 200)) === undefined, "a binary frame followed an error of state.getMemoryBinary");
 
-  // the bound: 16 MiB of main memory, whose last 64 bytes are those of state.getMemorySlice
+  // The bound: 16 MiB of main memory. Its bytes are compared with state.getMemorySlice in a window
+  // just past its first 64 KiB, at 0x0C010000 (the entry code of a program at 0x8C010000: the
+  // guest's _start, 2ndmix's 1ST_READ), and in its last 64 bytes (the top of a stack, which can
+  // be zeros: a read that is zeros past its first 64 KiB is told apart by the first window).
   const most = PROTOCOL_BOUNDS.memoryBinaryLength.max;
   const main = await readBinary(session, { target: "sh4", address: 0x0c000000, length: most });
-  sameAsSlice(main.payload.subarray(most - 64), await sliceOf(context, "sh4", 0x0c000000 + most - 64, 64), "the last 64 bytes of a read of 16 MiB from 0x0C000000");
   check(main.result.unreadable === undefined, `16 MiB of main memory from 0x0C000000: unreadable is ${JSON.stringify(main.result.unreadable)}`);
+  const windows: Uint8Array[] = [main.payload.subarray(PAST_FIRST_64_KIB, PAST_FIRST_64_KIB + 64)];
+  sameAsSlice(windows[0], await sliceOf(context, "sh4", 0x0c000000 + PAST_FIRST_64_KIB, 64), "a read of 16 MiB from 0x0C000000, at 0x0C010000 past its first 64 KiB");
+  sameAsSlice(main.payload.subarray(most - 64), await sliceOf(context, "sh4", 0x0c000000 + most - 64, 64), "the last 64 bytes of a read of 16 MiB from 0x0C000000");
 
-  // wave memory is one store behind both targets, over its 2 MiB
+  // wave memory is one store behind both targets, over its 2 MiB; and the ARM7's read is the
+  // ARM7's slice past its first 64 KiB (the guest's sine at 0x10000) and in its last 64 bytes
   if (targetOf(session.shape, "arm7")?.memory) {
     const wave = 0x200000;
     const arm7 = await readBinary(session, { target: "arm7", address: 0, length: wave });
     const viaSh4 = await readBinary(session, { target: "sh4", address: 0x00800000, length: wave });
     const differs = arm7.payload.findIndex((byte, offset) => viaSh4.payload[offset] !== byte);
     check(differs === -1, `wave memory: byte ${hex(differs)} reads ${arm7.payload[differs]} through the ARM7 and ${viaSh4.payload[differs]} through the SH4 at 0x00800000 + ${hex(differs)}`);
+    windows.push(arm7.payload.subarray(PAST_FIRST_64_KIB, PAST_FIRST_64_KIB + 64));
+    sameAsSlice(windows[1], await sliceOf(context, "arm7", PAST_FIRST_64_KIB, 64), "2 MiB of wave memory through the ARM7, at 0x00010000 past its first 64 KiB");
     sameAsSlice(arm7.payload.subarray(wave - 64), await sliceOf(context, "arm7", wave - 64, 64), "the last 64 bytes of 2 MiB of wave memory through the ARM7");
   }
-
-  // binaryId: per connection, one counter for the frames of every kind
-  const ids: number[] = [];
-  if (hasCapability(context, CAPABILITIES.SGC_CAPTURE)) {
-    const from = session.binary.length;
-    const capture = await session.outcome("state.getSgcFrameData", {});
-    if ("result" in capture) {
-      ids.push((capture.result as { binaryId: number }).binaryId);
-      // (its frame, so that the frames behind it are those of the reads)
-      await session.waitForBinary(from, session.scale(10_000));
-    }
+  if (!windows.some((window) => window.some((byte) => byte !== 0))) {
+    context.note("memory binary: the memory reads 0 in every window past the first 64 KiB of the large reads, so a read that is zeros past its first 64 KiB is not told apart");
   }
-  ids.push((await readBinary(session, { target: "sh4", address: 0x8c010000, length: 16 })).result.binaryId);
-  ids.push((await readBinary(session, { target: "sh4", address: 0x8c010000, length: 16 })).result.binaryId);
+
+  // binaryId: per connection from 1, one counter for the frames of every kind (M3-D36). The
+  // kinds interleaved, a read, a capture's read, a read: their ids increase with one counter
+  // only, since with a counter for each kind the second read has the id right behind the first.
+  const read = async () => (await readBinary(session, { target: "sh4", address: 0x8c010000, length: 16 })).result.binaryId;
+  if (!hasCapability(context, CAPABILITIES.SGC_CAPTURE)) {
+    const ids = [await read(), await read()];
+    check(ids[1] > ids[0], `binaryIds ${ids.join(", ")} of two requests in a row do not increase (M3-D36)`);
+    context.note('memory binary: no capability "sgc-capture", so the counter kind 1 shares with kind 2 was not exercised');
+    return;
+  }
+  const from = session.binary.length;
+  const existing = await session.outcome("state.getSgcFrameData", {});
+  if ("result" in existing) {
+    // (its frame, so that the frames behind it are those of the reads)
+    await session.waitForBinary(from, session.scale(10_000));
+  } else if (existing.error.code === -32011) {
+    // no capture yet (the part alone): one of a frame, from a stop, to read between the reads
+    const stop = (await ensurePaused(context)).tick;
+    const mark = session.mark();
+    await session.call("state.recordSgcFrames", { frames: 1 });
+    await session.waitForTick((tick) => isPaused(tick) && stopIdOf(tick) > stopIdOf(stop), 5000, 'the stop of state.recordSgcFrames {"frames":1}, a capture to read between two reads', mark);
+  } else {
+    return fail(`state.getSgcFrameData {}: ${existing.inBand ? "in-band" : "JSON-RPC"} error ${existing.error.code} "${existing.error.message}"`);
+  }
+  const ids = [await read(), (await readCapture(session, "state.getSgcFrameData between two reads of state.getMemoryBinary")).binaryId, await read()];
   check(
-    ids.every((id, position) => position === 0 || id > ids[position - 1]),
-    `binaryIds ${ids.join(", ")} of requests in a row do not increase; a connection has one counter for the binary frames of every kind (M3-D36)`,
+    ids[0] < ids[1] && ids[1] < ids[2],
+    `binaryIds ${ids.join(", ")} of state.getMemoryBinary, state.getSgcFrameData and state.getMemoryBinary in a row do not increase; a connection has one counter for the binary frames of every kind (M3-D36)`,
   );
 };
+
 
 const s17: Scenario = {
   id: "S17",
@@ -3964,11 +3991,14 @@ const s21: Scenario = {
     };
 
     // The first act, at the first stop (under --dsp-program the anchor): with the ARM7 held a
-    // step of the DSP is a step all the same.
+    // step of the DSP is a step all the same, and what the DSP cannot do is -32004 as ever, not
+    // -32012 (refused, the two change nothing in front of the step).
     const first = await ensurePaused(context);
     let atDspStop = false;
     if (targetOf(session.shape, "arm7") !== undefined && !arm7Clocked(first.tick)) {
       try {
+        await session.expectError("control.stepOver", { target: "dsp" }, -32004);
+        await session.expectError("control.stepOut", { target: "dsp" }, -32004);
         await stepDsp(false, "control.step {dsp} with the ARM7 held");
       } catch (error) {
         if (error instanceof ContractFailure) {
@@ -4139,7 +4169,8 @@ const s21: Scenario = {
     await ensureRunning(context);
     await session.expectError("control.step", { target: "dsp" }, -32003);
     await ensurePaused(context);
-    // there is nothing to step over or out of in a DSP program
+    // there is nothing to step over or out of in a DSP program (with the ARM7 held at the first
+    // stop, they were asked there as well)
     await session.expectError("control.stepOver", { target: "dsp" }, -32004);
     await session.expectError("control.stepOut", { target: "dsp" }, -32004);
 

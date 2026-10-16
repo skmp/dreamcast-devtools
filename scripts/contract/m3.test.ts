@@ -29,6 +29,8 @@ afterEach(closeServers);
 interface Machine {
   running: boolean;
   cycles: bigint;
+  nextBurst: bigint;
+  stopBreakpointId: number | undefined;
   arm7HeldFor: number | undefined;
   suspended: { sample: number; step: number; exempt: boolean } | undefined;
   recording: { client: unknown; id: number; frames: number; endAt: bigint; stopAtEnd: boolean; deadline: ReturnType<typeof setTimeout> } | undefined;
@@ -44,7 +46,7 @@ interface Machine {
   leaveStop(): void;
   isActive(breakpoint: { id: number; event: string; enabled: boolean }): boolean;
   activeDspBreakpoints(): Map<number, number>;
-  runBurst(sample: number, step: number, exempt: boolean): boolean;
+  runBurst(sample: number, step: number, exempt: boolean, last?: number): boolean;
   finishBurst(): void;
   completeSample(): void;
   stepDsp(): void;
@@ -475,10 +477,16 @@ describe("S17, part sgcCapture", () => {
 
 describe("S17, part memoryBinary", () => {
   it("the mock passes; without the capability the part is not applicable", async () => {
+    // (alone, the part makes a capture of one frame to read between its two last reads)
     const summary = await s17(undefined, undefined, {}, "memoryBinary");
     expect(partOf(summary, "memory binary")).toEqual({ name: "memory binary", status: "passed" });
+    expect(summary.scenarios[0].notes).toEqual([]);
     const m2 = await s17({ supports: MOCK_M2_SUPPORT });
     expect(reportOf(m2)).toEqual(['S17 not-applicable no capability "sgc-capture"; no capability "memory-binary"']);
+    // a server without the capture: the counter kind 1 shares is not exercised, and the part says so
+    const noCapture = await s17({ supports: { ...MOCK_M3_SUPPORT, capabilities: MOCK_M3_SUPPORT.capabilities.filter((capability) => capability !== "sgc-capture") } });
+    expect(partOf(noCapture, "memory binary")).toEqual({ name: "memory binary", status: "passed" });
+    expect(noCapture.scenarios[0].notes).toEqual(['memory binary: no capability "sgc-capture", so the counter kind 1 shares with kind 2 was not exercised']);
   }, 60_000);
 
   it("broken server 1: no method, a frame of another kind, another length or other bytes than the memory", async () => {
@@ -507,7 +515,7 @@ describe("S17, part memoryBinary", () => {
     }
   }, 120_000);
 
-  it("a frame that goes to every client, and a read of 16 MiB that is zeros behind its first 64 KiB", async () => {
+  it("a frame that goes to every client; large reads that are zeros past their first 64 KiB, their last 64 bytes kept or not, and a read of 16 MiB whose last 64 bytes alone differ", async () => {
     const broadcast = patched((machine) => {
       const binary = machine.getMemoryBinary.bind(machine);
       machine.getMemoryBinary = (params, context) => {
@@ -525,27 +533,86 @@ describe("S17, part memoryBinary", () => {
     expect(partOf(everyone, "memory binary")?.detail).toBe(
       "a second connection received a binary frame of a state.getMemoryBinary it did not ask for; the frame goes to the requesting client only (M3-D36)",
     );
-    const zeros: Faults = {
-      toClientBinary: (frame) => (frame.readUInt32LE(4) === BinaryFrameKind.MEMORY && frame.length > 16 + 65536 ? Buffer.concat([frame.subarray(0, 16 + 65536), Buffer.alloc(frame.length - 16 - 65536)]) : frame),
-    };
-    const short = await s17(undefined, zeros, {}, "memoryBinary");
-    expect(partOf(short, "memory binary")?.detail).toMatch(/^the last 64 bytes of a read of 16 MiB from 0x0C000000: byte \d+ is 0, state\.getMemorySlice reads \d+ there$/);
-  }, 60_000);
-
-  it("binaryId counted per kind, a frame in front of its response, a frame behind an error", async () => {
-    const perKind = patched((machine) => {
-      let memory = 0;
-      machine.getMemoryBinary = (params, context) => {
-        const target = machine.memoryTarget(params);
-        const { data, unreadable } = machine.readMemory(target, params.address as number, params.length as number);
-        const binaryId = ++memory;
-        context.afterResponse.push(() => context.client.connection.sendBinary(encodeBinaryFrame(BinaryFrameKind.MEMORY, binaryId, data)));
-        return { baseAddress: params.address, totalBytes: data.byteLength, ...(unreadable.length ? { unreadable } : {}), binaryId };
+    /** the frames of kind 2 whose payload has `length` bytes: zeros past their first 64 KiB (but their last 64 bytes, with `tail`), or their last byte changed */
+    const large = (length: number, change: "zeros" | "zeros, tail kept" | "last byte"): Faults => ({
+      toClientBinary: (frame) => {
+        if (frame.readUInt32LE(4) !== BinaryFrameKind.MEMORY || frame.length !== 16 + length) return frame;
+        const copy = Buffer.from(frame);
+        if (change === "last byte") {
+          copy[copy.length - 1] ^= 0xff;
+        } else {
+          copy.fill(0, 16 + 0x10000, change === "zeros" ? copy.length : copy.length - 64);
+        }
+        return copy;
+      },
+    });
+    const sixteen = 16 * 1048576;
+    // (the server of a guest whose stack, at the top of main memory, is zeros: the window at 0x0C010000 tells)
+    for (const change of ["zeros", "zeros, tail kept"] as const) {
+      const short = await s17(undefined, large(sixteen, change), {}, "memoryBinary");
+      expect(partOf(short, "memory binary")?.detail, change).toMatch(/^a read of 16 MiB from 0x0C000000, at 0x0C010000 past its first 64 KiB: byte \d+ is 0, state\.getMemorySlice reads \d+ there$/);
+    }
+    const tail = await s17(undefined, large(sixteen, "last byte"), {}, "memoryBinary");
+    expect(partOf(tail, "memory binary")?.detail).toMatch(/^the last 64 bytes of a read of 16 MiB from 0x0C000000: byte 63 is \d+, state\.getMemorySlice reads \d+ there$/);
+    // wave memory, both reads alike (so that they agree with each other)
+    const wave = await s17(undefined, large(0x200000, "zeros, tail kept"), {}, "memoryBinary");
+    expect(partOf(wave, "memory binary")?.detail).toMatch(/^2 MiB of wave memory through the ARM7, at 0x00010000 past its first 64 KiB: byte \d+ is 0, state\.getMemorySlice reads \d+ there$/);
+    // memory that reads 0 in every window past 64 KiB, in both methods: the part passes, and says that it could not tell
+    const zeroWindows = patched((machine) => {
+      const readMemory = machine.readMemory.bind(machine);
+      machine.readMemory = (target, address, length) => {
+        const read = readMemory(target, address, length);
+        const windows = target === "sh4" ? [0x0c010000, 0x00810000] : [0x10000];
+        for (let offset = 0; offset < length; offset++) {
+          const at = target === "sh4" ? (address + offset) & 0x1fffffff : address + offset;
+          if (windows.some((start) => at >= start && at < start + 64)) read.data[offset] = 0;
+        }
+        return read;
       };
     });
-    // (both parts: the captures of sgcCapture put frames of kind 1 in front of the reads)
-    const ids = await s17(perKind, undefined, {});
-    expect(partOf(ids, "memory binary")?.detail).toMatch(/^binaryIds \d+, \d+, \d+ of requests in a row do not increase; a connection has one counter for the binary frames of every kind \(M3-D36\)$/);
+    const zero = await s17(zeroWindows, undefined, {}, "memoryBinary");
+    expect(partOf(zero, "memory binary")).toEqual({ name: "memory binary", status: "passed" });
+    expect(zero.scenarios[0].notes).toEqual([
+      "memory binary: the memory reads 0 in every window past the first 64 KiB of the large reads, so a read that is zeros past its first 64 KiB is not told apart",
+    ]);
+  }, 120_000);
+
+  it("binaryId counted per kind, a frame in front of its response, a frame behind an error", async () => {
+    /** a server that counts the frames of kind 2 apart from those of kind 1; with `spends`, an error of the method takes an id too */
+    const perKind = (options: MockDebuggerOptions = {}, spends = false) =>
+      patched((machine) => {
+        let memory = 0;
+        machine.getMemoryBinary = (params, context) => {
+          let read: ReturnType<Machine["readMemory"]>;
+          try {
+            read = machine.readMemory(machine.memoryTarget(params), params.address as number, params.length as number);
+          } catch (error) {
+            if (spends) memory++;
+            throw error;
+          }
+          const binaryId = ++memory;
+          context.afterResponse.push(() => context.client.connection.sendBinary(encodeBinaryFrame(BinaryFrameKind.MEMORY, binaryId, read.data)));
+          return { baseAddress: params.address, totalBytes: read.data.byteLength, ...(read.unreadable.length ? { unreadable: read.unreadable } : {}), binaryId };
+        };
+      }, options);
+    // A read, a capture's read, a read: with a counter for each kind the second read has the id
+    // right behind the first, whatever the connection had before, so no id of kind 1 fits in
+    // between. The whole of S17 (the captures of sgcCapture in front), the part alone (it makes a
+    // capture of its own), a server whose DSP does not step (a capture fewer), and one that spends
+    // ids on the errors of the method.
+    for (const [label, server, part] of [
+      ["S17", perKind(), undefined],
+      ["the part alone", perKind(), "memoryBinary"],
+      ["the DSP not stepping", perKind({ supports: { stepping: ["sh4", "arm7"] } }), undefined],
+      ["ids spent on errors", perKind({}, true), undefined],
+      ["ids spent on errors, the part alone", perKind({}, true), "memoryBinary"],
+    ] as const) {
+      const summary = await s17(server, undefined, {}, part);
+      const detail = partOf(summary, "memory binary")?.detail ?? "";
+      const ids = /^binaryIds (\d+), (\d+), (\d+) of state\.getMemoryBinary, state\.getSgcFrameData and state\.getMemoryBinary in a row do not increase; a connection has one counter for the binary frames of every kind \(M3-D36\)$/.exec(detail);
+      expect(ids, `${label}: ${detail}`).not.toBeNull();
+      expect(Number(ids![3]), label).toBe(Number(ids![1]) + 1);
+    }
 
     const early = await s17(undefined, { afterNextBinary: (frame) => typeof (frame.result as Json | undefined)?.baseAddress === "number" && (frame.result as Json).totalBytes !== undefined }, {}, "memoryBinary");
     expect(partOf(early, "memory binary")?.detail).toMatch(/the binary frame of state\.getMemoryBinary arrived before its JSON response; the response is sent first, the binary frame second/);
@@ -598,11 +665,27 @@ describe("S21", () => {
   }, 60_000);
 
   it("broken server 6, inverted: a step of the DSP answered -32012 while the ARM7 is held fails S21", async () => {
-    const summary = await s21(ANCHORED, refusedWhileHeld((request) => /^control\.step/.test(String(request.method)) && paramsOf(request).target === "dsp"));
+    // (control.step alone: step over and step out are -32004 held or not, the test below)
+    const summary = await s21(ANCHORED, refusedWhileHeld((request) => request.method === "control.step" && paramsOf(request).target === "dsp"));
     expect(statusOf(summary, "S21")).toBe("failed");
     expect(firstOf(summary, "S21")).toMatch(
       /^with the ARM7 held \(ENABLED reads 0\) at the first stop of S21: control\.step \{"target":"dsp"\}: in-band error -32012 .*; the AICA is clocked whatever ARMRST says: .* \(the M3 round's M3-D7\)$/,
     );
+  }, 60_000);
+
+  it("with the ARM7 held, step over and step out of the DSP are -32004 as ever: a server that answers -32012 for them while the ARM7 is held fails S21", async () => {
+    const overOrOut = (request: Json) => /^control\.step(Over|Out)$/.test(String(request.method)) && paramsOf(request).target === "dsp";
+    for (const method of ["control.stepOver", "control.stepOut"]) {
+      const summary = await s21(ANCHORED, refusedWhileHeld((request) => request.method === method && paramsOf(request).target === "dsp"));
+      expect(statusOf(summary, "S21")).toBe("failed");
+      expect(firstOf(summary, "S21"), method).toMatch(
+        new RegExp(
+          `^with the ARM7 held \\(ENABLED reads 0\\) at the first stop of S21: ${method.replace(".", "\\.")} \\{"target":"dsp"\\}: expected the error -32004, got -32012 "[^"]*"; the AICA is clocked whatever ARMRST says: .* \\(the M3 round's M3-D7\\)$`,
+        ),
+      );
+    }
+    // (the same server with its ARM7 clocked answers -32004, as the mock does: S21 passes)
+    expect(reportOf(await s21(undefined, refusedWhileHeld(overOrOut)))).toEqual(["S21 passed "]);
   }, 60_000);
 
   it("the server that behaves as the emulator on the guest passes: the ARM7 held at the anchor, the DSP clocked there, the program loaded behind it, its words in the ELF", async () => {
@@ -621,7 +704,7 @@ describe("S21", () => {
   it("the rules of the resume from a DSP breakpoint: no exemption, a breakpoint reached once a burst", async () => {
     const noExemption = patched((machine) => {
       const runBurst = machine.runBurst.bind(machine);
-      machine.runBurst = (sample, step) => runBurst(sample, step, false);
+      machine.runBurst = (sample, step, _exempt, last) => runBurst(sample, step, false, last);
     });
     const once = await s21(noExemption);
     expect(detailOf(once, "S21")).toMatch(/^a resume from the stop of the DSP breakpoint on step \d+ stopped at it again with MDEC_CT (0x[0-9A-F]+), it was \1: expected one less, the same step one sample later/);
