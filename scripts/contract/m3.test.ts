@@ -356,7 +356,7 @@ describe("S17, part sgcCapture", () => {
     expect(reordered).toBeGreaterThanOrEqual(3);
   }, 60_000);
 
-  it("broken server 3: a server that cannot record while the target runs, or that stops it for the capture", async () => {
+  it("broken server 3: a server that cannot record while the target runs, that stops it for the capture, or that is paused behind it", async () => {
     const refused = (): Faults => {
       const watch = watchingEnabled();
       return { toClient: watch.toClient, answer: (request) => (request.method === "state.recordSgcFrames" && watch.state.running ? inBand(request, -32003, "not paused") : undefined) };
@@ -372,6 +372,23 @@ describe("S17, part sgcCapture", () => {
     });
     const stopped = await s17(stops, undefined, {}, "sgcCapture");
     expect(partOf(stopped, "sgc capture")?.detail).toMatch(/^state\.recordSgcFrames while running stopped the target \(#\d+ paused stop \d+ capture\); a running target keeps running$/);
+    // paused behind the capture with no new stop: a paused tick that keeps the stopId of the run
+    const quietly = patched((machine) => {
+      const completeCapture = machine.completeCapture.bind(machine);
+      machine.completeCapture = (stop) => {
+        const whileRunning = machine.recording?.stopAtEnd === false;
+        const madeAStop = completeCapture(stop);
+        if (whileRunning) {
+          const quiet = machine as unknown as { reason: string; broadcastTick(): void };
+          machine.running = false;
+          quiet.reason = "pause";
+          quiet.broadcastTick();
+        }
+        return madeAStop;
+      };
+    });
+    const still = await s17(quietly, undefined, {}, "sgcCapture");
+    expect(partOf(still, "sgc capture")?.detail).toMatch(/^the target does not run behind a capture while running: #\d+ paused stop \d+ pause$/);
   }, 60_000);
 
   it("broken server 4: a server that ignores frames when it is absent, or that runs for any time between the request and the stop", async () => {
