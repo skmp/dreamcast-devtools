@@ -11,7 +11,7 @@
     "build": "npm run build:native",
     "build:native": "tsc -b && vite build --outDir dist-native",
     "build:wasm": "tsc -b && cross-env VITE_TRANSPORT_MODE=wasm vite build --outDir dist-wasm",
-    "build:dspsim": "cd crates/aica-dsp && wasm-pack build --target web --out-dir ../../src/wasm/aica-dsp && node -e \"require('node:fs').rmSync('../../src/wasm/aica-dsp/.gitignore', { force: true })\"",
+    "build:dspsim": "tsx --tsconfig tsconfig.scripts.json scripts/build-dspsim.ts",
     "lint": "eslint .",
     "typecheck": "tsc -b",
     "test": "vitest",
