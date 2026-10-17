@@ -1879,7 +1879,8 @@ export const DspPlaygroundPanel = () => {
           </Button>
           <Box sx={{ flexGrow: 1 }} />
           {shareToken && (
-            <Tooltip title={DSP_SHARE_HELP}>
+            // describeChild: the help describes the button, whose name stays "Share"
+            <Tooltip title={DSP_SHARE_HELP} describeChild>
               <Button
                 variant="outlined"
                 size="small"
