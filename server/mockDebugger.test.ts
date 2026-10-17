@@ -34,6 +34,13 @@ interface Frame {
 
 const BASE_PATHS = ["dc.aica.arm7", "dc.aica.dsp", "dc.sh4.cpu", "dc.timing"];
 
+/**
+ * Real, monotonic time for the timing tests: performance.now taken at module load, before beforeEach's fake timers
+ * replace it (they stop performance.now() and process.hrtime()). Not vi.getRealSystemTime(): that is the wall clock
+ * (the real Date.now), which a host may step forward by seconds at any moment (a resync of the clock).
+ */
+const monotonicNow = performance.now.bind(performance);
+
 /** Every text frame the mock sent in a test, as sent: for the "no null" rule. */
 let wire: string[] = [];
 let mocks: MockDebugger[] = [];
@@ -2423,10 +2430,10 @@ describe("milestone M3", () => {
 
     it("reads 16 MiB of main memory within 2 s, and wave memory is one store behind both targets", () => {
       const { session } = setup();
-      // in real time: the fake timers of this file stop performance.now() and process.hrtime()
-      const started = vi.getRealSystemTime();
+      // in real time, on the monotonic clock (monotonicNow): the fake timers of this file stop performance.now()
+      const started = monotonicNow();
       const result = session.ok("state.getMemoryBinary", { address: 0x0c000000, length: 16777216 }) as { totalBytes: number; unreadable?: unknown };
-      const elapsed = vi.getRealSystemTime() - started;
+      const elapsed = Math.round(monotonicNow() - started);
       expect(elapsed, `${elapsed} ms`).toBeLessThan(2000);
       expect(result.totalBytes).toBe(16777216);
       expect(result.unreadable).toBeUndefined();
