@@ -15,6 +15,26 @@ const registerValue = async (page: Page, name: string) => Number((await register
 const plot = (page: Page, label: string): Locator =>
   page.getByText(label, { exact: true }).locator("xpath=ancestor::div[.//canvas][1]").locator("canvas");
 
+/** A mono WAV file of 32-bit float samples (format 3), whose samples can be beyond full scale. */
+const floatWav = (rate: number, samples: Float32Array): Buffer => {
+  const data = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + data.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(3, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(rate, 24);
+  header.writeUInt32LE(rate * 4, 28);
+  header.writeUInt16LE(4, 32);
+  header.writeUInt16LE(32, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(data.length, 40);
+  return Buffer.concat([header, data]);
+};
+
 const expandDebugger = async (page: Page) => {
   await page.getByRole("heading", { name: "Debugger" }).locator("xpath=following-sibling::button").click();
   await expect(page.getByText("Disassembly", { exact: true })).toBeVisible();
@@ -318,6 +338,64 @@ test("the keyboard input drives the input plot and the program's output plot, at
   } finally {
     await page.keyboard.up("z");
   }
+  await page.getByRole("button", { name: "Stop DSP" }).click();
+});
+
+test("a file's input is limited to 16 bits, and MIXS shows the bank the DSP reads", async ({ page }) => {
+  // In 00 is a file whose samples alternate between 1.05, past full scale, and -0.25: the inputs of the samples
+  // n = 0, 1, 2, ... are 32767 (limited to 16 bits) and -8192, sent as << 4. Without the limit, 34405 << 4 wraps
+  // in MIXS's 20 bits to -498096, an input and an output of the other sign. The DSP reads in sample n what step 0 of
+  // sample n - 1 sent, from the bank it has (MIXS_BANK), and the banks change every sample: shown at the end of a
+  // sample n (Sample n + 1, Step 0), MIXS[0] is the input of sample n - 1 and EFREG[0] (In 00 times 4095 / 4096,
+  // SHIFTED[23:8]) its output, 32759 or -8190; the other bank has the input of sample n
+  await page.getByRole("tab", { name: "Assembler" }).click();
+  await expect(editorStatus(page)).toHaveText("Assembled");
+  await monacoReplaceAll(
+    page,
+    monacoEditor(page),
+    "COEF[0] = 32760\nMPRO[0] = XSEL:1 YSEL:1 IRA:32 ZERO:1\nMPRO[1] = EWT:1 EWA:0\n",
+  );
+  await expect(editorStatus(page)).toHaveText("Assembled");
+
+  // the file at the rate its decoder resamples to, so that its samples come back as they are; 10 s
+  const rate = await page.evaluate(async () => {
+    const context = new AudioContext();
+    const { sampleRate } = context;
+    await context.close();
+    return sampleRate;
+  });
+  const samples = new Float32Array(10 * rate).map((_, n) => (n % 2 === 0 ? 1.05 : -0.25));
+  const input = page.getByText("In 00", { exact: true }).locator("xpath=ancestor::div[.//canvas][1]");
+  await input.getByRole("combobox").click();
+  const chooser = page.waitForEvent("filechooser");
+  await page.getByRole("option", { name: "Add audio file..." }).click();
+  await (await chooser).setFiles({ name: "past-full-scale.wav", mimeType: "audio/wav", buffer: floatWav(rate, samples) });
+  // decoded, at the rate it was written at
+  await expect(page.getByText(new RegExp(`^10\\.00s, ${rate}Hz, `))).toBeVisible();
+  await expect(input.getByRole("combobox")).not.toHaveAttribute("aria-disabled", "true");
+
+  await page.getByRole("button", { name: "Start DSP" }).click();
+  await expandDebugger(page);
+  await tooltipButton(page, "Pause").click();
+  await expect(tooltipButton(page, "Step")).toBeEnabled();
+  await expect(register(page, "Step")).toHaveText(/^\s*0$/);
+  const sample = await registerValue(page, "Sample");
+  expect(sample + 2, "the run before the pause stays inside the file").toBeLessThan(samples.length);
+
+  const inputOf = (n: number) => (n % 2 === 0 ? 32767 : -8192);
+  const outputOf = (n: number) => (n % 2 === 0 ? 32759 : -8190);
+  const banks = new Set<number>();
+  for (const n of [sample, sample + 1]) {
+    await tooltipButton(page, "Run to next sample").click();
+    await expect(register(page, "Sample")).toHaveText(new RegExp(`^\\s*${n + 1}$`));
+    await expect(register(page, "Step")).toHaveText(/^\s*0$/);
+    await expect(register(page, "MIXS[0]"), `sample ${n}`).toHaveText(new RegExp(`^\\s*${inputOf(n - 1) * 16}$`));
+    await expect(register(page, "EFREG[0]"), `sample ${n}`).toHaveText(new RegExp(`^\\s*${outputOf(n - 1)}$`));
+    banks.add(await registerValue(page, "MIXS_BANK"));
+  }
+  // both banks were shown: in one of the two samples the bank the DSP reads is bank 1
+  expect([...banks].sort()).toEqual([0, 1]);
+
   await page.getByRole("button", { name: "Stop DSP" }).click();
 });
 

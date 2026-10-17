@@ -674,7 +674,9 @@ export const DspPlaygroundPanel = () => {
   }, [wasmInitialized]);
 
   // The sample of input `channel` for the sample the DSP starts next: a file at the sample counter, the
-  // keyboard (keyboardSample, null while the DSP is paused), or silence. 16 bit
+  // keyboard (keyboardSample, null while the DSP is paused), or silence. 16 bit: a channel of the console sends
+  // at most a 16 bit sample, and a file's can be beyond full scale (a decoded or resampled file's floats can pass
+  // +-1.0), so it is limited to 16 bits here; << 4 of more than that wraps in MIXS's 20 bits to the other sign
   const channelInput = useCallback((channel: number, keyboardSample: number | null): number => {
     const source = inputSourcesRef.current[channel];
     if (typeof source === "object" && source.type === "file") {
@@ -685,7 +687,7 @@ export const DspPlaygroundPanel = () => {
 
         // Read sample if within bounds, otherwise silent
         if (pos < channelData.length) {
-          return Math.round(channelData[pos] * 32767);
+          return Math.max(-32768, Math.min(32767, Math.round(channelData[pos] * 32767)));
         }
       }
       return 0;
