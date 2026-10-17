@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch --tsconfig tsconfig.server.json server/mockServer.ts",
     "mock:serve": "tsx --tsconfig tsconfig.server.json server/mockServer.ts",
-    "mock:dev": "npm run build:dspsim && tsx --tsconfig tsconfig.server.json server/mockServer.ts",
+    "mock:dev": "tsx --tsconfig tsconfig.server.json server/mockServer.ts",
     "mock:prod": "npm run build:native && cross-env NODE_ENV=production tsx --tsconfig tsconfig.server.json server/mockServer.ts",
     "build": "npm run build:native",
     "build:native": "tsc -b && vite build --outDir dist-native",
