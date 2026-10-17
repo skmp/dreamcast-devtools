@@ -138,6 +138,75 @@ test("Start DSP runs the program; paused, the debugger steps it one step, one sa
   await expect(page.getByRole("button", { name: "Start DSP" })).toBeVisible();
 });
 
+test("a breakpoint on the step a run starts from is passed, one on the step behind it stops the run", async ({ page }) => {
+  await expect(editorStatus(page)).toHaveText("Compiled");
+  await page.getByRole("button", { name: "Start DSP" }).click();
+  await expandDebugger(page);
+  await tooltipButton(page, "Pause").click();
+  await expect(tooltipButton(page, "Step")).toBeEnabled();
+  await expect(register(page, "Step")).toHaveText(/^\s*0$/);
+  await tooltipButton(page, "Step").click();
+  await expect(register(page, "Step")).toHaveText(/^\s*1$/);
+  const sample = await registerValue(page, "Sample");
+
+  for (const step of [1, 2]) {
+    const row = page.locator(`[data-address="${step}"]`);
+    await row.hover();
+    await row.locator(".breakpoint-gutter").click();
+    await expect(row.locator(".breakpoint-gutter")).toHaveAttribute("data-breakpoint", "enabled");
+  }
+
+  // from step 1: its breakpoint is passed, the one on step 2 stops the run
+  await tooltipButton(page, "Run to next sample").click();
+  await expect(register(page, "Step")).toHaveText(/^\s*2$/);
+  expect(await registerValue(page, "Sample")).toBe(sample);
+  // from step 2, the same: the run ends at step 1 of the next sample
+  await tooltipButton(page, "Run 128 samples").click();
+  await expect(register(page, "Step")).toHaveText(/^\s*1$/);
+  await expect(register(page, "Sample")).toHaveText(new RegExp(`^\\s*${sample + 1}$`));
+  // and the DSP running with the audio: Run passes step 1 and stops at step 2
+  await tooltipButton(page, "Run").click();
+  await expect(tooltipButton(page, "Step")).toBeEnabled();
+  await expect(register(page, "Step")).toHaveText(/^\s*2$/);
+  await expect(register(page, "Sample")).toHaveText(new RegExp(`^\\s*${sample + 1}$`));
+  await expect(page.locator(".current-instruction")).toHaveAttribute("data-address", "2");
+
+  await page.getByRole("button", { name: "Stop DSP" }).click();
+});
+
+test("the registers are the core's: whole MEMS words, EFREG as signed 16 bits, one read latch", async ({ page }) => {
+  // MEMS[0] = -0x100000, written as MEMS_H (bits 23:8) and MEMS_L (bits 7:0, which the CPU cannot write);
+  // EFREG[0] = SHIFTED[23:8] of MEMS[0] times COEF[0] (4095 / 4096)
+  await page.getByRole("tab", { name: "Assembler" }).click();
+  await expect(editorStatus(page)).toHaveText("Assembled");
+  await monacoReplaceAll(
+    page,
+    monacoEditor(page),
+    "COEF[0] = 32760\nMEMS_L[0] = 0x00\nMEMS_H[0] = 0xF000\nMEMS_L[1] = 0x5A\nMEMS_H[1] = 0x1234\nMPRO[0] = XSEL:1 YSEL:1 IRA:0 ZERO:1\nMPRO[1] = EWT:1 EWA:0\n",
+  );
+  await expect(editorStatus(page)).toHaveText("Assembled");
+
+  await page.getByRole("button", { name: "Start DSP" }).click();
+  await expandDebugger(page);
+  await tooltipButton(page, "Pause").click();
+  await expect(tooltipButton(page, "Step")).toBeEnabled();
+  await tooltipButton(page, "Run to next sample").click();
+
+  await expect(register(page, "MEMS[0]")).toHaveText(/^\s*-1048576$/);
+  await expect(register(page, "MEMS[0]")).toHaveAttribute("title", "0xF00000");
+  await expect(register(page, "MEMS[1]")).toHaveText(/^\s*1193050$/);
+  await expect(register(page, "MEMS[1]")).toHaveAttribute("title", "0x12345A");
+  await expect(register(page, "EFREG[0]")).toHaveText(/^\s*-4095$/);
+  await expect(register(page, "EFREG[0]")).toHaveAttribute("title", "0xF001");
+  await expect(register(page, "COEF[0]")).toHaveAttribute("title", "0x7FF8");
+  for (const name of ["LATCH", "LATCH_COPY", "MEMVAL", "MIXS_BANK", "ACC", "INPUTS"]) {
+    await expect(register(page, name)).toBeVisible();
+  }
+  await expect(page.getByText("MEMVAL[0]:", { exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Stop DSP" }).click();
+});
+
 test("Pause stops the DSP at once", async ({ page }) => {
   // regression (race): Pause calls AudioContext.suspend(), which is asynchronous. An audio
   // buffer that was already queued used to run 1024 more samples after the debugger showed
@@ -159,8 +228,11 @@ test("Pause stops the DSP at once", async ({ page }) => {
   }
 });
 
-test("the keyboard input drives the input plot and the program's output plot", async ({ page }) => {
-  // In 00 (MIXS[0], input 32) times COEF[0] (just under 1.0) -> Out 00 (EFREG[0])
+test("the keyboard input drives the input plot and the program's output plot, at the console's scale", async ({ page }) => {
+  // In 00 times COEF[0] (just under 1.0) -> Out 00 (EFREG[0]). The input goes to MIXS[0] as the console's
+  // sound generator sends it, its 16-bit sample << 4, the DSP reads it as INPUTS 32 (MIXS << 4) and EWT writes
+  // SHIFTED[23:8]: the output is the input, one sample later, as tall in its plot. An input written to MIXS at
+  // the old playground's scale, the sample itself, would come out 16 times lower: a flat line
   await page.getByRole("tab", { name: "Assembler" }).click();
   await expect(editorStatus(page)).toHaveText("Assembled");
   await monacoReplaceAll(
@@ -187,6 +259,13 @@ test("the keyboard input drives the input plot and the program's output plot", a
     // a 130 Hz sine instead of the flat line, on the input and on the output it is copied to
     await expect.poll(async () => (await canvasStats(input)).inkRows).toBeGreaterThan(15);
     await expect.poll(async () => (await canvasStats(output)).inkRows).toBeGreaterThan(15);
+    // the two plots show the same samples, one apart: the output is about as tall as the input
+    await expect
+      .poll(async () => {
+        const [inputRows, outputRows] = [(await canvasStats(input)).inkRows, (await canvasStats(output)).inkRows];
+        return inputRows > 15 && outputRows >= 0.75 * inputRows && outputRows <= 1.25 * inputRows;
+      })
+      .toBe(true);
     // an input without a source stays flat
     expect((await canvasStats(silentInput)).inkRows).toBeLessThan(5);
   } finally {
@@ -202,6 +281,10 @@ test("Share copies a link with the compiled program and Download Regs saves the 
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await expect(editorStatus(page)).toHaveText("Compiled");
 
+  // the help says where the link goes: the original online playground, whose DSP is not this one
+  await page.getByRole("button", { name: "Share" }).hover();
+  await expect(page.getByRole("tooltip")).toContainText("the original online AICA DSP playground");
+  await expect(page.getByRole("tooltip")).toContainText("Its DSP is not this one");
   await page.getByRole("button", { name: "Share" }).click();
   await expect(page.getByRole("button", { name: "Copied!" })).toBeVisible();
   const url = await page.evaluate(() => navigator.clipboard.readText());
