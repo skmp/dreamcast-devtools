@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
+import * as loader from "../wasm/aica-dsp-core/aica_dsp_core.mjs";
 import { AICA_DSP_RAM_BYTES, AICA_DSP_STEPS, aicaDsp, REG, VIEW, VIEW_WORDS } from "./aicaDsp";
 
 // aicaDsp, the playground's DSP: one core of the emulator's DSP with 2 MiB of wave RAM, behind the core's
@@ -39,6 +40,29 @@ describe("aicaDsp, the playground's DSP core", () => {
     await aicaDsp.initialize(readFileSync(WASM));
     expect(aicaDsp.ram[0x1ffffe]).toBe(0x5a);
     aicaDsp.ram[0x1ffffe] = 0;
+  });
+
+  it("has a loader whose exports are those its hand-written declarations name, with their values", () => {
+    expect(Object.keys(loader).sort()).toEqual(["AICA_DSP_API_VERSION", "FIELDS", "MEM_OP", "REG", "VIEW", "VIEW_WORDS", "loadAicaDsp"]);
+    expect(loader.AICA_DSP_API_VERSION).toBe(1);
+    expect({ ...loader.REG }).toEqual({
+      STEP: 0, SAMPLES: 1, MDEC_CT: 2, RBPL: 3, ACC: 4, Y_REG: 5, FRC_REG: 6, ADRS_REG: 7, LATCH: 8, LATCH_COPY: 9,
+      MEMVAL: 10, NOFL_PIPE: 11, MIXS_DSP: 12, MIXS_FILL: 13,
+    });
+    expect({ ...loader.VIEW }).toEqual({
+      step: 0, MDEC_CT: 1, INPUTS: 2, SHIFTED: 3, X: 4, Y: 5, B: 6, ACC: 7, FRC_REG: 8, Y_REG: 9, ADRS_REG: 10,
+      memval: 11, memval_nofl: 12, latch: 13, latch_copy: 14, mem_op: 15, mem_addr: 16, mem_data: 17, slot_taken: 18,
+      mixs_bank: 19,
+    });
+    expect(loader.VIEW_WORDS).toBe(20);
+    expect({ ...loader.MEM_OP }).toEqual({ NONE: 0, READ: 1, WRITE: 2, WRITE_NO_READ: 3, LOST: 4 });
+    expect(loader.FIELDS).toHaveLength(24);
+    // the arrays and calls of a core and of the module that the declarations give them
+    for (const name of ["ram", "coef", "madrs", "mpro", "temp", "mems", "mixs", "efreg", "exts", "view", "inputsMixs", "inputsFetchWords"] as const) {
+      expect(ArrayBuffer.isView(aicaDsp[name]), name).toBe(true);
+    }
+    expect(aicaDsp.wasm.decode([0, 0xb000, 0x0002, 0])).toMatchObject({ XSEL: 1, YSEL: 1, IRA: 32, ZERO: 1 });
+    expect(aicaDsp.wasm.unpack(aicaDsp.wasm.pack(-0x123400))).toBe(-0x123400);
   });
 
   it("has the core's registers by index, MIXS_DSP, MIXS_FILL and RBPL among them, and its views", () => {
