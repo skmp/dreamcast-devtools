@@ -291,6 +291,8 @@ interface ScriptedCaptures {
   server: ScriptedDebugger;
   /** the capture the server has from the next state.recordSgcFrames on */
   next(capture: Uint8Array): void;
+  /** the next state.getSgcFrameData answers this JSON-RPC error instead of the capture (or -32011) */
+  failNext(code: number, message: string): void;
   /** when each binary frame of state.getSgcFrameData was sent (performance.now of the test process) */
   readonly sentAt: number[];
 }
@@ -298,13 +300,15 @@ interface ScriptedCaptures {
 /**
  * A scripted server with the SGC capture: state.getSgcFrameData answers the server's capture
  * (`initial`, or -32011 while it has none) and sends it as one binary frame behind the
- * response; each state.recordSgcFrames makes the capture given by `next()` the server's.
+ * response, unless `failNext()` gave it an error to answer; each state.recordSgcFrames makes the
+ * capture given by `next()` the server's.
  */
 const serveCaptures = async (page: Page, initial: Uint8Array | null): Promise<ScriptedCaptures> => {
   const server = await serveScriptedDebugger(page);
   (server.shape.capabilities as string[]).push("sgc-capture");
   let current = initial;
   const pending: Uint8Array[] = [];
+  const failures: Array<{ code: number; message: string }> = [];
   const sentAt: number[] = [];
   let binaryId = 0;
   server.answer("state.recordSgcFrames", () => {
@@ -312,6 +316,10 @@ const serveCaptures = async (page: Page, initial: Uint8Array | null): Promise<Sc
     return {};
   });
   server.answer("state.getSgcFrameData", () => {
+    const failure = failures.shift();
+    if (failure) {
+      return jsonRpcError(failure.code, failure.message);
+    }
     if (!current) {
       return jsonRpcError(-32011, "no capture available");
     }
@@ -329,7 +337,12 @@ const serveCaptures = async (page: Page, initial: Uint8Array | null): Promise<Sc
       binaryId: id,
     };
   });
-  return { server, next: (capture) => pending.push(capture), sentAt };
+  return {
+    server,
+    next: (capture) => pending.push(capture),
+    failNext: (code, message) => failures.push({ code, message }),
+    sentAt,
+  };
 };
 
 const openAudio = async (page: Page, server: ScriptedDebugger) => {
@@ -598,6 +611,43 @@ test.describe("captures of a scripted server", () => {
     await clickAt(page, canvas, 1);
     await leaveCanvas(page, canvas);
     await expect(head).toHaveText(/HEAD:\s+40[89]\d:/);
+  });
+
+  test("only -32011 is \"no capture yet\": another error of the first fetch is logged, and the panel has no capture to show", async ({
+    page,
+    diagnostics,
+  }) => {
+    const logged = /^console\.error: Failed to fetch SGC frame data: JsonRpcException: boom/;
+    diagnostics.allow(logged, "the SGC panel logs a first fetch the server failed");
+    const sgc = await serveCaptures(page, null);
+    sgc.failNext(-32603, "boom");
+    const view = await openAudio(page, sgc.server);
+    await expect(view.getByText("Record some data to display here")).toBeVisible();
+    await expect(view.getByRole("button", { name: "Active (0)" })).toBeVisible();
+    await expect(view.locator("canvas")).toHaveCount(0);
+    // the error, logged once: a server that fails is not one that has nothing recorded yet
+    await expect.poll(() => diagnostics.all().filter((problem) => logged.test(problem))).toHaveLength(1);
+    expect(sgc.server.requestsOf("state.getSgcFrameData")).toHaveLength(1);
+  });
+
+  test("after a Record another error of the fetch is the alert's message, not \"no capture available\"", async ({ page, diagnostics }) => {
+    const logged = /^console\.error: Failed to record SGC frame data: JsonRpcException: boom/;
+    diagnostics.allow(logged, "the SGC panel logs a record whose fetch the server failed");
+    const sgc = await serveCaptures(page, null);
+    const view = await openAudio(page, sgc.server);
+    await expect(view.getByText("Record some data to display here")).toBeVisible();
+    // the record succeeds; the fetch behind it fails with the server's own error
+    sgc.next(buildCapture(64, { 2: { enabled: () => true } }));
+    sgc.failNext(-32603, "boom");
+    await tooltipButton(view, RECORD).click();
+    const alert = page.getByRole("alert");
+    await expect(alert).toHaveCount(1);
+    await expect(alert).toContainText("Record: boom");
+    await expect(alert).not.toContainText("no capture available");
+    await expect.poll(() => diagnostics.all().filter((problem) => logged.test(problem))).toHaveLength(1);
+    expect(sgc.server.requestsOf("state.recordSgcFrames")).toEqual([{ frames: 1024 }]);
+    expect(sgc.server.requestsOf("state.getSgcFrameData")).toHaveLength(2);
+    await expect(view.locator("canvas")).toHaveCount(0);
   });
 
   test("a channel with a level above 0 and flags bit 0 clear is not active; one enabled at level 0 is", async ({ page }) => {
