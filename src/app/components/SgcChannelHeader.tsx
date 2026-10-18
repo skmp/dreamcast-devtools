@@ -186,6 +186,16 @@ export const SgcChannelHeader = ({ channelIndex, channelData }: SgcChannelHeader
         </Typography>
       </HideOnHoverTooltip>
 
+      <HideOnHoverTooltip title="AEG State">
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ fontFamily: 'monospace', fontSize: '0.65rem' }}
+        >
+          {channelData.aegStateName.padEnd(7, '\u00A0')}
+        </Typography>
+      </HideOnHoverTooltip>
+
       <HideOnHoverTooltip title="FEG">
         <Typography
           variant="caption"
