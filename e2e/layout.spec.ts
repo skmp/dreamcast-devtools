@@ -7,7 +7,6 @@ import {
   openWorkspace,
   panel,
   saveScreenshot,
-  KNOWN,
   WORKSPACES,
   type WorkspaceId,
 } from "./support/fixtures";
@@ -155,10 +154,7 @@ for (const size of [
     test.use({ viewport: size });
 
     for (const workspace of WORKSPACES) {
-      test(`${workspace}: the default layout can be read, and every run control is there`, async ({ page, diagnostics }, testInfo) => {
-        if (workspace === "audio-debugger") {
-          diagnostics.allow(...KNOWN.sgcNoData);
-        }
+      test(`${workspace}: the default layout can be read, and every run control is there`, async ({ page }, testInfo) => {
         await openWorkspace(page, workspace);
         await expect(page.getByRole("status", { name: "Execution state" })).toHaveText("Paused · waiting at the start · stop 1");
 

@@ -11,7 +11,6 @@ import {
   tooltipButton,
   treeItem,
   treeItemRow,
-  KNOWN,
   WORKSPACES,
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
@@ -76,10 +75,7 @@ const CALLSTACKS: Record<string, RegExp> = {
 };
 
 for (const workspace of WORKSPACES) {
-  test(`${workspace}: every default panel is mounted and shows data from the server`, async ({ page, diagnostics }) => {
-    if (workspace === "audio-debugger") {
-      diagnostics.allow(...KNOWN.sgcNoData);
-    }
+  test(`${workspace}: every default panel is mounted and shows data from the server`, async ({ page }) => {
     await openWorkspace(page, workspace);
     const expected = DEFAULT_PANELS[workspace];
     for (const [id, content] of Object.entries(expected)) {
@@ -160,11 +156,9 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
 
 test("the panel selector offers every panel that is not in the dock, and each one mounts with content", async ({
   page,
-  diagnostics,
   rpc,
 }) => {
   test.slow();
-  diagnostics.allow(...KNOWN.sgcNoData);
   await openWorkspace(page, "sh4-debugger");
 
   // The mock starts running and sends a tick five times a second, and every tick renders every

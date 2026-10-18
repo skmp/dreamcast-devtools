@@ -8,7 +8,6 @@ import {
   panel,
   saveScreenshot,
   statusBar,
-  KNOWN,
   type Diagnostics,
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
@@ -81,7 +80,6 @@ const allowServerDown = (diagnostics: Diagnostics) => {
 };
 
 test("a panel whose code could not be downloaded offers Reload page, which loads it", async ({ page, diagnostics }, testInfo) => {
-  diagnostics.allow(...KNOWN.sgcNoData);
   const release = await refuseChunk(page, diagnostics, "AudioPanel");
   await gotoRoute(page, "/workspace/audio-debugger");
   await expect(statusBar(page)).toContainText("Connection: connected");
@@ -196,7 +194,6 @@ test("a panel first opened while the server is down is loaded by Reload page onc
   diagnostics,
 }, testInfo) => {
   allowServerDown(diagnostics);
-  diagnostics.allow(...KNOWN.sgcNoData);
   await openWorkspace(page, "sh4-debugger");
   await expect(panel(page, "watches")).toContainText("dc.sh4.cpu.pc = 0x8C0000");
 

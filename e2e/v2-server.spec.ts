@@ -12,7 +12,6 @@ import {
   tooltipButton,
   treeItem,
   treeItemRow,
-  KNOWN,
   type WorkspaceId,
 } from "./support/fixtures";
 import type { Page } from "@playwright/test";
@@ -380,7 +379,6 @@ test("a tick without `callstacks` has no frames, one without `watches` no watche
 test("a binary frame without the header is not taken: the capture it was announced with does not arrive", async ({ page, diagnostics }) => {
   // the client waits ten seconds for the frame
   test.slow();
-  diagnostics.allow(...KNOWN.sgcNoData);
   diagnostics.allow(/^console\.error: Failed to record SGC frame data: Error: The binary frame /, "the SGC panel logs a capture that failed");
   const server = await serveScriptedDebugger(page);
   (server.shape.capabilities as string[]).push("sgc-capture");

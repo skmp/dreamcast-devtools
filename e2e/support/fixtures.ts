@@ -54,17 +54,7 @@ export class Diagnostics {
  * Messages that were investigated and are expected with today's code. Tests opt
  * in with `diagnostics.allow(...KNOWN.x)`; nothing is allowed globally.
  */
-export const KNOWN = {
-  /**
-   * Before the first recording the server answers state.getSgcFrameData with the JSON-RPC
-   * error -32011; AudioPanel (src/app/panels/AudioPanel.tsx) reports that expected empty
-   * state through console.error and then renders "Record some data to display here".
-   */
-  sgcNoData: [
-    /^console\.error: Failed to fetch SGC frame data: JsonRpcException: no capture available/,
-    "SGC panel logs the expected 'nothing recorded yet' answer of the server with console.error",
-  ],
-} as const satisfies Record<string, readonly [RegExp, string]>;
+export const KNOWN = {} as const satisfies Record<string, readonly [RegExp, string]>;
 
 const attachDiagnostics = (page: Page, diagnostics: Diagnostics) => {
   page.on("console", (message) => {

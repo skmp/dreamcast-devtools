@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { test, expect, gotoRoute, openWorkspace, panel, statusBar, KNOWN, WORKSPACES } from "./support/fixtures";
+import { test, expect, gotoRoute, openWorkspace, panel, statusBar, WORKSPACES } from "./support/fixtures";
 import { expectMonacoReady, monacoEditor, monacoTokenClasses, monacoVisibleText } from "./support/monaco";
 import { DIST_DIR } from "./support/paths";
 import { startStaticServer } from "./support/staticServer";
@@ -112,9 +112,8 @@ test.describe("with every other origin unreachable", () => {
     expect(attempted).toEqual([]);
   });
 
-  test("no page of the application asks another origin for anything", async ({ page, diagnostics, rpc, mock }) => {
+  test("no page of the application asks another origin for anything", async ({ page, rpc, mock }) => {
     test.slow();
-    diagnostics.allow(...KNOWN.sgcNoData);
     const attempted = await blockOtherOrigins(page);
 
     await gotoRoute(page, "/");

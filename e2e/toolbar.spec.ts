@@ -14,7 +14,6 @@ import {
   statusBar,
   tooltipButton,
   treeItemRow,
-  KNOWN,
   WORKSPACES,
   type RpcLog,
   type WorkspaceId,
@@ -488,7 +487,7 @@ test("the reason of a stop can be read in a window that is not wide: it wraps be
 test.describe("the run controls, the step buttons and Go to current PC", () => {
   test.use({ mockOptions: { startPaused: true, graceMs: 600_000 } });
 
-  test("are buttons with names: what the tooltip says is what the button is called", async ({ page, diagnostics }) => {
+  test("are buttons with names: what the tooltip says is what the button is called", async ({ page }) => {
     // The tooltip of an icon button is its only text. On an element around the button it names
     // that element, and the button, which is what has the focus and what is announced, has no
     // name: by role and name it is then not found.
@@ -538,7 +537,6 @@ test.describe("the run controls, the step buttons and Go to current PC", () => {
     await expect(named(page.locator("header"), "Step Over")).toBeFocused();
 
     // the step button of the DSP view is called Step
-    diagnostics.allow(...KNOWN.sgcNoData);
     await openWorkspace(page, "audio-debugger");
     const dsp = panel(page, "dsp-disassembly");
     for (const name of ["Step", "Go to current PC", "Refresh"]) {
@@ -560,10 +558,7 @@ test.describe("the step buttons of the toolbar", () => {
 
   for (const workspace of WORKSPACES) {
     const own = OWN[workspace];
-    test(`${workspace}: they act on the ${own.label}, the target the workspace is for, and the toolbar says so`, async ({ page, rpc, diagnostics }) => {
-      if (workspace === "audio-debugger") {
-        diagnostics.allow(...KNOWN.sgcNoData);
-      }
+    test(`${workspace}: they act on the ${own.label}, the target the workspace is for, and the toolbar says so`, async ({ page, rpc }) => {
       await openWorkspace(page, workspace);
       await expect(executionState(page)).toHaveText("Paused · waiting at the start · stop 1");
       await expect(focusedTarget(page)).toHaveText(own.label);
@@ -708,8 +703,7 @@ test.describe("the step buttons of the toolbar", () => {
     await expect(target).toHaveText("SH4");
   });
 
-  test("every workspace page starts with its own target, whatever had the focus on the page before", async ({ page, diagnostics }) => {
-    diagnostics.allow(...KNOWN.sgcNoData);
+  test("every workspace page starts with its own target, whatever had the focus on the page before", async ({ page }) => {
     await openWorkspace(page, "mixed-mode-debugger");
     await panel(page, "arm7-disassembly").locator(".current-instruction span").first().click();
     await expect(focusedTarget(page)).toHaveText("ARM7");
@@ -804,8 +798,7 @@ test.describe("the function keys", () => {
     expect(controlRequests(rpc)).toEqual(["control.step sh4", "control.stepOver arm7", "control.stepOut arm7"]);
   });
 
-  test("a key whose control is off sends nothing, and is still not the browser's", async ({ page, rpc, diagnostics }) => {
-    diagnostics.allow(...KNOWN.sgcNoData);
+  test("a key whose control is off sends nothing, and is still not the browser's", async ({ page, rpc }) => {
     const keys = await recordKeys(page);
     const loads: string[] = [];
     page.on("load", () => loads.push(page.url()));
@@ -996,10 +989,7 @@ test.describe("the function keys", () => {
     ["sh4-debugger", "SH4: Simulator", "sh4-sim", "sh4", "SH4"],
     ["audio-debugger", "DSP: Playground", "dsp-playground", "dsp", "DSP"],
   ] as const) {
-    test(`the Find box of an editor is no dialog of the page: open or closed, the keys are the toolbar's outside the editor (${title})`, async ({ page, rpc, diagnostics }) => {
-      if (workspace === "audio-debugger") {
-        diagnostics.allow(...KNOWN.sgcNoData);
-      }
+    test(`the Find box of an editor is no dialog of the page: open or closed, the keys are the toolbar's outside the editor (${title})`, async ({ page, rpc }) => {
       const keys = await recordKeys(page);
       const loads: string[] = [];
       page.on("load", () => loads.push(page.url()));

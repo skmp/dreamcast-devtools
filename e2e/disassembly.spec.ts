@@ -11,7 +11,6 @@ import {
   pauseFromToolbar,
   recordFlashes,
   tooltipButton,
-  KNOWN,
   type HeldResponses,
   type WorkspaceId,
 } from "./support/fixtures";
@@ -141,10 +140,7 @@ const showAddress = async (view: Locator, target: Target, address: number) => {
 
 for (const target of TARGETS) {
   test.describe(`${target.name} disassembly`, () => {
-    test.beforeEach(async ({ page, diagnostics }) => {
-      if (target.workspace === "audio-debugger") {
-        diagnostics.allow(...KNOWN.sgcNoData);
-      }
+    test.beforeEach(async ({ page }) => {
       await openWorkspace(page, target.workspace);
     });
 
@@ -433,8 +429,7 @@ test.describe("where the address space of a target ends (addressMax of debugger.
     await expect(rows).toHaveCount(7);
   });
 
-  test("DSP: the last line is step 127, whatever step is asked for", async ({ page, rpc, diagnostics }) => {
-    diagnostics.allow(...KNOWN.sgcNoData);
+  test("DSP: the last line is step 127, whatever step is asked for", async ({ page, rpc }) => {
     await openWorkspace(page, "audio-debugger");
     const view = panel(page, "dsp-disassembly");
     const rows = disassemblyRows(view);
