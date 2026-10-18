@@ -30,6 +30,7 @@ import ZoomInIcon from "@mui/icons-material/ZoomIn";
 import FullscreenIcon from "@mui/icons-material/Fullscreen";
 import FullscreenExitIcon from "@mui/icons-material/FullscreenExit";
 import { deflate, inflate } from "pako";
+import { useLocation } from "react-router-dom";
 import { Panel } from "../layout/Panel";
 import { DspAssemblyEditor } from "../components/DspAssemblyEditor";
 import type { DspAssemblyEditorRef } from "../components/DspAssemblyEditor";
@@ -44,6 +45,19 @@ import { assembleSource, assembleSourceWithPreprocessing, writeRegisters, decode
 import { compileDspSource, CompilationError } from "../dsp/dspCompiler";
 import { DSP_DEFAULT_SOURCE } from "../dsp/defaultSource";
 import { DEFAULT_DSP_SOURCE } from "../dsp/defaultDspSource";
+import {
+  applySnapshot,
+  dspSourceFromRegisters,
+  snapshotNotes,
+  snapshotOff,
+  snapshotSource,
+  snapshotTime,
+  takeEmulatorSnapshot,
+} from "../dsp/emulatorSnapshot";
+import { CAPABILITIES } from "../../lib/debuggerSchema";
+import { endpointLabel, useSessionStore } from "../../state/sessionStore";
+import { useDebuggerDataStore } from "../../state/debuggerDataStore";
+import { useCapability, useTarget } from "../../state/debuggerSelectors";
 
 declare global {
   interface Window {
@@ -63,10 +77,26 @@ const DSP_SHARE_HELP =
 // The inputs of every sample go to all 16 buses: an input without a source sends 0
 const DSP_ALL_BUSES = 0xffff;
 
+// "Load from emulator", what it does: the button's help while it can be used
+const LOAD_FROM_EMULATOR_HELP =
+  "Loads the emulator's DSP, at the stop it is in, into the playground: its program, TEMP, MEMS, MIXS, EFREG, RBP and RBL, the step it is at, MDEC_CT and the datapath (ACC, Y_REG, FRC_REG, ADRS_REG, the read latch, its copy, MEMVAL, NOFL_PIPE, the MIXS bank), and the first 2 MiB of wave memory. The playground is then paused at that step.";
+
+/** The banner of the snapshot the playground's DSP was loaded with: its source, its stop, the tick's time, its notes. */
+interface SnapshotBanner {
+  title: string;
+  /** the tick's time, as the banner shows it and as an ISO string */
+  time: string;
+  iso: string;
+  exact: boolean;
+  notes: string[];
+}
+
 /**
  * The Debugger section's internal registers: the datapath of the step that was executed last (the core's view
  * of it: SHIFTED, X, Y, B, INPUTS) and the core's own fields. One read latch, its copy and what IWT stores
- * (MEMVAL) are the console's; MIXS_BANK is the bank of MIXS the DSP reads in this sample, the one shown below.
+ * (MEMVAL) are the console's; NOFL_PIPE has the NOFL bits of the last two steps (bit 0 the last); MIXS_BANK is the
+ * bank of MIXS the DSP reads in this sample, the one shown below. With STEP these are the rows of the emulator's
+ * dc.aica.dsp that "Load from emulator" loads.
  */
 const DSP_INTERNAL_REGISTERS: ReadonlyArray<{ name: string; bits: number; signed: boolean; read: () => number }> = [
   { name: "MDEC_CT", bits: 16, signed: false, read: () => aicaDsp.get(REG.MDEC_CT) },
@@ -82,6 +112,7 @@ const DSP_INTERNAL_REGISTERS: ReadonlyArray<{ name: string; bits: number; signed
   { name: "FRC_REG", bits: 13, signed: true, read: () => aicaDsp.get(REG.FRC_REG) },
   { name: "Y_REG", bits: 24, signed: true, read: () => aicaDsp.get(REG.Y_REG) },
   { name: "ADRS_REG", bits: 12, signed: true, read: () => aicaDsp.get(REG.ADRS_REG) },
+  { name: "NOFL_PIPE", bits: 2, signed: false, read: () => aicaDsp.get(REG.NOFL_PIPE) },
   { name: "MIXS_BANK", bits: 1, signed: false, read: () => aicaDsp.get(REG.MIXS_DSP) },
 ];
 
@@ -308,6 +339,28 @@ export const DspPlaygroundPanel = () => {
   const outputContainerRefs = useRef<Array<HTMLElement | null>>(Array(16).fill(null));
   const inputSelectRefs = useRef<Array<HTMLSelectElement | null>>(Array(16).fill(null));
 
+  // "Load from emulator" takes the session of the workspace this panel is a dock panel of; the playground's tool
+  // page has no connection, and opens none
+  const inWorkspace = useLocation().pathname.startsWith("/workspace/");
+  const client = useSessionStore((state) => state.client);
+  const connected = useSessionStore((state) => state.connectionState === "connected");
+  const endpoint = useSessionStore((state) => state.endpoint);
+  const initialized = useDebuggerDataStore((state) => state.initialized);
+  const execution = useDebuggerDataStore((state) => state.executionState);
+  const emulatorName = useDebuggerDataStore((state) => state.shape?.emulator.name.trim());
+  const memoryBinary = useCapability(CAPABILITIES.MEMORY_BINARY);
+  const arm7Target = useTarget("arm7");
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [snapshotBanner, setSnapshotBanner] = useState<SnapshotBanner | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  // counts the loads: the register view reads the core again behind each, also at the step and sample it showed
+  const [snapshotSerial, setSnapshotSerial] = useState(0);
+  // The source of the program a snapshot put into the core. The Assembler tab, which a load switches to, writes its
+  // source into the core when it is switched to; for this source it does not: the core has the snapshot's program,
+  // and whatever the steps since the load have done to MEMS stays
+  const snapshotSourceRef = useRef<string | null>(null);
+  const loadOff = snapshotOff({ inWorkspace, connected, initialized, execution, arm7: arm7Target, memoryBinary, loading: snapshotLoading });
+
   // Sync the stops of the runs with the breakpoints
   useEffect(() => {
     const stops = new Uint8Array(AICA_DSP_STEPS);
@@ -397,8 +450,9 @@ export const DspPlaygroundPanel = () => {
     }
   }, [activeTab]);
 
+  // write false: the source is assembled for the editor (its status, its errors), and the core keeps its program
   const assembleAndWrite = useCallback(
-    (newSource: string) => {
+    (newSource: string, write = true) => {
       if (!wasmInitialized) return;
 
       editorRef.current?.setStatus('assembling');
@@ -407,8 +461,10 @@ export const DspPlaygroundPanel = () => {
       try {
         // Use preprocessing version to support #define macros
         const parsedData = assembleSourceWithPreprocessing(newSource);
-        writeRegisters(aicaDsp, parsedData);
-        setBinaryVersion(v => v + 1);
+        if (write) {
+          writeRegisters(aicaDsp, parsedData);
+          setBinaryVersion(v => v + 1);
+        }
         editorRef.current?.setStatus('assembled');
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -450,6 +506,7 @@ export const DspPlaygroundPanel = () => {
           // Assemble and write to DSP
           const lines = assembly.split("\n");
           const parsedData = assembleSource(lines);
+          snapshotSourceRef.current = null;
           writeRegisters(aicaDsp, parsedData);
           setBinaryVersion(v => v + 1);
 
@@ -540,6 +597,10 @@ export const DspPlaygroundPanel = () => {
     const timer = setTimeout(() => {
       if (activeTab === "source" || activeTab === "compiled") {
         compileAndWrite(dspSourceRef.current);
+      } else if (snapshotSourceRef.current !== null && snapshotSourceRef.current === assemblySourceRef.current) {
+        // the tab a snapshot was loaded into: its program is the core's already
+        snapshotSourceRef.current = null;
+        assembleAndWrite(assemblySourceRef.current, false);
       } else {
         assembleAndWrite(assemblySourceRef.current);
       }
@@ -561,6 +622,7 @@ export const DspPlaygroundPanel = () => {
   }, [compileAndWrite, saveToLocalStorage, updateShareToken]);
 
   const handleAssemblySourceChange = useCallback((newSource: string) => {
+    snapshotSourceRef.current = null;
     assemblySourceRef.current = newSource;
     assembleAndWrite(newSource);
     saveToLocalStorage();
@@ -584,55 +646,10 @@ export const DspPlaygroundPanel = () => {
         }
 
         // Read back and generate source
-        const lines: string[] = [];
-        lines.push("# AICA-DSP");
-        lines.push("");
-
-        lines.push("# COEF");
-        for (let i = 0; i < 128; i++) {
-          const value = aicaDsp.peekReg(0x3000 + i * 4);
-          if (value) {
-            lines.push(`COEF[${i}] = ${value}`);
-          }
-        }
-        lines.push("");
-
-        lines.push("# MADRS");
-        for (let i = 0; i < 64; i++) {
-          const value = aicaDsp.peekReg(0x3200 + i * 4);
-          if (value) {
-            lines.push(`MADRS[${i}] = ${value}`);
-          }
-        }
-        lines.push("");
-
-        lines.push("# MEMS");
-        for (let i = 0; i < 32; i++) {
-          const low = aicaDsp.peekReg(0x4400 + i * 8 + 0);
-          const high = aicaDsp.peekReg(0x4400 + i * 8 + 4);
-          if (low || high) {
-            lines.push(`MEMS_L[${i}] = ${low}`);
-            lines.push(`MEMS_H[${i}] = ${high}`);
-          }
-        }
-        lines.push("");
-
-        lines.push("# MPRO");
-        for (let i = 0; i < 128; i++) {
-          const dwords = [
-            aicaDsp.peekReg(0x3000 + 0x400 + i * 4 * 4 + 0),
-            aicaDsp.peekReg(0x3000 + 0x400 + i * 4 * 4 + 4),
-            aicaDsp.peekReg(0x3000 + 0x400 + i * 4 * 4 + 8),
-            aicaDsp.peekReg(0x3000 + 0x400 + i * 4 * 4 + 12),
-          ];
-          const desc = decodeInst(dwords);
-          const disasm = disassembleDesc(desc);
-          if (disasm) {
-            lines.push(`MPRO[${i}] = ${disasm}`);
-          }
-        }
-
-        const newSource = lines.join("\n");
+        const newSource = dspSourceFromRegisters((offset) => aicaDsp.peekReg(offset));
+        // what the playground has now is this file's, no snapshot's
+        snapshotSourceRef.current = null;
+        setSnapshotBanner(null);
         assemblySourceRef.current = newSource;
         assembleAndWrite(newSource);
         saveToLocalStorage();
@@ -753,21 +770,15 @@ export const DspPlaygroundPanel = () => {
     return aicaDsp.run(count, stops) < count;
   }, [startSampleInputs]);
 
-  const handleStartAudio = useCallback(() => {
-    if (!wasmInitialized) return;
-
-    // The counters start again; the program and the rest of the state stay
-    aicaDsp.set(REG.STEP, 0);
-    aicaDsp.set(REG.SAMPLES, 0);
-    setCurrentDspStep(0);
-    setCurrentSample(0);
-
+  // The audio of the DSP: its context and the callback that runs the DSP a sample at a time. paused: it starts
+  // with the DSP halted (as Pause leaves it), where it is; "Load from emulator" starts it so, at the loaded step
+  const startAudio = useCallback((paused: boolean) => {
     const audioContext = new (window.AudioContext || window.webkitAudioContext)({
       sampleRate: 44100,
     });
     const scriptNode = audioContext.createScriptProcessor(1024, 0, 1);
 
-    dspHaltedRef.current = false;
+    dspHaltedRef.current = paused;
     passStartRef.current = true;
     scriptNode.onaudioprocess = (event) => {
       const outputBuffer = event.outputBuffer.getChannelData(0);
@@ -857,8 +868,70 @@ export const DspPlaygroundPanel = () => {
     scriptNode.connect(audioContext.destination);
     audioContextRef.current = audioContext;
     scriptNodeRef.current = scriptNode;
+    if (paused) {
+      void audioContext.suspend();
+    }
     setAudioPlaying(true);
-  }, [wasmInitialized, runToSampleEnd, readSampleOutputs]);
+    setAudioPaused(paused);
+  }, [runToSampleEnd, readSampleOutputs]);
+
+  const handleStartAudio = useCallback(() => {
+    if (!wasmInitialized) return;
+
+    // The counters start again; the program and the rest of the state stay. A snapshot's step is left behind: the
+    // DSP is no longer where the emulator was
+    aicaDsp.set(REG.STEP, 0);
+    aicaDsp.set(REG.SAMPLES, 0);
+    setCurrentDspStep(0);
+    setCurrentSample(0);
+    setSnapshotBanner(null);
+    startAudio(false);
+  }, [wasmInitialized, startAudio]);
+
+  // "Load from emulator": a snapshot of the emulator's DSP at the stop the target is in (emulatorSnapshot.ts), into
+  // the core. The playground's DSP is halted first, or started halted, and stands at the loaded step; the program
+  // is the Assembler tab's, its source made from the loaded registers as Load Regs makes it
+  const handleLoadFromEmulator = useCallback(async () => {
+    if (loadOff !== undefined || !client || !wasmInitialized) return;
+    setSnapshotLoading(true);
+    setSnapshotError(null);
+    try {
+      const taken = await takeEmulatorSnapshot({
+        client,
+        execution: () => useDebuggerDataStore.getState().executionState,
+        source: endpointLabel(endpoint ?? "", emulatorName ? { endpoint: endpoint ?? "", name: emulatorName } : undefined),
+      });
+      if (audioContextRef.current) {
+        dspHaltedRef.current = true;
+        void audioContextRef.current.suspend();
+        setAudioPaused(true);
+      } else {
+        startAudio(true);
+      }
+      const program = snapshotSource(taken);
+      assemblySourceRef.current = program;
+      // the editor's status, and the program as its text has it; then the snapshot as it is
+      assembleAndWrite(program);
+      applySnapshot(aicaDsp, taken);
+      snapshotSourceRef.current = program;
+      saveToLocalStorage();
+      updateShareToken();
+      setActiveTab("assembly");
+      // the step the playground is at is executed by the next run, whatever breakpoint is there
+      passStartRef.current = true;
+      const step = aicaDsp.currentStep;
+      setCurrentDspStep(step);
+      setCurrentSample(aicaDsp.sampleCounter);
+      setGoToPc({ address: step, fromUrl: true, highlight: false });
+      setSnapshotSerial((serial) => serial + 1);
+      const { title, exact, notes } = snapshotNotes(taken);
+      setSnapshotBanner({ title, time: snapshotTime(taken.timestamp), iso: new Date(taken.timestamp).toISOString(), exact, notes });
+    } catch (error) {
+      setSnapshotError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSnapshotLoading(false);
+    }
+  }, [loadOff, client, wasmInitialized, endpoint, emulatorName, startAudio, assembleAndWrite, saveToLocalStorage, updateShareToken]);
 
   const handleStopAudio = useCallback(() => {
     if (scriptNodeRef.current) {
@@ -1041,7 +1114,7 @@ export const DspPlaygroundPanel = () => {
     for (let i = 0; i < 2; i++) {
       updateRegister(`EXTS[${i}]`, exts[i], 16);
     }
-  }, [wasmInitialized, audioPlaying, audioPaused, currentDspStep, currentSample]);
+  }, [wasmInitialized, audioPlaying, audioPaused, currentDspStep, currentSample, snapshotSerial]);
 
   // Sync inputSources ref to Select elements on audioFiles change
   useEffect(() => {
@@ -1879,6 +1952,20 @@ export const DspPlaygroundPanel = () => {
           <Button variant="outlined" size="small" onClick={handleDownloadRegs}>
             Download Regs
           </Button>
+          {/* off while the target runs, and anywhere else it could not be made: it says why */}
+          <Tooltip title={loadOff !== undefined ? `Load from emulator: ${loadOff}` : LOAD_FROM_EMULATOR_HELP} describeChild>
+            <Button
+              variant="outlined"
+              size="small"
+              aria-disabled={loadOff !== undefined || undefined}
+              disableRipple={loadOff !== undefined}
+              onClick={loadOff === undefined ? () => void handleLoadFromEmulator() : undefined}
+              startIcon={snapshotLoading ? <CircularProgress size={12} /> : undefined}
+              sx={loadOff !== undefined ? { color: "text.disabled", borderColor: "action.disabledBackground", cursor: "default", "&:hover": { borderColor: "action.disabledBackground", backgroundColor: "transparent" } } : undefined}
+            >
+              Load from emulator
+            </Button>
+          </Tooltip>
           <Box sx={{ flexGrow: 1 }} />
           {shareToken && (
             // describeChild: the help describes the button, whose name stays "Share"
@@ -1895,6 +1982,31 @@ export const DspPlaygroundPanel = () => {
             </Tooltip>
           )}
         </Stack>
+
+        {snapshotBanner && (
+          <Alert
+            severity={snapshotBanner.exact ? "info" : "warning"}
+            role="status"
+            aria-label="Snapshot from the emulator"
+            onClose={() => setSnapshotBanner(null)}
+            sx={{ py: 0.5 }}
+          >
+            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+              {snapshotBanner.title}, <time dateTime={snapshotBanner.iso}>{snapshotBanner.time}</time>
+            </Typography>
+            {snapshotBanner.notes.map((note) => (
+              <Typography key={note} variant="caption" component="p">
+                {note}
+              </Typography>
+            ))}
+          </Alert>
+        )}
+
+        {snapshotError && (
+          <Alert severity="error" onClose={() => setSnapshotError(null)} sx={{ py: 0.5 }}>
+            Load from emulator: {snapshotError}
+          </Alert>
+        )}
 
         {audioPlaying && (
           <Alert severity="info" sx={{ py: 0.5 }}>
