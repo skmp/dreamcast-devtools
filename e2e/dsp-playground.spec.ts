@@ -341,13 +341,14 @@ test("the keyboard input drives the input plot and the program's output plot, at
   await page.getByRole("button", { name: "Stop DSP" }).click();
 });
 
-test("a file's input is limited to 16 bits, and MIXS shows the bank the DSP reads", async ({ page }) => {
-  // In 00 is a file whose samples alternate between 1.05, past full scale, and -0.25: the inputs of the samples
-  // n = 0, 1, 2, ... are 32767 (limited to 16 bits) and -8192, sent as << 4. Without the limit, 34405 << 4 wraps
-  // in MIXS's 20 bits to -498096, an input and an output of the other sign. The DSP reads in sample n what step 0 of
-  // sample n - 1 sent, from the bank it has (MIXS_BANK), and the banks change every sample: shown at the end of a
-  // sample n (Sample n + 1, Step 0), MIXS[0] is the input of sample n - 1 and EFREG[0] (In 00 times 4095 / 4096,
-  // SHIFTED[23:8]) its output, 32759 or -8190; the other bank has the input of sample n
+test("a file's input is limited to 16 bits on both sides, and MIXS shows the bank the DSP reads", async ({ page }) => {
+  // In 00 is a file whose samples go round 1.05 and -1.05, both past full scale, and -0.25: the inputs of the samples
+  // n = 0, 1, 2, ... are 32767 (limited to 16 bits above), -8192 and -32768 (limited below), sent as << 4. Without the
+  // limit above, 34405 << 4 wraps in MIXS's 20 bits to -498096, and without the one below -34405 << 4 wraps to 498096:
+  // an input and an output of the other sign. The DSP reads in sample n what step 0 of sample n - 1 sent, from the
+  // bank it has (MIXS_BANK), and the banks change every sample: shown at the end of a sample n (Sample n + 1, Step 0),
+  // MIXS[0] is the input of sample n - 1 and EFREG[0] (In 00 times 4095 / 4096, SHIFTED[23:8]) its output, 32759,
+  // -8190 or -32760; the other bank has the input of sample n
   await page.getByRole("tab", { name: "Assembler" }).click();
   await expect(editorStatus(page)).toHaveText("Assembled");
   await monacoReplaceAll(
@@ -364,7 +365,8 @@ test("a file's input is limited to 16 bits, and MIXS shows the bank the DSP read
     await context.close();
     return sampleRate;
   });
-  const samples = new Float32Array(10 * rate).map((_, n) => (n % 2 === 0 ? 1.05 : -0.25));
+  const FILE = [1.05, -0.25, -1.05];
+  const samples = new Float32Array(10 * rate).map((_, n) => FILE[n % 3]);
   const input = page.getByText("In 00", { exact: true }).locator("xpath=ancestor::div[.//canvas][1]");
   await input.getByRole("combobox").click();
   const chooser = page.waitForEvent("filechooser");
@@ -380,21 +382,25 @@ test("a file's input is limited to 16 bits, and MIXS shows the bank the DSP read
   await expect(tooltipButton(page, "Step")).toBeEnabled();
   await expect(register(page, "Step")).toHaveText(/^\s*0$/);
   const sample = await registerValue(page, "Sample");
-  expect(sample + 2, "the run before the pause stays inside the file").toBeLessThan(samples.length);
+  expect(sample + 3, "the run before the pause stays inside the file").toBeLessThan(samples.length);
 
-  const inputOf = (n: number) => (n % 2 === 0 ? 32767 : -8192);
-  const outputOf = (n: number) => (n % 2 === 0 ? 32759 : -8190);
+  const inputOf = (n: number) => [32767, -8192, -32768][n % 3];
+  const outputOf = (n: number) => [32759, -8190, -32760][n % 3];
   const banks = new Set<number>();
-  for (const n of [sample, sample + 1]) {
+  const shown = new Set<number>();
+  for (const n of [sample, sample + 1, sample + 2]) {
     await tooltipButton(page, "Run to next sample").click();
     await expect(register(page, "Sample")).toHaveText(new RegExp(`^\\s*${n + 1}$`));
     await expect(register(page, "Step")).toHaveText(/^\s*0$/);
     await expect(register(page, "MIXS[0]"), `sample ${n}`).toHaveText(new RegExp(`^\\s*${inputOf(n - 1) * 16}$`));
     await expect(register(page, "EFREG[0]"), `sample ${n}`).toHaveText(new RegExp(`^\\s*${outputOf(n - 1)}$`));
     banks.add(await registerValue(page, "MIXS_BANK"));
+    shown.add(await registerValue(page, "MIXS[0]"));
   }
-  // both banks were shown: in one of the two samples the bank the DSP reads is bank 1
+  // both banks were shown: in one of the samples the bank the DSP reads is bank 1
   expect([...banks].sort()).toEqual([0, 1]);
+  // and both limits: the largest input above full scale, and the most negative one below it
+  expect([...shown].sort((a, b) => a - b)).toEqual([-32768 * 16, -8192 * 16, 32767 * 16]);
 
   await page.getByRole("button", { name: "Stop DSP" }).click();
 });
