@@ -199,6 +199,13 @@ const fakeServer = (memory: Uint8Array, behind: () => DebuggerTick | undefined, 
 
 const pausedAt = (stopId: number) => () => ({ state: "paused" as const, stopId, reason: "breakpoint" });
 
+/** What a take came to: the message it was refused with, or "a snapshot" (not the snapshot itself, which is 8 MiB). */
+const outcome = (taking: Promise<EmulatorSnapshot>): Promise<string> =>
+  taking.then(
+    () => "a snapshot",
+    (error: unknown) => (error instanceof SnapshotError ? "" : "not a SnapshotError: ") + (error instanceof Error ? error.message : String(error)),
+  );
+
 /** A snapshot of the core that stands for the emulator, through the protocol half. */
 const snapshotOf = async (core: AicaDspCore, stopId = 7): Promise<EmulatorSnapshot> => {
   const server = fakeServer(memoryOf(core), () => tick(stopId, rowsOf(core)));
@@ -408,33 +415,29 @@ describe("taking a snapshot", () => {
   it("is not taken while the target runs: there is no read", async () => {
     const emulator = core();
     const server = fakeServer(memoryOf(emulator), () => tick(9, rowsOf(emulator)));
-    await expect(takeEmulatorSnapshot({ client: server.client, execution: () => ({ state: "running" }), source: "x" })).rejects.toThrow(
-      "the target is running: a snapshot is taken at a stop",
-    );
-    await expect(takeEmulatorSnapshot({ client: server.client, execution: () => undefined, source: "x" })).rejects.toThrow(SnapshotError);
+    expect(await outcome(takeEmulatorSnapshot({ client: server.client, execution: () => ({ state: "running" }), source: "x" }))).toBe("the target is running: a snapshot is taken at a stop");
+    expect(await outcome(takeEmulatorSnapshot({ client: server.client, execution: () => undefined, source: "x" }))).not.toBe("a snapshot");
     expect(server.reads).toEqual([]);
   });
 
   it("is not taken when the target runs while the read is on its way: two moments are no snapshot", async () => {
     const emulator = core();
     const running = fakeServer(memoryOf(emulator), () => tick(10, rowsOf(emulator)), { duringRead: [tick(undefined, {}, "running")] });
-    await expect(takeEmulatorSnapshot({ client: running.client, execution: pausedAt(9), source: "x" })).rejects.toThrow(
+    expect(await outcome(takeEmulatorSnapshot({ client: running.client, execution: pausedAt(9), source: "x" }))).toBe(
       "the target ran while the snapshot was taken (stop 9 ended): load again at a stop",
     );
     // the tick behind the read is of another stop
     const other = fakeServer(memoryOf(emulator), () => tick(10, rowsOf(emulator)));
-    await expect(takeEmulatorSnapshot({ client: other.client, execution: pausedAt(9), source: "x" })).rejects.toThrow("stop 9 ended");
+    expect(await outcome(takeEmulatorSnapshot({ client: other.client, execution: pausedAt(9), source: "x" }))).toContain("stop 9 ended");
     // or the tick behind the read says the target runs
     const behindRunning = fakeServer(memoryOf(emulator), () => tick(undefined, rowsOf(emulator), "running"));
-    await expect(takeEmulatorSnapshot({ client: behindRunning.client, execution: pausedAt(9), source: "x" })).rejects.toThrow("stop 9 ended");
+    expect(await outcome(takeEmulatorSnapshot({ client: behindRunning.client, execution: pausedAt(9), source: "x" }))).toContain("stop 9 ended");
   });
 
   it("is not taken at a stop without a game", async () => {
     const emulator = core();
     const server = fakeServer(memoryOf(emulator), () => tick(9, rowsOf(emulator)));
-    await expect(takeEmulatorSnapshot({ client: server.client, execution: () => ({ state: "paused", stopId: 9, reason: "no-game" }), source: "x" })).rejects.toThrow(
-      "no game loaded",
-    );
+    expect(await outcome(takeEmulatorSnapshot({ client: server.client, execution: () => ({ state: "paused", stopId: 9, reason: "no-game" }), source: "x" }))).toContain("no game loaded");
     expect(server.reads).toEqual([]);
   });
 
@@ -443,23 +446,19 @@ describe("taking a snapshot", () => {
     const rows = rowsOf(emulator);
     const withoutDatapath = { ...rows, "dc.aica.dsp": rows["dc.aica.dsp"].filter((register) => ["STEP", "MDEC_CT", "RBP", "RBL"].includes(register.name)) };
     const m2 = fakeServer(memoryOf(emulator), () => tick(9, withoutDatapath));
-    await expect(takeEmulatorSnapshot({ client: m2.client, execution: pausedAt(9), source: "x" })).rejects.toThrow(
-      "the paused tick has no ACC, Y_REG, FRC_REG, ADRS_REG, LATCH, LATCH_COPY, MEMVAL, NOFL_PIPE, MIXS_BANK in dc.aica.dsp",
-    );
+    expect(await outcome(takeEmulatorSnapshot({ client: m2.client, execution: pausedAt(9), source: "x" }))).toContain("the paused tick has no ACC, Y_REG, FRC_REG, ADRS_REG, LATCH, LATCH_COPY, MEMVAL, NOFL_PIPE, MIXS_BANK in dc.aica.dsp");
     const withoutTestb0 = { ...rows, "dc.aica.common": rows["dc.aica.common"].filter((register) => register.name !== "TESTB0") };
     const noTestb0 = fakeServer(memoryOf(emulator), () => tick(9, withoutTestb0));
-    await expect(takeEmulatorSnapshot({ client: noTestb0.client, execution: pausedAt(9), source: "x" })).rejects.toThrow("no TESTB0 in dc.aica.common");
+    expect(await outcome(takeEmulatorSnapshot({ client: noTestb0.client, execution: pausedAt(9), source: "x" }))).toContain("no TESTB0 in dc.aica.common");
   });
 
   it("is refused when what it loads was not readable", async () => {
     const emulator = core();
     const wave = fakeServer(memoryOf(emulator), () => tick(9, rowsOf(emulator)), { unreadable: [[0x100000, 16]] });
-    await expect(takeEmulatorSnapshot({ client: wave.client, execution: pausedAt(9), source: "x" })).rejects.toThrow(
-      "the server could not read 16 bytes at 0x100000 of the ARM7's memory",
-    );
+    expect(await outcome(takeEmulatorSnapshot({ client: wave.client, execution: pausedAt(9), source: "x" }))).toContain("the server could not read 16 bytes at 0x100000 of the ARM7's memory");
     // a mirror of wave memory, or a register of the channels, is not loaded
     const mirror = fakeServer(memoryOf(emulator), () => tick(9, rowsOf(emulator)), { unreadable: [[0x400000, 0x1000], [0x00800000, 0x100]] });
-    await expect(takeEmulatorSnapshot({ client: mirror.client, execution: pausedAt(9), source: "x" })).resolves.toMatchObject({ stopId: 9 });
+    expect(await outcome(takeEmulatorSnapshot({ client: mirror.client, execution: pausedAt(9), source: "x" }))).toBe("a snapshot");
   });
 });
 

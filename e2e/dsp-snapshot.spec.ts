@@ -113,10 +113,12 @@ test.describe("against the mock", () => {
     await expect(loadButton(view)).not.toHaveAttribute("aria-disabled");
     await expect(banner(view)).toHaveCount(0);
 
+    const slices = rpc.requests("state.getMemorySlice").length;
     await loadButton(view).click();
     await expect(banner(view)).toBeVisible();
-    // one read, of the ARM7 from 0: wave memory and the register file of one moment
+    // one read, of the ARM7 from 0: wave memory and the register file of one moment, and no other
     expect(rpc.requests("state.getMemoryBinary").map((frame) => frame.params)).toEqual([READ]);
+    expect(rpc.requests("state.getMemorySlice")).toHaveLength(slices);
     const { result, memory, tick } = readOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
     expect(result.totalBytes).toBe(READ.length);
     expect(memory.byteLength).toBe(READ.length);

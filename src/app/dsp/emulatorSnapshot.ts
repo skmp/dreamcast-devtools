@@ -343,7 +343,7 @@ export const snapshotNotes = (snapshot: Pick<EmulatorSnapshot, "dsp" | "source" 
         `At step ${step}, in the DSP phase of a sample: up to the end of that sample (step 127) the playground computes what the emulator computes, step for step. From the next sample on the inputs are the playground's own.`,
       ]
     : [
-        "At step 0: MIXS of the next sample is not known. Step 0 hands the DSP the MIXS bank the sound generator filled last, which no read shows (an SH4 or ARM7 stop, the end of a sample); the playground goes on with a bank of zeros. A stop of a DSP breakpoint or a DSP step is behind step 0, and is continued exactly.",
+        "At step 0: MIXS of the next sample is not known. Step 0 hands the DSP the MIXS bank the sound generator's sweep filled a sample before, which neither a CPU's read nor MIXS_BANK shows (they show the other bank, at an SH4 or ARM7 stop, at the end of a sample and in front of step 0); the playground goes on with a bank of zeros. The stop of a DSP breakpoint or of a DSP step is behind step 0, and is continued exactly.",
       ];
   notes.push("EXTS (the CD-DA input) is no register a CPU reads: it is loaded as 0.");
   return { title: `Loaded from ${snapshot.source}, stop ${snapshot.stopId}`, exact, notes };
