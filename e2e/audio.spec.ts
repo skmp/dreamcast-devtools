@@ -558,9 +558,16 @@ test.describe("captures of a scripted server", () => {
     await expect.poll(async () => (await cursorColumns(canvas)).centre).toBeLessThan(0.08);
     expect((await cursorColumns(canvas)).centre).toBeGreaterThan(0.04);
 
-    // the hover: the mouse rests over frame 97x while Record is pressed from the keyboard, twice;
-    // with no move of the mouse the hover is the one it was, clamped to frame 63 when the short
-    // capture arrived and still 63 in the long one behind it
+    // the hover: first the playback position inside the 64 frames, near frame 20, so that the header
+    // tells a clamped hover (63) from one dropped (about 20, the playback position) or kept (97x);
+    // then the mouse rests over frame 97x while Record is pressed from the keyboard, twice: with no
+    // move of the mouse the hover is the one it was, clamped to frame 63 when the short capture
+    // arrived and still 63 in the long one behind it
+    await clickAt(page, canvas, 0.02);
+    await leaveCanvas(page, canvas);
+    // (a pixel of the canvas is one or two of the 1024 frames)
+    await expect(head).toHaveText(/HEAD:\s+(1\d|2[0-3]):/);
+    const played = await head.innerText();
     await pointAt(page, canvas, 0.95);
     await expect(head).toHaveText(/HEAD:\s+9[67]\d:/);
     sgc.next(short);
@@ -575,6 +582,9 @@ test.describe("captures of a scripted server", () => {
     await expect(view.locator("canvas")).toHaveCount(1);
     await expect(page.getByRole("alert")).toHaveCount(0);
     expect(sgc.server.requestsOf("state.recordSgcFrames")).toEqual(Array.from({ length: 4 }, () => ({ frames: 1024 })));
+    // and without the hover, the playback position: the frame near 20, kept through both captures
+    await leaveCanvas(page, canvas);
+    await expect(head).toHaveText(played);
   });
 
   test(`a capture of 4096 frames is scanned and shown within ${CAPTURE_4096_BOUND_MS} ms of reaching the page, and its positions run to its last frame`, async ({ page }) => {
