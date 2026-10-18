@@ -166,13 +166,15 @@ its own, three directories made for the run.
 ```
 mkdir -p <run dir>/home <run dir>/cfg <run dir>/data
 HOME=<run dir>/home XDG_CONFIG_HOME=<run dir>/cfg XDG_DATA_HOME=<run dir>/data \
-<emulator> -config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 , \
-                   Debugger:Enabled=yes , Debugger:Port=0 , Debugger:Required=yes , Debugger:StartPaused=yes \
+<emulator> --config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 , \
+                    Debugger:Enabled=yes , Debugger:Port=0 , Debugger:Required=yes , Debugger:StartPaused=yes \
            <emulator tree>/tests/debugger/guest/dsptest/dsptest.elf &
 E2E_EMULATOR_URL=http://127.0.0.1:<port>/ npx playwright test e2e/emulator-smoke.spec.ts --workers=1
 kill <pid of the emulator>
 ```
 
+- Every switch of the emulator has two dashes (`--config`); a switch with one dash is an error
+  that names the two-dash form, and the emulator ends.
 - The commas are arguments of their own. `Debugger:Enabled=yes` is needed: a headless run has
   the server off by default, and `StartPaused` without a server ends the process with exit code
   2. `Port=0` takes a free port.
@@ -191,7 +193,16 @@ kill <pid of the emulator>
 The spec connects at the start stop, runs to the entry of the program (a breakpoint at
 `0x8C010000`), steps the SH4 from the toolbar, writes `R0` in the register panel and sees it in
 the tick, writes a byte of memory and reads it back, resets, and after a resume steps the ARM7.
-One run per emulator process: it expects the machine in its start stop.
+Then the DSP, in the Audio Debugger: a DSP breakpoint on step 1 of the guest's program and a run
+to it; "Load from emulator" in the DSP: Playground panel at that stop (in a sample whose `MIXS[3]`,
+the send the program reads, is not 0), 17 steps in the playground and 17 steps of the emulator from
+the toolbar, which have to agree in the nine datapath rows of `dc.aica.dsp`, `MDEC_CT`, and every
+word of TEMP, MEMS and EFREG (the playground's from its Download Regs, the emulator's from a second
+load behind the steps); a capture of the SGC panel in which a channel is active and sounds; a load
+at a step of the SH4, whose banner says that MIXS of the next sample is not known and EXTS is
+loaded as 0; and, at the entry of the program behind a reset, where the guest holds its ARM7
+(`ENABLED` 0), a step of the DSP from the toolbar, and behind a second reset one from the DSP's
+disassembly view. One run per emulator process: it expects the machine in its start stop.
 
 What it holds the run to, beyond those steps:
 
@@ -204,7 +215,12 @@ What it holds the run to, beyond those steps:
   `0x8C010004` (the guest starts with two instructions that are no branch). A step of the ARM7
   ends at the next instruction, at the target of the branch it stands on, where `lr` says for
   the two ways its program goes back, or at `0x1C`, the vector of the timer interrupt its
-  program gets every 13 samples.
+  program gets every 13 samples. A step of the DSP ends in front of the next step, also while
+  the ARM7 is held: the emulator clocks the AICA whatever ARMRST says, and the UI offers the
+  DSP's steps then (`heldFor` in `src/state/runControls.ts`: only the ARM7 is ever held).
+- **The playground computes what the emulator computes.** A load at a stop behind step 0 of a
+  sample continues the emulator's DSP exactly to the end of that sample; the spec holds the 17
+  steps it makes to that, word for word.
 
 ## Error boundaries
 
@@ -963,6 +979,10 @@ Breakpoint panels:
   names are the `events` of the device tree; the server refuses an event it does not raise.
 - **SH4: Breakpoints**, **ARM7: Breakpoints**: code breakpoints by hex address, for example
   `0x8C0000A0`.
+- **DSP: Breakpoints**: a step of the DSP, in decimal (or hex after `0x`). A DSP breakpoint is
+  reached in every sample: Run from its stop runs one sample and stops at it again, and a step of
+  the SH4 from it is dropped when the sample comes round. To let the SH4 run on, disable the
+  breakpoint or mute the DSP category.
 
 Breakpoints live on the server. Every `event.tick` carries the full list, so all connected clients
 show the same set.
