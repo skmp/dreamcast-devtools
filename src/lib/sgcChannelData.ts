@@ -1,23 +1,82 @@
 /**
  * SGC Channel Data Helper
  *
- * Provides typed access to the 128-byte ChannelCommonData structure
- * for each SGC audio channel.
+ * Typed access to the 128-byte record of one channel in one frame of an SGC capture
+ * (`state.getSgcFrameData`, protocol v3, design 3.4). A capture is `frameCount` frames of
+ * 64 channels x 128 bytes, little-endian; one frame is one AICA sample. Every accessor
+ * reads the capture's buffer in place, through a DataView with the record's offset: nothing
+ * is copied per frame or per channel.
  *
- * Structure layout (72 bytes of data + 56 bytes padding):
- * - Registers: 18 x 32-bit words (72 bytes)
- * - Sample data: 9 x 16-bit values (18 bytes)
- * - Additional state: various sized fields (20 bytes)
- * - Padding: remaining bytes zeroed
+ * Record layout:
+ * - 0..71: the channel's registers, 18 x 32-bit words
+ * - 72: sample_current, 74: sample_previous (int16)
+ * - 76..83: filtered, post-AEG, post-FEG and post-TL samples (int16; 0 on the emulator's
+ *   fast tier, which does not compute them)
+ * - 84, 86, 88: the channel's outputs of the sample: left, right, DSP send (int16)
+ * - 90: ca_fraction (10 bits), 92: ca_step (32 bits)
+ * - 96: aeg_value, the level: 0 silent, 0x3FF loudest (32 bits)
+ * - 100: feg_value (32 bits)
+ * - 104, 105, 106: the LFO bytes
+ * - 107: ca_current (16 bits, unaligned)
+ * - 109: flags: bit 0 enabled (keyed on and not run to its end), bits 1-2 the AEG state
+ *   (0 attack, 1 decay 1, 2 decay 2, 3 release)
+ * - 110..127: zero
  */
 
-export class SgcChannelData {
-  private view: DataView;
-  private offset: number;
+import { SGC_BYTES_PER_CHANNEL, SGC_BYTES_PER_FRAME, SGC_CHANNELS_PER_FRAME } from "./binaryFrame";
 
-  constructor(buffer: ArrayBuffer, channelIndex: number) {
-    this.view = new DataView(buffer);
-    this.offset = channelIndex * 128; // 128 bytes per channel
+/** Offset of the flags byte in a channel's record. */
+export const SGC_FLAGS_OFFSET = 109;
+/** Flags bit 0: the channel is enabled (keyed on and not run to its end). */
+export const SGC_FLAG_ENABLED = 0x01;
+const AEG_STATE_SHIFT = 1;
+const AEG_STATE_MASK = 0x3;
+
+/** The AEG state of flags bits 1-2, by its value. */
+export const SGC_AEG_STATES = ["attack", "decay 1", "decay 2", "release"] as const;
+export type SgcAegStateName = (typeof SGC_AEG_STATES)[number];
+
+/** A capture as `fetchSgcFrameData` gives it: `data` is `frameCount` frames of 64 x 128 bytes. */
+export interface SgcCapture {
+  frameCount: number;
+  data: ArrayBuffer;
+}
+
+/** The capture's buffer holds exactly its `frameCount` frames; anything else is no capture (a RangeError). */
+export const checkCapture = ({ frameCount, data }: SgcCapture): void => {
+  if (!Number.isInteger(frameCount) || frameCount < 0 || data.byteLength !== frameCount * SGC_BYTES_PER_FRAME) {
+    throw new RangeError(`a capture of ${frameCount} frames is ${frameCount * SGC_BYTES_PER_FRAME} bytes, not ${data.byteLength}`);
+  }
+};
+
+/**
+ * `index` as a frame of a capture of `frameCount` frames: an integer from 0 to
+ * `frameCount - 1`, and 0 for a capture without frames.
+ */
+export const clampFrameIndex = (index: number, frameCount: number): number => {
+  if (!(frameCount > 0) || !Number.isFinite(index)) {
+    return 0;
+  }
+  return Math.min(Math.max(0, Math.floor(index)), frameCount - 1);
+};
+
+export class SgcChannelData {
+  private readonly view: DataView;
+  private readonly offset: number;
+
+  /**
+   * The record of channel `channelIndex` in frame `frameIndex` of `source`, a capture's
+   * buffer or a DataView on all of it (a scan shares one), read and written in place.
+   */
+  constructor(source: ArrayBuffer | DataView, channelIndex: number, frameIndex: number = 0) {
+    this.view = source instanceof DataView ? source : new DataView(source);
+    if (!Number.isInteger(channelIndex) || channelIndex < 0 || channelIndex >= SGC_CHANNELS_PER_FRAME) {
+      throw new RangeError(`Channel index ${channelIndex} out of range (0-${SGC_CHANNELS_PER_FRAME - 1})`);
+    }
+    this.offset = frameIndex * SGC_BYTES_PER_FRAME + channelIndex * SGC_BYTES_PER_CHANNEL;
+    if (!Number.isInteger(frameIndex) || frameIndex < 0 || this.offset + SGC_BYTES_PER_CHANNEL > this.view.byteLength) {
+      throw new RangeError(`Frame index ${frameIndex} out of range: the capture has ${Math.floor(this.view.byteLength / SGC_BYTES_PER_FRAME)} frames`);
+    }
   }
 
   // Helper to read 32-bit word
@@ -302,7 +361,36 @@ export class SgcChannelData {
     this.view.setUint16(this.offset + 107, value, true);
   }
 
-  // Remaining bytes (109-127) are padding/reserved
+  // +6D [109] - Flags: bit 0 enabled, bits 1-2 AEG state
+  get flags(): number {
+    return this.view.getUint8(this.offset + SGC_FLAGS_OFFSET);
+  }
+  set flags(value: number) {
+    this.view.setUint8(this.offset + SGC_FLAGS_OFFSET, value);
+  }
+
+  /** Flags bit 0: keyed on and not run to its end. The channel plays in this frame. */
+  get enabled(): boolean {
+    return (this.flags & SGC_FLAG_ENABLED) !== 0;
+  }
+  set enabled(value: boolean) {
+    this.flags = value ? this.flags | SGC_FLAG_ENABLED : this.flags & ~SGC_FLAG_ENABLED;
+  }
+
+  /** Flags bits 1-2: 0 attack, 1 decay 1, 2 decay 2, 3 release (SGC_AEG_STATES). */
+  get aegState(): number {
+    return (this.flags >> AEG_STATE_SHIFT) & AEG_STATE_MASK;
+  }
+  set aegState(value: number) {
+    this.flags = (this.flags & ~(AEG_STATE_MASK << AEG_STATE_SHIFT)) | ((value & AEG_STATE_MASK) << AEG_STATE_SHIFT);
+  }
+
+  /** The AEG state by its name. */
+  get aegStateName(): SgcAegStateName {
+    return SGC_AEG_STATES[this.aegState];
+  }
+
+  // Bytes 110-127 are zero
 
   /**
    * Get all channel data as a plain object
@@ -369,44 +457,56 @@ export class SgcChannelData {
       lfo_value: this.lfo_value,
       alfo_value: this.alfo_value,
       plfo_value: this.plfo_value,
+      flags: this.flags,
+      enabled: this.enabled ? 1 : 0,
+      aegState: this.aegState,
     };
   }
 }
 
 /**
- * Helper to access all channels in a frame
+ * The 64 channels of one frame of a capture, read in place: a view with the frame's
+ * offset, not a copy of the frame.
  */
 export class SgcFrameData {
-  private buffer: ArrayBuffer;
-  private channels: SgcChannelData[] = [];
+  private readonly view: DataView;
+  readonly frameIndex: number;
 
-  constructor(buffer: ArrayBuffer, frameIndex: number = 0) {
-    const BYTES_PER_FRAME = 8192; // 64 channels × 128 bytes
-    const frameOffset = frameIndex * BYTES_PER_FRAME;
-
-    // Create a view into the specific frame
-    this.buffer = buffer.slice(frameOffset, frameOffset + BYTES_PER_FRAME);
-
-    // Initialize channel accessors
-    for (let i = 0; i < 64; i++) {
-      this.channels[i] = new SgcChannelData(this.buffer, i);
+  /** Frame `frameIndex` of `source` (a capture's buffer, or a DataView on all of it). */
+  constructor(source: ArrayBuffer | DataView, frameIndex: number = 0) {
+    this.view = source instanceof DataView ? source : new DataView(source);
+    const frameCount = Math.floor(this.view.byteLength / SGC_BYTES_PER_FRAME);
+    if (!Number.isInteger(frameIndex) || frameIndex < 0 || frameIndex >= frameCount) {
+      throw new RangeError(`Frame index ${frameIndex} out of range: the capture has ${frameCount} frames`);
     }
+    this.frameIndex = frameIndex;
   }
 
   /**
    * Get channel data accessor for a specific channel (0-63)
    */
   getChannel(channelIndex: number): SgcChannelData {
-    if (channelIndex < 0 || channelIndex >= 64) {
-      throw new Error(`Channel index ${channelIndex} out of range (0-63)`);
-    }
-    return this.channels[channelIndex];
-  }
-
-  /**
-   * Get the underlying ArrayBuffer for this frame
-   */
-  getBuffer(): ArrayBuffer {
-    return this.buffer;
+    return new SgcChannelData(this.view, channelIndex, this.frameIndex);
   }
 }
+
+/**
+ * The channels that play in a capture: those enabled (flags bit 0, keyed on and not run to
+ * its end) in at least one of its frames. A level above 0 does not make a channel active.
+ * One routine for every capture the panel gets; it reads the flags byte of each record in
+ * place, through one DataView on the capture, and stops at a channel's first enabled frame.
+ */
+export const findActiveChannels = (capture: SgcCapture): Set<number> => {
+  checkCapture(capture);
+  const view = new DataView(capture.data);
+  const active = new Set<number>();
+  for (let channel = 0; channel < SGC_CHANNELS_PER_FRAME; channel++) {
+    for (let frame = 0; frame < capture.frameCount; frame++) {
+      if (new SgcChannelData(view, channel, frame).enabled) {
+        active.add(channel);
+        break;
+      }
+    }
+  }
+  return active;
+};
