@@ -545,18 +545,23 @@ test.describe("captures of a scripted server", () => {
     await expect.poll(async () => (await cursorColumns(canvas)).centre).toBeLessThan(0.08);
     expect((await cursorColumns(canvas)).centre).toBeGreaterThan(0.04);
 
-    // the hover: the mouse rests over frame 97x while Record is pressed from the keyboard
+    // the hover: the mouse rests over frame 97x while Record is pressed from the keyboard, twice;
+    // with no move of the mouse the hover is the one it was, clamped to frame 63 when the short
+    // capture arrived and still 63 in the long one behind it
     await pointAt(page, canvas, 0.95);
     await expect(head).toHaveText(/HEAD:\s+9[67]\d:/);
     sgc.next(short);
     await record.focus();
     await page.keyboard.press("Enter");
     await expect(view.getByText("64 frames", { exact: true })).toBeVisible();
-    // a frame of the 64 (the last one, or the one under the mouse if the browser moved it again)
-    await expect(head).toHaveText(/HEAD:\s+6[0-3]:/);
+    await expect(head).toHaveText(/HEAD:\s+63:/);
+    sgc.next(long);
+    await page.keyboard.press("Enter");
+    await expect(view.getByText("1024 frames", { exact: true })).toBeVisible();
+    await expect(head).toHaveText(/HEAD:\s+63:/);
     await expect(view.locator("canvas")).toHaveCount(1);
     await expect(page.getByRole("alert")).toHaveCount(0);
-    expect(sgc.server.requestsOf("state.recordSgcFrames")).toEqual([{ frames: 1024 }, { frames: 1024 }, { frames: 1024 }]);
+    expect(sgc.server.requestsOf("state.recordSgcFrames")).toEqual(Array.from({ length: 4 }, () => ({ frames: 1024 })));
   });
 
   test(`a capture of 4096 frames is scanned and shown within ${CAPTURE_4096_BOUND_MS} ms of reaching the page, and its positions run to its last frame`, async ({ page }) => {
