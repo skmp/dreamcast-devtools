@@ -1,10 +1,23 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { test, expect, type Locator, type Page } from "@playwright/test";
-import { Diagnostics, currentInstructionAddress, disassemblyRow, dockTab, panel, saveScreenshot, statusBar, type RpcFrame } from "./support/fixtures";
+import { test, expect, type Download, type Locator, type Page } from "@playwright/test";
+import {
+  Diagnostics,
+  addPanelFromSelector,
+  canvasStats,
+  currentInstructionAddress,
+  disassemblyRow,
+  dockTab,
+  panel,
+  saveScreenshot,
+  statusBar,
+  tooltipButton,
+  type RpcFrame,
+} from "./support/fixtures";
 import { DIST_DIR } from "./support/paths";
 import { branchTarget, isArmControlFlow, isSh4ControlFlow, mnemonicOf } from "../scripts/contract/disasm";
+import { BinaryFrameKind, parseBinaryFrame } from "../src/lib/binaryFrame";
 
 // The UI against the emulator: the page an emulator serves (the bundle it embeds), driven
 // against the debugger server of that emulator. Every other spec of this suite meets the mock
@@ -14,21 +27,29 @@ import { branchTarget, isArmControlFlow, isSh4ControlFlow, mnemonicOf } from "..
 // ("Debugger: http://127.0.0.1:<port>/"), of an emulator that embeds the bundle of this
 // checkout and was started headless and paused on the sounding guest of its tree, with a
 // configuration and a data directory of its own (the recipe is in README.md, "The UI against
-// the emulator"):
+// the emulator"; every switch of the emulator has two dashes, a one-dash switch is an error):
 //
 //   HOME=<run>/home XDG_CONFIG_HOME=<run>/cfg XDG_DATA_HOME=<run>/data \
-//   <emulator> -config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 ,
+//   <emulator> --config config:Headless=yes , audio:backend=none , config:Dreamcast.RTC=946684800 ,
 //       Debugger:Enabled=yes , Debugger:Port=0 , Debugger:Required=yes , Debugger:StartPaused=yes
 //       <emulator tree>/tests/debugger/guest/dsptest/dsptest.elf
 //
 // The guest (tests/debugger/guest/dsptest of the emulator's tree): reios enters it at
-// 0x8C010000, where it has `_start`; it copies an ARM7 program of 352 bytes to the start of the
-// wave memory and releases the ARM7 onto it, and then counts in a loop while the ARM7 and the
-// timer of the AICA make the sound. The spec expects the machine in its start stop: one run
-// per emulator process. It ends with the machine paused, which lasts as long as the page: ten
-// seconds after the last client has gone the server releases the stop, and the guest runs
-// until the process is ended. Whoever started the emulator ends it, by its pid, when
-// Playwright has returned.
+// 0x8C010000, where it has `_start`, with its ARM7 held (`ENABLED` 0); it copies an ARM7 program
+// of 352 bytes to the start of the wave memory, its DSP program of 18 steps to the DSP, and
+// releases the ARM7, and then counts in a loop while the ARM7, the timer of the AICA and the DSP
+// make the sound: two channels, and the two outputs of the DSP. The spec expects the machine in
+// its start stop: one run per emulator process. It ends with the machine paused, which lasts as
+// long as the page: ten seconds after the last client has gone the server releases the stop,
+// and the guest runs until the process is ended. Whoever started the emulator ends it, by its
+// pid, when Playwright has returned.
+//
+// The M2 part: the start stop, the entry, SH4 steps, a register and a byte written, a reset, ARM7
+// steps. The M3 part, in the Audio Debugger: a DSP breakpoint and steps of the DSP from the
+// toolbar; "Load from emulator" at the breakpoint's stop, and the same steps in the playground,
+// which give what the emulator's give; a capture of the SGC with a channel that sounds; a load at
+// a stop of the SH4, whose banner says what it cannot know; and a step of the DSP at the entry of
+// the program, where the guest holds its ARM7, from the toolbar and from the DSP's view.
 
 const EMULATOR_URL = process.env.E2E_EMULATOR_URL;
 
@@ -42,6 +63,22 @@ const ARM7_PROGRAM_BYTES = 352;
 const ARM7_FIQ_VECTOR = 0x1c;
 /** The node of the device tree that has the registers of the ARM7. */
 const ARM7_REGISTERS = "dc.aica.arm7";
+/** The node of the DSP, and the rows of it a load from the emulator takes. */
+const DSP_REGISTERS = "dc.aica.dsp";
+const DSP_ROWS = ["STEP", "MDEC_CT", "ACC", "Y_REG", "FRC_REG", "ADRS_REG", "LATCH", "LATCH_COPY", "MEMVAL", "NOFL_PIPE", "MIXS_BANK"];
+/** The step of the guest's DSP program the spec stops in front of, and how many steps it then makes: inside one sample, past every step of the program. */
+const DSP_STOP_STEP = 1;
+const DSP_STEPS = 17;
+/** The bus whose send the guest's DSP program reads (its first channel's ISEL): MIXS[3]. */
+const DSP_SEND_BUS = 3;
+/** Where the ARM7 sees the AICA's register file, in the read of a load from the emulator. */
+const REGISTER_FILE = 0x00800000;
+/** The DSP's registers that a step writes: TEMP, MEMS and EFREG, as offsets of the register file. */
+const DSP_WRITTEN = [
+  ["TEMP", 0x4000, 0x4400],
+  ["MEMS", 0x4400, 0x4500],
+  ["EFREG", 0x4580, 0x45c0],
+] as const;
 
 /** What `dist-native/bundle-info.json` says of a build (scripts/bundle-info.ts). */
 interface BundleInfo {
@@ -85,6 +122,20 @@ const lineAt = async (view: Locator, address: number): Promise<string> => {
   return (await row.locator("span").last().innerText()).trim();
 };
 
+/** The 16 bits a CPU reads at an offset of the AICA's register file, in a read of the ARM7 from 0. */
+const fileWord = (memory: Uint8Array, offset: number): number => memory[REGISTER_FILE + offset] | (memory[REGISTER_FILE + offset + 1] << 8);
+
+/** The value of a register in the playground's Debugger section, from its title (hex). */
+const playgroundRegister = async (view: Locator, name: string): Promise<number> =>
+  Number(await view.getByText(`${name}:`, { exact: true }).locator("xpath=following-sibling::span").getAttribute("title"));
+
+/** The register file of the playground's core, as its Download Regs saves it: one 16-bit register in each 32-bit slot. */
+const playgroundFile = async (page: Page, view: Locator): Promise<Uint8Array> => {
+  const download: Promise<Download> = page.waitForEvent("download");
+  await view.getByRole("button", { name: "Download Regs", exact: true }).click();
+  return new Uint8Array(readFileSync((await (await download).path())!));
+};
+
 const runControls = (page: Page): Locator => page.locator("header").getByRole("group", { name: "Run controls" });
 const control = (page: Page, name: string): Locator => runControls(page).getByRole("button", { name, exact: true });
 const focusedTarget = (page: Page): Locator => runControls(page).getByRole("status", { name: "Focused target" });
@@ -104,8 +155,8 @@ interface Tick {
 test.describe("the UI the emulator serves, against that emulator", () => {
   test.skip(!EMULATOR_URL, "E2E_EMULATOR_URL is not set: this spec needs the page URL of a running emulator (README.md)");
 
-  test("connects at the start stop, runs to the program, steps the SH4, writes a register and a byte, resets, and steps the ARM7", async ({ page }, testInfo) => {
-    test.setTimeout(240_000);
+  test("connects at the start stop, runs to the program, steps the SH4, writes a register and a byte, resets, and steps the ARM7; and the DSP: its breakpoint and steps, a load into the playground that steps as the emulator does, a capture, its steps while the ARM7 is held", async ({ page }, testInfo) => {
+    test.setTimeout(420_000);
     /** What the run met, for whoever reads its log: one line each. */
     const note = (line: string) => console.log(`[emulator-smoke] ${line}`);
     const origin = new URL(EMULATOR_URL!).origin;
@@ -135,6 +186,7 @@ test.describe("the UI the emulator serves, against that emulator", () => {
     // the JSON-RPC traffic of the page
     const sent: RpcFrame[] = [];
     const received: RpcFrame[] = [];
+    const binaries: Buffer[] = [];
     const sockets: string[] = [];
     page.on("websocket", (socket) => {
       sockets.push(socket.url());
@@ -146,6 +198,8 @@ test.describe("the UI the emulator serves, against that emulator", () => {
       socket.on("framereceived", ({ payload }) => {
         if (typeof payload === "string") {
           received.push(JSON.parse(payload) as RpcFrame);
+        } else {
+          binaries.push(payload);
         }
       });
     });
@@ -166,6 +220,27 @@ test.describe("the UI the emulator serves, against that emulator", () => {
     const arm7Register = (tick: Tick, name: string): number | undefined => {
       const value = tick.registers[ARM7_REGISTERS]?.find((register) => register.name === name)?.value;
       return value === undefined ? undefined : Number(value);
+    };
+    /** A register of the DSP as a tick has it. */
+    const dspRegister = (tick: Tick, name: string): number | undefined => {
+      const value = tick.registers[DSP_REGISTERS]?.find((register) => register.name === name)?.value;
+      return value === undefined ? undefined : Number(value);
+    };
+    /** The read of the latest load from the emulator: its request, its answer, and the bytes of its binary frame. */
+    const lastLoad = async (): Promise<{ request: RpcFrame; memory: Uint8Array }> => {
+      const request = requests("state.getMemoryBinary").at(-1)!;
+      expect(request.params, "a load is one read of the ARM7 from 0 for 0x808000 bytes").toEqual({ target: "arm7", address: 0, length: 0x00808000 });
+      const answer = await answerTo(request);
+      const { binaryId, totalBytes } = answer.result as { binaryId: number; totalBytes: number };
+      expect(totalBytes).toBe(0x00808000);
+      let frame: ReturnType<typeof parseBinaryFrame> | undefined;
+      await expect
+        .poll(() => {
+          frame = binaries.map((bytes) => parseBinaryFrame(bytes)).find((parsed) => parsed.ok && parsed.header.kind === BinaryFrameKind.MEMORY && parsed.header.binaryId === binaryId);
+          return frame !== undefined;
+        }, { message: `the frame of binaryId ${binaryId}` })
+        .toBe(true);
+      return { request, memory: new Uint8Array((frame as { payload: ArrayBuffer }).payload) };
     };
     /** Every control request was accepted: none of them could only be refused. */
     const expectAccepted = async (method: string, count: number) => {
@@ -464,10 +539,245 @@ test.describe("the UI the emulator serves, against that emulator", () => {
       await saveScreenshot(page, testInfo, "emulator-7-arm7-step");
     });
 
+    // --- the M3 part: the DSP, in the Audio Debugger ---
+    const audio = (path = "/workspace/audio-debugger") => page.goto(route(path));
+    const dspView = panel(page, "dsp-disassembly");
+    const playground = panel(page, "dsp-playground");
+    const loadButton = playground.getByRole("button", { name: "Load from emulator", exact: true });
+    const banner = playground.getByRole("status", { name: "Snapshot from the emulator" });
+    /** One step of the DSP, asked for by `ask` at a stop of the DSP: one accepted request, a new stop, the step after. */
+    const stepDsp = async (ask: () => Promise<void>): Promise<number> => {
+      const stop = await stopNumber(page);
+      const step = dspRegister(await pausedTick(stop), "STEP")!;
+      const steps = requests("control.step").length;
+      await ask();
+      await expect(state).toHaveText(`Paused · step completed · stop ${stop + 1}`);
+      expect(requests("control.step")).toHaveLength(steps + 1);
+      expect(requests("control.step").at(-1)?.params).toEqual({ target: "dsp" });
+      expect((await answerTo(requests("control.step").at(-1)!)).result).toEqual({});
+      const to = dspRegister(await pausedTick(stop + 1), "STEP");
+      expect(to, `a step of the DSP from step ${step}`).toBe((step + 1) % 128);
+      await expect(dspView.locator(".current-instruction")).toHaveAttribute("data-address", String(to));
+      return to!;
+    };
+
+    let breakpointStop = 0;
+    await test.step("the Audio Debugger: a DSP breakpoint stops the DSP in front of its step, in a sample of the guest's program", async () => {
+      await audio();
+      await expect(statusBar(page)).toContainText("Connection: connected");
+      await expect(focusedTarget(page)).toHaveText("DSP");
+      // the guest has loaded its program: the step is one of it, no empty one
+      const line = await lineAt(dspView, DSP_STOP_STEP);
+      expect(line, `the DSP's step ${DSP_STOP_STEP} is the guest's`).not.toMatch(/= TRA:0$/);
+      const breakpoints = panel(page, "dsp-breakpoints");
+      await breakpoints.getByRole("textbox").fill(String(DSP_STOP_STEP));
+      await breakpoints.getByRole("textbox").press("Enter");
+      await expect(breakpoints.getByRole("listitem")).toHaveCount(1);
+      const stop = await stopNumber(page);
+      await control(page, "Run").click();
+      const hit = `Paused · breakpoint dc.aica.dsp.step == ${String(DSP_STOP_STEP).padStart(3, "0")} · stop ${stop + 1}`;
+      await expect(state).toHaveText(hit);
+      expect(dspRegister(await pausedTick(stop + 1), "STEP")).toBe(DSP_STOP_STEP);
+      await expect(dspView.locator(".current-instruction")).toHaveAttribute("data-address", String(DSP_STOP_STEP));
+      breakpointStop = stop + 1;
+      note(`DSP breakpoint: ${await state.innerText()}, step ${DSP_STOP_STEP} "${line}"`);
+      await saveScreenshot(page, testInfo, "emulator-8-dsp-breakpoint");
+    });
+
+    await test.step(`Load from emulator at the breakpoint's stop, and ${DSP_STEPS} steps in the playground and from the toolbar: the same rows and the same TEMP, MEMS and EFREG`, async () => {
+      await addPanelFromSelector(page, 1, "DSP: Playground");
+      await expect(playground.getByRole("button", { name: "Start DSP" })).toBeVisible();
+      await expect(loadButton).not.toHaveAttribute("aria-disabled");
+      // a sample whose send the program reads is not 0: else a load into the other bank of MIXS would read the same
+      let first!: Uint8Array;
+      for (let attempt = 0; ; attempt++) {
+        await loadButton.click();
+        await expect(banner).toContainText(`, stop ${breakpointStop}, `);
+        first = (await lastLoad()).memory;
+        const send = (fileWord(first, 0x4500 + 8 * DSP_SEND_BUS + 4) << 4) | (fileWord(first, 0x4500 + 8 * DSP_SEND_BUS) & 0xf);
+        if (send !== 0) {
+          note(`MIXS[${DSP_SEND_BUS}] of the load is 0x${send.toString(16).toUpperCase()} (attempt ${attempt + 1})`);
+          break;
+        }
+        expect(attempt, `a sample whose MIXS[${DSP_SEND_BUS}] is not 0`).toBeLessThan(8);
+        // the breakpoint is reached in every sample: Run stops at it one sample later
+        await control(page, "Run").click();
+        await expect(state).toHaveText(new RegExp(` · stop ${breakpointStop + 1}$`));
+        breakpointStop++;
+      }
+      const at = await pausedTick(breakpointStop);
+      const host = new URL(EMULATOR_URL!).host;
+      await expect(banner).toContainText(new RegExp(`^Loaded from nullDC\\S* @ ${host.replace(/\./g, "\\.")}, stop ${breakpointStop}, `));
+      await expect(banner.locator("time")).toHaveAttribute("datetime", /^\d{4}-\d{2}-\d{2}T/);
+      await expect(banner).toContainText(`At step ${DSP_STOP_STEP}, in the DSP phase of a sample`);
+      await expect(banner).not.toContainText("not known");
+      await expect(banner).toContainText("loaded as 0");
+      // the playground stands at the step, paused
+      await playground.getByRole("heading", { name: "Debugger", exact: true }).locator("xpath=following-sibling::button").click();
+      await expect(playground.getByText("Step:", { exact: true }).locator("xpath=following-sibling::span")).toHaveText(new RegExp(`^\\s*${DSP_STOP_STEP}$`));
+      for (const name of DSP_ROWS.filter((row) => row !== "STEP")) {
+        expect(await playgroundRegister(playground, name), `${name} as loaded`).toBe(dspRegister(at, name));
+      }
+      // MIXS as the read has it, in the bank the DSP reads
+      const loaded = await playgroundFile(page, playground);
+      const word = (bytes: Uint8Array, offset: number) => bytes[offset] | (bytes[offset + 1] << 8);
+      for (let offset = 0x4500; offset < 0x4580; offset += 4) {
+        expect(word(loaded, offset), `MIXS at 0x${offset.toString(16)}`).toBe(fileWord(first, offset));
+      }
+
+      // the steps in the playground
+      const playgroundStep = tooltipButton(playground, "Step");
+      for (let k = 0; k < DSP_STEPS; k++) {
+        await playgroundStep.click();
+        await expect(playground.getByText("Step:", { exact: true }).locator("xpath=following-sibling::span")).toHaveText(new RegExp(`^\\s*${DSP_STOP_STEP + k + 1}$`));
+      }
+      const rows: Record<string, number> = {};
+      for (const name of DSP_ROWS.filter((row) => row !== "STEP")) {
+        rows[name] = await playgroundRegister(playground, name);
+      }
+      const computed = await playgroundFile(page, playground);
+
+      // the same steps of the emulator, from the toolbar
+      for (let k = 0; k < DSP_STEPS; k++) {
+        await stepDsp(() => control(page, "Step Into").click());
+      }
+      const after = await pausedTick(await stopNumber(page));
+      expect(dspRegister(after, "STEP")).toBe(DSP_STOP_STEP + DSP_STEPS);
+      // the rows the steps changed, and those they did not: every one is the playground's
+      const changed: string[] = [];
+      for (const name of DSP_ROWS.filter((row) => row !== "STEP")) {
+        expect(rows[name], `${name}: ${DSP_STEPS} steps of the playground and of the emulator`).toBe(dspRegister(after, name));
+        if (dspRegister(after, name) !== dspRegister(at, name)) changed.push(name);
+      }
+      expect(changed.length, "the steps changed rows of the datapath").toBeGreaterThan(0);
+      // read back: a load at the stop behind the steps, and its read is the emulator's
+      await loadButton.click();
+      await expect(banner).toContainText(new RegExp(`, stop ${await stopNumber(page)}, `));
+      const emulator = (await lastLoad()).memory;
+      let words = 0;
+      const written: string[] = [];
+      for (const [name, from, to] of DSP_WRITTEN) {
+        for (let offset = from; offset < to; offset += 4) {
+          words++;
+          expect(word(computed, offset), `${name} at 0x${offset.toString(16)}: the playground's ${DSP_STEPS} steps and the emulator's`).toBe(fileWord(emulator, offset));
+          if (fileWord(emulator, offset) !== fileWord(first, offset)) written.push(`${name}@0x${offset.toString(16)}`);
+        }
+      }
+      expect(written.length, "the steps wrote TEMP, MEMS or EFREG").toBeGreaterThan(0);
+      note(`playground and emulator after ${DSP_STEPS} steps from step ${DSP_STOP_STEP}: ${DSP_ROWS.length - 1} rows equal (changed: ${changed.join(", ")}), ${words} words of TEMP, MEMS and EFREG equal (${written.length} written)`);
+      await saveScreenshot(page, testInfo, "emulator-9-dsp-load");
+    });
+
+    await test.step("a capture of the SGC, in which a channel sounds", async () => {
+      // the DSP breakpoint would stop the capture's run in every sample
+      const breakpoints = panel(page, "dsp-breakpoints");
+      await breakpoints.getByRole("listitem").getByRole("button", { name: "Remove breakpoint" }).click();
+      await expect(breakpoints.getByRole("listitem")).toHaveCount(0);
+      await dockTab(page, "SGC").click();
+      const sgc = panel(page, "sgc");
+      const stop = await stopNumber(page);
+      await tooltipButton(sgc, "Run the emulator and record 1024 frames").click();
+      await expect(state).toHaveText(`Paused · capture finished · stop ${stop + 1}`, { timeout: 30_000 });
+      await expect(sgc.getByText("1024 frames", { exact: true })).toBeVisible({ timeout: 30_000 });
+      const active = sgc.getByRole("button", { name: /^Active \(\d+\)$/ });
+      await expect(active).toBeVisible();
+      const count = Number((await active.innerText()).match(/\((\d+)\)/)![1]);
+      expect(count, "channels that sound in the capture").toBeGreaterThan(0);
+      // each of them has its view, and the first sounds: its output to the left and the right (Post-VolPan, bytes 84
+      // and 86 of its records, which the emulator's fast tier fills; the Pre-VolPan sample of bytes 76 to 83 it does
+      // not) is no flat line
+      const canvases = sgc.locator("canvas");
+      await expect(canvases).toHaveCount(count);
+      await tooltipButton(sgc, "Post-VolPan (L/R/DSP)").first().click();
+      await expect
+        .poll(async () => {
+          const { bars } = await canvasStats(canvases.first());
+          return bars.blue + bars.pink;
+        }, { message: "the output of the first active channel, drawn" })
+        .toBeGreaterThan(100);
+      expect((await answerTo(requests("state.recordSgcFrames").at(-1)!)).result).toEqual({});
+      note(`capture: ${count} channels active, ${await state.innerText()}`);
+      await saveScreenshot(page, testInfo, "emulator-10-sgc");
+    });
+
+    await test.step("a load at a stop of the SH4: the banner says that MIXS of the next sample is not known, and that EXTS is loaded as 0", async () => {
+      await page.goto(route("/workspace/sh4-debugger"));
+      await expect(statusBar(page)).toContainText("Connection: connected");
+      await expect(focusedTarget(page)).toHaveText("SH4");
+      const stop = await stopNumber(page);
+      await control(page, "Step Into").click();
+      await expect(state).toHaveText(`Paused · step completed · stop ${stop + 1}`);
+      expect(dspRegister(await pausedTick(stop + 1), "STEP")).toBe(0);
+      await audio();
+      await expect(statusBar(page)).toContainText("Connection: connected");
+      await dockTab(page, "DSP: Playground").click();
+      await expect(loadButton).not.toHaveAttribute("aria-disabled");
+      await loadButton.click();
+      await expect(banner).toContainText(`, stop ${stop + 1}, `);
+      await expect(banner).toContainText("At step 0: MIXS of the next sample is not known.");
+      await expect(banner).toContainText("EXTS (the CD-DA input) is no register a CPU reads: it is loaded as 0.");
+      await lastLoad();
+      note(`load at the SH4's step: ${await banner.innerText()}`);
+      await saveScreenshot(page, testInfo, "emulator-11-sh4-load");
+    });
+
+    /**
+     * The entry of the program behind a reset: the guest holds its ARM7 there (`ENABLED` 0), and
+     * the DSP is clocked all the same. Returns the stop.
+     */
+    const toTheEntry = async (): Promise<number> => {
+      const stop = await stopNumber(page);
+      await control(page, "Reset").click();
+      await expect(state).toHaveText(`Paused · reset · stop ${stop + 1}`);
+      await control(page, "Run").click();
+      await expect(state).toHaveText(`Paused · breakpoint dc.sh4.cpu.pc == ${hex8(ENTRY)} · stop ${stop + 2}`);
+      expect(arm7Register(await pausedTick(stop + 2), "ENABLED"), "the ARM7 at the entry").toBe(0);
+      return stop + 2;
+    };
+
+    await test.step("at the entry, where the guest holds its ARM7, a step of the DSP from the toolbar; behind a reset, again, one from the DSP's view", async () => {
+      // the breakpoint at the entry, for the two runs from a reset
+      await page.goto(route("/workspace/sh4-debugger"));
+      await expect(statusBar(page)).toContainText("Connection: connected");
+      const breakpoints = panel(page, "sh4-breakpoints");
+      await breakpoints.getByRole("textbox").fill(hex8(ENTRY));
+      await breakpoints.getByRole("textbox").press("Enter");
+      await expect(breakpoints.getByRole("listitem")).toHaveCount(1);
+      await audio();
+      await expect(statusBar(page)).toContainText("Connection: connected");
+      await expect(focusedTarget(page)).toHaveText("DSP");
+
+      // the toolbar
+      const first = await toTheEntry();
+      await expect(control(page, "Step Into")).toBeEnabled();
+      await expect(control(page, "Step Into")).toHaveAccessibleDescription("Step Into (F11)");
+      await stepDsp(() => control(page, "Step Into").click());
+      note(`the DSP stepped from the toolbar at the entry (stop ${first}, ENABLED 0): ${await state.innerText()}`);
+      await saveScreenshot(page, testInfo, "emulator-12-dsp-held-toolbar");
+
+      // the view
+      const second = await toTheEntry();
+      const viewStep = tooltipButton(dspView, "Step");
+      await expect(viewStep).toBeEnabled();
+      await expect(viewStep).toHaveAccessibleDescription("");
+      await stepDsp(() => viewStep.click());
+      note(`the DSP stepped from its view at the entry (stop ${second}, ENABLED 0): ${await state.innerText()}`);
+      // never refused as held: the DSP has no such state
+      expect(received.filter((frame) => frame.method === undefined && JSON.stringify(frame).includes('"code":-32012'))).toEqual([]);
+      await saveScreenshot(page, testInfo, "emulator-13-dsp-held-view");
+    });
+
     // Nothing the emulator answered was a refusal of a control request or of a write: the UI
     // asked for nothing it could have known to be refused.
     const refused = [...sent]
-      .filter((frame) => frame.method?.startsWith("control.") || frame.method === "state.setRegister" || frame.method === "state.writeMemory")
+      .filter(
+        (frame) =>
+          frame.method?.startsWith("control.") ||
+          frame.method === "state.setRegister" ||
+          frame.method === "state.writeMemory" ||
+          frame.method === "state.getMemoryBinary" ||
+          frame.method === "state.recordSgcFrames",
+      )
       .map((frame) => ({ method: frame.method, answer: received.find((answer) => answer.id === frame.id && answer.method === undefined) }))
       .filter(({ answer }) => answer?.error !== undefined || (answer?.result as { error?: unknown } | undefined)?.error !== undefined);
     expect(refused).toEqual([]);
