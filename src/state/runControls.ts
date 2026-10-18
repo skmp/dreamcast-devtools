@@ -9,7 +9,8 @@ import { registerNumber, type TargetInfo } from "./targets";
 // A control is off whenever its request could only be refused: no step is sent to a server
 // that cannot step the target (-32004), to a target that runs (-32003), in a stop of the
 // emulator's own window (-32001, -32002), or to an ARM7 that is held in reset (-32012); no
-// reset to a server without the capability (-32004). A control that is off says why.
+// reset to a server without the capability (-32004). A control that is off says why. The DSP
+// is stepped while the ARM7 is held: the AICA is clocked whatever ARMRST says (`heldFor`).
 
 export type RunControlId = "run" | "pause" | "step" | "stepOver" | "stepOut" | "reset";
 
@@ -83,6 +84,16 @@ export const hotkeyControl = (event: {
 export const arm7Held = (registersByPath: Record<string, RegisterValue[]>, arm7: Pick<DebuggerTarget, "pcPath">): boolean =>
   registerNumber(registersByPath[arm7.pcPath]?.find((register) => register.name === "ENABLED")?.value) === 0;
 
+/**
+ * Whether `target` is held in reset, so that its steps are off (`StepInput.held`): the ARM7
+ * alone, while `ENABLED` of its node reads 0 (`arm7Held`). No other target is ever held. The
+ * DSP is not: the emulator clocks the AICA whatever ARMRST says, so a step of the DSP and a
+ * breakpoint on it work while the ARM7 is held, and only the ARM7's steps are refused then
+ * (-32012). The toolbar and every disassembly view ask this, for the target they step.
+ */
+export const heldFor = (target: Pick<DebuggerTarget, "id" | "pcPath">, registersByPath: Record<string, RegisterValue[]>): boolean =>
+  target.id === "arm7" && arm7Held(registersByPath, target);
+
 export const NOT_CONNECTED = "not connected";
 export const NO_SERVER_YET = "waiting for the server";
 export const TARGET_RUNS = "the target is running";
@@ -99,7 +110,7 @@ export interface StepInput {
   execution?: Pick<ExecutionState, "state" | "reason">;
   /** the target the steps are for */
   target: Pick<TargetInfo, "id" | "label" | "supported" | "stepping">;
-  /** `target` is the ARM7 and it is held in reset (`arm7Held`) */
+  /** `target` is held in reset: `heldFor(target, ...)`, which is the ARM7 alone (never the DSP) */
   held: boolean;
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { arm7Held, hotkeyControl, runControlsOff, stepOff, RUN_CONTROL_IDS, RUN_CONTROL_KEYS, RUN_CONTROL_NAMES } from "./runControls";
+import { arm7Held, heldFor, hotkeyControl, runControlsOff, stepOff, RUN_CONTROL_IDS, RUN_CONTROL_KEYS, RUN_CONTROL_NAMES } from "./runControls";
 import type { RunControlsInput } from "./runControls";
 import { targetBeforeFirstServer, unlistedTarget } from "./targets";
 
@@ -212,6 +212,48 @@ describe("whether the ARM7 is held in reset", () => {
     const elsewhere = { ...arm7, pcPath: "board.sound.cpu" };
     expect(arm7Held(registers("0x0"), elsewhere)).toBe(false);
     expect(arm7Held({ "board.sound.cpu": [{ name: "ENABLED", value: "0x0", width: 1 }] }, elsewhere)).toBe(true);
+  });
+});
+
+describe("which target is held in reset", () => {
+  // what a tick has while the guest holds its ARM7: ENABLED 0 in the node of the ARM7; the other two nodes are given
+  // an ENABLED 0 of their own too, so that a rule that reads any node at all finds one
+  const heldArm7 = {
+    "dc.sh4.cpu": [{ name: "PC", value: "0x8C010000", width: 32 }, { name: "ENABLED", value: "0x0", width: 1 }],
+    "dc.aica.arm7": [{ name: "PC", value: "0x00000000", width: 32 }, { name: "ENABLED", value: "0x0", width: 1 }],
+    "dc.aica.dsp": [{ name: "STEP", value: "0x0", width: 8 }, { name: "ENABLED", value: "0x0", width: 1 }],
+  };
+
+  it("is the ARM7 while ENABLED of its node reads 0", () => {
+    expect(heldFor(arm7, heldArm7)).toBe(true);
+    expect(heldFor(arm7, { ...heldArm7, "dc.aica.arm7": [{ name: "ENABLED", value: "0x1", width: 1 }] })).toBe(false);
+    expect(heldFor(arm7, {})).toBe(false);
+  });
+
+  it("is never the DSP: the AICA is clocked whatever ARMRST says, and the DSP is stepped while the ARM7 is held", () => {
+    expect(heldFor(dsp, heldArm7)).toBe(false);
+    // also for a server that puts the DSP's step in the node of the ARM7
+    expect(heldFor({ ...dsp, pcPath: "dc.aica.arm7" }, heldArm7)).toBe(false);
+  });
+
+  it("is never the SH4", () => {
+    expect(heldFor(sh4, heldArm7)).toBe(false);
+    expect(heldFor({ ...sh4, pcPath: "dc.aica.arm7" }, heldArm7)).toBe(false);
+  });
+
+  it("reads the node the server gives the ARM7", () => {
+    const elsewhere = { ...arm7, pcPath: "board.sound.cpu" };
+    expect(heldFor(elsewhere, heldArm7)).toBe(false);
+    expect(heldFor(elsewhere, { "board.sound.cpu": [{ name: "ENABLED", value: "0x0", width: 1 }] })).toBe(true);
+  });
+
+  it("decides the steps: with the ARM7 held the DSP's are on and the ARM7's are off", () => {
+    const input = (target: typeof sh4) => paused({ target, held: heldFor(target, heldArm7) });
+    expect(runControlsOff(input(dsp))).toMatchObject({ step: undefined, stepOver: "the DSP has no calls to step over or out of" });
+    expect(stepOff(input(dsp))).toBeUndefined();
+    expect(stepOff(input(sh4))).toBeUndefined();
+    expect(stepOff(input(arm7))).toBe("the ARM7 is held in reset");
+    expect(runControlsOff(input(arm7))).toMatchObject({ step: "the ARM7 is held in reset", stepOver: "the ARM7 is held in reset", stepOut: "the ARM7 is held in reset" });
   });
 });
 

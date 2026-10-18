@@ -14,7 +14,7 @@ import { useDebuggerDataStore } from "../../state/debuggerDataStore";
 import { useCapability, useTarget } from "../../state/debuggerSelectors";
 import { useFocusedTarget } from "../../state/focusedTarget";
 import {
-  arm7Held,
+  heldFor,
   runControlsOff,
   RUN_CONTROL_ARIA_KEYS,
   RUN_CONTROL_KEYS,
@@ -78,7 +78,8 @@ export const RunControls = ({ workspaceId }: RunControlsProps) => {
   const control = useDebuggerDataStore((state) => state.control);
   const canReset = useCapability(CAPABILITIES.RESET);
   const target = useTarget(useFocusedTarget(workspaceId));
-  const held = useDebuggerDataStore((state) => target.id === "arm7" && arm7Held(state.registersByPath, target));
+  // only the ARM7 is ever held in reset: the DSP is stepped while it is (`heldFor`)
+  const held = useDebuggerDataStore((state) => heldFor(target, state.registersByPath));
 
   const off = useMemo(
     () => runControlsOff({ connected, initialized, execution, target, held, canReset }),
