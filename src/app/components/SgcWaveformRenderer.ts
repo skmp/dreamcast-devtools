@@ -1,3 +1,140 @@
+import { SgcChannelData, checkCapture, clampFrameIndex, type SgcCapture } from "../../lib/sgcChannelData";
+
+export type SgcViewMode = 'pre-volpan' | 'post-volpan' | 'input';
+
+/** A vertex is x (a frame index), y (normalized, 0 at the top, 1 at the bottom), r, g, b, a. */
+export const FLOATS_PER_VERTEX = 6;
+/** A bar or a line segment is two triangles. */
+const FLOATS_PER_QUAD = 6 * FLOATS_PER_VERTEX;
+
+type Rgba = readonly [number, number, number, number];
+
+const BLUE: Rgba = [0.098, 0.463, 0.824, 0.8];
+const PINK: Rgba = [0.824, 0.098, 0.463, 0.8];
+const ORANGE: Rgba = [1.0, 0.596, 0.0, 0.8];
+const PURPLE: Rgba = [0.612, 0.153, 0.690, 0.8];
+const AEG_GREEN: Rgba = [0.298, 0.686, 0.314, 0.7];
+const FEG_ORANGE: Rgba = [1.0, 0.596, 0.0, 0.7];
+export const HOVER_COLOUR: Rgba = [1, 1, 1, 0.4];
+export const PLAYBACK_COLOUR: Rgba = [1, 0.596, 0, 0.9];
+
+/** How many vertices `vertices` holds. */
+export const vertexCount = (vertices: Float32Array): number => vertices.length / FLOATS_PER_VERTEX;
+
+/** A bar from x1 to x2 between y1 and y2. */
+const putBar = (vertices: Float32Array, offset: number, x1: number, x2: number, y1: number, y2: number, [r, g, b, a]: Rgba) => {
+  vertices.set([
+    x1, y1, r, g, b, a,
+    x2, y1, r, g, b, a,
+    x1, y2, r, g, b, a,
+    x2, y1, r, g, b, a,
+    x2, y2, r, g, b, a,
+    x1, y2, r, g, b, a,
+  ], offset);
+};
+
+/** A line from (x1, y1) to (x2, y2), `thickness` tall. */
+const putSegment = (vertices: Float32Array, offset: number, x1: number, y1: number, x2: number, y2: number, thickness: number, [r, g, b, a]: Rgba) => {
+  vertices.set([
+    x1, y1 - thickness, r, g, b, a,
+    x2, y2 - thickness, r, g, b, a,
+    x1, y1 + thickness, r, g, b, a,
+    x2, y2 - thickness, r, g, b, a,
+    x2, y2 + thickness, r, g, b, a,
+    x1, y1 + thickness, r, g, b, a,
+  ], offset);
+};
+
+/** What one channel of a capture draws: its waveform and its two envelopes. */
+export interface SgcChannelGeometry {
+  /** the capture's frame count: x runs over [0, frameCount) (a bar ends half a frame further) */
+  frameCount: number;
+  waveform: Float32Array;
+  /** one segment between two neighbouring frames: none for a capture of fewer than two */
+  aeg: Float32Array;
+  feg: Float32Array;
+}
+
+/**
+ * The vertices of one channel of a capture in a view mode, read from the capture in place
+ * (one DataView on it, no copy per frame). A capture without frames draws nothing.
+ */
+export const buildChannelGeometry = (capture: SgcCapture, channelIndex: number, viewMode: SgcViewMode): SgcChannelGeometry => {
+  checkCapture(capture);
+  const { frameCount } = capture;
+  const view = new DataView(capture.data);
+  const channel = (frame: number) => new SgcChannelData(view, channelIndex, frame);
+  // bars are 1.5 frames wide for a fatter appearance
+  const barWidth = 1.5;
+
+  let waveform: Float32Array;
+  if (viewMode === 'post-volpan') {
+    // three waveforms: left (blue) at 1/6, right (pink) at 1/2, DSP send (orange) at 5/6, each 12% tall
+    const scale = 0.12;
+    const lanes: Array<{ centre: number; colour: Rgba; sample: (data: SgcChannelData) => number }> = [
+      { centre: 1.0 / 6.0, colour: BLUE, sample: (data) => data.sample_left },
+      { centre: 0.5, colour: PINK, sample: (data) => data.sample_right },
+      { centre: 5.0 / 6.0, colour: ORANGE, sample: (data) => data.sample_dsp },
+    ];
+    waveform = new Float32Array(frameCount * lanes.length * FLOATS_PER_QUAD);
+    let offset = 0;
+    for (let frame = 0; frame < frameCount; frame++) {
+      const data = channel(frame);
+      for (const { centre, colour, sample } of lanes) {
+        // int16 to [-1, 1]
+        const amplitude = sample(data) / 32768.0;
+        const height = Math.abs(amplitude * scale);
+        const top = amplitude >= 0 ? centre - height : centre;
+        const bottom = amplitude >= 0 ? centre : centre + height;
+        putBar(waveform, offset, frame, frame + barWidth, top, bottom, colour);
+        offset += FLOATS_PER_QUAD;
+      }
+    }
+  } else {
+    // one waveform around the middle, 40% of the height: Pre-VolPan the sample after TL (blue),
+    // Input the filtered sample (purple)
+    const colour = viewMode === 'input' ? PURPLE : BLUE;
+    const scale = 0.4;
+    waveform = new Float32Array(frameCount * FLOATS_PER_QUAD);
+    for (let frame = 0; frame < frameCount; frame++) {
+      const data = channel(frame);
+      const amplitude = (viewMode === 'input' ? data.sample_filtered : data.sample_post_tl) / 32768.0;
+      const top = amplitude >= 0 ? 0.5 - amplitude * scale : 0.5;
+      const bottom = amplitude >= 0 ? 0.5 : 0.5 - amplitude * scale;
+      putBar(waveform, frame * FLOATS_PER_QUAD, frame, frame + barWidth, top, bottom, colour);
+    }
+  }
+
+  // the envelopes over the full height: AEG 0x3FF (loudest) and FEG 0x1FFF at the top, 0 at the bottom
+  const segments = Math.max(0, frameCount - 1);
+  const thickness = 0.003;
+  const aeg = new Float32Array(segments * FLOATS_PER_QUAD);
+  const feg = new Float32Array(segments * FLOATS_PER_QUAD);
+  for (let frame = 0; frame < segments; frame++) {
+    const here = channel(frame);
+    const next = channel(frame + 1);
+    putSegment(aeg, frame * FLOATS_PER_QUAD, frame, 1 - here.aeg_value / 0x3FF, frame + barWidth, 1 - next.aeg_value / 0x3FF, thickness, AEG_GREEN);
+    putSegment(feg, frame * FLOATS_PER_QUAD, frame, 1 - here.feg_value / 0x1FFF, frame + barWidth, 1 - next.feg_value / 0x1FFF, thickness, FEG_ORANGE);
+  }
+
+  return { frameCount, waveform, aeg, feg };
+};
+
+/**
+ * A cursor over the full height at `position`, a frame of a capture of `frameCount`
+ * frames (clamped to it), `halfWidth` frames to either side (the canvas makes that one
+ * pixel, so a cursor on a short capture is not a wide band). None for a capture without frames.
+ */
+export const buildCursorVertices = (position: number, frameCount: number, halfWidth: number, colour: Rgba): Float32Array => {
+  if (frameCount <= 0) {
+    return new Float32Array(0);
+  }
+  const frame = clampFrameIndex(position, frameCount);
+  const vertices = new Float32Array(FLOATS_PER_QUAD);
+  putBar(vertices, 0, frame - halfWidth, frame + halfWidth, 0, 1, colour);
+  return vertices;
+};
+
 /**
  * WebGL-based renderer for SGC waveform visualization
  * Renders to an offscreen canvas and can blit to multiple destination canvases
@@ -159,15 +296,19 @@ export class SgcWaveformRenderer {
   }
 
   /**
-   * Render vertex buffer to the offscreen canvas
+   * Render vertex buffer to the offscreen canvas. `numFrames` is the capture's frame count,
+   * the x range the canvas's width shows; a capture without frames draws nothing.
    */
   render(
     vertexBuffer: WebGLBuffer,
     vertexCount: number,
-    scrollOffsetX: number = 0,
-    zoomLevel: number = 1,
-    numFrames: number = 1024
+    scrollOffsetX: number,
+    zoomLevel: number,
+    numFrames: number
   ): void {
+    if (numFrames <= 0 || vertexCount <= 0) {
+      return;
+    }
     const gl = this.gl;
     const program = this.program;
 

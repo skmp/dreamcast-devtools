@@ -5,12 +5,13 @@ import InputIcon from '@mui/icons-material/Input';
 import FullscreenIcon from '@mui/icons-material/Fullscreen';
 import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
 import { HideOnHoverTooltip } from "./HideOnHoverTooltip";
+import type { SgcViewMode } from "./SgcWaveformRenderer";
 
 interface SgcChannelSidebarProps {
   channelIndex: number;
-  viewMode: 'pre-volpan' | 'post-volpan' | 'input';
+  viewMode: SgcViewMode;
   isFullscreen: boolean;
-  onViewModeChange: (mode: 'pre-volpan' | 'post-volpan' | 'input') => void;
+  onViewModeChange: (mode: SgcViewMode) => void;
   onFullscreenToggle: (index: number) => void;
 }
 

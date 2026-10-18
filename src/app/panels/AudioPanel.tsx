@@ -6,21 +6,56 @@ import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord';
 import { useSessionStore } from "../../state/sessionStore";
 import { useDebuggerDataStore } from "../../state/debuggerDataStore";
-import { SgcFrameData } from "../../lib/sgcChannelData";
-import { CAPABILITIES, type RpcError } from "../../lib/debuggerSchema";
+import { clampFrameIndex, findActiveChannels, type SgcCapture } from "../../lib/sgcChannelData";
+import { SGC_CHANNELS_PER_FRAME } from "../../lib/binaryFrame";
+import { CAPABILITIES, DebuggerErrorCode, PROTOCOL_BOUNDS, type RpcError } from "../../lib/debuggerSchema";
+import { JsonRpcException } from "../../lib/jsonRpc";
+import type { DebuggerClient } from "../../services/debuggerClient";
 import { useCapability, useNoDataText } from "../../state/debuggerSelectors";
 import { PanelNotice } from "../components/PanelNotice";
 
+/** What Record asks for: the protocol's default length of a capture. */
+const RECORD_FRAMES = PROTOCOL_BOUNDS.sgcFrames.default;
+
+const CHANNELS = Array.from({ length: SGC_CHANNELS_PER_FRAME }, (_, i) => i);
+
+interface LoadedCapture {
+  capture: SgcCapture;
+  /** the channels enabled in at least one frame */
+  active: Set<number>;
+}
+
+/**
+ * The server's capture and the channels that play in it, for the first fetch and for every
+ * record alike: one scan, over the frames the result announces. `null` when the server has
+ * none yet (-32011, "no capture available"), which is no error.
+ */
+const loadCapture = async (client: DebuggerClient): Promise<LoadedCapture | null> => {
+  let capture: SgcCapture;
+  try {
+    capture = await client.fetchSgcFrameData();
+  } catch (error) {
+    if (error instanceof JsonRpcException && error.code === DebuggerErrorCode.NO_CAPTURE) {
+      return null;
+    }
+    throw error;
+  }
+  const active = findActiveChannels(capture);
+  console.log(`Detected active channels: ${Array.from(active).sort((a, b) => a - b).join(', ')}`);
+  return { capture, active };
+};
+
 export const AudioPanel = () => {
   const [showFilter, setShowFilter] = useState<'all' | 'active'>('active');
-  const [hoverPosition, setHoverPosition] = useState<number | null>(null); // Sample index [0, 1024)
-  const [playbackPosition, setPlaybackPosition] = useState<number>(0); // Sample index [0, 1024)
+  // Frame indices of the capture [0, frameCount); clamped when a shorter capture arrives
+  const [hoverPosition, setHoverPosition] = useState<number | null>(null);
+  const [playbackPosition, setPlaybackPosition] = useState<number>(0);
   const [zoomLevel, setZoomLevel] = useState<number>(1); // 1 = 100%, 2 = 200%, etc.
   const [scrollOffsetX, setScrollOffsetX] = useState<number>(0); // Horizontal scroll offset when zoomed
   const [fullscreenChannel, setFullscreenChannel] = useState<number | null>(null); // Channel in fullscreen mode
 
   const [isDragging, setIsDragging] = useState<boolean>(false);
-  const [sgcBinaryData, setSgcBinaryData] = useState<ArrayBuffer | null>(null);
+  const [capture, setCapture] = useState<SgcCapture | null>(null);
   const [renderer, setRenderer] = useState<SgcWaveformRenderer | null>(null);
   const [webglError, setWebglError] = useState<string | null>(null);
   const [activeChannels, setActiveChannels] = useState<Set<number>>(new Set());
@@ -36,42 +71,39 @@ export const AudioPanel = () => {
   const dragStartXRef = useRef<number>(0);
   const dragStartScrollRef = useRef<number>(0);
   const channelRefsRef = useRef<Map<number, SgcChannelViewHandle>>(new Map());
+  // the latest load: an answer to an earlier one that arrives behind it is not shown
+  const loadSeqRef = useRef<number>(0);
+
+  // Shows a capture (null: none yet), and keeps the positions inside it
+  const showCapture = useCallback((loaded: LoadedCapture | null) => {
+    if (!loaded) {
+      setCapture(null);
+      setActiveChannels(new Set());
+      setNoDataAvailable(true);
+      return;
+    }
+    const { frameCount } = loaded.capture;
+    setCapture(loaded.capture);
+    setActiveChannels(loaded.active);
+    setNoDataAvailable(false);
+    setPlaybackPosition((position) => clampFrameIndex(position, frameCount));
+    setHoverPosition((position) => (position === null ? null : clampFrameIndex(position, frameCount)));
+  }, []);
 
   // Fetch SGC frame data when debugger is initialized
   useEffect(() => {
-    const fetchData = async () => {
-      if (!client || !initialized || !canCapture) return;
-      try {
-        const { data: arrayBuffer } = await client.fetchSgcFrameData();
-        setSgcBinaryData(arrayBuffer);
-        setNoDataAvailable(false);
-
-        // Detect active channels by scanning for non-zero AEG values
-        const detectedActiveChannels = new Set<number>();
-        for (let channel = 0; channel < 64; channel++) {
-          let hasNonZeroAeg = false;
-          for (let frame = 0; frame < 1024; frame++) {
-            const frameData = new SgcFrameData(arrayBuffer, frame);
-            const channelData = frameData.getChannel(channel);
-            if (channelData.aeg_value !== 0) {
-              hasNonZeroAeg = true;
-              break;
-            }
-          }
-          if (hasNonZeroAeg) {
-            detectedActiveChannels.add(channel);
-          }
-        }
-        setActiveChannels(detectedActiveChannels);
-        console.log(`Detected active channels: ${Array.from(detectedActiveChannels).sort((a, b) => a - b).join(', ')}`);
-      } catch (error) {
+    if (!client || !initialized || !canCapture) return;
+    const seq = ++loadSeqRef.current;
+    loadCapture(client).then(
+      (loaded) => {
+        if (seq === loadSeqRef.current) showCapture(loaded);
+      },
+      (error) => {
         console.error("Failed to fetch SGC frame data:", error);
-        setNoDataAvailable(true);
-        setSgcBinaryData(null);
-      }
-    };
-    fetchData();
-  }, [client, initialized, canCapture]);
+        if (seq === loadSeqRef.current) showCapture(null);
+      },
+    );
+  }, [client, initialized, canCapture, showCapture]);
 
   // Initialize WebGL renderer
   useEffect(() => {
@@ -99,42 +131,26 @@ export const AudioPanel = () => {
 
     try {
       // Request recording from server; it answers when the capture is complete, or says why not
-      const recorded = (await client.recordSgcFrames()) as RpcError;
+      const recorded = (await client.recordSgcFrames(RECORD_FRAMES)) as RpcError;
       if (recorded.error) {
         showError(`Record: ${recorded.error.message}`);
         return;
       }
 
-      // Fetch the new data
-      const { data: arrayBuffer } = await client.fetchSgcFrameData();
-      setSgcBinaryData(arrayBuffer);
-      setNoDataAvailable(false);
-
-      // Detect active channels by scanning for non-zero AEG values
-      const BYTES_PER_FRAME = 8192;
-      const numFrames = arrayBuffer.byteLength / BYTES_PER_FRAME;
-      const detectedActiveChannels = new Set<number>();
-      for (let channel = 0; channel < 64; channel++) {
-        let hasNonZeroAeg = false;
-        for (let frame = 0; frame < numFrames; frame++) {
-          const frameData = new SgcFrameData(arrayBuffer, frame);
-          const channelData = frameData.getChannel(channel);
-          if (channelData.aeg_value !== 0) {
-            hasNonZeroAeg = true;
-            break;
-          }
-        }
-        if (hasNonZeroAeg) {
-          detectedActiveChannels.add(channel);
-        }
+      // Fetch the new data: the capture is the server's now, so "none" is an error here
+      const seq = ++loadSeqRef.current;
+      const loaded = await loadCapture(client);
+      if (!loaded) {
+        throw new Error("no capture available");
       }
-      setActiveChannels(detectedActiveChannels);
-      console.log(`Detected active channels: ${Array.from(detectedActiveChannels).sort((a, b) => a - b).join(', ')}`);
+      if (seq === loadSeqRef.current) {
+        showCapture(loaded);
+      }
     } catch (error) {
       console.error("Failed to record SGC frame data:", error);
       showError(`Record: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }, [client, showError]);
+  }, [client, showError, showCapture]);
 
   const handleFilterChange = useCallback(
     (_event: React.MouseEvent<HTMLElement>, newFilter: 'all' | 'active' | null) => {
@@ -225,9 +241,9 @@ export const AudioPanel = () => {
     }
 
     if (showFilter === 'active') {
-      return Array.from({ length: 64 }, (_, i) => i).filter((i) => activeChannels.has(i));
+      return CHANNELS.filter((i) => activeChannels.has(i));
     }
-    return Array.from({ length: 64 }, (_, i) => i);
+    return CHANNELS;
   }, [showFilter, activeChannels, fullscreenChannel]);
 
   // Create stable ref callback
@@ -287,7 +303,7 @@ export const AudioPanel = () => {
         >
           {/* Record Control */}
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-            <Tooltip title="Run the emulator and record 1024 frames">
+            <Tooltip title={`Run the emulator and record ${RECORD_FRAMES} frames`}>
               <IconButton
                 size="small"
                 onClick={handleRecord}
@@ -301,6 +317,13 @@ export const AudioPanel = () => {
               </IconButton>
             </Tooltip>
           </Box>
+
+          {/* The length of the capture shown */}
+          {capture && initialized ? (
+            <Box component="span" role="status" aria-label="Capture length" sx={{ fontSize: '0.75rem', color: 'text.secondary', fontFamily: 'monospace' }}>
+              {capture.frameCount === 1 ? '1 frame' : `${capture.frameCount} frames`}
+            </Box>
+          ) : null}
 
           {/* Spacer */}
           <Box sx={{ flex: 1 }} />
@@ -317,7 +340,7 @@ export const AudioPanel = () => {
               }}
             >
               <ToggleButton value="all" sx={{ px: 1.5, fontSize: '0.75rem' }}>
-                All (64)
+                All ({SGC_CHANNELS_PER_FRAME})
               </ToggleButton>
               <ToggleButton value="active" sx={{ px: 1.5, fontSize: '0.75rem' }}>
                 Active ({activeChannels.size})
@@ -386,7 +409,21 @@ export const AudioPanel = () => {
             >
               Record some data to display here
             </Box>
-          ) : sgcBinaryData && renderer ? (
+          ) : capture && capture.frameCount === 0 ? (
+            // a capture without frames: nothing to scan, draw or point at
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                height: '100%',
+                color: 'text.secondary',
+                fontSize: '1.2rem',
+              }}
+            >
+              The capture has no frames
+            </Box>
+          ) : capture && renderer ? (
             <Stack
               direction="column"
               spacing={0.5}
@@ -404,7 +441,7 @@ export const AudioPanel = () => {
                   onFullscreenToggle={handleFullscreenToggle}
                   onHoverPositionChange={handleHoverPositionChange}
                   onPlaybackPositionChange={handlePlaybackPositionChange}
-                  sgcBinaryData={sgcBinaryData}
+                  capture={capture}
                   renderer={renderer}
                 />
               ))}
