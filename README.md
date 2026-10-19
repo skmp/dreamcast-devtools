@@ -28,6 +28,7 @@ Run `npm ci` once, then:
 | `npm run build:native` | Type-check and build the WebSocket variant into `dist-native/`. |
 | `npm run build:wasm` | Type-check and build the BroadcastChannel variant into `dist-wasm/`. |
 | `npm run build:dspsim` | Regenerate `src/wasm/aica-dsp-core/` from an emulator tree: `npm run build:dspsim -- --emulator <tree>` (see [Generated DSP module](#generated-dsp-module)). |
+| `npm run print-version` | Print the version a build made now would have (see [the version](#the-version)). |
 | `npm run lint` | ESLint. |
 | `npm run typecheck` | `tsc -b`: the app, the Vite/Vitest configs, the mock server, the scripts and the tests. |
 | `npm test` | Vitest in watch mode. |
@@ -269,9 +270,8 @@ Mock server, on the command line (`npm run mock:serve -- --start-paused`):
 | `--arm7-held` | Start with the ARM7 held in reset, as behind a reset: `ENABLED` reads 0, and the machine releases it when it has run for 8 emulation steps. With `--start-paused` it is held at the stop of the start however long the first client takes to come. |
 | `--testb0` | TESTB0 (bit 15 of the AICA's word 0x2804) set: `dc.aica.common.TESTB0` reads 1, and MDEC_CT is in the test mode of the DSP core, XORed with 0x8080 in every sample instead of counting down. |
 
-The status bar reads `Dreamcast DevTools <version>`. The version shown there and in the About
-dialog is the `package.json` version, followed by `+<git describe --tags --always --dirty>` when
-the build runs inside a git checkout.
+The status bar reads `Dreamcast DevTools <version>`, the version of the build (see
+[The version](#the-version)).
 
 The UI is called Dreamcast DevTools; the emulator it talks to is nullDC. Where the UI names the
 emulator, it gives the name the emulator reports in `debugger.describe` (`nullDC`, the mock
@@ -987,8 +987,82 @@ Breakpoint panels:
 Breakpoints live on the server. Every `event.tick` carries the full list, so all connected clients
 show the same set.
 
+## The version
+
+The version of the UI, the one of the status bar, of the About dialog, of the `client` of
+`debugger.describe` and of `bundle-info.json`, is made from git at every build by
+`scripts/version.ts` (`npm run print-version` prints it), from the tags `v<T>` and the base
+`<base>`, the `package.json` version (`3.0.0-pre`):
+
+| The checkout | The version | For example |
+| --- | --- | --- |
+| on the tag `v<T>` | `<T>` | `3.0.0-pre` |
+| N commits after it | `<T>+N.g<h>` | `3.0.0-pre+5.g1a2b3c4d5e` |
+| on the tag, with changes of tracked files | `<T>+dirty` | `3.0.0-pre+dirty` |
+| N commits after it, with changes | `<T>+N.g<h>.dirty` | `3.0.0-pre+5.g1a2b3c4d5e.dirty` |
+| no tag `v*` reachable (none yet, or a shallow clone) | `<base>+g<h>`, `.dirty` appended with changes | `3.0.0-pre+g1a2b3c4d5e` |
+| no git, or not the top of a checkout (an archive, a copy inside another repository) | `<base>+nogit` | `3.0.0-pre+nogit` |
+
+`<h>` is the first 10 characters of the commit (`git rev-parse HEAD`), always 10. The tag is the
+nearest one that `git describe --tags --long --match v[0-9]*` finds, without its `v`: no other tag
+is ever taken, and when one is reachable the version starts with it, whatever `package.json` says
+(the job that publishes a Release refuses a tag that is not the base). Untracked and ignored files
+are no changes. `gitRev` of `bundle-info.json` is the full commit, with `-dirty` by the same rule,
+and empty without git. git is run with an argument list, never through a shell, and with
+`GIT_OPTIONAL_LOCKS=0`, so that a build never holds `index.lock`. As the emulator's submodule
+`devtools/` the UI is a checkout of its own and has the version of this repository. The emulator
+makes its own version by the same rule.
+
 ## CI
 
-`.github/workflows/ci.yml` has two jobs on Node 22 (latest 22.x) for pull requests (not for pushes): `check` runs
-`npm ci` and `npm run check`; `e2e` installs Chromium (`npx playwright install --with-deps
-chromium`) and runs `npm run test:e2e`.
+`.github/workflows/ci.yml` runs on GitHub's `ubuntu-24.04` runners with Node 22 (the latest 22.x),
+on pull requests, on the push of a tag `v*`, and when it is dispatched by hand
+(`workflow_dispatch`, with the input `tag`); a push to a branch starts nothing. Every checkout has
+the whole history (`fetch-depth: 0`): the version needs the tag. Every action is pinned by its
+commit, the token is read-only in every job but `release`, and every artifact is kept 7 days.
+
+| Job | Runs on | What it does |
+| --- | --- | --- |
+| `check` | every run | `npm ci`, the version (`npm run print-version`) into the job summary, `npm run check` |
+| `e2e` | every run | Chromium (`npx playwright install --with-deps chromium`), `npm run test:e2e`; the Playwright report as an artifact |
+| `package` | every run | `build:native`, `build:wasm`, `release-files.ts pack`: the release files as the artifact `release-files` |
+| `release-check` | pull requests and dispatches | `release-files.ts check` on `package`'s files; on a dispatch the base against the input `tag`; prints what `release` would run, and the notes |
+| `release` | the push of a tag `v*` alone | after `check`, `e2e` and `package`: `release-files.ts publish`, the GitHub Release of `package`'s files |
+
+So every pull request makes the release files too, and its build can be tried from its artifact.
+A dispatch (`gh workflow run ci.yml -f tag=v3.0.0-pre`) checks the release files and the base
+against a tag before the tag is pushed, and creates nothing, on whatever ref it runs.
+
+## Releases
+
+On the push of a tag `v<version>` the job `release` makes the GitHub Release "Dreamcast DevTools
+<version>", a pre-release when the version has a pre-release part (`3.0.0-pre`), with three files:
+
+- `dreamcast-devtools-<version>-dist-native.zip`: the folder
+  `dreamcast-devtools-<version>-dist-native/`, with `dist-native/`, the bundle an emulator build
+  embeds (`-DNULLDC_DEVTOOLS_DIST=<that folder>/dist-native`), and the UI's `LICENSE`;
+- `dreamcast-devtools-<version>-dist-wasm.zip`: the same of `dist-wasm/`;
+- `SHA256SUMS`: the SHA-256 of the two zips, in `sha256sum`'s format (`sha256sum -c SHA256SUMS`).
+
+The notes come from `scripts/release-notes.template.md`. The emulator's Release of the same
+version (`skmp/nulldc3`) embeds the UI of the same tag.
+
+`scripts/release-files.ts` makes and publishes them, by three invocations, each named on its
+command line:
+
+- `pack` (the job `package`, on every run): the two zips, each holding exactly the files its
+  build's `bundle-info.json` lists, which must say the version, sorted, with relative names and one
+  fixed time, so that the same files give the same zip; `SHA256SUMS`; the notes. It never runs
+  `gh`. Locally: `npm run build:native && npm run build:wasm`, then
+  `npx tsx --tsconfig tsconfig.scripts.json scripts/release-files.ts pack --version "$(npm run --silent print-version)" --native dist-native --wasm dist-wasm --out <new directory>`.
+- `check --dir <directory> [--tag <tag>]` (the job `release-check`): `pack`'s files are named with
+  the version of the checkout and `SHA256SUMS` holds; with a tag (a dispatch) the tag without its
+  `v` must be the base; it prints the `gh` commands `publish` would run with the tag's version, and
+  the notes. It creates nothing.
+- `publish --dir <directory> --tag <tag>` (the job `release` alone): it refuses unless
+  `GITHUB_EVENT_NAME` is `push` and `GITHUB_REF_TYPE` is `tag`, and unless the tag without its `v`
+  is both the version of `package`'s files and the base. It makes a draft with the three files
+  (`gh release create --verify-tag --draft`), checks the draft's assets against the files and
+  `SHA256SUMS`, then publishes it (`gh release edit --draft=false`). Run again with the draft
+  there, it uploads the files with `--clobber` and publishes; a Release already published is
+  refused.
