@@ -1,8 +1,8 @@
-import { execFileSync } from "node:child_process";
+import * as childProcess from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   deriveGitRev,
   deriveVersion,
@@ -15,6 +15,21 @@ import {
   type GitExec,
   type VersionFacts,
 } from "./version";
+
+// Every way of starting a program, recorded (each still runs): the default runner of gitFacts is execFileSync("git").
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawn: vi.fn(actual.spawn),
+    spawnSync: vi.fn(actual.spawnSync),
+    exec: vi.fn(actual.exec),
+    execSync: vi.fn(actual.execSync),
+    execFile: vi.fn(actual.execFile),
+    execFileSync: vi.fn(actual.execFileSync),
+    fork: vi.fn(actual.fork),
+  };
+});
 
 const BASE = "3.0.0-pre";
 const HASH = "1a2b3c4d5e6f708192a3b4c5d6e7f80912a3b4c5";
@@ -197,9 +212,10 @@ describe("gitFacts: the git calls", () => {
   });
 });
 
-// The same, with git itself, in scratch repositories of a few commits (where describe abbreviates to 7 digits).
+// The same, with git itself, in scratch repositories of a few commits (where describe abbreviates to 7 digits). Their
+// path holds a space, quotes and a $: a git call joined into a command line for a shell, by any runner, breaks on it.
 describe("gitFacts with git", () => {
-  const scratch = mkdtempSync(join(tmpdir(), "version-test-"));
+  const scratch = mkdtempSync(join(tmpdir(), "version test 'q' $x-"));
   const emptyConfig = join(scratch, "empty.gitconfig");
   writeFileSync(emptyConfig, "");
   // The environment of the tests' own git calls: through gitEnvironment, as gitFacts', so that the GIT_DIR,
@@ -212,7 +228,7 @@ describe("gitFacts with git", () => {
   const gitWith =
     (environment: NodeJS.ProcessEnv) =>
     (dir: string, ...args: string[]): string =>
-      execFileSync("git", ["-C", dir, ...identity, ...args], { env: environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+      childProcess.execFileSync("git", ["-C", dir, ...identity, ...args], { env: environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   const git = gitWith(env);
   let repositories = 0;
   const repository = (commits: number, run = git): string => {
@@ -298,6 +314,27 @@ describe("gitFacts with git", () => {
     const outside = join(scratch, "no-repository");
     mkdirSync(outside);
     expect(info(outside)).toEqual({ version: "3.0.0-pre+nogit", gitRev: "" });
+  });
+
+  it("runs git by the default runner as execFileSync(\"git\", [...]): four argument vectors, no shell, no other way of starting a program", () => {
+    const dir = repository(1);
+    const head = git(dir, "rev-parse", "HEAD");
+    vi.clearAllMocks();
+    expect(info(dir)).toEqual({ version: `3.0.0-pre+g${head.slice(0, 10)}`, gitRev: head });
+    const calls = vi.mocked(childProcess.execFileSync).mock.calls as unknown as [string, string[], GitCallOptions][];
+    expect(calls.map(([file, args]) => [file, ...args])).toEqual([
+      ["git", "-C", dir, "rev-parse", "--show-prefix"],
+      ["git", "-C", dir, "rev-parse", "HEAD"],
+      ["git", "-C", dir, "describe", "--tags", "--long", "--match", "v[0-9]*"],
+      ["git", "-C", dir, "status", "--porcelain", "--untracked-files=no"],
+    ]);
+    for (const [, , options] of calls) {
+      expect(options).not.toHaveProperty("shell");
+      expect(options.env.GIT_OPTIONAL_LOCKS).toBe("0");
+    }
+    for (const other of [childProcess.spawn, childProcess.spawnSync, childProcess.exec, childProcess.execSync, childProcess.execFile, childProcess.fork]) {
+      expect(vi.mocked(other)).not.toHaveBeenCalled();
+    }
   });
 
   it("keeps the tests' own git calls in their scratch repositories when GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE name another (a hook)", () => {
