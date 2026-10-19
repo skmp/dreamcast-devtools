@@ -16,7 +16,6 @@ import {
   tooltipButton,
   treeItem,
   treeItemRow,
-  KNOWN,
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
 import { installLongTaskRecorder, takeLongTasks } from "./support/longTasks";
@@ -106,9 +105,7 @@ test.describe("the register panels of the two processors", () => {
     expect(rpc.sent.slice(before).map((frame) => frame.method)).toEqual([]);
   });
 
-  test("ARM7: Registers is the same in the ARM7 workspace, on dc.aica.arm7; the other two workspaces have no register panel", async ({ page, diagnostics }) => {
-    // (the audio workspace is opened below)
-    diagnostics.allow(...KNOWN.sgcNoData);
+  test("ARM7: Registers is the same in the ARM7 workspace, on dc.aica.arm7; the other two workspaces have no register panel", async ({ page }) => {
     await openWorkspace(page, "arm7-debugger");
     await expect(panel(page, "arm7-breakpoints")).toBeVisible();
     const view = await showRegisters(page, "ARM7");

@@ -1,4 +1,4 @@
-import { test, expect, gotoRoute, openWorkspace, panel, saveScreenshot, statusBar, KNOWN, WORKSPACES } from "./support/fixtures";
+import { test, expect, gotoRoute, openWorkspace, panel, saveScreenshot, statusBar, WORKSPACES } from "./support/fixtures";
 
 // Every route of src/App.tsx. The `page` fixture fails the test on any console.error,
 // uncaught exception, failed request, HTTP >= 400 or request to another origin.
@@ -51,10 +51,7 @@ test("/docs renders the documentation sections", async ({ page }) => {
 });
 
 for (const workspace of WORKSPACES) {
-  test(`/workspace/${workspace} loads, connects and renders its docks`, async ({ page, diagnostics }, testInfo) => {
-    if (workspace === "audio-debugger") {
-      diagnostics.allow(...KNOWN.sgcNoData);
-    }
+  test(`/workspace/${workspace} loads, connects and renders its docks`, async ({ page }, testInfo) => {
     await openWorkspace(page, workspace);
     await expect(statusBar(page)).toContainText(/Dreamcast DevTools 3\.0\.0/);
     await expect(panel(page, "device-tree")).toBeVisible();

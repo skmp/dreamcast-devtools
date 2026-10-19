@@ -8,7 +8,7 @@ import { useNoDataText, useProgramCounter, useRunState, useTarget } from "../../
 import { formatAddress, formatAddressInput, parseAddress, programCounter, withContextAbove } from "../../state/targets";
 import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks, type DisassemblyViewRef } from "../components/DisassemblyView";
 import { PanelNotice } from "../components/PanelNotice";
-import { arm7Held, stepOff } from "../../state/runControls";
+import { heldFor, stepOff } from "../../state/runControls";
 import { Panel } from "../layout/Panel";
 import { disassemblyNavigationService } from "../../state/disassemblyNavigationService";
 import { generateUUID } from "../../lib/uuid";
@@ -31,8 +31,10 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
   // Why this view cannot step its target now, by the rules the toolbar has for its own step
   // buttons (`stepOff`): the target runs, the stop is one of the emulator's own window, or
   // the target is an ARM7 that is held in reset (`ENABLED` reads 0, and the server would
-  // answer -32012). The buttons are off then, and say why. (A target the server cannot step
-  // at all has a notice in place of the buttons: `steppingNotice`, below.)
+  // answer -32012). The buttons are off then, and say why. Which target counts as held is
+  // `heldFor`'s to say: the ARM7 alone. The view of the DSP steps while the ARM7 is held, as
+  // the emulator clocks the AICA whatever ARMRST says. (A target the server cannot step at
+  // all has a notice in place of the buttons: `steppingNotice`, below.)
   const connected = useSessionStore((state) => state.connectionState === "connected");
   const stepOffReason = useDebuggerDataStore((state) =>
     stepOff({
@@ -40,7 +42,7 @@ const DisassemblyPanel = ({ target }: DisassemblyPanelProps) => {
       initialized: state.initialized,
       execution: state.executionState,
       target: info,
-      held: target === "arm7" && arm7Held(state.registersByPath, info),
+      held: heldFor(info, state.registersByPath),
     }),
   );
   const breakpoints = useDebuggerDataStore((state) => state.breakpoints);

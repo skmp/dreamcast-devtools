@@ -200,11 +200,11 @@ describe("the contract runner against the mock", () => {
     }
   }, 180_000);
 
-  it("S21: the run with the DSP test program selects the scenarios of that program alone, and the mock passes it", async () => {
+  it("S21: the run with the DSP test program selects S17 and the scenarios of that program, and the mock passes it", async () => {
     const { url } = await startServer();
     const summary = await runContract({ url, profile: "mock", milestone: "M3", dspProgram: true });
-    expect(reportOf(summary)).toEqual(["S21 passed "]);
-    expect(summary).toMatchObject({ ok: true, selected: ["S21"], required: ["S21"], dspProgram: true, cleanUpProblems: [] });
+    expect(reportOf(summary)).toEqual(["S17 passed ", "S21 passed "]);
+    expect(summary).toMatchObject({ ok: true, selected: ["S17", "S21"], required: ["S17", "S21"], dspProgram: true, cleanUpProblems: [] });
     expect((await stateOf(url)).breakpoints).toEqual({});
 
     // without the option the scenario is not for this program; a server whose DSP does not step is not asked
@@ -214,8 +214,15 @@ describe("the contract runner against the mock", () => {
     const m1 = await run(undefined, undefined, { supports: MOCK_M1_SUPPORT });
     expect(statusOf(m1, "S21")).toBe("not-applicable");
     const m1Dsp = await runContract({ url: (await startServer(undefined, { supports: MOCK_M1_SUPPORT })).url, profile: "mock", milestone: "M3", dspProgram: true });
-    expect(reportOf(m1Dsp)).toEqual(["S21 not-applicable targets: dsp.stepping is false"]);
-    expect(m1Dsp).toMatchObject({ ok: false, nothingVerified: true, requiredNotPassed: [{ id: "S21", status: "not-applicable" }] });
+    expect(reportOf(m1Dsp)).toEqual(['S17 not-applicable no capability "sgc-capture"; no capability "memory-binary"', "S21 not-applicable targets: dsp.stepping is false"]);
+    expect(m1Dsp).toMatchObject({
+      ok: false,
+      nothingVerified: true,
+      requiredNotPassed: [
+        { id: "S17", status: "not-applicable" },
+        { id: "S21", status: "not-applicable" },
+      ],
+    });
   }, 180_000);
 
   it("restores a paused server to paused, and keeps the watches it found", async () => {
@@ -490,7 +497,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
       },
       ["S01"],
     );
-    expect(shorter.invariantViolations.join("\n")).toMatch(/I4: registers\["dc\.aica\.dsp"\] carries \[STEP\], describe lists \[STEP MDEC_CT RBP RBL\]/);
+    expect(shorter.invariantViolations.join("\n")).toMatch(/I4: registers\["dc\.aica\.dsp"\] carries \[STEP\], describe lists \[STEP MDEC_CT RBP RBL ACC Y_REG FRC_REG ADRS_REG LATCH LATCH_COPY MEMVAL NOFL_PIPE MIXS_BANK\]/);
     expect(shorter.invariantViolations.join("\n")).toMatch(/I4: registers\["dc\.nowhere"\] is not a path of the describe tree/);
   });
 
@@ -955,7 +962,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     );
     expect(reportOf(anchorOnly)).toEqual(["S01 passed ", "S10 passed "]);
     const more = await run(
-      dsp((registers) => [...registers, { name: "ACC", value: "0x0000000", width: 26 }, { name: "MDEC_CT_RELOAD", value: "0x00002000", width: 32 }]),
+      dsp((registers) => [...registers, { name: "SHIFTED", value: "0x000000", width: 24 }, { name: "MDEC_CT_RELOAD", value: "0x00002000", width: 32 }]),
       ["S01"],
     );
     expect(reportOf(more)).toEqual(["S01 passed "]);
@@ -2642,7 +2649,7 @@ describe("the contract runner against a server that breaks the protocol", () => 
     const summary = await runContract({ url, profile: "mock", only: new Set(["S16", "S17", "S18"]), say: (line) => lines.push(line) });
     expect(summary.scenarios.map((scenario) => scenario.status)).toEqual(["not-applicable", "not-applicable", "not-applicable"]);
     expect(summary).toMatchObject({ passed: 0, failed: 0, partial: 0, notApplicable: 3 });
-    expect(detailsOf(summary, "S17")).toBe('no capability "sgc-capture"');
+    expect(detailsOf(summary, "S17")).toBe('no capability "sgc-capture"; no capability "memory-binary"');
     // nothing failed and nothing was asked to pass, and still this is no success: nothing passed
     expect(summary).toMatchObject({ ok: false, nothingVerified: true, required: [], requiredNotPassed: [] });
     expect(lines.slice(-3)).toEqual([
@@ -2747,23 +2754,23 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(scenariosOfMilestone("M1", "emulator")).toEqual(["S00", ...m1, "S15"]);
     expect(scenariosOfMilestone("M2", "emulator")).toEqual(["S00", ...m1, "S15", "S16"]);
     expect(scenariosOfMilestone("M3", "mock")).toEqual([...m1, "S16", "S17"]);
-    // the gate of M3 is two runs: everything but S21 with the test program of M1, S00 and S21 with the DSP test program
+    // the gate of M3 is two runs: everything but S21 with the test program of M1; S00, S17 and S21 with the DSP test program
     expect(scenariosOfMilestone("M3", "emulator")).toEqual(["S00", ...m1, "S15", "S16", "S17"]);
-    expect(scenariosOfMilestone("M3", "emulator", true)).toEqual(["S00", "S21"]);
-    expect(scenariosOfMilestone("M3", "mock", true)).toEqual(["S21"]);
+    expect(scenariosOfMilestone("M3", "emulator", true)).toEqual(["S00", "S17", "S21"]);
+    expect(scenariosOfMilestone("M3", "mock", true)).toEqual(["S17", "S21"]);
     expect(scenariosOfMilestone("M4", "emulator")).toEqual(SCENARIOS.map((scenario) => scenario.id).filter((id) => id !== "S21"));
-    expect(scenariosOfMilestone("M4", "emulator", true)).toEqual(["S00", "S21"]);
+    expect(scenariosOfMilestone("M4", "emulator", true)).toEqual(["S00", "S17", "S21"]);
     expect(SCENARIOS.map((scenario) => scenario.id)).toEqual(["S00", ...m1, "S15", "S16", "S17", "S18", "S21"]);
 
     const all = SCENARIOS.map((scenario) => scenario.id);
     // looking at a server: everything is run, nothing has to pass
     expect(selectScenarios({ profile: "mock" })).toEqual({ selected: all, required: [] });
     expect(selectScenarios({ profile: "emulator", only: new Set(["S05", "S02"]) })).toEqual({ selected: ["S02", "S05"], required: [] });
-    expect(selectScenarios({ profile: "emulator", dspProgram: true })).toEqual({ selected: ["S00", "S21"], required: [] });
+    expect(selectScenarios({ profile: "emulator", dspProgram: true })).toEqual({ selected: ["S00", "S17", "S21"], required: [] });
     // a gate: its scenarios, each required
     const gate = scenariosOfMilestone("M1", "emulator");
     expect(selectScenarios({ profile: "emulator", milestone: "M1" })).toEqual({ selected: gate, required: gate });
-    expect(selectScenarios({ profile: "emulator", milestone: "M3", dspProgram: true })).toEqual({ selected: ["S00", "S21"], required: ["S00", "S21"] });
+    expect(selectScenarios({ profile: "emulator", milestone: "M3", dspProgram: true })).toEqual({ selected: ["S00", "S17", "S21"], required: ["S00", "S17", "S21"] });
     expect(selectScenarios({ profile: "mock", milestone: "M1", only: new Set(["S02", "S16"]) })).toEqual({ selected: ["S02"], required: ["S02"] });
     expect(selectScenarios({ profile: "mock", milestone: "M1", only: new Set(["S16", "S17", "S18"]) })).toEqual({ selected: [], required: [] });
     expect(selectScenarios({ profile: "mock", milestone: "M2", only: new Set(["S17"]) })).toEqual({ selected: [], required: [] });
@@ -2825,8 +2832,9 @@ describe("the contract runner against a server that breaks the protocol", () => 
       ["S17"],
     );
     expect(statusOf(summary, "S17")).toBe("failed");
-    expect(detailsOf(summary, "S17")).toMatch(/sgc capture: binaryId is 99 in the header and 1 in the result/);
-  });
+    expect(detailsOf(summary, "S17")).toMatch(/sgc capture: state\.getSgcFrameData right behind the response of state\.recordSgcFrames \{"frames":64\}: binaryId is 99 in the header and 1 in the result/);
+    expect(detailsOf(summary, "S17")).toMatch(/memory binary: state\.getMemoryBinary \{"target":"sh4","address":2348875776,"length":64\}: binaryId is 99 in the header and \d+ in the result/);
+  }, 60_000);
 
   it("S17: a binary frame that is sent before the response it belongs to", async () => {
     const summary = await run({ afterNextBinary: (frame) => typeof (frame.result as Json | undefined)?.frameCount === "number" }, ["S17"]);
@@ -2834,7 +2842,9 @@ describe("the contract runner against a server that breaks the protocol", () => 
     expect(detailsOf(summary, "S17")).toMatch(
       /sgc capture: the binary frame of state\.getSgcFrameData arrived before its JSON response; the response is sent first, the binary frame second/,
     );
-  });
+    // (the part memoryBinary runs on to the capture it reads between its last two reads, a read of
+    // 16 MiB and two of 2 MiB on the way: some 2.5 s)
+  }, 60_000);
 });
 
 describe("what a failing run leaves behind", () => {
@@ -3314,7 +3324,7 @@ describe("the emulator profile", () => {
 
     // a server that selects its backend with the first Run(): neither capability at the StartPaused stop
     const { summary: late, lines } = await anchor((listed, hasRun) => (hasRun ? listed : withoutEngine(listed)));
-    expect(lines.find((line) => line.startsWith("server: "))).toMatch(/capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture; targets: /);
+    expect(lines.find((line) => line.startsWith("server: "))).toMatch(/capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, memory-binary; targets: /);
     expect(reportOf(late)).toEqual(["S00 passed SH4 debug engine: native"]);
     expect(late.ok).toBe(true);
     // (the summary names what the server said last)
@@ -3342,9 +3352,9 @@ describe("the emulator profile", () => {
 
     const summary = await running;
     expect(lines.filter((line) => /^server: |^waiting /.test(line)).map((line) => line.replace(/; targets: .*/, ""))).toEqual([
-      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture",
+      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, memory-binary",
       expect.stringMatching(/^waiting for the StartPaused stop \(the server is #\d+ paused stop 2 no-game\)$/),
-      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, sh4-debug-native",
+      "server: nullDC (mock) 3.0.0 (native), protocol 3, ui none; capabilities: event-breakpoints, callstack, memory-write, register-write, reset, sgc-capture, memory-binary, sh4-debug-native",
     ]);
     expect(reportOf(summary)).toEqual(["S00 passed SH4 debug engine: native"]);
     expect(summary.server.capabilities).toContain("sh4-debug-native");

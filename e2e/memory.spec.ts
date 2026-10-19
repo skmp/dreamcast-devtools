@@ -54,8 +54,8 @@ for (const { name, workspace, id, start, base, firstRow } of [
     id: "sh4-memory",
     start: 0x8c010000,
     base: 0x8c010000,
-    // sha256-derived, i.e. stable content of the mock for this address
-    firstRow: "45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B",
+    // a hash of the address, i.e. stable content of the mock for this address
+    firstRow: "86 4F 83 7E AE 81 E8 01 1D 47 B9 98 3A 3F 92 11",
   },
   { name: "ARM7", workspace: "arm7-debugger", id: "arm7-memory", start: 0, base: 0x00200000, firstRow: undefined },
 ] as const) {
@@ -709,7 +709,7 @@ test.describe("byte editing", () => {
     const view = panel(page, "sh4-memory");
     const listing = panel(page, "sh4-disassembly");
     const hex = (address: number) => rowAt(view, address).locator("span").nth(1);
-    await expect(hex(0x8c010000)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    await expect(hex(0x8c010000)).toHaveText("86 4F 83 7E AE 81 E8 01 1D 47 B9 98 3A 3F 92 11");
     await expect(hexCell(view, 0x8c010000)).toHaveAttribute("title", EDIT_HINT);
     const slices = () => rpc.requests("state.getMemorySlice").length;
     const listings = () => rpc.requests("state.getDisassembly").length;
@@ -721,7 +721,7 @@ test.describe("byte editing", () => {
     const editor = byteEditor(view);
     await expect(editor).toBeFocused();
     await expect(editor).toHaveAccessibleName("Bytes to write from 0x8C010004");
-    await expect(editor).toHaveValue("1F");
+    await expect(editor).toHaveValue("AE");
     expect(await editor.evaluate((input: HTMLInputElement) => [input.selectionStart, input.selectionEnd])).toEqual([0, 2]);
     // ... where the byte is: its digits are where those of the byte were
     const cell = (await hexCell(view, 0x8c010000).boundingBox())!;
@@ -729,13 +729,13 @@ test.describe("byte editing", () => {
     expect(Math.abs(box.x + 4 - (cell.x + 4 * 3 * (cell.width / 47)))).toBeLessThan(1.5);
     expect(box.x + box.width).toBeLessThanOrEqual(cell.x + cell.width + 9);
     // the row is what it was while the box is open
-    await expect(hex(0x8c010000)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    await expect(hex(0x8c010000)).toHaveText("86 4F 83 7E AE 81 E8 01 1D 47 B9 98 3A 3F 92 11");
 
     await page.keyboard.type("DE AD be ef");
     await saveScreenshot(page, testInfo, "memory-editing");
     await page.keyboard.press("Enter");
     await expect(editor).toHaveCount(0);
-    await expect(hex(0x8c010000)).toHaveText("45 BC 32 04 DE AD BE EF 89 E9 C0 58 4D 3C 9B 6B");
+    await expect(hex(0x8c010000)).toHaveText("86 4F 83 7E DE AD BE EF 1D 47 B9 98 3A 3F 92 11");
     expect(rpc.requests("state.writeMemory").map((frame) => frame.params)).toEqual([
       { target: "sh4", address: 0x8c010004, data: [0xde, 0xad, 0xbe, 0xef] },
     ]);
@@ -754,7 +754,7 @@ test.describe("byte editing", () => {
     await dblclickByte(view, 0x8c01000e);
     await byteEditor(view).fill("0011 2233 7");
     await byteEditor(view).press("Enter");
-    await expect(hex(0x8c010000)).toHaveText("45 BC 32 04 DE AD BE EF 89 E9 C0 58 4D 3C 00 11");
+    await expect(hex(0x8c010000)).toHaveText("86 4F 83 7E DE AD BE EF 1D 47 B9 98 3A 3F 00 11");
     await expect(hex(0x8c010010)).toHaveText(/^22 33 07 /);
     expect(rpc.requests("state.writeMemory").at(-1)?.params).toEqual({ target: "sh4", address: 0x8c01000e, data: [0x00, 0x11, 0x22, 0x33, 0x07] });
     // the last byte of a row, and the first
@@ -829,7 +829,7 @@ test.describe("byte editing", () => {
     await expect(byteEditor(view)).toHaveCount(0);
 
     expect(rpc.requests("state.writeMemory")).toEqual([]);
-    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText("86 4F 83 7E AE 81 E8 01 1D 47 B9 98 3A 3F 92 11");
   });
 
   test("what is no run of bytes is not sent, and what the server refuses is not written: the editor stays open and says why", async ({ page, rpc }) => {
@@ -1105,7 +1105,7 @@ test.describe("byte editing: the box of an editor is in a row of the listing", (
     // the listing went there, and no memory was written
     await expect(disassemblyRows(listing).first()).toHaveAttribute("data-address", String(0x8c020000 - 10 * 2));
     expect(rpc.requests("state.writeMemory")).toEqual([]);
-    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText("86 4F 83 7E AE 81 E8 01 1D 47 B9 98 3A 3F 92 11");
   });
 
   test("rows that give way to an error take an open editor with them: it is not back, with the focus, when the bytes are read again", async ({ page }) => {
@@ -1302,7 +1302,7 @@ test.describe("byte editing with the keyboard", () => {
     await pauseFromToolbar(page);
     const view = panel(page, "sh4-memory");
     await expect(memoryRows(view)).toHaveCount(60);
-    await expect(hexCell(view, 0x8c010000)).toHaveText("45 BC 32 04 1F 4A 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    await expect(hexCell(view, 0x8c010000)).toHaveText("86 4F 83 7E AE 81 E8 01 1D 47 B9 98 3A 3F 92 11");
     const mark = view.locator(".memory-cursor");
     const editor = byteEditor(view);
 
@@ -1314,7 +1314,7 @@ test.describe("byte editing with the keyboard", () => {
     await page.keyboard.press("Tab");
     await expect(hexCell(view, 0x8c010000)).toBeFocused();
     await expect(place(view)).toBeFocused();
-    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 86, write");
     await expect(place(view)).not.toHaveAttribute("aria-disabled");
     // the byte is framed, where its digits are
     const frameOf = async (address: number) => {
@@ -1329,11 +1329,11 @@ test.describe("byte editing with the keyboard", () => {
 
     // the arrows: along the row, and from row to row
     await page.keyboard.press("ArrowRight");
-    await expect(place(view)).toHaveAccessibleName("0x8C010001 BC, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C010001 4F, write");
     await page.keyboard.press("ArrowRight");
     await page.keyboard.press("ArrowRight");
     await page.keyboard.press("ArrowLeft");
-    await expect(place(view)).toHaveAccessibleName("0x8C010002 32, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C010002 83, write");
     expect(Math.abs((await frameOf(0x8c010002)).left + 2)).toBeLessThan(1);
     await page.keyboard.press("ArrowDown");
     await expect(hexCell(view, 0x8c010010)).toBeFocused();
@@ -1347,16 +1347,16 @@ test.describe("byte editing with the keyboard", () => {
     for (let press = 0; press < 20; press++) {
       await page.keyboard.press("ArrowRight");
     }
-    await expect(place(view)).toHaveAccessibleName("0x8C01000F 6B, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C01000F 11, write");
     for (let press = 0; press < 20; press++) {
       await page.keyboard.press("ArrowLeft");
     }
-    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 86, write");
     // with Ctrl an arrow is not the listing's, and no other key is
     await page.keyboard.press("Control+ArrowRight");
     await page.keyboard.press("a");
     await page.keyboard.press("5");
-    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 86, write");
     await expect(editor).toHaveCount(0);
 
     // Enter: the editor at that byte, as after a double click there
@@ -1366,12 +1366,12 @@ test.describe("byte editing with the keyboard", () => {
     await page.keyboard.press("Enter");
     await expect(editor).toBeFocused();
     await expect(editor).toHaveAccessibleName("Bytes to write from 0x8C010004");
-    await expect(editor).toHaveValue("1F");
+    await expect(editor).toHaveValue("AE");
     await expect(mark).toBeHidden();
     await page.keyboard.type("DE AD");
     await page.keyboard.press("Enter");
     await expect(editor).toHaveCount(0);
-    await expect(hexCell(view, 0x8c010000)).toHaveText("45 BC 32 04 DE AD 11 66 89 E9 C0 58 4D 3C 9B 6B");
+    await expect(hexCell(view, 0x8c010000)).toHaveText("86 4F 83 7E DE AD E8 01 1D 47 B9 98 3A 3F 92 11");
     // accepted: the focus is on the byte again, which is the one that was read again
     await expect(place(view)).toBeFocused();
     await expect(place(view)).toHaveAccessibleName("0x8C010004 DE, write");
@@ -1460,7 +1460,7 @@ test.describe("byte editing with the keyboard", () => {
     await page.keyboard.press("ArrowUp");
     await expect(first).toHaveText(hex8(0x8c010000));
     await expect(hexCell(view, 0x8c010000)).toBeFocused();
-    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 86, write");
     expect(slices().slice(read)).toEqual([0x8c010010, 0x8c010000]);
     expect(await headerTop(view)).toBe(top);
   });
@@ -1600,7 +1600,7 @@ test.describe("byte editing with the keyboard", () => {
     for (let press = 0; press < 15; press++) {
       await page.keyboard.press("ArrowRight");
     }
-    await expect(place(view)).toHaveAccessibleName("0x8C01000F 6B, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C01000F 11, write");
     // the last byte of a row is outside a panel this narrow, until the listing is scrolled to it
     // (all of its frame is on screen then, but for the fraction of a pixel a scroll position is rounded by)
     await expect(mark).toBeInViewport({ ratio: 0.9 });
@@ -1610,7 +1610,7 @@ test.describe("byte editing with the keyboard", () => {
     for (let press = 0; press < 15; press++) {
       await page.keyboard.press("ArrowLeft");
     }
-    await expect(place(view)).toHaveAccessibleName("0x8C010000 45, write");
+    await expect(place(view)).toHaveAccessibleName("0x8C010000 86, write");
     await expect(mark).toBeInViewport({ ratio: 0.9 });
     expect(await scrolledDown(view)).toBe(0);
     expect(await headerTop(view)).toBe(top);
@@ -1627,7 +1627,7 @@ test.describe("byte editing on a server that can do what the emulator of milesto
     await dblclickByte(view, 0x8c010000);
     await byteEditor(view).fill("01 02 03");
     await byteEditor(view).press("Enter");
-    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText(/^01 02 03 04 /);
+    await expect(rowAt(view, 0x8c010000).locator("span").nth(1)).toHaveText(/^01 02 03 7E /);
 
     await gotoRoute(page, "/workspace/arm7-debugger");
     const arm7 = panel(page, "arm7-memory");

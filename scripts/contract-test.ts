@@ -12,7 +12,7 @@ import { ContractFailure } from "./contract/session";
  *   npm run contract -- [--url ws://host:port/ws] [--profile mock|emulator] [--elf <path>]
  *                       [--milestone M1|M2|M3|M4] [--dsp-program] [--require S16,S17]
  *                       [--only S05,S06] [--parts S16:arm7+tree] [--require-note <text>]
- *                       [--mock-support m1|m2] [--json] [--json-file <path>] [--verbose]
+ *                       [--mock-support m1|m2|m3] [--json] [--json-file <path>] [--verbose]
  *   npm run contract -- --url ws://host:port/ws --idle-breakpoint <address|symbol> [--elf <path>]
  *
  * Without --url it starts the mock debugger in this process (no page, no Vite) and runs
@@ -48,7 +48,8 @@ const USAGE = `usage: npm run contract -- [options]
                               in the emulator profile only). One that is "not applicable" or
                               "partial" fails the gate
   --dsp-program               the server runs the DSP test program: the second run of the gate
-                              of M3 (and M4), which selects S00 and S21 alone
+                              of M3 (and M4), which selects S00, S17 and S21. The mock the
+                              runner starts for it is paused at its start with its ARM7 held
   --require <ids>             further scenarios that are run and have to pass, e.g. --require S16
   --only <ids>                narrow the selection to these scenarios, e.g. --only S05,S06; a
                               selection that leaves nothing to pass is a failed run
@@ -60,7 +61,7 @@ const USAGE = `usage: npm run contract -- [options]
   --require-note <text>       the run is no pass unless a selected scenario noted exactly this
                               text, e.g. --require-note "arm7: bl stepped over and out"; may be
                               given more than once, also with --milestone
-  --mock-support m1|m2        the mock that is started in this process implements what the
+  --mock-support m1|m2|m3     the mock that is started in this process implements what the
                               emulator does in that milestone and no more (not with --url)
   --timeout-factor <n>        multiply every timeout by n instead of the profile's factor
   --json                      print the summary as JSON on stdout (the scenario lines go to stderr)
@@ -84,7 +85,7 @@ interface Options {
   require?: Set<string>;
   parts?: Map<string, Set<string>>;
   requireNotes: string[];
-  mockSupport?: "m1" | "m2";
+  mockSupport?: "m1" | "m2" | "m3";
   milestone?: Milestone;
   dspProgram: boolean;
   timeoutFactor?: number;
@@ -151,8 +152,8 @@ const parseArguments = (argv: string[]): Options => {
       }
       case "--mock-support": {
         const support = value(index++, flag).toLowerCase();
-        if (support !== "m1" && support !== "m2") {
-          throw new Error(`--mock-support is m1 or m2, not "${support}"`);
+        if (support !== "m1" && support !== "m2" && support !== "m3") {
+          throw new Error(`--mock-support is m1, m2 or m3, not "${support}"`);
         }
         options.mockSupport = support;
         break;
@@ -271,7 +272,7 @@ const main = async (): Promise<number> => {
       const notes = [
         scenario.milestone ?? "M1",
         ...(scenario.emulatorOnly ? ["emulator profile"] : []),
-        ...(scenario.dspProgram ? ["--dsp-program"] : []),
+        ...(scenario.dspProgram === "only" ? ["--dsp-program"] : scenario.dspProgram === "also" ? ["also with --dsp-program"] : []),
         ...(scenario.parts ? [`parts: ${scenario.parts.join(", ")}`] : []),
       ];
       say(`${scenario.id} ${scenario.title} (${notes.join(", ")})`);

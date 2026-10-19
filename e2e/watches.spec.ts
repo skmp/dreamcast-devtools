@@ -96,13 +96,17 @@ test("the server stores an expression in lower case, and refuses one that names 
   await expect(watchRow(page, "dc.sh4.scif.scfrdr2")).toHaveText("dc.sh4.scif.scfrdr2 = n/a");
 });
 
+/** The watch expressions of the registers of the mock's dc.aica.dsp: the four of M1 and the datapath of M3. */
+const DSP_EXPRESSIONS = ["dc.aica.dsp.step", "dc.aica.dsp.mdec_ct", "dc.aica.dsp.rbp", "dc.aica.dsp.rbl", "dc.aica.dsp.acc", "dc.aica.dsp.y_reg", "dc.aica.dsp.frc_reg", "dc.aica.dsp.adrs_reg", "dc.aica.dsp.latch", "dc.aica.dsp.latch_copy", "dc.aica.dsp.memval", "dc.aica.dsp.nofl_pipe", "dc.aica.dsp.mixs_bank"];
+
 test("the expression box suggests the register paths of the device tree", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
   const input = panel(page, "watches").getByPlaceholder("Enter expression");
 
   await input.pressSequentially("dc.aica.dsp");
   const options = page.getByRole("option");
-  await expect(options).toHaveText(["dc.aica.dsp.step", "dc.aica.dsp.mdec_ct", "dc.aica.dsp.rbp", "dc.aica.dsp.rbl"]);
+  // the thirteen registers of dc.aica.dsp, in their order
+  await expect(options).toHaveText(DSP_EXPRESSIONS);
 });
 
 test("pasting an expression filters the suggestions", async ({ page }) => {
@@ -111,12 +115,7 @@ test("pasting an expression filters the suggestions", async ({ page }) => {
   await openWorkspace(page, "sh4-debugger");
   const input = panel(page, "watches").getByPlaceholder("Enter expression");
   await input.fill("dc.aica.dsp");
-  await expect(page.getByRole("option")).toHaveText([
-    "dc.aica.dsp.step",
-    "dc.aica.dsp.mdec_ct",
-    "dc.aica.dsp.rbp",
-    "dc.aica.dsp.rbl",
-  ]);
+  await expect(page.getByRole("option")).toHaveText(DSP_EXPRESSIONS);
 });
 
 test("a watch picked from the suggestions shows the register's live value", async ({ page }) => {

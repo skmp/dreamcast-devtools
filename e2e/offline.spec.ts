@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { test, expect, gotoRoute, openWorkspace, panel, statusBar, KNOWN, WORKSPACES } from "./support/fixtures";
+import { test, expect, gotoRoute, openWorkspace, panel, statusBar, WORKSPACES } from "./support/fixtures";
 import { expectMonacoReady, monacoEditor, monacoTokenClasses, monacoVisibleText } from "./support/monaco";
 import { DIST_DIR } from "./support/paths";
 import { startStaticServer } from "./support/staticServer";
@@ -112,9 +112,8 @@ test.describe("with every other origin unreachable", () => {
     expect(attempted).toEqual([]);
   });
 
-  test("no page of the application asks another origin for anything", async ({ page, diagnostics, rpc, mock }) => {
+  test("no page of the application asks another origin for anything", async ({ page, rpc, mock }) => {
     test.slow();
-    diagnostics.allow(...KNOWN.sgcNoData);
     const attempted = await blockOtherOrigins(page);
 
     await gotoRoute(page, "/");
@@ -217,8 +216,8 @@ test.describe("served as plain files from a sub-path (python3 -m http.server)", 
       await expect(page.locator(".find-widget.visible")).toBeVisible();
       await expect.poll(() => responses.some((response) => response.path.endsWith(".ttf"))).toBe(true);
 
-      // DSP playground: the WebAssembly module is instantiated from a streamed response,
-      // which the browser only accepts as application/wasm
+      // DSP playground: its loader fetches the WebAssembly module and instantiates it from the
+      // response's arrayBuffer(), which takes any content type (the file server's is application/wasm)
       await page.goto(`${server.url}#/tool/dsp-playground`);
       await expectMonacoReady(monacoEditor(page));
       await expect(page.locator(".monaco-editor").first().locator("xpath=../../following-sibling::div")).toHaveText(

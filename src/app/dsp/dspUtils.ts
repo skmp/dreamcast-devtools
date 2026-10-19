@@ -343,14 +343,15 @@ export const writeRegisters = (dsp: AicaDsp, parsedData: ParsedData): void => {
     dsp.writeReg(0x3200 + index * 4, value);
   });
 
-  // Write MEMS registers
+  // Write MEMS registers. MEMS_L is bits 7:0 of a MEMS word, which the CPU cannot write: it is written as a
+  // debugger writes it (pokeReg); MEMS_H, bits 23:8, as the CPU does
   for (let i = 0; i < 32; i++) {
-    dsp.writeReg(0x4400 + i * 8 + 0, 0);
+    dsp.pokeReg(0x4400 + i * 8 + 0, 0);
     dsp.writeReg(0x4400 + i * 8 + 4, 0);
   }
   parsedData.MEMS.forEach(({ index, low, high }) => {
     if (low !== undefined) {
-      dsp.writeReg(0x4400 + index * 8 + 0, low);
+      dsp.pokeReg(0x4400 + index * 8 + 0, low);
     }
     if (high !== undefined) {
       dsp.writeReg(0x4400 + index * 8 + 4, high);

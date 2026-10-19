@@ -30,6 +30,7 @@ import ZoomInIcon from "@mui/icons-material/ZoomIn";
 import FullscreenIcon from "@mui/icons-material/Fullscreen";
 import FullscreenExitIcon from "@mui/icons-material/FullscreenExit";
 import { deflate, inflate } from "pako";
+import { useLocation } from "react-router-dom";
 import { Panel } from "../layout/Panel";
 import { DspAssemblyEditor } from "../components/DspAssemblyEditor";
 import type { DspAssemblyEditorRef } from "../components/DspAssemblyEditor";
@@ -39,11 +40,24 @@ import { WaveformPlotter } from "../components/WaveformPlotter";
 import type { WaveformPlotterRef } from "../components/WaveformPlotter";
 import { DisassemblyView, type DisassemblyViewConfig, type DisassemblyViewCallbacks } from "../components/DisassemblyView";
 import type { DisassemblyLine } from "../../lib/debuggerSchema";
-import { aicaDsp } from "../../lib/aicaDsp";
+import { AICA_DSP_STEPS, aicaDsp, REG, VIEW } from "../../lib/aicaDsp";
 import { assembleSource, assembleSourceWithPreprocessing, writeRegisters, decodeInst, disassembleDesc } from "../dsp/dspUtils";
 import { compileDspSource, CompilationError } from "../dsp/dspCompiler";
 import { DSP_DEFAULT_SOURCE } from "../dsp/defaultSource";
 import { DEFAULT_DSP_SOURCE } from "../dsp/defaultDspSource";
+import {
+  applySnapshot,
+  dspSourceFromRegisters,
+  snapshotNotes,
+  snapshotOff,
+  snapshotSource,
+  snapshotTime,
+  takeEmulatorSnapshot,
+} from "../dsp/emulatorSnapshot";
+import { CAPABILITIES } from "../../lib/debuggerSchema";
+import { endpointLabel, useSessionStore } from "../../state/sessionStore";
+import { useDebuggerDataStore } from "../../state/debuggerDataStore";
+import { useCapability, useTarget } from "../../state/debuggerSelectors";
 
 declare global {
   interface Window {
@@ -56,6 +70,62 @@ const DSP_SOURCE_STORAGE_KEY = "nulldc-debugger-dsp-source";
 const DSP_ASSEMBLY_STORAGE_KEY = "nulldc-debugger-dsp-assembly";
 const DSP_TAB_STORAGE_KEY = "nulldc-debugger-dsp-active-tab";
 const DSP_SHARE_URL = "https://skmp.gitlab.io/aica-dsp-playground/";
+// The Share button's help: the link opens the program in another playground, with another DSP than this one
+const DSP_SHARE_HELP =
+  "Copies a link that opens this program in the original online AICA DSP playground. Its DSP is not this one: this playground runs the emulator's own DSP core, at the console's scale, and the online one can compute other outputs from the same program.";
+
+// The inputs of every sample go to all 16 buses: an input without a source sends 0
+const DSP_ALL_BUSES = 0xffff;
+
+// "Load from emulator", what it does: the button's help while it can be used
+const LOAD_FROM_EMULATOR_HELP =
+  "Loads the emulator's DSP, at the stop it is in, into the playground: its program, TEMP, MEMS, MIXS, EFREG, RBP and RBL, the step it is at, MDEC_CT and the datapath (ACC, Y_REG, FRC_REG, ADRS_REG, the read latch, its copy, MEMVAL, NOFL_PIPE, the MIXS bank), and the first 2 MiB of wave memory. The playground is then paused at that step.";
+
+/** The banner of the snapshot the playground's DSP was loaded with: its source, its stop, the tick's time, its notes. */
+interface SnapshotBanner {
+  title: string;
+  /** the tick's time, as the banner shows it and as an ISO string */
+  time: string;
+  iso: string;
+  exact: boolean;
+  notes: string[];
+}
+
+/**
+ * The Debugger section's internal registers: the datapath of the step that was executed last (the core's view
+ * of it: SHIFTED, X, Y, B, INPUTS) and the core's own fields. One read latch, its copy and what IWT stores
+ * (MEMVAL) are the console's; NOFL_PIPE has the NOFL bits of the last two steps (bit 0 the last); MIXS_BANK is the
+ * bank of MIXS the DSP reads in this sample, the one shown below. With STEP these are the rows of the emulator's
+ * dc.aica.dsp that "Load from emulator" loads.
+ */
+const DSP_INTERNAL_REGISTERS: ReadonlyArray<{ name: string; bits: number; signed: boolean; read: () => number }> = [
+  { name: "MDEC_CT", bits: 16, signed: false, read: () => aicaDsp.get(REG.MDEC_CT) },
+  { name: "ACC", bits: 26, signed: true, read: () => aicaDsp.get(REG.ACC) },
+  { name: "SHIFTED", bits: 24, signed: true, read: () => aicaDsp.view[VIEW.SHIFTED] },
+  { name: "X", bits: 24, signed: true, read: () => aicaDsp.view[VIEW.X] },
+  { name: "Y", bits: 13, signed: true, read: () => aicaDsp.view[VIEW.Y] },
+  { name: "B", bits: 26, signed: true, read: () => aicaDsp.view[VIEW.B] },
+  { name: "INPUTS", bits: 24, signed: true, read: () => aicaDsp.view[VIEW.INPUTS] },
+  { name: "LATCH", bits: 16, signed: false, read: () => aicaDsp.get(REG.LATCH) },
+  { name: "LATCH_COPY", bits: 16, signed: false, read: () => aicaDsp.get(REG.LATCH_COPY) },
+  { name: "MEMVAL", bits: 16, signed: false, read: () => aicaDsp.get(REG.MEMVAL) },
+  { name: "FRC_REG", bits: 13, signed: true, read: () => aicaDsp.get(REG.FRC_REG) },
+  { name: "Y_REG", bits: 24, signed: true, read: () => aicaDsp.get(REG.Y_REG) },
+  { name: "ADRS_REG", bits: 12, signed: true, read: () => aicaDsp.get(REG.ADRS_REG) },
+  { name: "NOFL_PIPE", bits: 2, signed: false, read: () => aicaDsp.get(REG.NOFL_PIPE) },
+  { name: "MIXS_BANK", bits: 1, signed: false, read: () => aicaDsp.get(REG.MIXS_DSP) },
+];
+
+/** A register's value as the Debugger section shows it: decimal (signed or not) in its bits, hex in the title. */
+const registerText = (value: number, bits: number, signed: boolean): { text: string; title: string } => {
+  const shift = 32 - bits;
+  const unsigned = (value << shift) >>> shift;
+  const shown = signed ? (value << shift) >> shift : unsigned;
+  return {
+    text: shown.toString().padStart(11, " "),
+    title: `0x${unsigned.toString(16).toUpperCase().padStart(Math.ceil(bits / 4), "0")}`,
+  };
+};
 
 const encodeSource = (value: string) => {
   const bytes = deflate(new TextEncoder().encode(value));
@@ -193,7 +263,11 @@ export const DspPlaygroundPanel = () => {
   const [currentSample, setCurrentSample] = useState(0);
   const [breakpoints, setBreakpoints] = useState<Map<number, { id: number; enabled: boolean }>>(new Map());
   const breakpointIdCounterRef = useRef(0);
-  const breakpointsRef = useRef<Map<number, { id: number; enabled: boolean }>>(breakpoints);
+  // The enabled breakpoints as the stops of the core's run(): a non-zero byte for each step that has one
+  const stopsRef = useRef<Uint8Array>(new Uint8Array(AICA_DSP_STEPS));
+  // The next run of the DSP is the one that starts it (Start DSP, Run): it executes the step it starts at whatever
+  // breakpoint is there. A breakpoint on step 0 stops the runs behind it at the sample boundary
+  const passStartRef = useRef(true);
   const [goToPc, setGoToPc] = useState<{ address: number; fromUrl: boolean; highlight?: boolean } | undefined>(undefined);
   const registerElementsRef = useRef<Map<string, HTMLElement>>(new Map());
   const sourceExpandedRef = useRef(true);
@@ -265,9 +339,37 @@ export const DspPlaygroundPanel = () => {
   const outputContainerRefs = useRef<Array<HTMLElement | null>>(Array(16).fill(null));
   const inputSelectRefs = useRef<Array<HTMLSelectElement | null>>(Array(16).fill(null));
 
-  // Sync breakpoints ref with state
+  // "Load from emulator" takes the session of the workspace this panel is a dock panel of; the playground's tool
+  // page has no connection, and opens none
+  const inWorkspace = useLocation().pathname.startsWith("/workspace/");
+  const client = useSessionStore((state) => state.client);
+  const connected = useSessionStore((state) => state.connectionState === "connected");
+  const endpoint = useSessionStore((state) => state.endpoint);
+  const initialized = useDebuggerDataStore((state) => state.initialized);
+  const execution = useDebuggerDataStore((state) => state.executionState);
+  const emulatorName = useDebuggerDataStore((state) => state.shape?.emulator.name.trim());
+  const memoryBinary = useCapability(CAPABILITIES.MEMORY_BINARY);
+  const arm7Target = useTarget("arm7");
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [snapshotBanner, setSnapshotBanner] = useState<SnapshotBanner | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  // counts the loads: the register view reads the core again behind each, also at the step and sample it showed
+  const [snapshotSerial, setSnapshotSerial] = useState(0);
+  // The source of the program a snapshot put into the core. The Assembler tab, which a load switches to, writes its
+  // source into the core when it is switched to; for this source it does not: the core has the snapshot's program,
+  // and whatever the steps since the load have done to MEMS stays
+  const snapshotSourceRef = useRef<string | null>(null);
+  const loadOff = snapshotOff({ inWorkspace, connected, initialized, execution, arm7: arm7Target, memoryBinary, loading: snapshotLoading });
+
+  // Sync the stops of the runs with the breakpoints
   useEffect(() => {
-    breakpointsRef.current = breakpoints;
+    const stops = new Uint8Array(AICA_DSP_STEPS);
+    breakpoints.forEach((bp, step) => {
+      if (bp.enabled && step >= 0 && step < AICA_DSP_STEPS) {
+        stops[step] = 1;
+      }
+    });
+    stopsRef.current = stops;
   }, [breakpoints]);
 
   // Initialize WASM
@@ -348,8 +450,11 @@ export const DspPlaygroundPanel = () => {
     }
   }, [activeTab]);
 
+  // write false: the source is assembled for the editor (its status, its errors), and the core keeps its program.
+  // A program written into the core ends a snapshot's banner (here and in compileAndWrite): the core is no longer
+  // the emulator's. The load itself writes its program's text this way, and sets its banner behind it
   const assembleAndWrite = useCallback(
-    (newSource: string) => {
+    (newSource: string, write = true) => {
       if (!wasmInitialized) return;
 
       editorRef.current?.setStatus('assembling');
@@ -358,8 +463,11 @@ export const DspPlaygroundPanel = () => {
       try {
         // Use preprocessing version to support #define macros
         const parsedData = assembleSourceWithPreprocessing(newSource);
-        writeRegisters(aicaDsp, parsedData);
-        setBinaryVersion(v => v + 1);
+        if (write) {
+          writeRegisters(aicaDsp, parsedData);
+          setSnapshotBanner(null);
+          setBinaryVersion(v => v + 1);
+        }
         editorRef.current?.setStatus('assembled');
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -401,7 +509,9 @@ export const DspPlaygroundPanel = () => {
           // Assemble and write to DSP
           const lines = assembly.split("\n");
           const parsedData = assembleSource(lines);
+          snapshotSourceRef.current = null;
           writeRegisters(aicaDsp, parsedData);
+          setSnapshotBanner(null);
           setBinaryVersion(v => v + 1);
 
           // Set compiled status
@@ -491,6 +601,10 @@ export const DspPlaygroundPanel = () => {
     const timer = setTimeout(() => {
       if (activeTab === "source" || activeTab === "compiled") {
         compileAndWrite(dspSourceRef.current);
+      } else if (snapshotSourceRef.current !== null && snapshotSourceRef.current === assemblySourceRef.current) {
+        // the tab a snapshot was loaded into: its program is the core's already
+        snapshotSourceRef.current = null;
+        assembleAndWrite(assemblySourceRef.current, false);
       } else {
         assembleAndWrite(assemblySourceRef.current);
       }
@@ -512,6 +626,7 @@ export const DspPlaygroundPanel = () => {
   }, [compileAndWrite, saveToLocalStorage, updateShareToken]);
 
   const handleAssemblySourceChange = useCallback((newSource: string) => {
+    snapshotSourceRef.current = null;
     assemblySourceRef.current = newSource;
     assembleAndWrite(newSource);
     saveToLocalStorage();
@@ -527,61 +642,18 @@ export const DspPlaygroundPanel = () => {
         const arrayBuffer = await file.arrayBuffer();
         const dataView = new DataView(arrayBuffer);
 
+        // A register file is loaded as a debugger writes it: also RBP / RBL, the low bytes of MEMS and EXTS,
+        // which are not the CPU's to write
         for (let i = 0; i < arrayBuffer.byteLength; i += 4) {
           const value = dataView.getUint32(i, true);
-          aicaDsp.writeReg(i, value);
+          aicaDsp.pokeReg(i, value);
         }
 
         // Read back and generate source
-        const lines: string[] = [];
-        lines.push("# AICA-DSP");
-        lines.push("");
-
-        lines.push("# COEF");
-        for (let i = 0; i < 128; i++) {
-          const value = aicaDsp.readReg(0x3000 + i * 4);
-          if (value) {
-            lines.push(`COEF[${i}] = ${value}`);
-          }
-        }
-        lines.push("");
-
-        lines.push("# MADRS");
-        for (let i = 0; i < 64; i++) {
-          const value = aicaDsp.readReg(0x3200 + i * 4);
-          if (value) {
-            lines.push(`MADRS[${i}] = ${value}`);
-          }
-        }
-        lines.push("");
-
-        lines.push("# MEMS");
-        for (let i = 0; i < 32; i++) {
-          const low = aicaDsp.readReg(0x4400 + i * 8 + 0);
-          const high = aicaDsp.readReg(0x4400 + i * 8 + 4);
-          if (low || high) {
-            lines.push(`MEMS_L[${i}] = ${low}`);
-            lines.push(`MEMS_H[${i}] = ${high}`);
-          }
-        }
-        lines.push("");
-
-        lines.push("# MPRO");
-        for (let i = 0; i < 128; i++) {
-          const dwords = [
-            aicaDsp.readReg(0x3000 + 0x400 + i * 4 * 4 + 0),
-            aicaDsp.readReg(0x3000 + 0x400 + i * 4 * 4 + 4),
-            aicaDsp.readReg(0x3000 + 0x400 + i * 4 * 4 + 8),
-            aicaDsp.readReg(0x3000 + 0x400 + i * 4 * 4 + 12),
-          ];
-          const desc = decodeInst(dwords);
-          const disasm = disassembleDesc(desc);
-          if (disasm) {
-            lines.push(`MPRO[${i}] = ${disasm}`);
-          }
-        }
-
-        const newSource = lines.join("\n");
+        const newSource = dspSourceFromRegisters((offset) => aicaDsp.peekReg(offset));
+        // what the playground has now is this file's, no snapshot's
+        snapshotSourceRef.current = null;
+        setSnapshotBanner(null);
         assemblySourceRef.current = newSource;
         assembleAndWrite(newSource);
         saveToLocalStorage();
@@ -600,9 +672,11 @@ export const DspPlaygroundPanel = () => {
   const handleDownloadRegs = useCallback(() => {
     if (!wasmInitialized) return;
 
+    // What the DSP has at each offset, as a debugger reads it (RBP / RBL at 0x2804, EXTS): one 16 bit
+    // register per 32 bit slot, 0 where the DSP has no register
     const buffer = new Uint8Array(0x8000);
     for (let offset = 0; offset < 0x8000; offset += 4) {
-      const value = aicaDsp.readReg(offset);
+      const value = aicaDsp.peekReg(offset);
       buffer[offset] = value & 0xff;
       buffer[offset + 1] = (value >> 8) & 0xff;
       buffer[offset + 2] = (value >> 16) & 0xff;
@@ -620,19 +694,96 @@ export const DspPlaygroundPanel = () => {
     URL.revokeObjectURL(url);
   }, [wasmInitialized]);
 
-  const handleStartAudio = useCallback(() => {
-    if (!wasmInitialized) return;
+  // The sample of input `channel` for the sample the DSP starts next: a file at the sample counter, the
+  // keyboard (keyboardSample, null while the DSP is paused), or silence. 16 bit: a channel of the console sends
+  // at most a 16 bit sample, and a file's can be beyond full scale (a decoded or resampled file's floats can pass
+  // +-1.0), so it is limited to 16 bits here; << 4 of more than that wraps in MIXS's 20 bits to the other sign
+  const channelInput = useCallback((channel: number, keyboardSample: number | null): number => {
+    const source = inputSourcesRef.current[channel];
+    if (typeof source === "object" && source.type === "file") {
+      const file = audioFilesRef.current.find(f => f.id === source.fileId);
+      if (file && file.audioBuffer) {
+        const channelData = file.audioBuffer.getChannelData(0);
+        const pos = aicaDsp.sampleCounter;
 
-    // Reset DSP step counter
-    aicaDsp.resetCounters();
-    setCurrentDspStep(0);
+        // Read sample if within bounds, otherwise silent
+        if (pos < channelData.length) {
+          return Math.max(-32768, Math.min(32767, Math.round(channelData[pos] * 32767)));
+        }
+      }
+      return 0;
+    }
+    return source === "keyboard" && keyboardSample !== null ? keyboardSample : 0;
+  }, []);
 
+  // The inputs of the sample that starts at step 0, once a sample, never between two of its steps. At the
+  // console's scale: a channel's send to MIXS is its 16 bit sample << 4 (MIXS is 20 bit, INPUTS is MIXS << 4),
+  // and the DSP reads it in the sample behind the one whose step 0 sent it, as the console's DSP does
+  const startSampleInputs = useCallback((keyboardSample: number | null) => {
+    const mixs = aicaDsp.inputsMixs;
+    for (let j = 0; j < 16; j++) {
+      const sample = channelInput(j, keyboardSample);
+      mixs[j] = sample << 4;
+      inputPlotterRefs.current[j]?.appendSample(sample);
+    }
+    aicaDsp.setInputs({ sent: DSP_ALL_BUSES });
+  }, [channelInput]);
+
+  // The 16 outputs of the sample that has just ended (EFREG, signed 16 bit, held from sample to sample) into the
+  // plots. Returns what is heard: the outputs that are not muted, or the soloed ones
+  const readSampleOutputs = useCallback((): number => {
+    const efreg = aicaDsp.efreg;
+    const states = channelStatesRef.current;
+    const hasSolo = states.some(s => s === 2);
+    let audioOut = 0;
+    let mixSampleInt = 0;
+
+    for (let j = 0; j < 16; j++) {
+      const fxSampleInt = efreg[j];
+
+      // Apply solo/mute logic based on channel state: if any channel is soloed, only soloed channels are
+      // enabled; otherwise, only muted channels are disabled
+      const channelEnabled = hasSolo ? states[j] === 2 : states[j] !== 1;
+      if (channelEnabled) {
+        audioOut += fxSampleInt / 32767;
+        mixSampleInt += fxSampleInt;
+      }
+
+      outputPlotterRefs.current[j]?.appendSample(fxSampleInt);
+    }
+
+    // Update mix plotter with combined output
+    mixPlotterRef.current?.appendSample(mixSampleInt);
+    return audioOut;
+  }, []);
+
+  // One run of the core to the end of the sample it is in, the breakpoints as its stops: true when it stopped in
+  // front of a breakpoint, false when the sample ended (the outputs are then the caller's to read). passStart: the
+  // run starts the DSP (Start, Run, a button of the Debugger section), and the step it starts at is executed
+  // whatever breakpoint is there; otherwise a breakpoint on step 0 stops it at the sample boundary
+  const runToSampleEnd = useCallback((passStart: boolean, keyboardSample: number | null): boolean => {
+    const stops = stopsRef.current;
+    const start = aicaDsp.currentStep;
+    if (!passStart && stops[start]) {
+      return true;
+    }
+    if (start === 0) {
+      startSampleInputs(keyboardSample);
+    }
+    const count = AICA_DSP_STEPS - start;
+    return aicaDsp.run(count, stops) < count;
+  }, [startSampleInputs]);
+
+  // The audio of the DSP: its context and the callback that runs the DSP a sample at a time. paused: it starts
+  // with the DSP halted (as Pause leaves it), where it is; "Load from emulator" starts it so, at the loaded step
+  const startAudio = useCallback((paused: boolean) => {
     const audioContext = new (window.AudioContext || window.webkitAudioContext)({
       sampleRate: 44100,
     });
     const scriptNode = audioContext.createScriptProcessor(1024, 0, 1);
 
-    dspHaltedRef.current = false;
+    dspHaltedRef.current = paused;
+    passStartRef.current = true;
     scriptNode.onaudioprocess = (event) => {
       const outputBuffer = event.outputBuffer.getChannelData(0);
       if (dspHaltedRef.current) {
@@ -652,59 +803,9 @@ export const DspPlaygroundPanel = () => {
         const smoothedKeyboardSample = Math.round(lastKeyboardSample.current * 0.97 + rawKeyboardSample * 0.02);
         lastKeyboardSample.current = smoothedKeyboardSample;
 
-        // Write input to DSP channels based on input source
-        for (let j = 0; j < 16; j++) {
-          let channelSample = 0;
-
-          // Route based on input source (use ref to get current value)
-          const source = inputSourcesRef.current[j];
-          if (typeof source === "object" && source.type === "file") {
-            // File source
-            const file = audioFilesRef.current.find(f => f.id === source.fileId);
-            if (file && file.audioBuffer) {
-              const channelData = file.audioBuffer.getChannelData(0);
-              const pos = aicaDsp.getSampleCounter();
-
-              // Read sample if within bounds, otherwise silent
-              if (pos < channelData.length) {
-                channelSample = Math.round(channelData[pos] * 32767);
-              }
-            }
-          } else {
-            // String sources
-            switch (source) {
-              case "keyboard":
-                channelSample = smoothedKeyboardSample;
-                break;
-              case "none":
-              default:
-                channelSample = 0;
-                break;
-            }
-          }
-
-          aicaDsp.writeReg(0x3000 + 0x1500 + 0 + j * 8, (channelSample >> 0) & 0xf);
-          aicaDsp.writeReg(0x3000 + 0x1500 + 4 + j * 8, (channelSample >> 4) & 0xffff);
-          inputPlotterRefs.current[j]?.appendSample(channelSample);
-        }
-
-        // Execute 128 DSP steps (one full sample) or until breakpoint hit
-        let hitBreakpoint = false;
-        const startStep = aicaDsp.getCurrentStep();
-
-        do {
-          aicaDsp.doDspStep();
-          const currentStep = aicaDsp.getCurrentStep();
-
-          // Check if we hit a breakpoint (but not on the starting step)
-          if (currentStep !== startStep) {
-            const bp = breakpointsRef.current.get(currentStep);
-            if (bp && bp.enabled) {
-              hitBreakpoint = true;
-              break;
-            }
-          }
-        } while (aicaDsp.getCurrentStep() !== 0);
+        // One run of the DSP a sample: the rest of this sample, or up to a breakpoint
+        const hitBreakpoint = runToSampleEnd(passStartRef.current, smoothedKeyboardSample);
+        passStartRef.current = false;
 
         // If we hit a breakpoint, pause audio and don't continue processing this buffer
         if (hitBreakpoint) {
@@ -715,8 +816,9 @@ export const DspPlaygroundPanel = () => {
           }
           queueMicrotask(() => {
             setAudioPaused(true);
-            const currentStep = aicaDsp.getCurrentStep();
+            const currentStep = aicaDsp.currentStep;
             setCurrentDspStep(currentStep);
+            setCurrentSample(aicaDsp.sampleCounter);
             setGoToPc({ address: currentStep, fromUrl: true, highlight: false });
           });
           // Fill rest of buffer with silence
@@ -727,39 +829,7 @@ export const DspPlaygroundPanel = () => {
         }
 
         // Read DSP outputs
-        let audioOut = 0;
-        let mixSampleInt = 0;
-        const states = channelStatesRef.current;
-        const hasSolo = states.some(s => s === 2);
-
-        for (let j = 0; j < 16; j++) {
-          let fxSampleInt = aicaDsp.readReg(0x3000 + 0x1580 + j * 4);
-          fxSampleInt = fxSampleInt & 0xffff;
-          if (fxSampleInt & 0x8000) {
-            fxSampleInt |= 0xffff0000;
-          }
-
-          // Apply solo/mute logic based on channel state
-          let channelEnabled = true;
-          if (hasSolo) {
-            // If any channel is soloed, only soloed channels are enabled
-            channelEnabled = states[j] === 2;
-          } else {
-            // Otherwise, only muted channels are disabled
-            channelEnabled = states[j] !== 1;
-          }
-
-          const fxSample = fxSampleInt / 32767;
-          if (channelEnabled) {
-            audioOut += fxSample;
-            mixSampleInt += fxSampleInt;
-          }
-
-          outputPlotterRefs.current[j]?.appendSample(fxSampleInt);
-        }
-
-        // Update mix plotter with combined output
-        mixPlotterRef.current?.appendSample(mixSampleInt);
+        const audioOut = readSampleOutputs();
 
         // If a channel is tapped, output only the input of that channel
         const tapped = tappedChannelRef.current;
@@ -771,7 +841,7 @@ export const DspPlaygroundPanel = () => {
             const file = audioFilesRef.current.find(f => f.id === source.fileId);
             if (file && file.audioBuffer) {
               const channelData = file.audioBuffer.getChannelData(0);
-              const pos = aicaDsp.getSampleCounter();
+              const pos = aicaDsp.sampleCounter;
 
               // Read sample if within bounds, otherwise silent
               if (pos < channelData.length) {
@@ -802,8 +872,71 @@ export const DspPlaygroundPanel = () => {
     scriptNode.connect(audioContext.destination);
     audioContextRef.current = audioContext;
     scriptNodeRef.current = scriptNode;
+    if (paused) {
+      void audioContext.suspend();
+    }
     setAudioPlaying(true);
-  }, [wasmInitialized]);
+    setAudioPaused(paused);
+  }, [runToSampleEnd, readSampleOutputs]);
+
+  const handleStartAudio = useCallback(() => {
+    if (!wasmInitialized) return;
+
+    // The counters start again; the program and the rest of the state stay. A snapshot's step is left behind: the
+    // DSP is no longer where the emulator was
+    aicaDsp.set(REG.STEP, 0);
+    aicaDsp.set(REG.SAMPLES, 0);
+    setCurrentDspStep(0);
+    setCurrentSample(0);
+    setSnapshotBanner(null);
+    startAudio(false);
+  }, [wasmInitialized, startAudio]);
+
+  // "Load from emulator": a snapshot of the emulator's DSP at the stop the target is in (emulatorSnapshot.ts), into
+  // the core. The playground's DSP is halted first, or started halted, and stands at the loaded step; the program
+  // is the Assembler tab's, its source made from the loaded registers as Load Regs makes it
+  const handleLoadFromEmulator = useCallback(async () => {
+    if (loadOff !== undefined || !client || !wasmInitialized) return;
+    setSnapshotLoading(true);
+    setSnapshotError(null);
+    try {
+      const taken = await takeEmulatorSnapshot({
+        client,
+        execution: () => useDebuggerDataStore.getState().executionState,
+        source: endpointLabel(endpoint ?? "", emulatorName ? { endpoint: endpoint ?? "", name: emulatorName } : undefined),
+      });
+      if (audioContextRef.current) {
+        dspHaltedRef.current = true;
+        void audioContextRef.current.suspend();
+        setAudioPaused(true);
+      } else {
+        startAudio(true);
+      }
+      const program = snapshotSource(taken);
+      assemblySourceRef.current = program;
+      // the editor's status, and the program as its text has it (which ends a banner of an earlier load); then the
+      // snapshot as it is, and its banner
+      assembleAndWrite(program);
+      applySnapshot(aicaDsp, taken);
+      snapshotSourceRef.current = program;
+      saveToLocalStorage();
+      updateShareToken();
+      setActiveTab("assembly");
+      // the step the playground is at is executed by the next run, whatever breakpoint is there
+      passStartRef.current = true;
+      const step = aicaDsp.currentStep;
+      setCurrentDspStep(step);
+      setCurrentSample(aicaDsp.sampleCounter);
+      setGoToPc({ address: step, fromUrl: true, highlight: false });
+      setSnapshotSerial((serial) => serial + 1);
+      const { title, exact, notes } = snapshotNotes(taken);
+      setSnapshotBanner({ title, time: snapshotTime(taken.timestamp), iso: new Date(taken.timestamp).toISOString(), exact, notes });
+    } catch (error) {
+      setSnapshotError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSnapshotLoading(false);
+    }
+  }, [loadOff, client, wasmInitialized, endpoint, emulatorName, startAudio, assembleAndWrite, saveToLocalStorage, updateShareToken]);
 
   const handleStopAudio = useCallback(() => {
     if (scriptNodeRef.current) {
@@ -914,12 +1047,11 @@ export const DspPlaygroundPanel = () => {
   useEffect(() => {
     if (!wasmInitialized || !audioPlaying || !audioPaused) return;
 
-    const sampleNum = aicaDsp.getSampleCounter();
-    const stepNum = aicaDsp.getCurrentStep();
-    const regs = aicaDsp.getDspRegisters();
+    const sampleNum = aicaDsp.sampleCounter;
+    const stepNum = aicaDsp.currentStep;
 
     // Helper to update register element only if value changed
-    const updateRegister = (name: string, value: number, bits: number = 32) => {
+    const updateRegister = (name: string, value: number, bits: number, signed: boolean = true) => {
       const lastValue = lastRegValuesRef.current.get(name);
       if (lastValue === value) return; // Skip if unchanged
 
@@ -927,14 +1059,9 @@ export const DspPlaygroundPanel = () => {
 
       const el = registerElementsRef.current.get(name);
       if (el) {
-        const signExtend = (value: number, bits: number): number => {
-          const shift = 32 - bits;
-          return (value << shift) >> shift;
-        };
-        const signedValue = signExtend(value, bits);
-        const hexValue = (value >>> 0).toString(16).toUpperCase().padStart(Math.ceil(bits / 4), '0');
-        el.textContent = signedValue.toString().padStart(11, ' ');
-        el.title = `0x${hexValue}`;
+        const { text, title } = registerText(value, bits, signed);
+        el.textContent = text;
+        el.title = title;
       }
     };
 
@@ -950,47 +1077,49 @@ export const DspPlaygroundPanel = () => {
       stepEl.title = `0x${stepNum.toString(16).toUpperCase()}`;
     }
 
-    // Update internal registers
-    const regNames = ["MDEC_CT", "ACC", "SHIFTED", "X", "Y", "B", "INPUTS", "MEMVAL[0]", "MEMVAL[1]", "MEMVAL[2]", "MEMVAL[3]", "FRC_REG", "Y_REG", "ADRS_REG"];
-    regNames.forEach((name, i) => {
-      updateRegister(name, regs[i], i === 0 ? 10 : i >= 4 && i <= 7 ? 24 : 32);
+    // Update internal registers: the view of the last executed step and the core's fields
+    DSP_INTERNAL_REGISTERS.forEach(({ name, bits, signed, read }) => {
+      updateRegister(name, read(), bits, signed);
     });
 
-    // Update TEMP registers (128 registers, 24-bit)
+    // The arrays of the state, whole values
+    const temp = aicaDsp.temp;
     for (let i = 0; i < 128; i++) {
-      updateRegister(`TEMP[${i}]`, aicaDsp.readReg(0x3000 + 0x1000 + i * 8), 24);
+      updateRegister(`TEMP[${i}]`, temp[i], 24);
     }
 
-    // Update COEF registers (128 registers, 16-bit)
+    const coef = aicaDsp.coef;
     for (let i = 0; i < 128; i++) {
-      updateRegister(`COEF[${i}]`, aicaDsp.readReg(0x3000 + 0x000 + i * 4), 16);
+      updateRegister(`COEF[${i}]`, coef[i], 16);
     }
 
-    // Update MADRS registers (64 registers, 16-bit)
+    const madrs = aicaDsp.madrs;
     for (let i = 0; i < 64; i++) {
-      updateRegister(`MADRS[${i}]`, aicaDsp.readReg(0x3000 + 0x200 + i * 4), 16);
+      updateRegister(`MADRS[${i}]`, madrs[i], 16, false);
     }
 
-    // Update MEMS registers (32 registers, 24-bit)
+    const mems = aicaDsp.mems;
     for (let i = 0; i < 32; i++) {
-      updateRegister(`MEMS[${i}]`, aicaDsp.readReg(0x3000 + 0x1400 + i * 8), 24);
+      updateRegister(`MEMS[${i}]`, mems[i], 24);
     }
 
-    // Update MIXS registers (16 registers, 20-bit)
+    // MIXS of the bank the DSP reads in this sample
+    const mixs = aicaDsp.mixs;
+    const bank = aicaDsp.get(REG.MIXS_DSP);
     for (let i = 0; i < 16; i++) {
-      updateRegister(`MIXS[${i}]`, aicaDsp.readReg(0x3000 + 0x1500 + i * 8), 20);
+      updateRegister(`MIXS[${i}]`, mixs[16 * bank + i], 20);
     }
 
-    // Update EFREG registers (16 registers, 32-bit)
+    const efreg = aicaDsp.efreg;
     for (let i = 0; i < 16; i++) {
-      updateRegister(`EFREG[${i}]`, aicaDsp.readReg(0x3000 + 0x1580 + i * 4), 32);
+      updateRegister(`EFREG[${i}]`, efreg[i], 16);
     }
 
-    // Update EXTS registers (2 registers, 16-bit)
+    const exts = aicaDsp.exts;
     for (let i = 0; i < 2; i++) {
-      updateRegister(`EXTS[${i}]`, aicaDsp.readReg(0x3000 + 0x15C0 + i * 4), 16);
+      updateRegister(`EXTS[${i}]`, exts[i], 16);
     }
-  }, [wasmInitialized, audioPlaying, audioPaused, currentDspStep, currentSample]);
+  }, [wasmInitialized, audioPlaying, audioPaused, currentDspStep, currentSample, snapshotSerial]);
 
   // Sync inputSources ref to Select elements on audioFiles change
   useEffect(() => {
@@ -1552,150 +1681,46 @@ export const DspPlaygroundPanel = () => {
     input.click();
   }, []);
 
-  // Helper function to check if a breakpoint is hit
-  const checkBreakpoint = useCallback((step: number): boolean => {
-    const bp = breakpoints.get(step);
-    return bp !== undefined && bp.enabled;
-  }, [breakpoints]);
-
-  // Handler for running to next sample (run until currentStep === 0)
+  // Handler for running to next sample: one run of the core, from the step it is at to the end of the sample or
+  // to a breakpoint (one on the starting step is passed)
   const handleRunToNextSample = useCallback(() => {
     if (!wasmInitialized || !audioPaused) return;
 
-    // Run until we reach the next sample boundary (step 0) or hit a breakpoint
-    const startStep = aicaDsp.getCurrentStep();
-
-    // Always step at least once, then continue until we reach step 0
-    for (;;) {
-      aicaDsp.doDspStep();
-      const currentStep = aicaDsp.getCurrentStep();
-
-      // Check if we hit a breakpoint (but not on the starting step)
-      if (currentStep !== startStep && checkBreakpoint(currentStep)) {
-        break;
-      }
-
-      // Stop when we reach step 0 (sample boundary)
-      if (currentStep === 0) {
-        break;
-      }
+    if (!runToSampleEnd(true, null)) {
+      readSampleOutputs();
     }
 
     // Update current step and sample for the disassembly view
-    const newStep = aicaDsp.getCurrentStep();
-    const newSample = aicaDsp.getSampleCounter();
+    const newStep = aicaDsp.currentStep;
+    const newSample = aicaDsp.sampleCounter;
     setCurrentDspStep(newStep);
     setCurrentSample(newSample);
 
     // Scroll to the current PC without highlighting
     setGoToPc({ address: newStep, fromUrl: true, highlight: false });
-  }, [wasmInitialized, audioPaused, checkBreakpoint]);
+  }, [wasmInitialized, audioPaused, runToSampleEnd, readSampleOutputs]);
 
-  // Handler for running 128 samples
+  // Handler for running 128 samples: one run of the core a sample, up to a breakpoint (one on the step the first
+  // run starts at is passed). Keyboard input is not included when paused
   const handleRun128Samples = useCallback(() => {
     if (!wasmInitialized || !audioPaused) return;
 
-    let startStep = aicaDsp.getCurrentStep();
-    let hitBreakpoint = false;
-
-    // Run 128 samples (or until breakpoint)
     for (let sampleIdx = 0; sampleIdx < 128; sampleIdx++) {
-      // Process inputs for all 16 channels
-      for (let j = 0; j < 16; j++) {
-        const source = inputSourcesRef.current[j];
-        let channelSample = 0;
-
-        if (typeof source === "object" && source.type === "file") {
-          // File source
-          const file = audioFilesRef.current.find(f => f.id === source.fileId);
-          if (file && file.audioBuffer) {
-            const channelData = file.audioBuffer.getChannelData(0);
-            const pos = aicaDsp.getSampleCounter();
-
-            // Read sample if within bounds, otherwise silent
-            if (pos < channelData.length) {
-              channelSample = Math.round(channelData[pos] * 32767);
-            }
-          }
-        }
-        // Note: keyboard input is not included when paused
-
-        aicaDsp.writeReg(0x3000 + 0x1500 + 0 + j * 8, (channelSample >> 0) & 0xf);
-        aicaDsp.writeReg(0x3000 + 0x1500 + 4 + j * 8, (channelSample >> 4) & 0xffff);
-        inputPlotterRefs.current[j]?.appendSample(channelSample);
-      }
-
-      // Run one full sample (128 DSP steps) or until breakpoint hit
-      let completedSample = false;
-
-      for (;;) {
-        aicaDsp.doDspStep();
-        const currentStep = aicaDsp.getCurrentStep();
-
-        // Check if we hit a breakpoint (but not on the starting step)
-        if (currentStep !== startStep && checkBreakpoint(currentStep)) {
-          hitBreakpoint = true;
-          break;
-        }
-
-        startStep = -1;
-
-        // Check if we completed a full sample
-        if (currentStep === 0) {
-          completedSample = true;
-          break;
-        }
-      }
-
-      // Only read outputs and update plotters if we completed the full sample
-      if (completedSample) {
-
-        // Read DSP outputs and update plotters
-        let mixSampleInt = 0;
-        const states = channelStatesRef.current;
-        const hasSolo = states.some(s => s === 2);
-
-        for (let j = 0; j < 16; j++) {
-          let fxSampleInt = aicaDsp.readReg(0x3000 + 0x1580 + j * 4);
-          fxSampleInt = fxSampleInt & 0xffff;
-          if (fxSampleInt & 0x8000) {
-            fxSampleInt |= 0xffff0000;
-          }
-
-          // Apply solo/mute logic based on channel state
-          let channelEnabled = true;
-          if (hasSolo) {
-            channelEnabled = states[j] === 2;
-          } else {
-            channelEnabled = states[j] !== 1;
-          }
-
-          if (channelEnabled) {
-            mixSampleInt += fxSampleInt;
-          }
-
-          outputPlotterRefs.current[j]?.appendSample(fxSampleInt);
-        }
-
-        // Update mix plotter with combined output
-        mixPlotterRef.current?.appendSample(mixSampleInt);
-      }
-
-      // Stop if we hit a breakpoint
-      if (hitBreakpoint) {
+      if (runToSampleEnd(sampleIdx === 0, null)) {
         break;
       }
+      readSampleOutputs();
     }
 
     // Update current step and sample for the disassembly view
-    const newStep = aicaDsp.getCurrentStep();
-    const newSample = aicaDsp.getSampleCounter();
+    const newStep = aicaDsp.currentStep;
+    const newSample = aicaDsp.sampleCounter;
     setCurrentDspStep(newStep);
     setCurrentSample(newSample);
 
     // Scroll to the current PC without highlighting
     setGoToPc({ address: newStep, fromUrl: true, highlight: false });
-  }, [wasmInitialized, audioPaused, checkBreakpoint]);
+  }, [wasmInitialized, audioPaused, runToSampleEnd, readSampleOutputs]);
 
   // DisassemblyView configuration for DSP
   const disassemblyConfig: DisassemblyViewConfig = useMemo(() => ({
@@ -1774,65 +1799,23 @@ export const DspPlaygroundPanel = () => {
     onStep: async () => {
       if (!wasmInitialized || !audioPaused) return;
 
-      // Process inputs for all 16 channels
-      for (let j = 0; j < 16; j++) {
-        const source = inputSourcesRef.current[j];
-        let channelSample = 0;
-
-        if (typeof source === "object" && source.type === "file") {
-          const file = audioFilesRef.current.find(f => f.id === source.fileId);
-          if (file && file.audioBuffer) {
-            const channelData = file.audioBuffer.getChannelData(0);
-            const pos = aicaDsp.getSampleCounter();
-
-            if (pos < channelData.length) {
-              channelSample = Math.round(channelData[pos] * 32767);
-            }
-          }
-        }
-
-        aicaDsp.writeReg(0x3000 + 0x1500 + 0 + j * 8, (channelSample >> 0) & 0xf);
-        aicaDsp.writeReg(0x3000 + 0x1500 + 4 + j * 8, (channelSample >> 4) & 0xffff);
-        inputPlotterRefs.current[j]?.appendSample(channelSample);
+      // Execute one DSP step, the one the core is at: step 0 takes the inputs of its sample (keyboard input is
+      // not included when paused), and the step that ends a sample gives its outputs
+      if (aicaDsp.currentStep === 0) {
+        startSampleInputs(null);
+      }
+      aicaDsp.step();
+      if (aicaDsp.currentStep === 0) {
+        readSampleOutputs();
       }
 
-      // Execute one DSP step
-      aicaDsp.doDspStep();
-
       // Update current step for the disassembly view
-      const newStep = aicaDsp.getCurrentStep();
+      const newStep = aicaDsp.currentStep;
       setCurrentDspStep(newStep);
+      setCurrentSample(aicaDsp.sampleCounter);
 
       // Scroll to the current PC without highlighting
       setGoToPc({ address: newStep, fromUrl: true, highlight: false });
-
-      // Read DSP outputs and update plotters
-      let mixSampleInt = 0;
-      const states = channelStatesRef.current;
-      const hasSolo = states.some(s => s === 2);
-
-      for (let j = 0; j < 16; j++) {
-        let fxSampleInt = aicaDsp.readReg(0x3000 + 0x1580 + j * 4);
-        fxSampleInt = fxSampleInt & 0xffff;
-        if (fxSampleInt & 0x8000) {
-          fxSampleInt |= 0xffff0000;
-        }
-
-        let channelEnabled = true;
-        if (hasSolo) {
-          channelEnabled = states[j] === 2;
-        } else {
-          channelEnabled = states[j] !== 1;
-        }
-
-        if (channelEnabled) {
-          mixSampleInt += fxSampleInt;
-        }
-
-        outputPlotterRefs.current[j]?.appendSample(fxSampleInt);
-      }
-
-      mixPlotterRef.current?.appendSample(mixSampleInt);
     },
     onBreakpointAdd: async (address: number) => {
 
@@ -1844,8 +1827,16 @@ export const DspPlaygroundPanel = () => {
         await void audioContextRef.current.suspend();
         setAudioPaused(true);
 
-        while (aicaDsp.getCurrentStep() != address) {
-          aicaDsp.doDspStep();
+        // Then run the DSP up to the new breakpoint's step, sample by sample
+        while (aicaDsp.currentStep !== address) {
+          const start = aicaDsp.currentStep;
+          if (start === 0) {
+            startSampleInputs(null);
+          }
+          aicaDsp.run(address > start ? address - start : AICA_DSP_STEPS - start);
+          if (aicaDsp.currentStep === 0) {
+            readSampleOutputs();
+          }
         }
       }
 
@@ -1854,8 +1845,9 @@ export const DspPlaygroundPanel = () => {
 
       // Update display after adding breakpoint
       if (wasmInitialized && audioWasPaused) {
-        const newStep = aicaDsp.getCurrentStep();
+        const newStep = aicaDsp.currentStep;
         setCurrentDspStep(newStep);
+        setCurrentSample(aicaDsp.sampleCounter);
       }
     },
     onBreakpointRemove: async (id: number) => {
@@ -1892,7 +1884,9 @@ export const DspPlaygroundPanel = () => {
       if (!audioPlaying) return; // Disabled when audio not playing
 
       if (audioPaused) {
-        // Resume - update state first, then resume audio in microtask
+        // Resume - update state first, then resume audio in microtask. The run that resumes executes the
+        // step the DSP is paused at, whatever breakpoint is there
+        passStartRef.current = true;
         dspHaltedRef.current = false;
         setAudioPaused(false);
         queueMicrotask(() => {
@@ -1910,15 +1904,16 @@ export const DspPlaygroundPanel = () => {
           setAudioPaused(true);
           // Scroll to current step when pausing
           if (wasmInitialized) {
-            const currentStep = aicaDsp.getCurrentStep();
+            const currentStep = aicaDsp.currentStep;
             setCurrentDspStep(currentStep);
+            setCurrentSample(aicaDsp.sampleCounter);
             setGoToPc({ address: currentStep, fromUrl: true, highlight: false });
           }
         });
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- dropping breakpoints would stop DisassemblyView refetching on breakpoint changes (it refetches when callbacks changes identity)
-  }), [wasmInitialized, audioPlaying, audioPaused, breakpoints]);
+  }), [wasmInitialized, audioPlaying, audioPaused, breakpoints, startSampleInputs, readSampleOutputs]);
 
   if (!wasmInitialized) {
     return (
@@ -1962,19 +1957,61 @@ export const DspPlaygroundPanel = () => {
           <Button variant="outlined" size="small" onClick={handleDownloadRegs}>
             Download Regs
           </Button>
-          <Box sx={{ flexGrow: 1 }} />
-          {shareToken && (
+          {/* off while the target runs, and anywhere else it could not be made: it says why */}
+          <Tooltip title={loadOff !== undefined ? `Load from emulator: ${loadOff}` : LOAD_FROM_EMULATOR_HELP} describeChild>
             <Button
               variant="outlined"
               size="small"
-              onClick={handleShare}
-              startIcon={<ContentCopyIcon fontSize="small" />}
-              color={copied ? "success" : "primary"}
+              aria-disabled={loadOff !== undefined || undefined}
+              disableRipple={loadOff !== undefined}
+              onClick={loadOff === undefined ? () => void handleLoadFromEmulator() : undefined}
+              startIcon={snapshotLoading ? <CircularProgress size={12} /> : undefined}
+              sx={loadOff !== undefined ? { color: "text.disabled", borderColor: "action.disabledBackground", cursor: "default", "&:hover": { borderColor: "action.disabledBackground", backgroundColor: "transparent" } } : undefined}
             >
-              {copied ? "Copied!" : "Share"}
+              Load from emulator
             </Button>
+          </Tooltip>
+          <Box sx={{ flexGrow: 1 }} />
+          {shareToken && (
+            // describeChild: the help describes the button, whose name stays "Share"
+            <Tooltip title={DSP_SHARE_HELP} describeChild>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={handleShare}
+                startIcon={<ContentCopyIcon fontSize="small" />}
+                color={copied ? "success" : "primary"}
+              >
+                {copied ? "Copied!" : "Share"}
+              </Button>
+            </Tooltip>
           )}
         </Stack>
+
+        {snapshotBanner && (
+          <Alert
+            severity={snapshotBanner.exact ? "info" : "warning"}
+            role="status"
+            aria-label="Snapshot from the emulator"
+            onClose={() => setSnapshotBanner(null)}
+            sx={{ py: 0.5 }}
+          >
+            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+              {snapshotBanner.title}, <time dateTime={snapshotBanner.iso}>{snapshotBanner.time}</time>
+            </Typography>
+            {snapshotBanner.notes.map((note) => (
+              <Typography key={note} variant="caption" component="p">
+                {note}
+              </Typography>
+            ))}
+          </Alert>
+        )}
+
+        {snapshotError && (
+          <Alert severity="error" onClose={() => setSnapshotError(null)} sx={{ py: 0.5 }}>
+            Load from emulator: {snapshotError}
+          </Alert>
+        )}
 
         {audioPlaying && (
           <Alert severity="info" sx={{ py: 0.5 }}>
@@ -2141,12 +2178,10 @@ export const DspPlaygroundPanel = () => {
           }}>
             {wasmInitialized && (() => {
               // Use default values for initial render
-              const regNames = ["MDEC_CT", "ACC", "SHIFTED", "X", "Y", "B", "INPUTS", "MEMVAL[0]", "MEMVAL[1]", "MEMVAL[2]", "MEMVAL[3]", "FRC_REG", "Y_REG", "ADRS_REG"];
               const counters = [
                 { name: "Sample", value: 0 },
                 { name: "Step", value: 0 },
               ];
-              const internalRegs = Array(regNames.length).fill(0);
               const tempRegs = Array.from({ length: 128 }, (_, i) => ({ name: `TEMP[${i}]`, value: 0 }));
               const coefRegs = Array.from({ length: 128 }, (_, i) => ({ name: `COEF[${i}]`, value: 0 }));
               const madrsRegs = Array.from({ length: 64 }, (_, i) => ({ name: `MADRS[${i}]`, value: 0 }));
@@ -2155,15 +2190,8 @@ export const DspPlaygroundPanel = () => {
               const efregRegs = Array.from({ length: 16 }, (_, i) => ({ name: `EFREG[${i}]`, value: 0 }));
               const extsRegs = Array.from({ length: 2 }, (_, i) => ({ name: `EXTS[${i}]`, value: 0 }));
 
-              // Sign extend values based on bit width
-              const signExtend = (value: number, bits: number): number => {
-                const shift = 32 - bits;
-                return (value << shift) >> shift;
-              };
-
-              const renderRegister = (name: string, value: number, bits: number = 32) => {
-                const signedValue = signExtend(value, bits);
-                const hexValue = (value >>> 0).toString(16).toUpperCase().padStart(Math.ceil(bits / 4), '0');
+              const renderRegister = (name: string, value: number, bits: number, signed: boolean = true) => {
+                const { text, title } = registerText(value, bits, signed);
 
                 return (
                   <Box key={name} sx={{ display: "flex", gap: 1 }}>
@@ -2176,9 +2204,9 @@ export const DspPlaygroundPanel = () => {
                         if (el) registerElementsRef.current.set(name, el);
                       }}
                       sx={{ fontWeight: "bold", cursor: "default" }}
-                      title={`0x${hexValue}`}
+                      title={title}
                     >
-                      {signedValue.toString().padStart(11, ' ')}
+                      {text}
                     </Typography>
                   </Box>
                 );
@@ -2211,11 +2239,7 @@ export const DspPlaygroundPanel = () => {
                       Internal Registers
                     </Typography>
                   </Box>
-                  {regNames.map((name, i) => {
-                    // Internal registers are 24-bit signed values, except MDEC_CT and ADRS_REG
-                    const bits = (name === "MDEC_CT" || name === "ADRS_REG") ? 32 : 24;
-                    return renderRegister(name, internalRegs[i], bits);
-                  })}
+                  {DSP_INTERNAL_REGISTERS.map(({ name, bits, signed }) => renderRegister(name, 0, bits, signed))}
 
                   {/* TEMP registers - 24-bit signed */}
                   <Box key="temp-header" sx={{ gridColumn: "1 / -1", mt: 1 }}>
@@ -2239,7 +2263,7 @@ export const DspPlaygroundPanel = () => {
                       MADRS (Memory Addresses)
                     </Typography>
                   </Box>
-                  {madrsRegs.map(({ name, value }) => renderRegister(name, value, 16))}
+                  {madrsRegs.map(({ name, value }) => renderRegister(name, value, 16, false))}
 
                   {/* MEMS registers - 24-bit signed */}
                   <Box key="mems-header" sx={{ gridColumn: "1 / -1", mt: 1 }}>
@@ -2249,21 +2273,21 @@ export const DspPlaygroundPanel = () => {
                   </Box>
                   {memsRegs.map(({ name, value }) => renderRegister(name, value, 24))}
 
-                  {/* MIXS registers - 20-bit signed */}
+                  {/* MIXS registers - 20-bit signed, the bank the DSP reads (MIXS_BANK) */}
                   <Box key="mixs-header" sx={{ gridColumn: "1 / -1", mt: 1 }}>
                     <Typography variant="caption" sx={{ color: "text.disabled", fontWeight: "bold" }}>
-                      MIXS (Mixer Samples)
+                      {"MIXS (Mixer Samples: the bank the DSP reads; an input is its 16-bit sample << 4)"}
                     </Typography>
                   </Box>
                   {mixsRegs.map(({ name, value }) => renderRegister(name, value, 20))}
 
-                  {/* EFREG registers - 32-bit unsigned */}
+                  {/* EFREG registers - 16-bit signed, held from sample to sample */}
                   <Box key="efreg-header" sx={{ gridColumn: "1 / -1", mt: 1 }}>
                     <Typography variant="caption" sx={{ color: "text.disabled", fontWeight: "bold" }}>
                       EFREG (Effect Outputs)
                     </Typography>
                   </Box>
-                  {efregRegs.map(({ name, value }) => renderRegister(name, value, 32))}
+                  {efregRegs.map(({ name, value }) => renderRegister(name, value, 16))}
 
                   {/* EXTS registers - 16-bit signed */}
                   <Box key="exts-header" sx={{ gridColumn: "1 / -1", mt: 1 }}>

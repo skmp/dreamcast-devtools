@@ -1,4 +1,4 @@
-import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT, MockDebugger } from "../../server/mockDebugger";
+import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT, MOCK_M3_SUPPORT, MockDebugger } from "../../server/mockDebugger";
 import { listenMockDebugger } from "../../server/mockWebSocket";
 import type { MockListener } from "../../server/mockWebSocket";
 import type { DebuggerShape, DebuggerTick } from "../../src/lib/debuggerSchema";
@@ -21,7 +21,11 @@ export interface ContractOptions {
    * applicable, and that is no failure.
    */
   milestone?: Milestone;
-  /** the server runs the DSP test program: the anchor and the scenarios of that program alone (the second run of the M3 gate) */
+  /**
+   * The server runs the DSP test program: the anchor, S17 and the scenarios of that program (the
+   * second run of the M3 gate). The mock the runner starts for it is held at a stop of its start
+   * with its ARM7 held in reset, as the emulator's guest is at the anchor.
+   */
   dspProgram?: boolean;
   /** narrows the selection to these scenarios, also inside a gate */
   only?: Set<string>;
@@ -40,7 +44,7 @@ export interface ContractOptions {
    */
   requireNotes?: string[];
   /** the profile of the mock that is started in this process (no `url`): everything it can do, or what the emulator of a milestone does */
-  mockSupport?: "m1" | "m2";
+  mockSupport?: "m1" | "m2" | "m3";
   /** multiplies every timeout; default 1 for the mock profile, 5 for the emulator profile */
   timeoutFactor?: number;
   verbose?: boolean;
@@ -122,10 +126,18 @@ const prepare = async (options: ContractOptions) => {
     if (options.profile !== "mock") {
       throw new Error("--profile emulator needs --url");
     }
-    const supports = options.mockSupport === "m1" ? MOCK_M1_SUPPORT : options.mockSupport === "m2" ? MOCK_M2_SUPPORT : undefined;
-    listener = await listenMockDebugger(new MockDebugger({ supports }));
+    const supports = options.mockSupport ? { m1: MOCK_M1_SUPPORT, m2: MOCK_M2_SUPPORT, m3: MOCK_M3_SUPPORT }[options.mockSupport] : undefined;
+    // With the DSP test program the emulator's run starts at its anchor, where the guest holds its
+    // ARM7: the mock starts at its stop of the start (reason "start", its anchor) with its ARM7
+    // held, which only emulation steps of a running machine release, so that the first scenario
+    // meets it held however long the session takes to open (the M3 round's M3-D31).
+    const held = options.dspProgram === true;
+    listener = await listenMockDebugger(new MockDebugger({ supports, ...(held ? { arm7Held: true, startPaused: true } : {}) }));
     url = listener.url;
-    say(`mock debugger started in this process at ${url}${options.mockSupport ? `, as a server of milestone ${options.mockSupport.toUpperCase()}` : ""}`);
+    say(
+      `mock debugger started in this process at ${url}${options.mockSupport ? `, as a server of milestone ${options.mockSupport.toUpperCase()}` : ""}` +
+        `${held ? ", paused at its start with its ARM7 held" : ""}`,
+    );
   }
   const target = url;
   const timeoutFactor = options.timeoutFactor ?? (options.profile === "emulator" ? 5 : 1);

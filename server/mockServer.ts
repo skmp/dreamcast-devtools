@@ -3,7 +3,7 @@ import { createServer as createHttpServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createServer as createViteServer } from "vite";
-import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT, MockDebugger } from "./mockDebugger";
+import { MOCK_M1_SUPPORT, MOCK_M2_SUPPORT, MOCK_M3_SUPPORT, MockDebugger } from "./mockDebugger";
 import { attachMockDebugger } from "./mockWebSocket";
 
 /**
@@ -17,7 +17,9 @@ import { attachMockDebugger } from "./mockWebSocket";
  *   --stale-registers  behave like a backend whose running ticks cannot carry dc.sh4.cpu
  *   --m1               implement what the emulator does in milestone M1, and nothing more
  *   --m2               implement what the emulator does in milestone M2, and nothing more
+ *   --m3               implement what the emulator does in milestone M3, and nothing more
  *   --arm7-held        start with the ARM7 held in reset, as behind a reset; the running machine releases it
+ *   --testb0           TESTB0 of the AICA's word 0x2804 set (dc.aica.common.TESTB0 1, MDEC_CT in its test mode)
  */
 
 const PORT = Number(process.env.PORT ?? 5173);
@@ -86,8 +88,9 @@ const start = async () => {
     startPaused: FLAGS.has("--start-paused"),
     forceFallback: FLAGS.has("--force-fallback"),
     sliceContext: !FLAGS.has("--stale-registers"),
-    supports: FLAGS.has("--m1") ? MOCK_M1_SUPPORT : FLAGS.has("--m2") ? MOCK_M2_SUPPORT : undefined,
+    supports: FLAGS.has("--m1") ? MOCK_M1_SUPPORT : FLAGS.has("--m2") ? MOCK_M2_SUPPORT : FLAGS.has("--m3") ? MOCK_M3_SUPPORT : undefined,
     arm7Held: FLAGS.has("--arm7-held"),
+    testb0: FLAGS.has("--testb0"),
   });
   const server = createHttpServer(app);
   const endpoint = attachMockDebugger(mock, server, WS_PATH);

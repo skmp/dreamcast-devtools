@@ -11,7 +11,6 @@ import {
   tooltipButton,
   treeItem,
   treeItemRow,
-  KNOWN,
   WORKSPACES,
 } from "./support/fixtures";
 import type { Locator, Page } from "@playwright/test";
@@ -26,7 +25,7 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
     "device-tree": /SYSCLK = 200MHz/,
     // a disassembly view opens where its target is: around the mock's loop
     "sh4-disassembly": /0x8C0000A0/,
-    "sh4-memory": /0x8C010000\s*45 BC 32 04/,
+    "sh4-memory": /0x8C010000\s*86 4F 83 7E/,
     "sh4-breakpoints": /No breakpoints defined\./,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
     "sh4-callstack": /Empty callstack\./,
@@ -43,8 +42,8 @@ const DEFAULT_PANELS: Record<(typeof WORKSPACES)[number], Record<string, RegExp>
   "audio-debugger": {
     "device-tree": /SYSCLK = 200MHz/,
     sgc: /Record some data to display here/,
-    // the DSP is at any of its 128 steps: some lines of the mock's program, numbered in decimal
-    "dsp-disassembly": /\d{3}(TWT|YSEL|XSEL) [A-Z]+.*\d{3}(TWT|YSEL|XSEL) /,
+    // the DSP is at any of its 128 steps: some lines of the mock's program (the playground's lines), numbered in decimal
+    "dsp-disassembly": /\d{3}MPRO\[\d+\] = [A-Z]+.*\d{3}MPRO\[\d+\] = [A-Z]+/,
     "dsp-breakpoints": /No breakpoints defined\./,
     watches: /dc\.sh4\.cpu\.pc = 0x8C0000A/,
   },
@@ -76,10 +75,7 @@ const CALLSTACKS: Record<string, RegExp> = {
 };
 
 for (const workspace of WORKSPACES) {
-  test(`${workspace}: every default panel is mounted and shows data from the server`, async ({ page, diagnostics }) => {
-    if (workspace === "audio-debugger") {
-      diagnostics.allow(...KNOWN.sgcNoData);
-    }
+  test(`${workspace}: every default panel is mounted and shows data from the server`, async ({ page }) => {
     await openWorkspace(page, workspace);
     const expected = DEFAULT_PANELS[workspace];
     for (const [id, content] of Object.entries(expected)) {
@@ -147,8 +143,8 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
   { title: "CLX2: TA", id: "holly-ta", content: /This view is under consideration\./ },
   { title: "CLX2: CORE", id: "holly-core", content: /Drop your refsw2 log here/ },
   { title: "SGC", id: "sgc", content: /Record some data to display here/ },
-  // ... and the DSP is at any of its 128 steps: some lines of the mock's program, numbered in decimal
-  { title: "DSP: Disassembly", id: "dsp-disassembly", content: /\d{3}(TWT|YSEL|XSEL) [A-Z]+.*\d{3}(TWT|YSEL|XSEL) / },
+  // ... and the DSP is at any of its 128 steps: some lines of the mock's program (the playground's lines), numbered in decimal
+  { title: "DSP: Disassembly", id: "dsp-disassembly", content: /\d{3}MPRO\[\d+\] = [A-Z]+.*\d{3}MPRO\[\d+\] = [A-Z]+/ },
   { title: "DSP: Breakpoints", id: "dsp-breakpoints", content: /No breakpoints defined\./ },
   { title: "DSP: Playground", id: "dsp-playground", content: /Start DSP/ },
   { title: "Device Tree", id: "device-tree", content: /SYSCLK = 200MHz/ },
@@ -160,11 +156,9 @@ const SELECTOR_PANELS: Array<{ title: string; id: string; content: RegExp | ((vi
 
 test("the panel selector offers every panel that is not in the dock, and each one mounts with content", async ({
   page,
-  diagnostics,
   rpc,
 }) => {
   test.slow();
-  diagnostics.allow(...KNOWN.sgcNoData);
   await openWorkspace(page, "sh4-debugger");
 
   // The mock starts running and sends a tick five times a second, and every tick renders every

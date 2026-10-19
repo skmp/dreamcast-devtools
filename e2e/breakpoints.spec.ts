@@ -9,7 +9,6 @@ import {
   panel,
   pauseFromToolbar,
   tooltipButton,
-  KNOWN,
 } from "./support/fixtures";
 import { requestAsAnotherClient } from "./support/mockServer";
 import { serveScriptedDebugger, V3_TARGETS } from "./support/scriptedDebugger";
@@ -131,8 +130,7 @@ test("ARM7: Breakpoints adds, toggles and removes", async ({ page }) => {
   await expect(view.getByText("No breakpoints defined.")).toBeVisible();
 });
 
-test("DSP: Breakpoints adds a step breakpoint, toggles and removes it", async ({ page, diagnostics }) => {
-  diagnostics.allow(...KNOWN.sgcNoData);
+test("DSP: Breakpoints adds a step breakpoint, toggles and removes it", async ({ page }) => {
   await openWorkspace(page, "audio-debugger");
   await pauseFromToolbar(page);
   const view = panel(page, "dsp-breakpoints");
@@ -156,10 +154,9 @@ test("DSP: Breakpoints adds a step breakpoint, toggles and removes it", async ({
   await expect(view.getByText("No breakpoints defined.")).toBeVisible();
 });
 
-test("DSP: Breakpoints reads a plain number as a decimal step and 0x as hex", async ({ page, diagnostics }) => {
+test("DSP: Breakpoints reads a plain number as a decimal step and 0x as hex", async ({ page }) => {
   // regression: the step was parsed with radix 16 although the placeholder ("0, 5, 0x10") and
   // the DSP disassembly view are decimal, so typing 10 set a breakpoint on step 16
-  diagnostics.allow(...KNOWN.sgcNoData);
   await openWorkspace(page, "audio-debugger");
   await pauseFromToolbar(page);
   const view = panel(page, "dsp-breakpoints");
@@ -405,9 +402,7 @@ test("mute and solo are kept by the server: a reload shows them again, and so do
 test("the list of a target has that target's code breakpoints, each in the address format of its target", async ({
   page,
   mock,
-  diagnostics,
 }) => {
-  diagnostics.allow(...KNOWN.sgcNoData);
   await openWorkspace(page, "audio-debugger");
   await pauseFromToolbar(page);
   const dsp = panel(page, "dsp-breakpoints");
