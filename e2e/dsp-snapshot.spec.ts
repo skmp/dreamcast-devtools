@@ -289,6 +289,44 @@ test.describe("against the mock", () => {
     await expect(register(view, "Sample")).toHaveText(/^\s*0$/);
     await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", "6");
   });
+
+  test("a program written into the core after a load ends its banner: the Compiled tab, and an edit in the Assembler tab", async ({ page }) => {
+    await openWorkspace(page, "audio-debugger");
+    const view = await openPlayground(page);
+    await loadButton(view).click();
+    await expect(banner(view)).toBeVisible();
+    // the Assembler tab the load switched to has the core's program: it is not written again, and the banner stays
+    await expect(view.getByRole("tab", { name: "Assembler" })).toHaveAttribute("aria-selected", "true");
+    const editor = monacoEditor(view);
+    const status = editor.locator("xpath=../../following-sibling::div");
+    await expect.poll(() => monacoVisibleText(editor)).toMatch(/^# AICA-DSP\n\n# COEF\n/);
+    await expect(status).toHaveText("Assembled");
+    await page.waitForTimeout(300);
+    await expect(banner(view)).toBeVisible();
+
+    // the Compiled tab writes the Compiler tab's program into the core: no snapshot is there any more
+    await view.getByRole("tab", { name: "Compiled" }).click();
+    await expect(view.getByRole("tab", { name: "Compiled" })).toHaveAttribute("aria-selected", "true");
+    await expect(banner(view)).toHaveCount(0);
+    // nor when the Assembler tab writes the snapshot's text again
+    await view.getByRole("tab", { name: "Assembler" }).click();
+    await expect.poll(() => monacoVisibleText(monacoEditor(view))).toMatch(/^# AICA-DSP\n/);
+    await page.waitForTimeout(300);
+    await expect(banner(view)).toHaveCount(0);
+
+    // a load again, into the Assembler tab it is in; an edit there is assembled and written: the banner goes
+    await loadButton(view).click();
+    await expect(banner(view)).toBeVisible();
+    await expect(view.getByRole("tab", { name: "Assembler" })).toHaveAttribute("aria-selected", "true");
+    await page.waitForTimeout(300);
+    await expect(banner(view)).toBeVisible();
+    await monacoEditor(view).click();
+    await page.keyboard.press("ControlOrMeta+End");
+    await page.keyboard.insertText("\n# an edit\n");
+    await expect.poll(() => monacoVisibleText(monacoEditor(view))).toContain("# an edit");
+    await expect(monacoEditor(view).locator("xpath=../../following-sibling::div")).toHaveText("Assembled");
+    await expect(banner(view)).toHaveCount(0);
+  });
 });
 
 test.describe("against the mock with TESTB0 set", () => {

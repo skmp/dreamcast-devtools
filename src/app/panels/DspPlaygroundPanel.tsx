@@ -450,7 +450,9 @@ export const DspPlaygroundPanel = () => {
     }
   }, [activeTab]);
 
-  // write false: the source is assembled for the editor (its status, its errors), and the core keeps its program
+  // write false: the source is assembled for the editor (its status, its errors), and the core keeps its program.
+  // A program written into the core ends a snapshot's banner (here and in compileAndWrite): the core is no longer
+  // the emulator's. The load itself writes its program's text this way, and sets its banner behind it
   const assembleAndWrite = useCallback(
     (newSource: string, write = true) => {
       if (!wasmInitialized) return;
@@ -463,6 +465,7 @@ export const DspPlaygroundPanel = () => {
         const parsedData = assembleSourceWithPreprocessing(newSource);
         if (write) {
           writeRegisters(aicaDsp, parsedData);
+          setSnapshotBanner(null);
           setBinaryVersion(v => v + 1);
         }
         editorRef.current?.setStatus('assembled');
@@ -508,6 +511,7 @@ export const DspPlaygroundPanel = () => {
           const parsedData = assembleSource(lines);
           snapshotSourceRef.current = null;
           writeRegisters(aicaDsp, parsedData);
+          setSnapshotBanner(null);
           setBinaryVersion(v => v + 1);
 
           // Set compiled status
@@ -910,7 +914,8 @@ export const DspPlaygroundPanel = () => {
       }
       const program = snapshotSource(taken);
       assemblySourceRef.current = program;
-      // the editor's status, and the program as its text has it; then the snapshot as it is
+      // the editor's status, and the program as its text has it (which ends a banner of an earlier load); then the
+      // snapshot as it is, and its banner
       assembleAndWrite(program);
       applySnapshot(aicaDsp, taken);
       snapshotSourceRef.current = program;
