@@ -60,6 +60,30 @@ const readOf = (rpc: RpcLog, request: RpcFrame) => {
   return { result, memory, tick };
 };
 
+/**
+ * readOf once the test's log has all three: the page has the answer, the frame and the tick before it shows a
+ * banner, the log of the test has them a moment later.
+ */
+const loadOf = async (rpc: RpcLog, request: RpcFrame) => {
+  await expect
+    .poll(
+      () => {
+        const at = rpc.received.findIndex((frame) => frame.id === request.id && frame.method === undefined);
+        if (at < 0) return "no answer";
+        const { binaryId } = rpc.received[at].result as { binaryId: number };
+        const frame = rpc.binaryFrames.some((bytes) => {
+          const parsed = parseBinaryFrame(bytes);
+          return parsed.ok && parsed.header.kind === BinaryFrameKind.MEMORY && parsed.header.binaryId === binaryId;
+        });
+        if (!frame) return "no frame";
+        return rpc.received.slice(at + 1).some((received) => received.method === "event.tick") ? "all three" : "no tick behind the answer";
+      },
+      { message: "the answer to state.getMemoryBinary, its frame and a tick behind the answer" },
+    )
+    .toBe("all three");
+  return readOf(rpc, request);
+};
+
 /** The 16 bits a CPU reads at an offset of the AICA's register file, in a read of the ARM7 from 0. */
 const slot = (memory: Uint8Array, offset: number): number => memory[REGISTER_FILE + offset] | (memory[REGISTER_FILE + offset + 1] << 8);
 const row = (tick: Tick, path: string, name: string): number => Number(tick.registers[path].find((register) => register.name === name)!.value);
@@ -119,7 +143,7 @@ test.describe("against the mock", () => {
     // one read, of the ARM7 from 0: wave memory and the register file of one moment, and no other
     expect(rpc.requests("state.getMemoryBinary").map((frame) => frame.params)).toEqual([READ]);
     expect(rpc.requests("state.getMemorySlice")).toHaveLength(slices);
-    const { result, memory, tick } = readOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
+    const { result, memory, tick } = await loadOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
     expect(result.totalBytes).toBe(READ.length);
     expect(memory.byteLength).toBe(READ.length);
     expect(tick?.executionState).toMatchObject({ state: "paused", stopId: 1, reason: "start" });
@@ -174,7 +198,7 @@ test.describe("against the mock", () => {
     const view = await openPlayground(page);
     await loadButton(view).click();
     await expect(banner(view)).toContainText("stop 2");
-    const { memory, tick } = readOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
+    const { memory, tick } = await loadOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
     expect(row(tick!, "dc.aica.dsp", "STEP")).toBe(5);
     await expect(banner(view)).toContainText("At step 5, in the DSP phase of a sample: up to the end of that sample (step 127) the playground computes what the emulator computes");
     await expect(banner(view)).not.toContainText("not known");
@@ -188,22 +212,34 @@ test.describe("against the mock", () => {
     await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", "6");
   });
 
-  test("the banner is of the stop it was loaded at: a load at a later stop names that one", async ({ page, rpc }) => {
+  test("the banner is of the stop it was loaded at: it keeps that stop and its time while the target goes on, and a load at a later stop names that one", async ({ page, rpc }) => {
     await openWorkspace(page, "audio-debugger");
     const view = await openPlayground(page);
     await loadButton(view).click();
-    await expect(banner(view)).toContainText("stop 1");
+    await expect(banner(view)).toContainText(", stop 1, ");
+    const first = await loadOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
+    expect(first.tick?.executionState).toMatchObject({ state: "paused", stopId: 1 });
+    const loadedAt = new Date(first.tick!.timestamp).toISOString();
+    await expect(banner(view).locator("time")).toHaveAttribute("datetime", loadedAt);
     // two DSP steps: stops 2 and 3
     await control(page, "Step Into").click();
     await expect(executionState(page)).toHaveText("Paused · step completed · stop 2");
     await control(page, "Step Into").click();
     await expect(executionState(page)).toHaveText("Paused · step completed · stop 3");
+    // the target is in stop 3, and ticks of it have come: the banner is still of the load, its stop and its time
+    await expect.poll(() => rpc.received.some((frame) => frame.method === "event.tick" && (frame.params as unknown as Tick).executionState.stopId === 3)).toBe(true);
+    await page.waitForTimeout(300);
+    await expect(banner(view)).toContainText(", stop 1, ");
+    await expect(banner(view)).not.toContainText("stop 3");
+    await expect(banner(view).locator("time")).toHaveAttribute("datetime", loadedAt);
+    expect(rpc.requests("state.getMemoryBinary")).toHaveLength(1);
+
     await loadButton(view).click();
     await expect(banner(view)).toContainText(/, stop 3, /);
     await expect(banner(view)).not.toContainText("stop 1");
     const reads = rpc.requests("state.getMemoryBinary");
     expect(reads).toHaveLength(2);
-    const { tick } = readOf(rpc, reads[1]);
+    const { tick } = await loadOf(rpc, reads[1]);
     expect(tick?.executionState).toMatchObject({ state: "paused", stopId: 3, reason: "step" });
     await expect(banner(view).locator("time")).toHaveAttribute("datetime", new Date(tick!.timestamp).toISOString());
     // a DSP step's stop is behind step 0: no warning
@@ -222,7 +258,7 @@ test.describe("against the mock with TESTB0 set", () => {
     const view = await openPlayground(page);
     await loadButton(view).click();
     await expect(banner(view)).toBeVisible();
-    const { tick } = readOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
+    const { tick } = await loadOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
     const common = (name: string) => row(tick!, "dc.aica.common", name);
     expect(common("TESTB0")).toBe(1);
     const regs = await downloadRegs(page, view);

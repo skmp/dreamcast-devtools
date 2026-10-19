@@ -609,6 +609,7 @@ test.describe("the UI the emulator serves, against that emulator", () => {
       const host = new URL(EMULATOR_URL!).host;
       await expect(banner).toContainText(new RegExp(`^Loaded from nullDC\\S* @ ${host.replace(/\./g, "\\.")}, stop ${breakpointStop}, `));
       await expect(banner.locator("time")).toHaveAttribute("datetime", /^\d{4}-\d{2}-\d{2}T/);
+      const loadedAt = (await banner.locator("time").getAttribute("datetime"))!;
       await expect(banner).toContainText(`At step ${DSP_STOP_STEP}, in the DSP phase of a sample`);
       await expect(banner).not.toContainText("not known");
       await expect(banner).toContainText("loaded as 0");
@@ -650,9 +651,14 @@ test.describe("the UI the emulator serves, against that emulator", () => {
         if (dspRegister(after, name) !== dspRegister(at, name)) changed.push(name);
       }
       expect(changed.length, "the steps changed rows of the datapath").toBeGreaterThan(0);
+      // the banner is still of the load: the breakpoint's stop and the time of its tick, not the stop the steps went on to
+      const stepped = await stopNumber(page);
+      await expect(banner).toContainText(`, stop ${breakpointStop}, `);
+      await expect(banner).not.toContainText(`, stop ${stepped}, `);
+      await expect(banner.locator("time")).toHaveAttribute("datetime", loadedAt);
       // read back: a load at the stop behind the steps, and its read is the emulator's
       await loadButton.click();
-      await expect(banner).toContainText(new RegExp(`, stop ${await stopNumber(page)}, `));
+      await expect(banner).toContainText(new RegExp(`, stop ${stepped}, `));
       const emulator = (await lastLoad()).memory;
       let words = 0;
       const written: string[] = [];
