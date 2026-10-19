@@ -12,11 +12,11 @@ import { bundleInfoPlugin } from "./bundle-info";
 // the emulator reports ("<emulator name> @ <host>" in the connection picker).
 // Identifiers that no one reads keep their nulldc spelling, since a rename would lose saved
 // state: the localStorage keys nulldc-debugger-* and nulldc-theme-mode, the nulldc:crash-test
-// event, environment and CMake variable names (NULLDC_*), and the logo file
-// public/nulldc_logo.png. None of them is an old name of the UI in the sense below, so none
-// needs an exception. The BroadcastChannels of a wasm build are not kept: they are
-// dreamcast-devtools-announce and dreamcast-devtools-<id>, and no file names the old ones
-// (OLD_CHANNEL below) but where a test shows that nothing is heard or said on them.
+// event, and environment and CMake variable names (NULLDC_*). None of them is an old name of
+// the UI in the sense below, so none needs an exception. The BroadcastChannels of a wasm
+// build are not kept: they are dreamcast-devtools-announce and dreamcast-devtools-<id>, and no
+// file names the old ones (OLD_CHANNEL below) but where a test shows that nothing is heard or
+// said on them.
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -132,7 +132,6 @@ describe("the name of the UI", () => {
       "nulldc-theme-mode",
       "nulldc:crash-test",
       "-DNULLDC_DEVTOOLS_DIST=<this checkout>/dist-native",
-      "nulldc_logo.png",
     ]) {
       expect(oldUiNames(kept), kept).toEqual([]);
     }
