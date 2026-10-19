@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <title>Dreamcast DevTools</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2645"/>
+      <stop offset="1" stop-color="#0f111a"/>
+    </linearGradient>
+    <radialGradient id="disc" cx="0.36" cy="0.3" r="0.85">
+      <stop offset="0" stop-color="#ffbe6b"/>
+      <stop offset="0.55" stop-color="#ff7d1f"/>
+      <stop offset="1" stop-color="#d95600"/>
+    </radialGradient>
+  </defs>
+  <rect x="4" y="4" width="248" height="248" rx="56" fill="url(#tile)"/>
+  <g fill="none" stroke="#4fc3f7" stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="76,72 34,128 76,184"/>
+    <polyline points="180,72 222,128 180,184"/>
+  </g>
+  <circle cx="128" cy="128" r="43" fill="url(#disc)"/>
+  <circle cx="128" cy="128" r="31" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="2.5"/>
+  <circle cx="128" cy="128" r="18" fill="#ffe2bd" fill-opacity=".4"/>
+  <circle cx="128" cy="128" r="10" fill="#0f111a"/>
+  <path d="M 93.4 107.8 A 40 40 0 0 1 113.2 90.8" fill="none" stroke="#fff" stroke-opacity=".45" stroke-width="5" stroke-linecap="round"/>
+  <rect x="5" y="5" width="246" height="246" rx="55" fill="none" stroke="#4fc3f7" stroke-opacity=".3" stroke-width="2"/>
+</svg>
