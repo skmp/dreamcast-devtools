@@ -248,6 +248,47 @@ test.describe("against the mock", () => {
     await expandDebugger(view);
     await expect(register(view, "Step")).toHaveText(/^\s*2$/);
   });
+
+  test("a load into a playground whose DSP runs halts it at the loaded step, and it stays there", async ({ page, rpc }) => {
+    await openWorkspace(page, "audio-debugger");
+    const breakpoints = panel(page, "dsp-breakpoints");
+    await breakpoints.getByRole("textbox").fill("5");
+    await breakpoints.getByRole("textbox").press("Enter");
+    await expect(breakpoints.getByRole("listitem")).toHaveCount(1);
+    await control(page, "Run").click();
+    await expect(executionState(page)).toHaveText("Paused · breakpoint dc.aica.dsp.step == 005 · stop 2");
+    const view = await openPlayground(page);
+    await view.getByRole("button", { name: "Start DSP" }).click();
+    await expect(view.getByRole("button", { name: "Stop DSP" })).toBeVisible();
+    await expandDebugger(view);
+    // the playground's DSP runs: paused for a moment it has run samples, and it runs on
+    await page.waitForTimeout(300);
+    await tooltipButton(view, "Pause").click();
+    await expect(tooltipButton(view, "Step")).toBeEnabled();
+    expect(await registerValue(view, "Sample"), "samples the playground ran before the load").toBeGreaterThan(0);
+    await tooltipButton(view, "Run").click();
+    await expect(tooltipButton(view, "Step")).toBeDisabled();
+    await page.waitForTimeout(500);
+
+    await loadButton(view).click();
+    await expect(banner(view)).toContainText(", stop 2, ");
+    const { tick } = await loadOf(rpc, rpc.requests("state.getMemoryBinary")[0]);
+    expect(row(tick!, "dc.aica.dsp", "STEP")).toBe(5);
+    // halted, at the loaded step and sample 0: its steps can be used, its Run resumes it
+    await expect(tooltipButton(view, "Step")).toBeEnabled();
+    await expect(tooltipButton(view, "Run")).toBeVisible();
+    await expect(register(view, "Step")).toHaveText(/^\s*5$/);
+    await expect(register(view, "Sample")).toHaveText(/^\s*0$/);
+    await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", "5");
+    // and it stays there: no audio callback runs it on. The step reads the core again: the one behind the loaded one
+    await page.waitForTimeout(700);
+    await expect(register(view, "Step")).toHaveText(/^\s*5$/);
+    await expect(register(view, "Sample")).toHaveText(/^\s*0$/);
+    await tooltipButton(view, "Step").click();
+    await expect(register(view, "Step")).toHaveText(/^\s*6$/);
+    await expect(register(view, "Sample")).toHaveText(/^\s*0$/);
+    await expect(view.locator(".current-instruction")).toHaveAttribute("data-address", "6");
+  });
 });
 
 test.describe("against the mock with TESTB0 set", () => {
