@@ -202,20 +202,27 @@ describe("gitFacts with git", () => {
   const scratch = mkdtempSync(join(tmpdir(), "version-test-"));
   const emptyConfig = join(scratch, "empty.gitconfig");
   writeFileSync(emptyConfig, "");
-  // the user's own configuration does not reach these repositories (signing, hooks, a default branch)
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: "1", GIT_CEILING_DIRECTORIES: scratch };
+  // The environment of the tests' own git calls: through gitEnvironment, as gitFacts', so that the GIT_DIR,
+  // GIT_INDEX_FILE, ... of a hook that runs the tests never send a commit or a tag to the repository of the hook. The
+  // user's own configuration does not reach these repositories (signing, hooks, a default branch).
+  const scratchEnvironment = (outer: NodeJS.ProcessEnv): NodeJS.ProcessEnv =>
+    gitEnvironment({ ...outer, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: "1", GIT_CEILING_DIRECTORIES: scratch });
+  const env = scratchEnvironment(process.env);
   const identity = ["-c", "user.name=Version Test", "-c", "user.email=version-test@example.invalid", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"];
-  const git = (dir: string, ...args: string[]): string =>
-    execFileSync("git", ["-C", dir, ...identity, ...args], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const gitWith =
+    (environment: NodeJS.ProcessEnv) =>
+    (dir: string, ...args: string[]): string =>
+      execFileSync("git", ["-C", dir, ...identity, ...args], { env: environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const git = gitWith(env);
   let repositories = 0;
-  const repository = (commits: number): string => {
+  const repository = (commits: number, run = git): string => {
     const dir = join(scratch, `repo${repositories++}`);
     mkdirSync(dir);
-    git(dir, "init", "-q", "-b", "main");
+    run(dir, "init", "-q", "-b", "main");
     for (let i = 0; i < commits; i++) {
       writeFileSync(join(dir, "file.txt"), `${i}\n`);
-      git(dir, "add", "file.txt");
-      git(dir, "commit", "-q", "-m", `commit ${i}`);
+      run(dir, "add", "file.txt");
+      run(dir, "commit", "-q", "-m", `commit ${i}`);
     }
     return dir;
   };
@@ -291,5 +298,19 @@ describe("gitFacts with git", () => {
     const outside = join(scratch, "no-repository");
     mkdirSync(outside);
     expect(info(outside)).toEqual({ version: "3.0.0-pre+nogit", gitRev: "" });
+  });
+
+  it("keeps the tests' own git calls in their scratch repositories when GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE name another (a hook)", () => {
+    const outer = repository(1);
+    const outerHead = git(outer, "rev-parse", "HEAD");
+    const hooked = gitWith(
+      scratchEnvironment({ ...process.env, GIT_DIR: join(outer, ".git"), GIT_WORK_TREE: outer, GIT_INDEX_FILE: join(outer, ".git", "index"), GIT_PREFIX: "" }),
+    );
+    const dir = repository(2, hooked);
+    hooked(dir, "tag", "-a", "v3.0.0-pre", "-m", "scratch tag");
+    expect(git(outer, "rev-parse", "HEAD")).toBe(outerHead);
+    expect(git(outer, "tag", "--list")).toBe("");
+    expect(git(outer, "status", "--porcelain")).toBe("");
+    expect(info(dir).version).toBe("3.0.0-pre");
   });
 });
