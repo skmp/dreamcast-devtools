@@ -256,12 +256,15 @@ describe("check", () => {
 interface FakeAsset {
   name: string;
   size: number;
-  digest: string;
+  digest: string | null;
   state: string;
 }
 
 /** gh with one Release (or none) of its own, recording each call. */
-const fakeGh = (start: { isDraft: boolean; assets?: FakeAsset[] } | null, misbehave: { dropOnCreate?: boolean; viewError?: string } = {}) => {
+const fakeGh = (
+  start: { isDraft: boolean; assets?: FakeAsset[] } | null,
+  misbehave: { dropOnCreate?: boolean; alterOnCreate?: (asset: FakeAsset) => FakeAsset; viewError?: string } = {},
+) => {
   const calls: string[][] = [];
   let release: { isDraft: boolean; isPrerelease: boolean; assets: FakeAsset[] } | null = start ? { isDraft: start.isDraft, isPrerelease: true, assets: start.assets ?? [] } : null;
   const asset = (path: string): FakeAsset => {
@@ -290,7 +293,9 @@ const fakeGh = (start: { isDraft: boolean; assets?: FakeAsset[] } | null, misbeh
       return release ? { status: 0, stdout: JSON.stringify({ tagName: tag, ...release }), stderr: "" } : { status: 1, stdout: "", stderr: "release not found\n" };
     }
     if (command === "create") {
-      const assets = files(rest).map(asset);
+      const assets = files(rest)
+        .map(asset)
+        .map(misbehave.alterOnCreate ?? ((same) => same));
       release = { isDraft: rest.includes("--draft"), isPrerelease: rest.includes("--prerelease"), assets: misbehave.dropOnCreate ? assets.slice(1) : assets };
       return ok;
     }
@@ -380,6 +385,25 @@ describe("publish", () => {
     expect(() => publish({ directory: out, tag: "v3.0.0-pre", env: TAG_PUSH, root, gh: fake.gh, log: quiet })).toThrow(/is not the release files: its assets are .*It stays a draft/);
     expect(fake.calls.map((call) => call[1])).toEqual(["view", "create", "view"]);
     expect(fake.state()?.isDraft).toBe(true);
+  });
+
+  it("leaves a draft unpublished whose asset under a file's name is not the file: another size, another digest", () => {
+    const cases: [string, (asset: FakeAsset) => FakeAsset, RegExp][] = [
+      // cut short, and no digest given for it: the size alone tells
+      [SUMS_FILE, (asset) => ({ ...asset, size: asset.size - 1, digest: null }), /: SHA256SUMS has \d+ bytes, not \d+\. It stays a draft$/],
+      // the same size, other bytes
+      [
+        zipName("3.0.0-pre", "dist-native"),
+        (asset) => ({ ...asset, digest: `sha256:${"0".repeat(64)}` }),
+        /: dreamcast-devtools-3\.0\.0-pre-dist-native\.zip has the digest sha256:0{64}, not sha256:[0-9a-f]{64} \(SHA256SUMS\)\. It stays a draft$/,
+      ],
+    ];
+    for (const [name, alter, problem] of cases) {
+      const fake = fakeGh(null, { alterOnCreate: (asset) => (asset.name === name ? alter(asset) : asset) });
+      expect(() => publish({ directory: out, tag: "v3.0.0-pre", env: TAG_PUSH, root, gh: fake.gh, log: quiet }), name).toThrow(problem);
+      expect(fake.calls.map((call) => call[1])).toEqual(["view", "create", "view"]);
+      expect(fake.state()?.isDraft).toBe(true);
+    }
   });
 
   it("stops at a view that fails for another reason than a missing Release", () => {
