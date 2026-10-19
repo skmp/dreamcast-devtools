@@ -1019,7 +1019,10 @@ makes its own version by the same rule.
 on pull requests, on the push of a tag `v*`, and when it is dispatched by hand
 (`workflow_dispatch`, with the input `tag`); a push to a branch starts nothing. Every checkout has
 the whole history (`fetch-depth: 0`): the version needs the tag. Every action is pinned by its
-commit, the token is read-only in every job but `release`, and every artifact is kept 7 days.
+commit, the token is read-only in every job but `release`, and every artifact is kept 7 days. No
+checkout keeps the token in `.git/config` (`persist-credentials: false`; no job pushes with git),
+and `release-check` and `release` install with `npm ci --ignore-scripts`, so that no dependency's
+install script runs beside the token that can write.
 
 | Job | Runs on | What it does |
 | --- | --- | --- |
