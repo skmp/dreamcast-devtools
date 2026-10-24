@@ -13,6 +13,7 @@
     "build:wasm": "tsc -b && cross-env VITE_TRANSPORT_MODE=wasm vite build --outDir dist-wasm",
     "build:dspsim": "tsx --tsconfig tsconfig.scripts.json scripts/build-dspsim.ts",
     "build:icon": "tsx --tsconfig tsconfig.scripts.json scripts/build-icon.ts",
+    "print-version": "tsx --tsconfig tsconfig.scripts.json scripts/version.ts",
     "lint": "eslint .",
     "typecheck": "tsc -b",
     "test": "vitest",

@@ -1,30 +1,59 @@
 name: CI
 
+# Pull requests build and test the UI and make its release files (artifacts, 7 days). A push of a tag v* does the
+# same and makes the GitHub Release of the files (the job release, the only one that can write). A dispatch, given
+# the tag it checks against, runs what a pull request runs and creates nothing. Pushes to branches start nothing.
 on:
   pull_request:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The tag the release files are checked against (release-check), e.g. v3.0.0-pre. Nothing is created.'
+        type: string
+        required: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # the whole history and its tags: the version is made from the tag v* that HEAD descends from. No job pushes with
+      # git, so no checkout keeps the token in .git/config, where any install script of a dependency could read it.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
       - run: npm ci
-      # lint, typecheck, test:run and build:native; stops at the first failure
+      - name: Version
+        run: |
+          version="$(npm run --silent print-version)"
+          echo "$version"
+          echo "Dreamcast DevTools \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+      # lint, typecheck, test:run, the contract gate on the mock, build:native and build:wasm; stops at the first failure
       - run: npm run check
 
   # Browser tests: not part of `npm run check`, they need Chromium.
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -32,7 +61,7 @@ jobs:
       - run: npx playwright install --with-deps chromium
       # builds dist-native/, then drives it in headless Chromium, one mock server per test
       - run: npm run test:e2e
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ !cancelled() }}
         with:
           name: playwright-report
@@ -40,3 +69,88 @@ jobs:
             playwright-report/
             test-results/
           retention-days: 7
+
+  # The release files, on every run: the two zips, SHA256SUMS and the notes (scripts/release-files.ts pack, which never
+  # runs gh).
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:native
+      - run: npm run build:wasm
+      - name: Pack the release files
+        run: |
+          version="$(npm run --silent print-version)"
+          npx tsx --tsconfig tsconfig.scripts.json scripts/release-files.ts pack --version "$version" --native dist-native --wasm dist-wasm --out "$RUNNER_TEMP/release-files"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/release-files/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Pull requests and dispatches: the release files checked, and what the job release would run printed
+  # (scripts/release-files.ts check, which creates nothing). Skipped on the push of a tag.
+  release-check:
+    if: github.event_name != 'push'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      # tsx alone runs here, and esbuild's binary comes from its platform package: no dependency's install script runs
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/release-files
+      - name: Check the release files
+        env:
+          # the input of a dispatch; empty on a pull request
+          TAG: ${{ inputs.tag }}
+        run: npx tsx --tsconfig tsconfig.scripts.json scripts/release-files.ts check --dir "$RUNNER_TEMP/release-files" --tag "$TAG"
+
+  # The push of a tag v* alone: the GitHub Release of package's files (scripts/release-files.ts publish: a draft, its
+  # assets checked, then published). Never needs release-check, which is skipped on the push of a tag.
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [check, e2e, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      # tsx alone runs here, and esbuild's binary comes from its platform package: no dependency's install script runs
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/release-files
+      - name: Publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: npx tsx --tsconfig tsconfig.scripts.json scripts/release-files.ts publish --dir "$RUNNER_TEMP/release-files" --tag "$GITHUB_REF_NAME"

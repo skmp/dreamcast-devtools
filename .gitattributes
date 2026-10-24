@@ -1,0 +1,3 @@
+# Every file is checked out byte for byte as it is committed, whatever core.autocrlf says: the DSP module of
+# src/wasm/aica-dsp-core/ is hashed by the emulator's tests on every system, and no file of this tree needs CRLF.
+* -text
